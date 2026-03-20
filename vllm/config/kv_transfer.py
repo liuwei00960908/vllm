@@ -72,6 +72,29 @@ class KVTransferConfig:
     'recompute': reschedule the request to recompute failed blocks
     'fail': immediately fail the request with an error finish reason (default)"""
 
+    sparse_kv_topk_transfer: bool = False
+    """When True, P2pNcclConnector may send only a sparse subset of KV slots
+    (prefix / suffix / Top-K heuristic or k-means representatives) instead of
+    full blocks. **Experimental**: decode attention must respect the same
+    subset (see :class:`~vllm.v1.topk_history.TopKHistoryManager`)."""
+
+    sparse_kv_topk_k: int = 64
+    """Target number of logical tokens to keep (including prefix/tail forcing)
+    for sparse KV transfer."""
+
+    sparse_kv_prefix_keep: int = 8
+    """Always include the first N prompt tokens (logical indices)."""
+
+    sparse_kv_tail_keep: int = 16
+    """Always include the last N tokens in the current span (prefix+decode)."""
+
+    sparse_kv_sliding_window: int = 512
+    """Sliding window size used by :class:`~vllm.v1.topk_history.TopKHistoryManager`
+    when merging spilled tokens into the global pool (decode-side; WIP)."""
+
+    sparse_kv_kmeans_iters: int = 5
+    """Lloyd iterations when clustering key vectors on GPU/worker."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -84,9 +107,12 @@ class KVTransferConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        # no factors to consider.
-        # this config will not affect the computation graph.
         factors: list[Any] = []
+        if self.sparse_kv_topk_transfer:
+            factors.append("sparse_kv_topk_transfer")
+            factors.append(self.sparse_kv_topk_k)
+            factors.append(self.sparse_kv_prefix_keep)
+            factors.append(self.sparse_kv_tail_keep)
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -105,6 +131,16 @@ class KVTransferConfig:
                 "Please specify kv_role when kv_connector "
                 f"is set, supported roles are {get_args(KVRole)}"
             )
+
+        if self.sparse_kv_topk_transfer:
+            if self.sparse_kv_topk_k < 1:
+                raise ValueError("sparse_kv_topk_k must be >= 1")
+            if self.sparse_kv_prefix_keep < 0 or self.sparse_kv_tail_keep < 0:
+                raise ValueError("sparse_kv_prefix_keep/tail_keep must be >= 0")
+            if self.sparse_kv_sliding_window < 1:
+                raise ValueError("sparse_kv_sliding_window must be >= 1")
+            if self.sparse_kv_kmeans_iters < 1:
+                raise ValueError("sparse_kv_kmeans_iters must be >= 1")
 
     @property
     def is_kv_transfer_instance(self) -> bool:

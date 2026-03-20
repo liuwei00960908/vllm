@@ -20,7 +20,9 @@ from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.topk_history import TopKHistoryManager, logical_indices_to_physical_slots
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -39,16 +41,27 @@ class ReqMeta:
     block_ids: torch.Tensor
     # Request num tokens
     num_tokens: int
+    # Optional physical slot ids (see ExampleConnector / sparse KV transfer).
+    fallback_sparse_slot_mapping: torch.Tensor | None = None
+    layer_sparse_slot_mapping: dict[str, torch.Tensor] | None = None
 
     @staticmethod
     def make_meta(
-        request_id: str, token_ids: list[int], block_ids: list[int], block_size: int
+        request_id: str,
+        token_ids: list[int],
+        block_ids: list[int],
+        block_size: int,
+        fallback_sparse_slot_mapping: torch.Tensor | None = None,
+        layer_sparse_slot_mapping: dict[str, torch.Tensor] | None = None,
     ) -> "ReqMeta":
+        del block_size  # unused; kept for signature compatibility
         block_ids_tensor = torch.tensor(block_ids)
         return ReqMeta(
             request_id=request_id,
             block_ids=block_ids_tensor,
             num_tokens=len(token_ids),
+            fallback_sparse_slot_mapping=fallback_sparse_slot_mapping,
+            layer_sparse_slot_mapping=layer_sparse_slot_mapping,
         )
 
 
@@ -65,10 +78,80 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         token_ids: list[int],
         block_ids: list[int],
         block_size: int,
+        fallback_sparse_slot_mapping: torch.Tensor | None = None,
+        layer_sparse_slot_mapping: dict[str, torch.Tensor] | None = None,
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(request_id, token_ids, block_ids, block_size)
+            ReqMeta.make_meta(
+                request_id,
+                token_ids,
+                block_ids,
+                block_size,
+                fallback_sparse_slot_mapping,
+                layer_sparse_slot_mapping,
+            )
         )
+
+
+def _resolve_sparse_slots_for_layer(
+    request: ReqMeta, layer_name: str
+) -> torch.Tensor | None:
+    if request.layer_sparse_slot_mapping and layer_name in request.layer_sparse_slot_mapping:
+        return request.layer_sparse_slot_mapping[layer_name]
+    return request.fallback_sparse_slot_mapping
+
+
+def _extract_kv_sparse(
+    layer: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    block_size: int,
+) -> torch.Tensor:
+    if (
+        isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
+    ):  # MLA or FlashInfer
+        num_pages, page_size = layer.shape[0], layer.shape[1]
+        return layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]
+    if isinstance(attn_metadata, TritonAttentionMetadata):
+        block_idxs = slot_mapping // block_size
+        offsets = slot_mapping % block_size
+        return layer[block_idxs, :, offsets]
+    num_pages, page_size = layer.shape[1], layer.shape[2]
+    return layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping, ...]
+
+
+def _inject_kv_sparse(
+    dst_layer: torch.Tensor,
+    src: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    block_size: int,
+) -> None:
+    if (
+        isinstance(attn_metadata, MLACommonMetadata) or dst_layer.shape[1] == 2
+    ):  # MLA or FlashInfer
+        num_pages = dst_layer.shape[0]
+        page_size = dst_layer.shape[1]
+        flat = dst_layer.reshape(num_pages * page_size, -1)
+        flat[slot_mapping, ...] = src
+    elif isinstance(attn_metadata, TritonAttentionMetadata):
+        block_idxs = slot_mapping // block_size
+        offsets = slot_mapping % block_size
+        dst_layer[block_idxs, :, offsets] = src
+    else:
+        num_pages = dst_layer.shape[1]
+        page_size = dst_layer.shape[2]
+        flat = dst_layer.reshape(2, num_pages * page_size, -1)
+        flat[:, slot_mapping, ...] = src
+
+
+def _attn_metadata_for_layer(
+    attn_metadata: Any,
+    layer_name: str,
+) -> AttentionMetadata | None:
+    if isinstance(attn_metadata, dict):
+        return attn_metadata.get(layer_name)
+    return attn_metadata
 
 
 class P2pNcclConnector(KVConnectorBase_V1):
@@ -104,6 +187,18 @@ class P2pNcclConnector(KVConnectorBase_V1):
             else None
         )
 
+    def _sparse_slot_bundle(
+        self, token_ids: list[int], block_ids: list[int]
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None]:
+        if not self._kv_transfer_config.sparse_kv_topk_transfer:
+            return None, None
+        mgr = TopKHistoryManager.from_kv_config(self._kv_transfer_config)
+        logical = mgr.plan_prefill_logical_indices(len(token_ids))
+        slots = logical_indices_to_physical_slots(
+            block_ids, self._block_size, logical
+        )
+        return slots, None
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -131,67 +226,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
         if attn_metadata is None:
             return
 
-        def inject_kv_into_layer(
-            layer: torch.Tensor,
-            kv_cache: torch.Tensor,
-            block_ids: torch.Tensor,
-            request_id: str,
-        ) -> None:
-            """
-            Inject KV cache data into a given attention layer tensor.
-
-            This function updates `layer` in-place with values from `kv_cache`,
-            handling different backend layouts:
-              - MLA (Multi-Linear Attention) or FlashInfer: KV tensors are
-                indexed along the first dimension.
-              - FlashAttention: KV tensors are indexed along the second
-                dimension.
-
-            If the number of provided block IDs does not match the number of KV
-            blocks, only the overlapping portion is updated, and a warning is
-            logged.
-
-            Args:
-                layer (torch.Tensor): The attention layer KV tensor to update.
-                kv_cache (torch.Tensor): The KV cache tensor to inject.
-                block_ids (torch.Tensor): Indices of the blocks to update.
-                request_id (str): Request identifier used for logging.
-
-            Returns:
-                None. The function modifies `layer` in-place.
-            """
-            if (
-                isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
-            ):  # MLA or FlashInfer
-                num_block = kv_cache.shape[0]
-                self.check_tensors_except_dim(layer, kv_cache, 0)
-                if len(block_ids) == num_block:
-                    layer[block_ids, ...] = kv_cache
-                else:
-                    layer[block_ids[:num_block], ...] = kv_cache
-                    logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
-                        "num_block:%d, request_id:%s",
-                        len(block_ids),
-                        num_block,
-                        request_id,
-                    )
-
-            elif layer.shape[0] == 2:  # FlashAttention
-                num_block = kv_cache.shape[1]
-                self.check_tensors_except_dim(layer, kv_cache, 1)
-                if len(block_ids) == num_block:
-                    layer[:, block_ids, ...] = kv_cache
-                else:
-                    layer[:, block_ids[:num_block], ...] = kv_cache
-                    logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
-                        "num_block:%d, request_id:%s",
-                        len(block_ids),
-                        num_block,
-                        request_id,
-                    )
-
         # Get the metadata
         metadata: KVConnectorMetadata = self._get_connector_metadata()
         assert isinstance(metadata, P2pNcclConnectorMetadata)
@@ -210,23 +244,87 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # Only process layers that have kv_cache
                 # attribute (attention layers) Skip non-attention
                 # layers like FusedMoE
-                kv_cache = getattr(layer, "kv_cache", None)
-                if kv_cache is None:
+                kv_cache_attr = getattr(layer, "kv_cache", None)
+                if kv_cache_attr is None:
                     continue
 
-                layer = kv_cache[0]
+                layer = kv_cache_attr[0]
+                md = _attn_metadata_for_layer(attn_metadata, layer_name)
+                if md is None:
+                    logger.warning(
+                        "🚧 attn_metadata missing for layer %s, request %s",
+                        layer_name,
+                        request.request_id,
+                    )
+                    continue
 
-                kv_cache = self.p2p_nccl_engine.recv_tensor(
+                def inject_kv_into_layer(
+                    layer_: torch.Tensor,
+                    kv_cache_: torch.Tensor,
+                    block_ids: torch.Tensor,
+                    req_id: str,
+                    meta: AttentionMetadata,
+                ) -> None:
+                    if (
+                        isinstance(meta, MLACommonMetadata) or layer_.shape[1] == 2
+                    ):  # MLA or FlashInfer
+                        num_block = kv_cache_.shape[0]
+                        self.check_tensors_except_dim(layer_, kv_cache_, 0)
+                        if len(block_ids) == num_block:
+                            layer_[block_ids, ...] = kv_cache_
+                        else:
+                            layer_[block_ids[:num_block], ...] = kv_cache_
+                            logger.warning(
+                                "🚧kv_cache does not match, block_ids:%d, "
+                                "num_block:%d, request_id:%s",
+                                len(block_ids),
+                                num_block,
+                                req_id,
+                            )
+
+                    elif layer_.shape[0] == 2:  # FlashAttention
+                        num_block = kv_cache_.shape[1]
+                        self.check_tensors_except_dim(layer_, kv_cache_, 1)
+                        if len(block_ids) == num_block:
+                            layer_[:, block_ids, ...] = kv_cache_
+                        else:
+                            layer_[:, block_ids[:num_block], ...] = kv_cache_
+                            logger.warning(
+                                "🚧kv_cache does not match, block_ids:%d, "
+                                "num_block:%d, request_id:%s",
+                                len(block_ids),
+                                num_block,
+                                req_id,
+                            )
+
+                kv_cache_tensor = self.p2p_nccl_engine.recv_tensor(
                     request.request_id + "#" + layer_name, remote_address
                 )
 
-                if kv_cache is None:
+                if kv_cache_tensor is None:
                     logger.warning("🚧kv_cache is None, %s", request.request_id)
                     continue
 
-                inject_kv_into_layer(
-                    layer, kv_cache, request.block_ids, request.request_id
-                )
+                sparse_slots = _resolve_sparse_slots_for_layer(request, layer_name)
+                if sparse_slots is not None:
+                    slots_dev = sparse_slots.to(
+                        layer.device, dtype=torch.long, non_blocking=True
+                    )
+                    _inject_kv_sparse(
+                        layer,
+                        kv_cache_tensor,
+                        slots_dev,
+                        md,
+                        self._block_size,
+                    )
+                else:
+                    inject_kv_into_layer(
+                        layer,
+                        kv_cache_tensor,
+                        request.block_ids,
+                        request.request_id,
+                        md,
+                    )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
@@ -301,7 +399,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
-            kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+            sparse_slots = _resolve_sparse_slots_for_layer(request, layer_name)
+            if sparse_slots is not None:
+                slots_dev = sparse_slots.to(
+                    kv_layer.device, dtype=torch.long, non_blocking=True
+                )
+                kv_cache = _extract_kv_sparse(
+                    kv_layer, slots_dev, attn_metadata, self._block_size
+                )
+            else:
+                kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
             self.p2p_nccl_engine.send_tensor(
                 request_id + "#" + layer_name, kv_cache, remote_address
             )
@@ -405,19 +512,27 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     )
                     continue
                 # the request's prompt is not chunked prefill
+                tids = new_req.prompt_token_ids or []
+                fb, lm = self._sparse_slot_bundle(tids, new_req.block_ids[0])
                 meta.add_request(
                     request_id=new_req.req_id,
-                    token_ids=new_req.prompt_token_ids or [],
+                    token_ids=tids,
                     block_ids=new_req.block_ids[0],
                     block_size=self._block_size,
+                    fallback_sparse_slot_mapping=fb,
+                    layer_sparse_slot_mapping=lm,
                 )
                 continue
             if new_req.req_id in self._requests_need_load:
+                tids = new_req.prompt_token_ids or []
+                fb, lm = self._sparse_slot_bundle(tids, new_req.block_ids[0])
                 meta.add_request(
                     request_id=new_req.req_id,
-                    token_ids=new_req.prompt_token_ids or [],
+                    token_ids=tids,
                     block_ids=new_req.block_ids[0],
                     block_size=self._block_size,
+                    fallback_sparse_slot_mapping=fb,
+                    layer_sparse_slot_mapping=lm,
                 )
                 self._requests_need_load.pop(new_req.req_id)
 
@@ -442,11 +557,14 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     self.chunked_prefill[req_id] = (block_ids, prompt_token_ids)
                     continue
                 # the request's prompt is all prefilled finally
+                fb, lm = self._sparse_slot_bundle(prompt_token_ids, block_ids)
                 meta.add_request(
                     request_id=req_id,
                     token_ids=prompt_token_ids,
                     block_ids=block_ids,
                     block_size=self._block_size,
+                    fallback_sparse_slot_mapping=fb,
+                    layer_sparse_slot_mapping=lm,
                 )
                 self.chunked_prefill.pop(req_id, None)
                 continue
