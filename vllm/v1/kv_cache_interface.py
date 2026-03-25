@@ -320,6 +320,146 @@ class CrossAttentionSpec(AttentionSpec):
         return cdiv(max_encoder_len, self.block_size) * self.page_size_bytes
 
 
+@dataclass(frozen=True, kw_only=True)
+class SparseAttentionSpec(FullAttentionSpec):
+    """
+    KV cache spec for RetroInfer-style dynamic sparse attention.
+
+    Algorithm overview
+    ------------------
+    1. **Prefill** – after all prompt KV is computed, the block-level key
+       features are clustered via Segment K-Means (``n_segment`` position
+       segments, ``num_clusters`` centroids total).  Mean-centering is applied
+       before clustering and restored afterwards.
+    2. **Prefill TopK** – using the last ``prefill_topk_query_window`` prompt
+       query vectors, compute cluster scores once and cache the selection for
+       the entire decode phase.
+    3. **Decode** – reuse the cached cluster selection (no per-token search).
+       Every ``update_threshold_blocks`` new decode blocks the index is
+       refreshed with a fresh segment K-Means on the accumulated decode KV.
+    4. **Steady Zone** – the first ``static_pattern_start`` tokens (attention
+       sinks) and the last ``static_pattern_end`` tokens (local window) are
+       always loaded regardless of cluster scores.
+
+    Attributes
+    ----------
+    num_clusters:
+        Total number of K-Means cluster centroids across all segments.
+    n_segment:
+        Number of position-aligned segments the sequence is divided into
+        before running per-segment K-Means (preserves temporal locality).
+    nprobe:
+        Retrieve zone size: number of top-scored clusters whose blocks are
+        fully loaded into GPU memory each decode step.
+    static_pattern_start:
+        Number of leading tokens kept as attention sinks (steady zone head).
+        Should be aligned to ``block_size`` for efficiency.
+    static_pattern_end:
+        Number of trailing tokens kept as the local window (steady zone tail).
+        Should be aligned to ``block_size`` for efficiency.
+    prefill_topk_query_window:
+        Number of last-prompt query vectors to average when computing the
+        one-shot prefill cluster selection.  Set to 0 to disable prefill
+        caching (run per-token TopK at every decode step instead).
+    update_threshold_blocks:
+        After this many new decode blocks accumulate, re-run segment K-Means
+        on them and append new centroids to the index.
+        Corresponds to ``THRESHOLD_LENGTH // block_size`` in RetroInfer.
+
+    TODO(estimation-zone)
+    ---------------------
+    The Estimation Zone is **not yet implemented**.  The design is:
+    - Select ``max_compute_cluster_num - nprobe`` additional clusters beyond
+      the retrieve zone as the estimation zone.
+    - Compute approximate attention for those clusters using only the stored
+      ``_cluster_value_sum`` (centroid as K representative, value_sum/size as V).
+    - Merge the estimation zone output with the retrieve zone flash-attention
+      result via log-sum-exp (lse) combination, as in RetroInfer's
+      ``weighted_flash_decoding``.
+    To enable: set ``estimation_zone_size > 0`` and implement
+    ``SparseKVManager._estimate_zone_attn()`` in the model runner side.
+    """
+
+    # ── Clustering ──────────────────────────────────────────────────────
+    num_clusters: int = 32
+    """Total K-Means centroids (distributed evenly across segments)."""
+    n_segment: int = 8
+    """Position segments for segment K-Means."""
+
+    # ── Retrieve zone ───────────────────────────────────────────────────
+    nprobe: int = 16
+    """Number of top-scored clusters to fully load (retrieve zone)."""
+
+    # TODO(estimation-zone): add ``estimation_zone_size: int = 0`` here
+    # and ``max_compute_cluster_num = nprobe + estimation_zone_size``.
+
+    # ── Steady zone ─────────────────────────────────────────────────────
+    static_pattern_start: int = 0
+    """Attention sink tokens always kept on GPU (leading tokens)."""
+    static_pattern_end: int = 0
+    """Local window tokens always kept on GPU (trailing tokens)."""
+
+    # ── Prefill TopK caching ─────────────────────────────────────────────
+    prefill_topk_query_window: int = 8
+    """
+    Average cluster scores from the last N prompt query vectors for the
+    one-shot prefill selection.  0 = disable, do per-token search instead.
+    """
+
+    # ── Dynamic index update ─────────────────────────────────────────────
+    update_threshold_blocks: int = 64
+    """
+    Re-run segment K-Means on accumulated decode blocks after this many
+    new blocks.  Mirrors RetroInfer's THRESHOLD_LENGTH / block_size.
+    """
+
+    # ── Legacy / compat ─────────────────────────────────────────────────
+    max_selected_blocks: int = 64
+    """
+    Hard cap on total selected blocks per decode step
+    (steady zone + retrieve zone combined).
+    """
+
+    @property
+    def n_sink_blocks(self) -> int:
+        """Leading blocks permanently in the steady zone (attention sinks)."""
+        return cdiv(self.static_pattern_start, self.block_size)
+
+    @property
+    def n_recent_blocks(self) -> int:
+        """Trailing blocks permanently in the steady zone (local window)."""
+        return cdiv(self.static_pattern_end, self.block_size)
+
+    @classmethod
+    def merge(cls, specs: list["SparseAttentionSpec"]) -> "SparseAttentionSpec":  # type: ignore[override]
+        assert all(isinstance(spec, SparseAttentionSpec) for spec in specs), (
+            "All layers in a sparse group must be SparseAttentionSpec."
+        )
+        base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
+        return cls(
+            block_size=base.block_size,
+            num_kv_heads=base.num_kv_heads,
+            head_size=base.head_size,
+            head_size_v=base.head_size_v,
+            dtype=base.dtype,
+            page_size_padded=base.page_size_padded,
+            sliding_window=base.sliding_window,
+            attention_chunk_size=base.attention_chunk_size,
+            num_clusters=specs[0].num_clusters,
+            n_segment=specs[0].n_segment,
+            nprobe=specs[0].nprobe,
+            static_pattern_start=specs[0].static_pattern_start,
+            static_pattern_end=specs[0].static_pattern_end,
+            prefill_topk_query_window=specs[0].prefill_topk_query_window,
+            update_threshold_blocks=specs[0].update_threshold_blocks,
+            max_selected_blocks=specs[0].max_selected_blocks,
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: "VllmConfig") -> int:
+        # GPU resident at once: steady zone + retrieve zone + 1 new decode block.
+        return (self.max_selected_blocks + 1) * self.page_size_bytes
+
+
 @dataclass(frozen=True)
 class SinkFullAttentionSpec(FullAttentionSpec):
     sink_len: int | None = None
@@ -403,6 +543,18 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             # Different block sizes, not uniform.
             return False
         one_spec = next(iter(kv_cache_specs.values()))
+        if isinstance(one_spec, SparseAttentionSpec):
+            return all(
+                isinstance(spec, SparseAttentionSpec)
+                and spec.max_selected_blocks == one_spec.max_selected_blocks
+                and spec.num_clusters == one_spec.num_clusters
+                and spec.n_segment == one_spec.n_segment
+                and spec.nprobe == one_spec.nprobe
+                and spec.static_pattern_start == one_spec.static_pattern_start
+                and spec.static_pattern_end == one_spec.static_pattern_end
+                and spec.update_threshold_blocks == one_spec.update_threshold_blocks
+                for spec in kv_cache_specs.values()
+            )
         if isinstance(one_spec, FullAttentionSpec):
             return all(
                 isinstance(spec, FullAttentionSpec) for spec in kv_cache_specs.values()

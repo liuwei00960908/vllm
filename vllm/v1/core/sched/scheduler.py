@@ -1495,6 +1495,39 @@ class Scheduler(SchedulerInterface):
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
+        # ── Sparse KV attention hooks ────────────────────────────────────
+        # These are no-ops when no SparseAttentionSpec group is present.
+        #
+        # Order matters:
+        #   1. rebalance()  – absorb newly written decode blocks FIRST so that
+        #      the clustering reflects the latest state.
+        #   2. indexing()   – cluster prefill blocks for requests that just
+        #      finished their first forward pass (num_output_tokens == 1).
+        #   3. update + select() – store the query from this step and
+        #      pre-compute block selection for the *next* step.
+        # ── Sparse KV manager hooks ───────────────────────────────────────
+        # Execution order matters:
+        #   1. rebalance() – absorb new decode blocks into the cluster index.
+        #   2. indexing()  – build the initial cluster index after prefill.
+        #   3. update_query_vector() + select() – pre-compute block selection
+        #      for the next decode step.
+        if model_runner_output.sparse_new_block_features:
+            self.kv_cache_manager.sparse_post_decode_rebalance(
+                model_runner_output.sparse_new_block_features,
+                model_runner_output.sparse_new_value_features,
+            )
+        if model_runner_output.sparse_block_features:
+            vfeat_map = model_runner_output.sparse_block_value_features or {}
+            for req_id, feats in model_runner_output.sparse_block_features.items():
+                self.kv_cache_manager.sparse_notify_prefill_done(
+                    req_id, feats, vfeat_map.get(req_id)
+                )
+        if model_runner_output.sparse_query_vectors:
+            self.kv_cache_manager.sparse_update_query_vectors(
+                model_runner_output.sparse_query_vectors
+            )
+        # ─────────────────────────────────────────────────────────────────
+
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
         engine_core_outputs = {

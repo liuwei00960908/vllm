@@ -4,7 +4,9 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
+
+import numpy as np
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -14,6 +16,9 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager
 
 logger = init_logger(__name__)
 
@@ -511,3 +516,84 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()
+
+    # ------------------------------------------------------------------
+    # Sparse KV attention integration
+    # ------------------------------------------------------------------
+
+    def get_sparse_manager(self) -> "SparseKVManager | None":
+        """Return the ``SparseKVManager`` instance if present, else ``None``."""
+        from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager  # noqa: PLC0415
+        for mgr in self.coordinator.single_type_managers:
+            if isinstance(mgr, SparseKVManager):
+                return mgr
+        return None
+
+    def sparse_notify_prefill_done(
+        self,
+        request_id: str,
+        block_features: np.ndarray,
+        block_value_features: np.ndarray | None = None,
+    ) -> None:
+        """
+        Trigger ``SparseKVManager.indexing()`` after prefill completes.
+
+        Args:
+            request_id:           The request ID.
+            block_features:       ``[num_blocks, D]`` float32 numpy – mean K
+                                  per block (extracted by the model runner).
+            block_value_features: ``[num_blocks, D]`` float32 numpy – mean V
+                                  per block (optional; for Estimation Zone).
+        """
+        mgr = self.get_sparse_manager()
+        if mgr is not None:
+            mgr.indexing(request_id, block_features, block_value_features)
+
+    def sparse_update_query_vectors(
+        self,
+        query_vectors: dict[str, np.ndarray],
+    ) -> None:
+        """
+        Store pending query vectors and pre-compute block selection for the
+        next decode step.
+
+        Called by the scheduler in ``update_from_output`` after processing
+        model-runner outputs.  For each request in ``query_vectors``:
+          1. Store the query via ``update_query_vector()``.
+          2. Immediately run ``select()`` so that ``_selected_block_indices``
+             is ready for the upcoming ``schedule()`` → ``allocate_slots()``
+             call.
+
+        Args:
+            query_vectors: req_id → ``[feature_dim]`` float32 numpy array.
+        """
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return
+        for req_id, qv in query_vectors.items():
+            if req_id not in mgr.req_to_blocks:
+                continue
+            mgr.update_query_vector(req_id, qv)
+            mgr.select(req_id, qv, mgr._spec.max_selected_blocks)
+
+    def sparse_post_decode_rebalance(
+        self,
+        new_block_features: dict[str, np.ndarray],
+        new_value_features: dict[str, np.ndarray] | None = None,
+    ) -> None:
+        """
+        Update the clustering structure after a decode step writes new KV data.
+
+        Args:
+            new_block_features: req_id → ``[D]`` float32 – mean K of the
+                                newly written decode block.
+            new_value_features: req_id → ``[D]`` float32 – mean V of the
+                                newly written decode block (optional; stored
+                                for the Estimation Zone TODO).
+        """
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return
+        vfeat_map = new_value_features or {}
+        for req_id, feat in new_block_features.items():
+            mgr.rebalance(req_id, feat, vfeat_map.get(req_id))

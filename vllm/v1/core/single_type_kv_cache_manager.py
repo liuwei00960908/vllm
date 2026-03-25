@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowSpec,
+    SparseAttentionSpec,
 )
 from vllm.v1.request import Request
 
@@ -1114,7 +1115,19 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     MambaSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
     SinkFullAttentionSpec: SinkFullAttentionManager,
+    # Registered last so SparseAttentionSpec (subclass of FullAttentionSpec)
+    # gets its own dedicated manager rather than falling back to
+    # FullAttentionManager.
+    SparseAttentionSpec: None,  # filled below after import to avoid circular
 }
+
+# Deferred import to avoid circular dependency:
+# sparse_kv_cache_manager → single_type_kv_cache_manager → kv_cache_interface
+def _register_sparse_manager() -> None:
+    from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager  # noqa: PLC0415
+    spec_manager_map[SparseAttentionSpec] = SparseKVManager
+
+_register_sparse_manager()
 
 
 def get_manager_for_kv_cache_spec(
