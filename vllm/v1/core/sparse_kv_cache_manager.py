@@ -296,6 +296,16 @@ class SparseKVManager(FullAttentionManager):
 
         self._current_step: int = 0
 
+        # ── physical block tracking (Bug 1 fix) ──────────────────────────
+        # _prefill_blocks[req_id]: permanent list of all physical blocks
+        # allocated during prefill (indexed by logical block index 0..N-1).
+        # Never freed until the request is fully freed.
+        self._prefill_blocks: dict[str, list[KVCacheBlock]] = {}
+        # _decode_block[req_id]: the single "current" decode block being
+        # filled this step.  Freed and replaced at the start of each new
+        # decode step.
+        self._decode_block: dict[str, KVCacheBlock | None] = {}
+
     # ------------------------------------------------------------------
     # Required abstract-method implementations
     # ------------------------------------------------------------------
@@ -354,16 +364,17 @@ class SparseKVManager(FullAttentionManager):
                 total_computed_tokens,
                 num_tokens_main_model,
             )
-        # Decode: net new blocks needed from the free pool after freeing the
-        # old allocation and re-allocating for the new selection.
-        #
-        #   num_needed = |selected| + 1    (selected history + current token)
-        #   num_old    = current len(req_to_blocks)   (will all be freed)
-        #   net_new    = max(num_needed - num_old, 0)
-        selected = self._selected_block_indices.get(request_id, [])
-        num_needed = len(selected) + 1
-        num_old = len(self.req_to_blocks.get(request_id, []))
-        return max(num_needed - num_old, 0)
+        # Decode: we always allocate exactly 1 new block (the decode block)
+        # and recycle the previous one.
+        #   - First decode step: prefill blocks are held permanently; we
+        #     need 1 new block from the pool.
+        #   - Subsequent steps: we free the old decode block first (inside
+        #     allocate_new_blocks), so net pool usage is 0.
+        if request_id not in self._prefill_blocks:
+            # First decode step: 1 new block needed from the pool.
+            return 1
+        # Subsequent steps: old decode block is freed before new one taken.
+        return 0
 
     def allocate_new_computed_blocks(
         self,
@@ -393,22 +404,50 @@ class SparseKVManager(FullAttentionManager):
                 request_id, num_tokens, num_tokens_main_model
             )
 
-        # Decode: free ALL old blocks, then allocate a fresh set for the
-        # current selection.
+        # ── Decode ────────────────────────────────────────────────────────
+        # Key principle (Bug 1 fix): we NEVER free the physical prefill
+        # blocks so that their KV data is preserved.  Only the single
+        # "current decode block" (which accumulates the latest token) is
+        # replaced each step.
         req_blocks = self.req_to_blocks[request_id]
-        if req_blocks:
-            non_null = [b for b in req_blocks if not b.is_null]
-            self.block_pool.free_blocks(reversed(non_null))
-            req_blocks.clear()
 
+        # On the first decode call, snapshot all prefill blocks.
+        if request_id not in self._prefill_blocks:
+            self._prefill_blocks[request_id] = list(req_blocks)
+
+        # Free the old decode block from the previous step (if any).
+        prev_decode = self._decode_block.get(request_id)
+        if prev_decode is not None and not prev_decode.is_null:
+            self.block_pool.free_blocks([prev_decode])
+            self._decode_block[request_id] = None
+
+        # Map selected logical indices → physical prefill blocks.
+        # Indices >= len(prefill_blocks) are decode-step logical blocks
+        # whose physical refs are not tracked; skip them to stay safe.
+        prefill_blocks = self._prefill_blocks[request_id]
         selected = self._selected_block_indices.get(request_id, [])
-        num_needed = len(selected) + 1  # history slots + current-token slot
+        physical_selected = [
+            prefill_blocks[i]
+            for i in selected
+            if i < len(prefill_blocks)
+        ]
 
-        new_blocks = self.block_pool.get_new_blocks(num_needed)
-        req_blocks.extend(new_blocks)
-        self.new_block_ids.extend(b.block_id for b in new_blocks)
+        # Allocate exactly 1 new block for the current decode token.
+        new_decode_list = self.block_pool.get_new_blocks(1)
+        new_decode = new_decode_list[0]
+        self._decode_block[request_id] = new_decode
+
+        # Rebuild req_to_blocks: [selected prefill blocks..., decode block].
+        req_blocks.clear()
+        req_blocks.extend(physical_selected)
+        req_blocks.append(new_decode)
+
+        self.new_block_ids.append(new_decode.block_id)
         self.num_cached_block[request_id] = 0
-        return new_blocks
+
+        # Return the FULL new block list so the model runner can rebuild
+        # the block table row via add_row (not just append the new block).
+        return list(req_blocks)
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
         # Sparse blocks are not entered into the prefix-hash cache.
@@ -418,6 +457,24 @@ class SparseKVManager(FullAttentionManager):
         )
 
     def free(self, request_id: str) -> None:
+        # Free non-selected prefill blocks that are no longer referenced by
+        # req_to_blocks (they were "held" to preserve KV data but not picked
+        # by the latest selection round).
+        prefill_blocks = self._prefill_blocks.pop(request_id, [])
+        current_block_ids = {
+            id(b) for b in self.req_to_blocks.get(request_id, [])
+        }
+        orphaned = [
+            b for b in prefill_blocks
+            if id(b) not in current_block_ids and not b.is_null
+        ]
+        if orphaned:
+            self.block_pool.free_blocks(reversed(orphaned))
+
+        # Clear decode block ref (the block itself is in req_to_blocks and
+        # will be freed by super().free()).
+        self._decode_block.pop(request_id, None)
+
         super().free(request_id)
         self._cluster_centres.pop(request_id, None)
         self._cluster_value_sum.pop(request_id, None)

@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    SparseAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -518,6 +519,39 @@ class Attention(nn.Module, AttentionLayerBase):
         block_size = vllm_config.cache_config.block_size
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
+
+        # Bug 4 fix: if sparse_attention is configured in CacheConfig,
+        # return a SparseAttentionSpec for every decoder attention layer.
+        # Sliding-window layers are left as-is (sparse + sliding-window is
+        # not yet supported).
+        sparse_cfg = getattr(vllm_config.cache_config, "sparse_attention", None)
+        if sparse_cfg is not None and self.sliding_window is None:
+            return SparseAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                num_clusters=int(sparse_cfg.get("num_clusters", 32)),
+                n_segment=int(sparse_cfg.get("n_segment", 8)),
+                nprobe=int(sparse_cfg.get("nprobe", 16)),
+                static_pattern_start=int(
+                    sparse_cfg.get("static_pattern_start", 0)
+                ),
+                static_pattern_end=int(
+                    sparse_cfg.get("static_pattern_end", 0)
+                ),
+                prefill_topk_query_window=int(
+                    sparse_cfg.get("prefill_topk_query_window", 8)
+                ),
+                update_threshold_blocks=int(
+                    sparse_cfg.get("update_threshold_blocks", 64)
+                ),
+                max_selected_blocks=int(
+                    sparse_cfg.get("max_selected_blocks", 64)
+                ),
+            )
+
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"

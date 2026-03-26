@@ -150,6 +150,40 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    sparse_attention: dict | None = None
+    """Configuration dict for RetroInfer-style dynamic sparse attention.
+    When set, ``Attention.get_kv_cache_spec()`` returns a
+    ``SparseAttentionSpec`` for every decoder attention layer instead of the
+    default ``FullAttentionSpec``.
+
+    Supported keys (all optional; defaults mirror ``SparseAttentionSpec``):
+
+    * ``num_clusters`` (int, default 32) – total K-Means centroids.
+    * ``n_segment`` (int, default 8) – position segments for segment K-Means.
+    * ``nprobe`` (int, default 16) – retrieve-zone cluster count.
+    * ``static_pattern_start`` (int, default 0) – attention-sink tokens.
+    * ``static_pattern_end`` (int, default 0) – local-window tokens.
+    * ``prefill_topk_query_window`` (int, default 8) – query window for the
+      one-shot prefill cluster selection (0 = disabled).
+    * ``update_threshold_blocks`` (int, default 64) – decode blocks to buffer
+      before refreshing the segment K-Means index.
+    * ``max_selected_blocks`` (int, default 64) – hard cap on total selected
+      blocks per decode step.
+
+    Example::
+
+        cache_config = CacheConfig(
+            sparse_attention={
+                "num_clusters": 64,
+                "n_segment": 8,
+                "nprobe": 32,
+                "static_pattern_start": 64,
+                "static_pattern_end": 64,
+                "max_selected_blocks": 128,
+            }
+        )
+    """
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

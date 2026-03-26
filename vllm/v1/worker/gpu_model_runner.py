@@ -1268,11 +1268,27 @@ class GPUModelRunner(
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
+            # For sparse decode requests we must REPLACE the entire block
+            # table row (not append) because the sparse manager rebuilds
+            # req_to_blocks from scratch each step (Bug 1 fix).
+            is_sparse_decode = (
+                self._has_sparse_attn and num_output_tokens > 0
+            )
             if not resumed_from_preemption:
                 if new_block_ids is not None:
-                    # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
-                        block_ids.extend(new_ids)
+                    if is_sparse_decode:
+                        # Sparse decode: replace block IDs in-place so
+                        # that any subsequent resumption uses the correct
+                        # (sparse) block set.
+                        for gid, new_ids_for_group in enumerate(new_block_ids):
+                            req_state.block_ids[gid].clear()
+                            req_state.block_ids[gid].extend(new_ids_for_group)
+                    else:
+                        # Standard: append new blocks to existing IDs.
+                        for block_ids, new_ids in zip(
+                            req_state.block_ids, new_block_ids
+                        ):
+                            block_ids.extend(new_ids)
             else:
                 assert req_index is None
                 assert new_block_ids is not None
@@ -1300,7 +1316,17 @@ class GPUModelRunner(
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                self.input_batch.block_table.append_row(new_block_ids, req_index)
+                if is_sparse_decode:
+                    # Sparse decode: rebuild the entire row (not append)
+                    # because the sparse manager provides the full new block
+                    # list (selected history + decode block).
+                    self.input_batch.block_table.add_row(
+                        new_block_ids, req_index
+                    )
+                else:
+                    self.input_batch.block_table.append_row(
+                        new_block_ids, req_index
+                    )
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
@@ -1813,6 +1839,16 @@ class GPUModelRunner(
                 output_idx += num_sched
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+
+        # Bug 3 fix: for sparse decode requests, override the slot_mapping
+        # so the new token is written into the correct slot of the decode
+        # block rather than the out-of-range "full-context" position.
+        # Pass cu_num_tokens (already computed above) so we can locate each
+        # request's token(s) in the flat token array without relying on
+        # query_start_loc.np, which is not yet filled at this point.
+        if self._has_sparse_attn:
+            self._override_sparse_slot_mapping(num_reqs, cu_num_tokens)
+
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
@@ -2122,6 +2158,17 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+
+            # Bug 2 fix: for sparse attention groups, override seq_lens so
+            # the attention kernel sees only the blocks that are actually
+            # loaded (selected history + decode block) rather than the full
+            # context length.  This prevents the kernel from reading KV
+            # entries from null / unloaded blocks beyond the sparse table.
+            if isinstance(kv_cache_group.kv_cache_spec, SparseAttentionSpec):
+                cm = self._override_sparse_seq_lens(
+                    cm, kv_cache_gid, num_reqs, num_reqs_padded,
+                    kv_cache_group.kv_cache_spec.block_size,
+                )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):
@@ -6821,6 +6868,135 @@ class GPUModelRunner(
             sparse_query_vectors or None,
             sparse_new_block_features or None,
         )
+
+    def _override_sparse_seq_lens(
+        self,
+        cm: "CommonAttentionMetadata",
+        kv_cache_gid: int,
+        num_reqs: int,
+        num_reqs_padded: int,
+        block_size: int,
+    ) -> "CommonAttentionMetadata":
+        """Bug 2 fix: replace seq_lens with sparse block-table length.
+
+        For sparse decode requests the block table only contains the selected
+        history blocks plus the single decode block.  The standard
+        ``seq_lens`` value (full context length) would make the attention
+        kernel attempt to read KV from blocks that don't exist in the sparse
+        table, producing garbage outputs.
+
+        This helper builds a corrected ``seq_lens`` GPU tensor where each
+        decode request's length is capped to
+        ``num_blocks_in_sparse_table * block_size``.
+        Prefill requests are left unchanged (their block tables still cover
+        the full prompt).
+        """
+        blk_table = self.input_batch.block_table[kv_cache_gid]
+        seq_lens_np = cm._seq_lens_cpu.numpy().copy()
+
+        for req_idx in range(num_reqs):
+            req_id = self.input_batch.req_ids[req_idx]
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            num_output_tokens = len(req_state.output_token_ids)
+            if num_output_tokens == 0:
+                continue  # prefill – leave seq_len as-is
+            # Decode: cap to actual number of blocks * block_size.
+            num_blocks = int(blk_table.num_blocks_per_row[req_idx])
+            seq_lens_np[req_idx] = num_blocks * block_size
+
+        sparse_seq_lens_gpu = torch.tensor(
+            seq_lens_np[:num_reqs_padded],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        new_cm = copy(cm)
+        new_cm.seq_lens = sparse_seq_lens_gpu
+        new_cm._seq_lens_cpu = torch.tensor(
+            seq_lens_np[:num_reqs_padded], dtype=torch.int32
+        )
+        if num_reqs > 0:
+            new_cm.max_seq_len = int(seq_lens_np[:num_reqs].max())
+        return new_cm
+
+    def _override_sparse_slot_mapping(
+        self, num_reqs: int, cu_num_tokens: np.ndarray
+    ) -> None:
+        """Bug 3 fix: write sparse-decode tokens into the decode block slot.
+
+        Standard ``compute_slot_mapping`` uses the full-context sequence
+        position to index the block table:
+          ``slot = block_table[req, position // block_size] * B + position % B``
+
+        For sparse requests the block table only has ``k+1`` entries
+        (k selected history blocks + 1 decode block), so
+        ``position // block_size`` is typically far out of range and
+        resolves to a null / stale block ID.
+
+        For each sparse decode request we override the slot to:
+          ``decode_block_id * block_size + fill_offset``
+        where ``decode_block_id`` is the last (newest) block in the sparse
+        table and ``fill_offset`` is the token's position within that block.
+        Since each decode step allocates a fresh decode block, the offset
+        is always ``0`` (first slot of the block).
+
+        Args:
+            num_reqs: Number of active requests in the batch.
+            cu_num_tokens: Cumulative scheduled-token counts per request,
+                shape ``[num_reqs]`` (``cu_num_tokens[i]`` = end index of
+                request i's tokens in the flat batch; start index of
+                request 0 is 0, start of request i > 0 is
+                ``cu_num_tokens[i-1]``).
+        """
+        if not hasattr(self, "kv_cache_config"):
+            return
+
+        sparse_gids = [
+            gid
+            for gid, grp in enumerate(self.kv_cache_config.kv_cache_groups)
+            if isinstance(grp.kv_cache_spec, SparseAttentionSpec)
+        ]
+        if not sparse_gids:
+            return
+
+        # For each sparse group, override the slot_mapping of decode reqs.
+        for gid in sparse_gids:
+            blk_table = self.input_batch.block_table[gid]
+            block_size = blk_table.block_size
+
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                req_state = self.requests.get(req_id)
+
+                # Token range for this request in the flat batch.
+                tok_start = int(cu_num_tokens[req_idx - 1]) if req_idx > 0 else 0
+                tok_end = int(cu_num_tokens[req_idx])
+                num_sched = tok_end - tok_start
+
+                if req_state is None or num_sched == 0:
+                    continue
+
+                num_output_tokens = len(req_state.output_token_ids)
+                if num_output_tokens == 0:
+                    # Prefill: leave slot_mapping unchanged.
+                    continue
+
+                # Decode: redirect to the last (decode) block, slot 0.
+                # Each decode step uses a fresh decode block so fill_offset
+                # is always 0 (first position in the block).
+                num_blocks = int(blk_table.num_blocks_per_row[req_idx])
+                if num_blocks == 0:
+                    continue
+                decode_block_id = int(
+                    blk_table.block_table.np[req_idx, num_blocks - 1]
+                )
+                # fill_offset: position within the decode block.
+                # With a fresh block every step this is always 0.
+                slot = decode_block_id * block_size
+                # Override every token slot for this request (typically 1
+                # in pure decode, more with spec-decode).
+                blk_table.slot_mapping.np[tok_start:tok_end] = slot
 
     # ── End sparse KV attention helpers ──────────────────────────────────────
 
