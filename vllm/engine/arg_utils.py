@@ -1015,6 +1015,9 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+        cache_group.add_argument(
+            "--sparse-attention", **cache_kwargs["sparse_attention"]
+        )
 
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
