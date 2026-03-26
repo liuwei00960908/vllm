@@ -139,6 +139,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    SparseAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -494,6 +495,16 @@ class GPUModelRunner(
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
+
+        # ── Sparse KV attention state (RetroInfer-style) ──────────────────────
+        # Set to True once a SparseAttentionSpec KV-cache group is detected.
+        self._has_sparse_attn: bool = False
+        # Captured query tensors from the current forward pass, keyed by layer
+        # name.  Populated by forward pre-hooks registered in
+        # _setup_sparse_attention(); cleared at the start of each step.
+        self._sparse_q_captures: dict[str, torch.Tensor] = {}
+        # Hook handles so they can be removed if needed.
+        self._sparse_q_hooks: list[torch.utils.hooks.RemovableHandle] = []
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -4096,6 +4107,18 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            # ── Sparse KV attention features ──────────────────────────────
+            (
+                sparse_block_features,
+                sparse_query_vectors,
+                sparse_new_block_features,
+            ) = self._collect_sparse_features(
+                scheduler_output, self.input_batch.num_reqs
+            )
+            # Clear per-step Q captures to free GPU memory references.
+            self._sparse_q_captures.clear()
+            # ──────────────────────────────────────────────────────────────
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4108,6 +4131,9 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                sparse_block_features=sparse_block_features,
+                sparse_query_vectors=sparse_query_vectors,
+                sparse_new_block_features=sparse_new_block_features,
             )
 
         if not self.use_async_scheduling:
@@ -6557,12 +6583,246 @@ class GPUModelRunner(
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
+        # Register sparse Q-capture hooks if any sparse attention groups exist.
+        self._setup_sparse_attention()
+
     def _get_attention_kv_cache_gid(self) -> int:
         """Find the KV cache group index for attention layers."""
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 return gid
         return 0
+
+    # ── Sparse KV attention helpers ───────────────────────────────────────────
+
+    def _setup_sparse_attention(self) -> None:
+        """Register forward pre-hooks on sparse attention layers to capture Q.
+
+        Called once at the end of ``initialize_kv_cache``.  For each attention
+        layer that belongs to a ``SparseAttentionSpec`` KV-cache group, a
+        ``register_forward_pre_hook`` is attached.  The hook stores the raw
+        query tensor so that ``_collect_sparse_features`` can later read it
+        without an extra GPU→CPU copy.
+
+        The hooks write into ``self._sparse_q_captures`` unconditionally on
+        every forward pass.  This means the writes are captured by CUDA graphs
+        in the usual way (they are part of the static graph).  We only *read*
+        from ``_sparse_q_captures`` when sparse features are needed.
+        """
+        if not hasattr(self, "kv_cache_config"):
+            return
+        for group in self.kv_cache_config.kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, SparseAttentionSpec):
+                continue
+            self._has_sparse_attn = True
+            for layer_name in group.layer_names:
+                attn_mod = self.compilation_config.static_forward_context.get(
+                    layer_name
+                )
+                if attn_mod is None:
+                    continue
+
+                def _make_hook(name: str):
+                    def _hook(
+                        module: torch.nn.Module, args: tuple
+                    ) -> None:
+                        # args[0] is *query*; shape is either
+                        # [num_tokens, num_q_heads * head_size] (2-D) or
+                        # [num_tokens, num_q_heads, head_size] (3-D).
+                        if args:
+                            self._sparse_q_captures[name] = args[0]
+
+                    return _hook
+
+                handle = attn_mod.register_forward_pre_hook(
+                    _make_hook(layer_name)
+                )
+                self._sparse_q_hooks.append(handle)
+
+    def _collect_sparse_features(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+    ) -> tuple[
+        "dict[str, np.ndarray] | None",
+        "dict[str, np.ndarray] | None",
+        "dict[str, np.ndarray] | None",
+    ]:
+        """Extract block-level K features and per-request Q vectors.
+
+        Called at the end of ``sample_tokens`` before building
+        ``ModelRunnerOutput``.
+
+        Feature convention
+        ------------------
+        * ``feature_dim = head_size`` – all per-head vectors are averaged over
+          the KV-head (or Q-head) dimension.  This matches the default assumed
+          by ``SparseKVManager``.
+        * Block K features are averaged over all attention layers that share
+          the same ``SparseAttentionSpec`` group.
+        * Q features are averaged over all those layers and over Q-heads.
+
+        Returns
+        -------
+        sparse_block_features
+            ``req_id → [num_blocks, head_size]`` CPU float32; emitted only for
+            requests that are *completing prefill* this step
+            (``num_output_tokens_before == 0`` **and** all prompt tokens
+            have been processed).
+        sparse_query_vectors
+            ``req_id → [head_size]`` CPU float32; emitted for every request
+            scheduled in this step (both completing-prefill and decode).
+        sparse_new_block_features
+            ``req_id → [head_size]`` CPU float32; emitted for decode steps –
+            the mean-K of the *last* KV block (which is being filled with
+            decode tokens).
+        """
+        if not self._has_sparse_attn:
+            return None, None, None
+
+        sparse_groups = [
+            (gid, grp)
+            for gid, grp in enumerate(self.kv_cache_config.kv_cache_groups)
+            if isinstance(grp.kv_cache_spec, SparseAttentionSpec)
+        ]
+        if not sparse_groups:
+            return None, None, None
+
+        # Build req_id → num_output_tokens_before_this_step mapping.
+        # New requests (scheduled_new_reqs) always have 0 output tokens.
+        num_output_map: dict[str, int] = {}
+        for new_req in scheduler_output.scheduled_new_reqs:
+            num_output_map[new_req.req_id] = 0
+        cached = scheduler_output.scheduled_cached_reqs
+        for idx, rid in enumerate(cached.req_ids):
+            num_output_map[rid] = cached.num_output_tokens[idx]
+
+        sparse_block_features: dict[str, np.ndarray] = {}
+        sparse_query_vectors: dict[str, np.ndarray] = {}
+        sparse_new_block_features: dict[str, np.ndarray] = {}
+
+        for req_idx in range(num_reqs):
+            req_id = self.input_batch.req_ids[req_idx]
+            if req_id not in scheduler_output.num_scheduled_tokens:
+                continue  # not scheduled this step
+            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            if num_scheduled == 0:
+                continue
+
+            num_output_before = num_output_map.get(req_id, -1)
+            if num_output_before < 0:
+                continue
+
+            num_prompt_tokens = int(
+                self.input_batch.num_prompt_tokens[req_idx]
+            )
+            seq_len_after = int(self.seq_lens.np[req_idx])
+
+            is_prefill_done = (
+                num_output_before == 0
+                and seq_len_after == num_prompt_tokens
+            )
+            is_decode = num_output_before > 0
+
+            if not (is_prefill_done or is_decode):
+                # Mid-prefill chunk – nothing to emit yet.
+                continue
+
+            # Token index range for this request in the flat batch tensor.
+            tok_start = int(self.query_start_loc.np[req_idx])
+            tok_end = int(self.query_start_loc.np[req_idx + 1])
+            last_tok_idx = tok_end - 1  # last token of this request
+
+            # ── Q vector: average over sparse layers and Q-heads ─────────────
+            q_layer_vecs: list[torch.Tensor] = []
+            for _, grp in sparse_groups:
+                for layer_name in grp.layer_names:
+                    q_raw = self._sparse_q_captures.get(layer_name)
+                    if q_raw is None or last_tok_idx >= q_raw.shape[0]:
+                        continue
+                    q_tok = q_raw[last_tok_idx]  # [num_q_heads * head_size] or
+                    #                               [num_q_heads, head_size]
+                    if q_tok.dim() == 2:
+                        # 3-D input: [num_q_heads, head_size] → [head_size]
+                        q_tok = q_tok.mean(dim=0)
+                    else:
+                        # 2-D (flattened): reshape then average over q-heads
+                        attn_mod = (
+                            self.compilation_config.static_forward_context.get(
+                                layer_name
+                            )
+                        )
+                        if attn_mod is not None and attn_mod.num_heads > 0:
+                            q_tok = q_tok.view(
+                                attn_mod.num_heads, attn_mod.head_size
+                            ).mean(dim=0)
+                        # else: leave as-is (best-effort)
+                    q_layer_vecs.append(q_tok.float())
+
+            if q_layer_vecs:
+                q_feat = torch.stack(q_layer_vecs, dim=0).mean(dim=0)
+                sparse_query_vectors[req_id] = q_feat.cpu().numpy()
+
+            # ── K block features from KV cache ───────────────────────────────
+            for gid, grp in sparse_groups:
+                block_table = self.input_batch.block_table[gid]
+                num_blocks = int(block_table.num_blocks_per_row[req_idx])
+                if num_blocks == 0:
+                    continue
+
+                # CPU block IDs for this request.
+                block_ids_np = block_table.block_table.np[
+                    req_idx, :num_blocks
+                ].copy()
+                block_ids_t = torch.from_numpy(block_ids_np).to(self.device)
+
+                layer_k_feats: list[torch.Tensor] = []
+                for layer_name in grp.layer_names:
+                    attn_mod = (
+                        self.compilation_config.static_forward_context.get(
+                            layer_name
+                        )
+                    )
+                    if (
+                        attn_mod is None
+                        or not attn_mod.kv_cache
+                        or attn_mod.kv_cache[0] is None
+                    ):
+                        continue
+                    kv = attn_mod.kv_cache[0]
+                    # kv: [2, total_blocks, block_size, num_kv_heads, head_size]
+                    # Index 0 = K, index 1 = V.
+                    k_blocks = kv[0][block_ids_t]
+                    # k_blocks: [num_blocks, block_size, num_kv_heads, head_size]
+                    # Average over tokens (dim=1) then over KV heads (dim=1).
+                    k_feat = k_blocks.mean(dim=1).mean(dim=1)
+                    # k_feat: [num_blocks, head_size]
+                    layer_k_feats.append(k_feat.float())
+
+                if not layer_k_feats:
+                    continue
+
+                # Average over attention layers.
+                block_feat = torch.stack(layer_k_feats, dim=0).mean(dim=0)
+                # block_feat: [num_blocks, head_size]
+
+                if is_prefill_done:
+                    sparse_block_features[req_id] = (
+                        block_feat.cpu().numpy()
+                    )
+                if is_decode:
+                    # Emit last block's mean-K as the "new decode block" feature.
+                    sparse_new_block_features[req_id] = (
+                        block_feat[-1].cpu().numpy()
+                    )
+
+        return (
+            sparse_block_features or None,
+            sparse_query_vectors or None,
+            sparse_new_block_features or None,
+        )
+
+    # ── End sparse KV attention helpers ──────────────────────────────────────
 
     def init_routed_experts_capturer(self):
         logger.info(
