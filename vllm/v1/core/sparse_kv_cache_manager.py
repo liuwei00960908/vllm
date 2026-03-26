@@ -512,7 +512,11 @@ class SparseKVManager(FullAttentionManager):
         self._all_block_features[request_id] = [feat[i] for i in range(num_blocks)]
         self._all_value_features[request_id] = [vfeat[i] for i in range(num_blocks)]
         self._mean_key[request_id] = mean_key
-        self._prefill_topk_ready[request_id] = False
+        # Remove the key so that update_query_vector knows it needs to
+        # compute the prefill TopK for the first time.  Setting it to False
+        # here would be indistinguishable from the "invalidated by dynamic
+        # update" state, which must NOT retrigger _compute_prefill_topk.
+        self._prefill_topk_ready.pop(request_id, None)
         self._decode_block_buffer[request_id] = []
         self._decode_value_buffer[request_id] = []
 
@@ -638,11 +642,14 @@ class SparseKVManager(FullAttentionManager):
         """
         self._pending_query[request_id] = query_vec
 
-        # If indexing completed but prefill TopK hasn't been computed yet,
-        # compute it now using this query (the last prompt token's query).
+        # If indexing completed but prefill TopK hasn't been computed yet
+        # (key is absent — set by indexing() via pop), compute it now.
+        # When the key is False it means a dynamic update explicitly invalidated
+        # the cache; we must NOT re-cache it here so that fresh select() is
+        # used on subsequent decode steps.
         if (
             request_id in self._cluster_centres
-            and not self._prefill_topk_ready.get(request_id, False)
+            and request_id not in self._prefill_topk_ready
             and self._spec.prefill_topk_query_window > 0
         ):
             self._compute_prefill_topk(request_id, query_vec)
@@ -731,13 +738,52 @@ class SparseKVManager(FullAttentionManager):
 
         The cached selection is stored in ``_prefill_selected`` and the flag
         ``_prefill_topk_ready`` is set to ``True``.
+
+        NOTE: This method intentionally does NOT call ``self.select()`` to
+        avoid a double ``select()`` invocation in callers that will explicitly
+        call ``select()`` afterwards (e.g. ``sparse_update_query_vectors``).
+        The selection logic below mirrors the fresh-TopK path in ``select()``.
         """
-        num_blocks = len(self._all_block_features.get(request_id, []))
-        selected = self.select(
-            request_id,
-            query_vec,
-            num_blocks=self._spec.max_selected_blocks,
-        )
+        total_blocks = len(self._all_block_features.get(request_id, []))
+        cap = self._spec.max_selected_blocks
+
+        # Steady zone (identical to select()).
+        n_sink = self._spec.n_sink_blocks
+        n_recent = self._spec.n_recent_blocks
+        sink_set = set(range(min(n_sink, total_blocks)))
+        recent_set = set(range(max(0, total_blocks - n_recent), total_blocks))
+        steady_set = sink_set | recent_set
+
+        centres = self._cluster_centres.get(request_id)
+        block_to_cluster = self._block_to_cluster.get(request_id)
+
+        if centres is None or block_to_cluster is None or len(centres) == 0:
+            fallback = set(range(max(0, total_blocks - cap), total_blocks))
+            selected = sorted(fallback | steady_set)[:cap]
+        else:
+            q = query_vec.astype(np.float32)
+            D = q.shape[-1]
+            scores = (q @ centres.T) / np.sqrt(max(D, 1))
+            nprobe = min(self._spec.nprobe, len(centres))
+            top_cluster_ids = set(
+                int(c) for c in np.argpartition(scores, -nprobe)[-nprobe:]
+            )
+            retrieve_blocks = {
+                bidx
+                for bidx, cid in enumerate(block_to_cluster)
+                if cid in top_cluster_ids
+            }
+            combined = steady_set | retrieve_blocks
+            if len(combined) > cap:
+                non_steady = sorted(
+                    retrieve_blocks - steady_set,
+                    key=lambda b: scores[block_to_cluster[b]],
+                    reverse=True,
+                )
+                budget = max(0, cap - len(steady_set))
+                combined = steady_set | set(non_steady[:budget])
+            selected = sorted(combined)
+
         self._prefill_selected[request_id] = selected
         self._prefill_topk_ready[request_id] = True
         logger.debug(
