@@ -7270,8 +7270,8 @@ class GPUModelRunner(
           ``decode_block_id * block_size + fill_offset``
         where ``decode_block_id`` is the last (newest) block in the sparse
         table and ``fill_offset`` is the token's position within that block.
-        Since each decode step allocates a fresh decode block, the offset
-        is always ``0`` (first slot of the block).
+        ``fill_offset`` is derived from the number of already generated decode
+        tokens modulo ``block_size``.
 
         Args:
             num_reqs: Number of active requests in the batch.
@@ -7314,9 +7314,9 @@ class GPUModelRunner(
                     # Prefill: leave slot_mapping unchanged.
                     continue
 
-                # Decode: redirect to the last (decode) block, slot 0.
-                # Each decode step uses a fresh decode block so fill_offset
-                # is always 0 (first position in the block).
+                # Decode: redirect to the last (active decode) block.
+                # Sparse decode reuses this block until it is full, so writes
+                # must start from the current in-block offset.
                 num_blocks = int(blk_table.num_blocks_per_row[req_idx])
                 if num_blocks == 0:
                     continue
@@ -7324,21 +7324,27 @@ class GPUModelRunner(
                     blk_table.block_table.np[req_idx, num_blocks - 1]
                 )
                 base_slot = decode_block_id * block_size
+                fill_offset = int(num_output_tokens % block_size)
                 # Override token slots for this request. For common decode
                 # (num_sched=1), this writes one slot. For multi-token decode,
                 # write contiguous offsets within the decode block.
                 if num_sched == 1:
-                    blk_table.slot_mapping.np[tok_start] = base_slot
+                    blk_table.slot_mapping.np[tok_start] = (
+                        base_slot + min(fill_offset, block_size - 1)
+                    )
                 else:
-                    fill_offsets = np.arange(num_sched, dtype=np.int64)
-                    if num_sched > block_size:
+                    fill_offsets = fill_offset + np.arange(
+                        num_sched, dtype=np.int64
+                    )
+                    if fill_offset + num_sched > block_size:
                         logger.warning_once(
-                            "Sparse decode token burst exceeds block size: "
-                            "req_id=%s gid=%d num_sched=%d block_size=%d "
-                            "decode_block_id=%d",
+                            "Sparse decode token burst exceeds decode-block "
+                            "capacity: req_id=%s gid=%d num_sched=%d "
+                            "fill_offset=%d block_size=%d decode_block_id=%d",
                             req_id,
                             gid,
                             num_sched,
+                            fill_offset,
                             block_size,
                             decode_block_id,
                         )

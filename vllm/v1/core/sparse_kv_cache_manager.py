@@ -311,10 +311,14 @@ class SparseKVManager(FullAttentionManager):
         # allocated during prefill (indexed by logical block index 0..N-1).
         # Never freed until the request is fully freed.
         self._prefill_blocks: dict[str, list[KVCacheBlock]] = {}
-        # _decode_block[req_id]: the single "current" decode block being
-        # filled this step.  Freed and replaced at the start of each new
-        # decode step.
+        # _decode_block[req_id]: the active decode block. It is reused across
+        # steps until full, then replaced.
         self._decode_block: dict[str, KVCacheBlock | None] = {}
+        # Number of decode tokens already written into _decode_block.
+        self._decode_block_fill: dict[str, int] = {}
+        # Last observed num_tokens_main_model to estimate decode tokens
+        # scheduled in the current step.
+        self._last_num_tokens_main_model: dict[str, int] = {}
 
     def _debug_log_state(self, request_id: str, phase: str, **kwargs) -> None:
         if not self._debug_state_transitions:
@@ -402,10 +406,17 @@ class SparseKVManager(FullAttentionManager):
                 total_computed_tokens,
                 num_tokens_main_model,
             )
-        # Decode: allocate exactly 1 new block each step for the latest token.
-        # We keep prior decode blocks as sparse-selectable history, so they are
-        # not recycled immediately.
-        return 1
+        # Decode: allocate a new block only when there is no active decode
+        # block, or when the active decode block does not have enough room.
+        step_tokens = self._estimate_decode_tokens_this_step(
+            request_id, num_tokens_main_model
+        )
+        cur_decode = self._decode_block.get(request_id)
+        if cur_decode is None or cur_decode.is_null:
+            return 1
+        fill = self._decode_block_fill.get(request_id, 0)
+        remaining = max(0, self.block_size - fill)
+        return 1 if step_tokens > remaining else 0
 
     def allocate_new_computed_blocks(
         self,
@@ -445,13 +456,6 @@ class SparseKVManager(FullAttentionManager):
         if request_id not in self._prefill_blocks:
             self._prefill_blocks[request_id] = list(req_blocks)
 
-        # Finalize the old decode block from the previous step (if any) by
-        # moving it into the persistent sparse history.
-        prev_decode = self._decode_block.get(request_id)
-        if prev_decode is not None and not prev_decode.is_null:
-            self._prefill_blocks[request_id].append(prev_decode)
-            self._decode_block[request_id] = None
-
         # Map selected logical indices → physical historical blocks.
         # The history list contains original prefill blocks followed by
         # finalized decode blocks in chronological order.
@@ -463,17 +467,42 @@ class SparseKVManager(FullAttentionManager):
             if i < len(prefill_blocks)
         ]
 
-        # Allocate exactly 1 new block for the current decode token.
-        new_decode_list = self.block_pool.get_new_blocks(1)
-        new_decode = new_decode_list[0]
-        self._decode_block[request_id] = new_decode
+        step_tokens = self._estimate_decode_tokens_this_step(
+            request_id, num_tokens_main_model
+        )
+
+        cur_decode = self._decode_block.get(request_id)
+        fill = self._decode_block_fill.get(request_id, 0)
+        allocated_new_decode = False
+        if cur_decode is None or cur_decode.is_null:
+            new_decode = self.block_pool.get_new_blocks(1)[0]
+            self._decode_block[request_id] = new_decode
+            self._decode_block_fill[request_id] = 0
+            cur_decode = new_decode
+            fill = 0
+            allocated_new_decode = True
+        elif fill + step_tokens > self.block_size:
+            # Current decode block is full for this step; freeze it into
+            # sparse-selectable history and start a fresh decode block.
+            self._prefill_blocks[request_id].append(cur_decode)
+            new_decode = self.block_pool.get_new_blocks(1)[0]
+            self._decode_block[request_id] = new_decode
+            self._decode_block_fill[request_id] = 0
+            cur_decode = new_decode
+            fill = 0
+            allocated_new_decode = True
 
         # Rebuild req_to_blocks: [selected prefill blocks..., decode block].
         req_blocks.clear()
         req_blocks.extend(physical_selected)
-        req_blocks.append(new_decode)
+        req_blocks.append(cur_decode)
 
-        self.new_block_ids.append(new_decode.block_id)
+        if allocated_new_decode:
+            self.new_block_ids.append(cur_decode.block_id)
+        self._decode_block_fill[request_id] = min(
+            self.block_size, fill + step_tokens
+        )
+        self._last_num_tokens_main_model[request_id] = num_tokens_main_model
         self.num_cached_block[request_id] = 0
 
         # Return the FULL new block list so the model runner can rebuild
@@ -505,6 +534,8 @@ class SparseKVManager(FullAttentionManager):
         # Clear decode block ref (the block itself is in req_to_blocks and
         # will be freed by super().free()).
         self._decode_block.pop(request_id, None)
+        self._decode_block_fill.pop(request_id, None)
+        self._last_num_tokens_main_model.pop(request_id, None)
 
         super().free(request_id)
         self._cluster_centres.pop(request_id, None)
@@ -522,6 +553,17 @@ class SparseKVManager(FullAttentionManager):
         self._decode_block_buffer.pop(request_id, None)
         self._decode_value_buffer.pop(request_id, None)
         self._step_trace.pop(request_id, None)
+
+    def _estimate_decode_tokens_this_step(
+        self, request_id: str, num_tokens_main_model: int
+    ) -> int:
+        """Estimate decode tokens scheduled for this request in current step."""
+        prev = self._last_num_tokens_main_model.get(request_id)
+        if prev is None:
+            return 1
+        delta = num_tokens_main_model - prev
+        # Keep at least one token to preserve decode fast-path assumptions.
+        return max(1, delta)
 
     def new_step_starts(self) -> None:
         if self._debug_state_transitions and self._step_trace:
