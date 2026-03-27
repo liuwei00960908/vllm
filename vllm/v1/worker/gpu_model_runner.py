@@ -7008,6 +7008,7 @@ class GPUModelRunner(
         shown_token_ids = token_ids[-max_show:]
 
         decoded_text = None
+        token_pieces = None
         if self._sparse_debug_tokenizer is not None:
             try:
                 decoded_text = self._sparse_debug_tokenizer.decode(
@@ -7017,14 +7018,22 @@ class GPUModelRunner(
                 )
             except Exception:
                 decoded_text = None
+            try:
+                token_pieces = self._sparse_debug_tokenizer.convert_ids_to_tokens(
+                    shown_token_ids,
+                    skip_special_tokens=False,
+                )
+            except Exception:
+                token_pieces = None
 
         logger.info(
             "Sparse decode token trace: req_id=%s seq_len=%d shown=%d "
-            "token_ids=%s decoded_tail=%r",
+            "token_ids=%s token_pieces=%r decoded_tail=%r",
             req_id,
             seq_len,
             len(shown_token_ids),
             shown_token_ids,
+            token_pieces,
             decoded_text,
         )
 
@@ -7076,6 +7085,7 @@ class GPUModelRunner(
                 continue
             block_token_ids = all_token_ids[start:end]
             block_text = None
+            block_pieces = None
             if self._sparse_debug_tokenizer is not None and block_token_ids:
                 try:
                     block_text = self._sparse_debug_tokenizer.decode(
@@ -7085,9 +7095,17 @@ class GPUModelRunner(
                     )
                 except Exception:
                     block_text = None
+                try:
+                    block_pieces = self._sparse_debug_tokenizer.convert_ids_to_tokens(
+                        block_token_ids,
+                        skip_special_tokens=False,
+                    )
+                except Exception:
+                    block_pieces = None
             block_lines.append(
                 f"  - block={int(logical_block_idx)} span=[{start},{end}) "
-                f"len={len(block_token_ids)} ids={block_token_ids} text={block_text!r}"
+                f"len={len(block_token_ids)} ids={block_token_ids} "
+                f"pieces={block_pieces!r} text={block_text!r}"
             )
 
         logger.info(
