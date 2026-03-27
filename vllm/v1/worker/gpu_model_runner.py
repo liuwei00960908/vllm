@@ -6903,22 +6903,27 @@ class GPUModelRunner(
             if num_output_tokens == 0:
                 continue  # prefill – leave seq_len as-is
             old_seq_len = int(seq_lens_np[req_idx])
-            # Decode: cap to actual number of blocks * block_size.
+            # Decode: cap to actual number of sparse blocks * block_size.
             num_blocks = int(blk_table.num_blocks_per_row[req_idx])
-            new_seq_len = num_blocks * block_size
+            sparse_cap_seq_len = num_blocks * block_size
+            # Keep seq_len within sparse-table capacity, but never expose
+            # unwritten decode-block tail beyond the currently materialized
+            # sequence length.
+            new_seq_len = min(old_seq_len, sparse_cap_seq_len)
             seq_lens_np[req_idx] = new_seq_len
-            # Diagnostic only: if new sparse seq_len extends past currently
-            # materialized tokens by less than one block, kernels may read the
-            # decode-block tail (unwritten slots) depending on backend logic.
-            tail_slack = new_seq_len - old_seq_len
+            # Diagnostic: if sparse capacity is larger than materialized tokens,
+            # the gap is decode-block tail that must stay hidden from kernels.
+            tail_slack = sparse_cap_seq_len - old_seq_len
             if 0 < tail_slack < block_size:
                 logger.warning_once(
                     "Sparse decode potential tail read: req_id=%s gid=%d "
-                    "old_seq_len=%d new_seq_len=%d block_size=%d "
+                    "old_seq_len=%d sparse_cap_seq_len=%d applied_seq_len=%d "
+                    "block_size=%d "
                     "num_blocks=%d num_output_tokens=%d",
                     req_id,
                     kv_cache_gid,
                     old_seq_len,
+                    sparse_cap_seq_len,
                     new_seq_len,
                     block_size,
                     num_blocks,
@@ -7010,22 +7015,39 @@ class GPUModelRunner(
                 decode_block_id = int(
                     blk_table.block_table.np[req_idx, num_blocks - 1]
                 )
-                # fill_offset: position within the decode block.
-                # With a fresh block every step this is always 0.
-                slot = decode_block_id * block_size
-                # Override every token slot for this request (typically 1
-                # in pure decode, more with spec-decode).
-                blk_table.slot_mapping.np[tok_start:tok_end] = slot
+                base_slot = decode_block_id * block_size
+                # Override token slots for this request. For common decode
+                # (num_sched=1), this writes one slot. For multi-token decode,
+                # write contiguous offsets within the decode block.
+                if num_sched == 1:
+                    blk_table.slot_mapping.np[tok_start] = base_slot
+                else:
+                    fill_offsets = np.arange(num_sched, dtype=np.int64)
+                    if num_sched > block_size:
+                        logger.warning_once(
+                            "Sparse decode token burst exceeds block size: "
+                            "req_id=%s gid=%d num_sched=%d block_size=%d "
+                            "decode_block_id=%d",
+                            req_id,
+                            gid,
+                            num_sched,
+                            block_size,
+                            decode_block_id,
+                        )
+                    fill_offsets = np.minimum(fill_offsets, block_size - 1)
+                    blk_table.slot_mapping.np[tok_start:tok_end] = (
+                        base_slot + fill_offsets
+                    )
                 if num_sched > 1:
                     logger.warning_once(
-                        "Sparse decode multi-token slot overwrite risk: "
+                        "Sparse decode multi-token slot mapping applied: "
                         "req_id=%s gid=%d num_sched=%d decode_block_id=%d "
-                        "slot=%d tok_range=[%d,%d)",
+                        "base_slot=%d tok_range=[%d,%d)",
                         req_id,
                         gid,
                         num_sched,
                         decode_block_id,
-                        slot,
+                        base_slot,
                         tok_start,
                         tok_end,
                     )
