@@ -529,6 +529,14 @@ class GPUModelRunner(
                     "Failed to initialize tokenizer for sparse decode debug logs: %s",
                     e,
                 )
+            logger.info(
+                "Sparse decode debug logging enabled: "
+                "VLLM_SPARSE_DEBUG_DECODE_TOKENS=1 "
+                "VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX=%d "
+                "VLLM_SPARSE_DEBUG_MAX_BLOCKS=%d",
+                self._sparse_debug_decode_tokens_max,
+                self._sparse_debug_max_blocks,
+            )
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -7010,7 +7018,7 @@ class GPUModelRunner(
             except Exception:
                 decoded_text = None
 
-        logger.warning(
+        logger.info(
             "Sparse decode token trace: req_id=%s seq_len=%d shown=%d "
             "token_ids=%s decoded_tail=%r",
             req_id,
@@ -7030,13 +7038,13 @@ class GPUModelRunner(
         if not self._sparse_debug_decode_tokens:
             return
         if req_state.prompt_token_ids is None:
-            logger.warning(
+            logger.info(
                 "Sparse selected KV trace skipped (no prompt token IDs): req_id=%s",
                 req_id,
             )
             return
         if not selected_logical_blocks:
-            logger.warning(
+            logger.info(
                 "Sparse selected KV trace: req_id=%s selected_blocks=[]",
                 req_id,
             )
@@ -7073,7 +7081,7 @@ class GPUModelRunner(
                 f"len={len(block_token_ids)} ids={block_token_ids} text={block_text!r}"
             )
 
-        logger.warning(
+        logger.info(
             "Sparse selected KV trace:\n"
             "req_id=%s\n"
             "selected_blocks(total=%d shown=%d, max=%d)=%s\n"
