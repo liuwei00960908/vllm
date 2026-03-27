@@ -609,3 +609,15 @@ class KVCacheManager:
         if selected is None:
             return None
         return list(selected)
+
+    def get_sparse_retrieve_block_indices(
+        self, request_id: str
+    ) -> list[int] | None:
+        """Return sparse retrieve-zone logical block indices for a request."""
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return None
+        selected = mgr._selected_retrieve_block_indices.get(request_id)
+        if selected is None:
+            return None
+        return list(selected)

@@ -125,6 +125,9 @@ class CachedRequestData:
     # Optional sparse debug payload: req_id -> selected logical block indices
     # used to build the sparse KV table for the upcoming decode forward.
     sparse_selected_block_indices: dict[str, list[int]] | None = None
+    # Optional sparse debug payload: req_id -> retrieve-zone logical block
+    # indices (steady zone excluded) that truly participate in sparse retrieval.
+    sparse_retrieve_block_indices: dict[str, list[int]] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -176,6 +179,7 @@ class CachedRequestData:
             num_computed_tokens=[],
             num_output_tokens=[],
             sparse_selected_block_indices=None,
+            sparse_retrieve_block_indices=None,
         )
 
 

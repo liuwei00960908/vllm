@@ -286,6 +286,8 @@ class SparseKVManager(FullAttentionManager):
         # ── selection state ───────────────────────────────────────────────
         self._pending_query: dict[str, np.ndarray] = {}
         self._selected_block_indices: dict[str, list[int]] = {}
+        # Per-step retrieve-zone logical block indices (steady-zone excluded).
+        self._selected_retrieve_block_indices: dict[str, list[int]] = {}
         # prefill TopK cache
         self._prefill_topk_ready: dict[str, bool] = {}
         self._prefill_selected: dict[str, list[int]] = {}
@@ -514,6 +516,7 @@ class SparseKVManager(FullAttentionManager):
         self._mean_key.pop(request_id, None)
         self._pending_query.pop(request_id, None)
         self._selected_block_indices.pop(request_id, None)
+        self._selected_retrieve_block_indices.pop(request_id, None)
         self._prefill_topk_ready.pop(request_id, None)
         self._prefill_selected.pop(request_id, None)
         self._decode_block_buffer.pop(request_id, None)
@@ -690,6 +693,9 @@ class SparseKVManager(FullAttentionManager):
                 result = sorted(set(cached) | steady_set)
                 result = result[:num_blocks]
                 self._selected_block_indices[request_id] = result
+                self._selected_retrieve_block_indices[request_id] = sorted(
+                    set(result) - steady_set
+                )
                 used_prefill_cache = True
                 self._debug_log_state(
                     request_id,
@@ -713,6 +719,9 @@ class SparseKVManager(FullAttentionManager):
             fallback = set(range(max(0, total_blocks - num_blocks), total_blocks))
             result = sorted(fallback | steady_set)[:num_blocks]
             self._selected_block_indices[request_id] = result
+            self._selected_retrieve_block_indices[request_id] = sorted(
+                set(result) - steady_set
+            )
             return result
 
         # Attention-score TopK: q · centroid / sqrt(D)
@@ -749,6 +758,9 @@ class SparseKVManager(FullAttentionManager):
 
         result = sorted(combined)
         self._selected_block_indices[request_id] = result
+        self._selected_retrieve_block_indices[request_id] = sorted(
+            combined - steady_set
+        )
         self._debug_log_state(
             request_id,
             "select_done",

@@ -511,6 +511,9 @@ class GPUModelRunner(
         self._sparse_debug_decode_tokens: bool = bool(
             int(os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS", "0"))
         )
+        # Latest scheduler-selected logical blocks per request. This is used to
+        # print the KV blocks/tokens that are actually fed to sparse attention.
+        self._sparse_debug_selected_logical_blocks: dict[str, list[int]] = {}
         self._sparse_debug_decode_tokens_max: int = int(
             os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX", "256")
         )
@@ -1208,6 +1211,7 @@ class GPUModelRunner(
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
         sparse_selected_map = req_data.sparse_selected_block_indices or {}
+        sparse_retrieve_map = req_data.sparse_retrieve_block_indices or {}
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
         # Save scheduler-allocated spec lengths before trimming so
@@ -1317,11 +1321,23 @@ class GPUModelRunner(
                             req_state.block_ids[gid].clear()
                             req_state.block_ids[gid].extend(new_ids_for_group)
                         selected_logical_blocks = sparse_selected_map.get(req_id)
+                        retrieve_logical_blocks = sparse_retrieve_map.get(req_id)
+                        if retrieve_logical_blocks is not None:
+                            self._debug_log_sparse_selected_kv_tokens(
+                                req_id=req_id,
+                                req_state=req_state,
+                                selected_logical_blocks=retrieve_logical_blocks,
+                                zone_name="retrieve",
+                            )
                         if selected_logical_blocks is not None:
+                            self._sparse_debug_selected_logical_blocks[req_id] = list(
+                                selected_logical_blocks
+                            )
                             self._debug_log_sparse_selected_kv_tokens(
                                 req_id=req_id,
                                 req_state=req_state,
                                 selected_logical_blocks=selected_logical_blocks,
+                                zone_name="merged",
                             )
                     else:
                         # Standard: append new blocks to existing IDs.
@@ -6980,6 +6996,13 @@ class GPUModelRunner(
                 req_idx=req_idx,
                 seq_len=new_seq_len,
             )
+            self._debug_log_sparse_forward_kv_tokens(
+                req_id=req_id,
+                req_idx=req_idx,
+                seq_len=new_seq_len,
+                kv_cache_gid=kv_cache_gid,
+                block_size=block_size,
+            )
 
         sparse_seq_lens_gpu = torch.tensor(
             seq_lens_np[:num_reqs_padded],
@@ -7042,19 +7065,22 @@ class GPUModelRunner(
         req_id: str,
         req_state: "CachedRequestState",
         selected_logical_blocks: list[int],
+        zone_name: str = "merged",
     ) -> None:
         """Log original tokens that sparse decode KV actually uses."""
         if not self._sparse_debug_decode_tokens:
             return
         if req_state.prompt_token_ids is None:
             logger.info(
-                "Sparse selected KV trace skipped (no prompt token IDs): req_id=%s",
+                "Sparse %s KV trace skipped (no prompt token IDs): req_id=%s",
+                zone_name,
                 req_id,
             )
             return
         if not selected_logical_blocks:
             logger.info(
-                "Sparse selected KV trace: req_id=%s selected_blocks=[]",
+                "Sparse %s KV trace: req_id=%s selected_blocks=[]",
+                zone_name,
                 req_id,
             )
             return
@@ -7109,16 +7135,121 @@ class GPUModelRunner(
             )
 
         logger.info(
-            "Sparse selected KV trace:\n"
+            "Sparse %s KV trace:\n"
             "req_id=%s\n"
             "selected_blocks(total=%d shown=%d, max=%d)=%s\n"
             "%s",
+            zone_name,
             req_id,
             len(selected_logical_blocks),
             len(shown_blocks),
             max_blocks,
             shown_blocks,
             "\n".join(block_lines) if block_lines else "  - (no mappable blocks)",
+        )
+
+    def _debug_log_sparse_forward_kv_tokens(
+        self,
+        req_id: str,
+        req_idx: int,
+        seq_len: int,
+        kv_cache_gid: int,
+        block_size: int,
+    ) -> None:
+        """Log KV tokens that are actually consumed by sparse attention forward."""
+        if not self._sparse_debug_decode_tokens:
+            return
+        if seq_len <= 0:
+            return
+        req_state = self.requests.get(req_id)
+        if req_state is None or req_state.prompt_token_ids is None:
+            logger.info(
+                "Sparse forward KV trace skipped: req_id=%s reason=%s",
+                req_id,
+                "missing_request_state_or_prompt_ids",
+            )
+            return
+
+        blk_table = self.input_batch.block_table[kv_cache_gid]
+        num_blocks = int(blk_table.num_blocks_per_row[req_idx])
+        block_ids = blk_table.block_table.np[req_idx, :num_blocks].tolist()
+        used_blocks = min(num_blocks, cdiv(seq_len, block_size))
+        used_block_ids = block_ids[:used_blocks]
+
+        all_token_ids = req_state.prompt_token_ids + req_state.output_token_ids
+        selected_logical_blocks = self._sparse_debug_selected_logical_blocks.get(
+            req_id, []
+        )
+
+        max_blocks = self._sparse_debug_max_blocks
+        shown_used_blocks = (
+            list(range(used_blocks))
+            if max_blocks <= 0
+            else list(range(min(used_blocks, max(1, max_blocks))))
+        )
+
+        block_lines: list[str] = []
+        for table_pos in shown_used_blocks:
+            physical_block_id = int(used_block_ids[table_pos])
+            block_token_ids: list[int] = []
+            source = "unknown"
+
+            if table_pos < len(selected_logical_blocks):
+                logical_block_idx = int(selected_logical_blocks[table_pos])
+                start = logical_block_idx * block_size
+                end = min(start + block_size, len(all_token_ids))
+                if start < len(all_token_ids):
+                    block_token_ids = all_token_ids[start:end]
+                source = f"logical_block={logical_block_idx}"
+            else:
+                # The extra block after selected history is the active decode block.
+                # We only map the currently materialized tail tokens.
+                compact_start = table_pos * block_size
+                compact_end = min((table_pos + 1) * block_size, seq_len)
+                n_tokens = max(0, compact_end - compact_start)
+                if n_tokens > 0:
+                    block_token_ids = all_token_ids[-n_tokens:]
+                source = "decode_block_tail(best_effort)"
+
+            block_text = None
+            block_pieces = None
+            if self._sparse_debug_tokenizer is not None and block_token_ids:
+                try:
+                    block_text = self._sparse_debug_tokenizer.decode(
+                        block_token_ids,
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                except Exception:
+                    block_text = None
+                try:
+                    block_pieces = self._sparse_debug_tokenizer.convert_ids_to_tokens(
+                        block_token_ids,
+                        skip_special_tokens=False,
+                    )
+                except Exception:
+                    block_pieces = None
+
+            block_lines.append(
+                f"  - table_pos={table_pos} block_id={physical_block_id} "
+                f"source={source} len={len(block_token_ids)} ids={block_token_ids} "
+                f"pieces={block_pieces!r} text={block_text!r}"
+            )
+
+        logger.info(
+            "Sparse forward KV trace:\n"
+            "req_id=%s gid=%d seq_len=%d block_size=%d\n"
+            "used_blocks(total=%d shown=%d, max=%d) block_ids=%s\n"
+            "%s",
+            req_id,
+            kv_cache_gid,
+            seq_len,
+            block_size,
+            used_blocks,
+            len(shown_used_blocks),
+            max_blocks,
+            used_block_ids,
+            "\n".join(block_lines) if block_lines else "  - (no mapped blocks)",
         )
 
     def _override_sparse_slot_mapping(
