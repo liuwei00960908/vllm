@@ -69,6 +69,7 @@ To enable the Estimation Zone:
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -296,6 +297,13 @@ class SparseKVManager(FullAttentionManager):
 
         self._current_step: int = 0
 
+        # Reuse existing sparse debug switch used by GPUModelRunner.
+        self._debug_state_transitions: bool = bool(
+            int(os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS", "0"))
+        )
+        # Per-step compact trace (req_id -> latest key state in this step).
+        self._step_trace: dict[str, dict[str, object]] = {}
+
         # ── physical block tracking (Bug 1 fix) ──────────────────────────
         # _prefill_blocks[req_id]: permanent list of all physical blocks
         # allocated during prefill (indexed by logical block index 0..N-1).
@@ -305,6 +313,34 @@ class SparseKVManager(FullAttentionManager):
         # filled this step.  Freed and replaced at the start of each new
         # decode step.
         self._decode_block: dict[str, KVCacheBlock | None] = {}
+
+    def _debug_log_state(self, request_id: str, phase: str, **kwargs) -> None:
+        if not self._debug_state_transitions:
+            return
+        trace = self._step_trace.setdefault(request_id, {})
+        trace["phase"] = phase
+        trace["step"] = self._current_step
+        for key in (
+            "prefill_topk_ready",
+            "selected_count",
+            "selected_preview",
+            "used_prefill_cache",
+            "total_blocks",
+            "buffered_blocks",
+            "threshold",
+            "added_clusters",
+            "total_clusters",
+        ):
+            if key in kwargs:
+                trace[key] = kwargs[key]
+        payload = " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+        logger.info(
+            "Sparse state trace: step=%d req_id=%s phase=%s %s",
+            self._current_step,
+            request_id,
+            phase,
+            payload,
+        )
 
     # ------------------------------------------------------------------
     # Required abstract-method implementations
@@ -482,8 +518,31 @@ class SparseKVManager(FullAttentionManager):
         self._prefill_selected.pop(request_id, None)
         self._decode_block_buffer.pop(request_id, None)
         self._decode_value_buffer.pop(request_id, None)
+        self._step_trace.pop(request_id, None)
 
     def new_step_starts(self) -> None:
+        if self._debug_state_transitions and self._step_trace:
+            for req_id in sorted(self._step_trace):
+                trace = self._step_trace[req_id]
+                logger.info(
+                    "Sparse step summary: step=%d req_id=%s phase=%r "
+                    "prefill_topk_ready=%r used_prefill_cache=%r "
+                    "selected_count=%r total_blocks=%r buffered=%r/%r "
+                    "added_clusters=%r total_clusters=%r selected_preview=%r",
+                    self._current_step,
+                    req_id,
+                    trace.get("phase"),
+                    trace.get("prefill_topk_ready"),
+                    trace.get("used_prefill_cache"),
+                    trace.get("selected_count"),
+                    trace.get("total_blocks"),
+                    trace.get("buffered_blocks"),
+                    trace.get("threshold"),
+                    trace.get("added_clusters"),
+                    trace.get("total_clusters"),
+                    trace.get("selected_preview"),
+                )
+            self._step_trace.clear()
         self._current_step += 1
 
     # ------------------------------------------------------------------
@@ -569,6 +628,13 @@ class SparseKVManager(FullAttentionManager):
         self._prefill_topk_ready.pop(request_id, None)
         self._decode_block_buffer[request_id] = []
         self._decode_value_buffer[request_id] = []
+        self._debug_log_state(
+            request_id,
+            "indexing_done",
+            num_blocks=num_blocks,
+            num_clusters=n_k,
+            prefill_topk_ready=self._prefill_topk_ready.get(request_id, None),
+        )
 
         logger.debug(
             "sparse indexing: req %s – %d blocks → %d clusters (%d segments)",
@@ -617,12 +683,24 @@ class SparseKVManager(FullAttentionManager):
         steady_set = sink_set | recent_set
 
         # ── Prefill TopK cache ─────────────────────────────────────────
+        used_prefill_cache = False
         if self._prefill_topk_ready.get(request_id, False):
             cached = self._prefill_selected.get(request_id, [])
             if cached:
                 result = sorted(set(cached) | steady_set)
                 result = result[:num_blocks]
                 self._selected_block_indices[request_id] = result
+                used_prefill_cache = True
+                self._debug_log_state(
+                    request_id,
+                    "select_done",
+                    total_blocks=total_blocks,
+                    num_blocks_cap=num_blocks,
+                    selected_count=len(result),
+                    selected_preview=result[:16],
+                    used_prefill_cache=used_prefill_cache,
+                    prefill_topk_ready=self._prefill_topk_ready.get(request_id),
+                )
                 return result
 
         # ── Fresh TopK search ──────────────────────────────────────────
@@ -671,6 +749,16 @@ class SparseKVManager(FullAttentionManager):
 
         result = sorted(combined)
         self._selected_block_indices[request_id] = result
+        self._debug_log_state(
+            request_id,
+            "select_done",
+            total_blocks=total_blocks,
+            num_blocks_cap=num_blocks,
+            selected_count=len(result),
+            selected_preview=result[:16],
+            used_prefill_cache=used_prefill_cache,
+            prefill_topk_ready=self._prefill_topk_ready.get(request_id),
+        )
         return result
 
     def update_query_vector(
@@ -691,6 +779,13 @@ class SparseKVManager(FullAttentionManager):
             query_vec:  ``[D]`` float32 query (mean Q per KV-head group).
         """
         self._pending_query[request_id] = query_vec
+        self._debug_log_state(
+            request_id,
+            "query_updated",
+            query_dim=int(query_vec.shape[-1]) if query_vec.ndim > 0 else 0,
+            has_index=(request_id in self._cluster_centres),
+            prefill_topk_ready=self._prefill_topk_ready.get(request_id, None),
+        )
 
         # If indexing completed but prefill TopK hasn't been computed yet
         # (key is absent — set by indexing() via pop), compute it now.
@@ -750,6 +845,13 @@ class SparseKVManager(FullAttentionManager):
         vbuf = self._decode_value_buffer.setdefault(request_id, [])
         buf.append(feat)
         vbuf.append(vfeat)
+        self._debug_log_state(
+            request_id,
+            "rebalance_buffered",
+            buffered_blocks=len(buf),
+            threshold=self._spec.update_threshold_blocks,
+            total_blocks=len(self._all_block_features.get(request_id, [])),
+        )
 
         # Assign to nearest existing cluster (for block_to_cluster bookkeeping).
         centres = self._cluster_centres.get(request_id)
@@ -836,6 +938,13 @@ class SparseKVManager(FullAttentionManager):
 
         self._prefill_selected[request_id] = selected
         self._prefill_topk_ready[request_id] = True
+        self._debug_log_state(
+            request_id,
+            "prefill_topk_cached",
+            selected_count=len(selected),
+            selected_preview=selected[:16],
+            prefill_topk_ready=self._prefill_topk_ready.get(request_id),
+        )
         logger.debug(
             "sparse prefill TopK: req %s – cached %d blocks",
             request_id,
@@ -916,6 +1025,14 @@ class SparseKVManager(FullAttentionManager):
         # Invalidate prefill TopK so next select() searches fresh.
         self._prefill_topk_ready[request_id] = False
         self._prefill_selected.pop(request_id, None)
+        self._debug_log_state(
+            request_id,
+            "dynamic_update_done",
+            buffered_blocks=M,
+            added_clusters=n_k_new,
+            total_clusters=len(self._cluster_centres[request_id]),
+            prefill_topk_ready=self._prefill_topk_ready.get(request_id),
+        )
 
         logger.debug(
             "sparse dynamic update: req %s – added %d clusters "
