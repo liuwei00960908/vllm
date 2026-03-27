@@ -364,17 +364,10 @@ class SparseKVManager(FullAttentionManager):
                 total_computed_tokens,
                 num_tokens_main_model,
             )
-        # Decode: we always allocate exactly 1 new block (the decode block)
-        # and recycle the previous one.
-        #   - First decode step: prefill blocks are held permanently; we
-        #     need 1 new block from the pool.
-        #   - Subsequent steps: we free the old decode block first (inside
-        #     allocate_new_blocks), so net pool usage is 0.
-        if request_id not in self._prefill_blocks:
-            # First decode step: 1 new block needed from the pool.
-            return 1
-        # Subsequent steps: old decode block is freed before new one taken.
-        return 0
+        # Decode: allocate exactly 1 new block each step for the latest token.
+        # We keep prior decode blocks as sparse-selectable history, so they are
+        # not recycled immediately.
+        return 1
 
     def allocate_new_computed_blocks(
         self,
@@ -405,25 +398,25 @@ class SparseKVManager(FullAttentionManager):
             )
 
         # ── Decode ────────────────────────────────────────────────────────
-        # Key principle (Bug 1 fix): we NEVER free the physical prefill
-        # blocks so that their KV data is preserved.  Only the single
-        # "current decode block" (which accumulates the latest token) is
-        # replaced each step.
+        # Key principle (Bug 1 fix): we NEVER free historical blocks during
+        # decode so their KV data stays selectable. This includes prefill
+        # blocks and finalized decode blocks from previous steps.
         req_blocks = self.req_to_blocks[request_id]
 
         # On the first decode call, snapshot all prefill blocks.
         if request_id not in self._prefill_blocks:
             self._prefill_blocks[request_id] = list(req_blocks)
 
-        # Free the old decode block from the previous step (if any).
+        # Finalize the old decode block from the previous step (if any) by
+        # moving it into the persistent sparse history.
         prev_decode = self._decode_block.get(request_id)
         if prev_decode is not None and not prev_decode.is_null:
-            self.block_pool.free_blocks([prev_decode])
+            self._prefill_blocks[request_id].append(prev_decode)
             self._decode_block[request_id] = None
 
-        # Map selected logical indices → physical prefill blocks.
-        # Indices >= len(prefill_blocks) are decode-step logical blocks
-        # whose physical refs are not tracked; skip them to stay safe.
+        # Map selected logical indices → physical historical blocks.
+        # The history list contains original prefill blocks followed by
+        # finalized decode blocks in chronological order.
         prefill_blocks = self._prefill_blocks[request_id]
         selected = self._selected_block_indices.get(request_id, [])
         physical_selected = [

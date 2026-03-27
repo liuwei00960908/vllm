@@ -6911,24 +6911,30 @@ class GPUModelRunner(
             # sequence length.
             new_seq_len = min(old_seq_len, sparse_cap_seq_len)
             seq_lens_np[req_idx] = new_seq_len
-            # Diagnostic: if sparse capacity is larger than materialized tokens,
-            # the gap is decode-block tail that must stay hidden from kernels.
+            # Diagnostic: sparse capacity can be larger than materialized
+            # tokens while the decode block is not yet full. This is expected
+            # as long as we keep applied seq_len equal to old_seq_len.
             tail_slack = sparse_cap_seq_len - old_seq_len
             if 0 < tail_slack < block_size:
-                logger.warning_once(
-                    "Sparse decode potential tail read: req_id=%s gid=%d "
-                    "old_seq_len=%d sparse_cap_seq_len=%d applied_seq_len=%d "
-                    "block_size=%d "
-                    "num_blocks=%d num_output_tokens=%d",
-                    req_id,
-                    kv_cache_gid,
-                    old_seq_len,
-                    sparse_cap_seq_len,
-                    new_seq_len,
-                    block_size,
-                    num_blocks,
-                    num_output_tokens,
-                )
+                if new_seq_len != old_seq_len:
+                    logger.warning_once(
+                        "Sparse decode tail exposure detected: req_id=%s gid=%d "
+                        "old_seq_len=%d sparse_cap_seq_len=%d applied_seq_len=%d "
+                        "block_size=%d num_blocks=%d num_output_tokens=%d",
+                        req_id,
+                        kv_cache_gid,
+                        old_seq_len,
+                        sparse_cap_seq_len,
+                        new_seq_len,
+                        block_size,
+                        num_blocks,
+                        num_output_tokens,
+                    )
+                else:
+                    logger.debug_once(
+                        "Sparse decode tail slack observed and safely hidden "
+                        "(applied_seq_len == old_seq_len)."
+                    )
 
         sparse_seq_lens_gpu = torch.tensor(
             seq_lens_np[:num_reqs_padded],
