@@ -597,3 +597,15 @@ class KVCacheManager:
         vfeat_map = new_value_features or {}
         for req_id, feat in new_block_features.items():
             mgr.rebalance(req_id, feat, vfeat_map.get(req_id))
+
+    def get_sparse_selected_block_indices(
+        self, request_id: str
+    ) -> list[int] | None:
+        """Return sparse-selected logical block indices for a request."""
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return None
+        selected = mgr._selected_block_indices.get(request_id)
+        if selected is None:
+            return None
+        return list(selected)

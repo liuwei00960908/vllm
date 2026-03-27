@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -102,6 +103,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
@@ -505,6 +507,28 @@ class GPUModelRunner(
         self._sparse_q_captures: dict[str, torch.Tensor] = {}
         # Hook handles so they can be removed if needed.
         self._sparse_q_hooks: list[torch.utils.hooks.RemovableHandle] = []
+        # Optional sparse decode token debug logs.
+        self._sparse_debug_decode_tokens: bool = bool(
+            int(os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS", "0"))
+        )
+        self._sparse_debug_decode_tokens_max: int = int(
+            os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX", "256")
+        )
+        # <= 0 means "no cap" (print all selected blocks).
+        self._sparse_debug_max_blocks: int = int(
+            os.getenv("VLLM_SPARSE_DEBUG_MAX_BLOCKS", "0")
+        )
+        self._sparse_debug_tokenizer = None
+        if self._sparse_debug_decode_tokens:
+            try:
+                self._sparse_debug_tokenizer = cached_tokenizer_from_config(
+                    self.model_config
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize tokenizer for sparse decode debug logs: %s",
+                    e,
+                )
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -1175,6 +1199,7 @@ class GPUModelRunner(
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
+        sparse_selected_map = req_data.sparse_selected_block_indices or {}
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
         # Save scheduler-allocated spec lengths before trimming so
@@ -1283,6 +1308,13 @@ class GPUModelRunner(
                         for gid, new_ids_for_group in enumerate(new_block_ids):
                             req_state.block_ids[gid].clear()
                             req_state.block_ids[gid].extend(new_ids_for_group)
+                        selected_logical_blocks = sparse_selected_map.get(req_id)
+                        if selected_logical_blocks is not None:
+                            self._debug_log_sparse_selected_kv_tokens(
+                                req_id=req_id,
+                                req_state=req_state,
+                                selected_logical_blocks=selected_logical_blocks,
+                            )
                     else:
                         # Standard: append new blocks to existing IDs.
                         for block_ids, new_ids in zip(
@@ -6935,6 +6967,11 @@ class GPUModelRunner(
                         "Sparse decode tail slack observed and safely hidden "
                         "(applied_seq_len == old_seq_len)."
                     )
+            self._debug_log_sparse_decode_tokens(
+                req_id=req_id,
+                req_idx=req_idx,
+                seq_len=new_seq_len,
+            )
 
         sparse_seq_lens_gpu = torch.tensor(
             seq_lens_np[:num_reqs_padded],
@@ -6949,6 +6986,105 @@ class GPUModelRunner(
         if num_reqs > 0:
             new_cm.max_seq_len = int(seq_lens_np[:num_reqs].max())
         return new_cm
+
+    def _debug_log_sparse_decode_tokens(
+        self, req_id: str, req_idx: int, seq_len: int
+    ) -> None:
+        """Optional per-step sparse decode token trace for debugging."""
+        if not self._sparse_debug_decode_tokens:
+            return
+        if seq_len <= 0:
+            return
+        token_ids = self.input_batch.token_ids_cpu[req_idx, :seq_len].tolist()
+        max_show = max(1, self._sparse_debug_decode_tokens_max)
+        shown_token_ids = token_ids[-max_show:]
+
+        decoded_text = None
+        if self._sparse_debug_tokenizer is not None:
+            try:
+                decoded_text = self._sparse_debug_tokenizer.decode(
+                    shown_token_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except Exception:
+                decoded_text = None
+
+        logger.warning(
+            "Sparse decode token trace: req_id=%s seq_len=%d shown=%d "
+            "token_ids=%s decoded_tail=%r",
+            req_id,
+            seq_len,
+            len(shown_token_ids),
+            shown_token_ids,
+            decoded_text,
+        )
+
+    def _debug_log_sparse_selected_kv_tokens(
+        self,
+        req_id: str,
+        req_state: "CachedRequestState",
+        selected_logical_blocks: list[int],
+    ) -> None:
+        """Log original tokens that sparse decode KV actually uses."""
+        if not self._sparse_debug_decode_tokens:
+            return
+        if req_state.prompt_token_ids is None:
+            logger.warning(
+                "Sparse selected KV trace skipped (no prompt token IDs): req_id=%s",
+                req_id,
+            )
+            return
+        if not selected_logical_blocks:
+            logger.warning(
+                "Sparse selected KV trace: req_id=%s selected_blocks=[]",
+                req_id,
+            )
+            return
+
+        all_token_ids = req_state.prompt_token_ids + req_state.output_token_ids
+        block_size = self.block_size
+        max_blocks = self._sparse_debug_max_blocks
+        shown_blocks = (
+            selected_logical_blocks
+            if max_blocks <= 0
+            else selected_logical_blocks[: max(1, max_blocks)]
+        )
+        block_lines: list[str] = []
+
+        for logical_block_idx in shown_blocks:
+            start = int(logical_block_idx) * block_size
+            end = min(start + block_size, len(all_token_ids))
+            if start >= len(all_token_ids):
+                continue
+            block_token_ids = all_token_ids[start:end]
+            block_text = None
+            if self._sparse_debug_tokenizer is not None and block_token_ids:
+                try:
+                    block_text = self._sparse_debug_tokenizer.decode(
+                        block_token_ids,
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                except Exception:
+                    block_text = None
+            block_lines.append(
+                f"  - block={int(logical_block_idx)} span=[{start},{end}) "
+                f"len={len(block_token_ids)} ids={block_token_ids} text={block_text!r}"
+            )
+
+        logger.warning(
+            "Sparse selected KV trace:\n"
+            "req_id=%s\n"
+            "selected_blocks(total=%d shown=%d, max=%d)=%s\n"
+            "%s",
+            req_id,
+            len(selected_logical_blocks),
+            len(shown_blocks),
+            max_blocks,
+            shown_blocks,
+            "\n".join(block_lines) if block_lines else "  - (no mappable blocks)",
+        )
 
     def _override_sparse_slot_mapping(
         self, num_reqs: int, cu_num_tokens: np.ndarray
