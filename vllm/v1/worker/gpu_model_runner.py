@@ -7051,7 +7051,16 @@ class GPUModelRunner(
             return
 
         all_token_ids = req_state.prompt_token_ids + req_state.output_token_ids
-        block_size = self.block_size
+        # Debug mapping is for sparse-selected logical blocks; use sparse
+        # KV group block_size from config (fall back to first block table size).
+        block_size = None
+        if hasattr(self, "kv_cache_config"):
+            for grp in self.kv_cache_config.kv_cache_groups:
+                if isinstance(grp.kv_cache_spec, SparseAttentionSpec):
+                    block_size = int(grp.kv_cache_spec.block_size)
+                    break
+        if block_size is None:
+            block_size = int(self.input_batch.block_table[0].block_size)
         max_blocks = self._sparse_debug_max_blocks
         shown_blocks = (
             selected_logical_blocks
