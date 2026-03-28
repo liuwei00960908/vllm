@@ -26,7 +26,7 @@ Group 4 – _collect_sparse_features GPU 侧逻辑
       · prefill 完成  → 输出 block_features + query_vectors
       · mid-prefill   → 不输出任何字段（chunked prefill 中间块）
       · decode 步     → 输出 query_vectors + new_block_features
-      · 多层平均      → feature_dim = head_size
+      · 每层独立 K/Q  → req_id → layer_name → 特征
 
 Group 5 – Prefill→Decode 完整生命周期
     用 SparseKVManager 真实逻辑跑一遍
@@ -45,7 +45,10 @@ import pytest
 import torch
 
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager
+from vllm.v1.core.sparse_kv_cache_manager import (
+    SPARSE_LEGACY_FLAT_LAYER,
+    SparseKVManager,
+)
 from vllm.v1.kv_cache_interface import SparseAttentionSpec
 from vllm.v1.outputs import ModelRunnerOutput
 
@@ -132,32 +135,32 @@ class TestModelRunnerOutputSparseFields:
 
     def test_sparse_block_features_assignment(self):
         out = self._empty_output()
-        feats = {"req1": np.ones((3, HEAD_SIZE), dtype=np.float32)}
+        feats = {"req1": {"L0": np.ones((3, HEAD_SIZE), dtype=np.float32)}}
         out = copy(out)
         out.sparse_block_features = feats
         assert out.sparse_block_features is feats
-        assert out.sparse_block_features["req1"].shape == (3, HEAD_SIZE)
+        assert out.sparse_block_features["req1"]["L0"].shape == (3, HEAD_SIZE)
 
     def test_sparse_query_vectors_assignment(self):
         out = self._empty_output()
-        qv = {"req1": rand_vec(1)}
+        qv = {"req1": {"L0": rand_vec(1)}}
         out = copy(out)
         out.sparse_query_vectors = qv
-        assert out.sparse_query_vectors["req1"].shape == (HEAD_SIZE,)
+        assert out.sparse_query_vectors["req1"]["L0"].shape == (HEAD_SIZE,)
 
     def test_sparse_new_block_features_assignment(self):
         out = self._empty_output()
-        nbf = {"req2": rand_vec(2)}
+        nbf = {"req2": {"L0": rand_vec(2)}}
         out = copy(out)
         out.sparse_new_block_features = nbf
-        assert out.sparse_new_block_features["req2"].shape == (HEAD_SIZE,)
+        assert out.sparse_new_block_features["req2"]["L0"].shape == (HEAD_SIZE,)
 
     def test_sparse_block_value_features_assignment(self):
         out = self._empty_output()
-        vf = {"req3": np.zeros((5, HEAD_SIZE), dtype=np.float32)}
+        vf = {"req3": {"L0": np.zeros((5, HEAD_SIZE), dtype=np.float32)}}
         out = copy(out)
         out.sparse_block_value_features = vf
-        assert out.sparse_block_value_features["req3"].shape == (5, HEAD_SIZE)
+        assert out.sparse_block_value_features["req3"]["L0"].shape == (5, HEAD_SIZE)
 
     def test_non_sparse_output_unaffected(self):
         """Adding sparse fields must not break standard sampled_token_ids."""
@@ -167,7 +170,7 @@ class TestModelRunnerOutputSparseFields:
             sampled_token_ids=[[42]],
             logprobs=None,
             prompt_logprobs_dict={},
-            sparse_query_vectors={"r0": rand_vec()},
+            sparse_query_vectors={"r0": {"L": rand_vec()}},
         )
         assert out.sampled_token_ids == [[42]]
         assert out.sparse_query_vectors is not None
@@ -403,8 +406,12 @@ class TestKVCacheManagerGetSparseManager:
 
         feats = rand_feats(12)
         KVCacheManager.sparse_notify_prefill_done(kvcm, "req0", feats)
-        assert "req0" in mgr._cluster_centres
-        assert mgr._cluster_centres["req0"].shape[1] == HEAD_SIZE
+        assert "req0" in mgr._layer_states
+        assert (
+            mgr._layer_states["req0"][SPARSE_LEGACY_FLAT_LAYER]
+            .cluster_centres.shape[1]
+            == HEAD_SIZE
+        )
 
     def test_update_query_vectors_sets_prefill_topk_ready(self):
         """After update, prefill TopK cache must be populated."""
@@ -429,10 +436,13 @@ class TestKVCacheManagerGetSparseManager:
         kvcm.get_sparse_manager.return_value = mgr
         mgr.indexing("req0", rand_feats(8))
 
-        before = len(mgr._all_block_features.get("req0", []))
+        st = mgr._layer_states["req0"][SPARSE_LEGACY_FLAT_LAYER]
+        before = len(st.all_block_features)
         KVCacheManager.sparse_post_decode_rebalance(kvcm,
                                                     {"req0": rand_vec()})
-        after = len(mgr._all_block_features["req0"])
+        after = len(
+            mgr._layer_states["req0"][SPARSE_LEGACY_FLAT_LAYER].all_block_features
+        )
         assert after == before + 1
 
 
@@ -623,12 +633,15 @@ class TestCollectSparseFeatures:
 
         assert bf is not None, "block_features must be emitted at prefill done"
         assert "r0" in bf
-        assert bf["r0"].shape == (n_blocks, HEAD_SIZE)
-        assert bf["r0"].dtype == np.float32
+        layer_names = runner.kv_cache_config.kv_cache_groups[0].layer_names
+        for ln in layer_names:
+            assert bf["r0"][ln].shape == (n_blocks, HEAD_SIZE)
+            assert bf["r0"][ln].dtype == np.float32
 
         assert qv is not None, "query_vectors must be emitted at prefill done"
         assert "r0" in qv
-        assert qv["r0"].shape == (HEAD_SIZE,)
+        for ln in layer_names:
+            assert qv["r0"][ln].shape == (HEAD_SIZE,)
 
         assert nbf is None, "new_block_features must NOT be emitted at prefill"
 
@@ -655,11 +668,12 @@ class TestCollectSparseFeatures:
         )
         bf, _, _ = runner._collect_sparse_features(sched, 1)
         assert bf is not None
+        ln0 = runner.kv_cache_config.kv_cache_groups[0].layer_names[0]
         # block 0: all K = 1.0, so mean = 1.0
         # block 1: all K = 2.0, so mean = 2.0
-        np.testing.assert_allclose(bf["r0"][0], np.ones(hs) * 1.0,
+        np.testing.assert_allclose(bf["r0"][ln0][0], np.ones(hs) * 1.0,
                                    rtol=1e-4)
-        np.testing.assert_allclose(bf["r0"][1], np.ones(hs) * 2.0,
+        np.testing.assert_allclose(bf["r0"][ln0][1], np.ones(hs) * 2.0,
                                    rtol=1e-4)
 
     # ── 4c: mid-prefill chunk (chunked prefill) ───────────────────────────────
@@ -699,8 +713,10 @@ class TestCollectSparseFeatures:
         assert bf is None, "block_features should NOT be emitted during decode"
         assert qv is not None, "query_vectors must be emitted during decode"
         assert nbf is not None, "new_block_features must be emitted during decode"
-        assert qv["r0"].shape == (HEAD_SIZE,)
-        assert nbf["r0"].shape == (HEAD_SIZE,)
+        layer_names = runner.kv_cache_config.kv_cache_groups[0].layer_names
+        for ln in layer_names:
+            assert qv["r0"][ln].shape == (HEAD_SIZE,)
+            assert nbf["r0"][ln].shape == (HEAD_SIZE,)
 
     def test_decode_new_block_is_last_block_mean_k(self):
         """new_block_features must be the mean-K of the last block."""
@@ -723,21 +739,18 @@ class TestCollectSparseFeatures:
         )
         _, _, nbf = runner._collect_sparse_features(sched, 1)
         assert nbf is not None
+        ln0 = runner.kv_cache_config.kv_cache_groups[0].layer_names[0]
         # last block (index 2) has K = 3.0
-        np.testing.assert_allclose(nbf["r0"], np.ones(hs) * 3.0, rtol=1e-4)
+        np.testing.assert_allclose(nbf["r0"][ln0], np.ones(hs) * 3.0, rtol=1e-4)
 
-    # ── 4e: Q averaging across layers ────────────────────────────────────────
+    # ── 4e: Q is kept per layer (no cross-layer mean) ───────────────────────
 
-    def test_q_averaging_across_layers(self):
-        """Query vector must be the average of Q across all sparse layers."""
+    def test_q_distinct_per_layer(self):
+        """Each sparse layer keeps its own mean Q (no averaging across layers)."""
         n_layers = 3
         total_tokens = 2
         q_dim = NUM_Q_HEADS * HEAD_SIZE
 
-        # Build Q data: layer i contributes a constant vector of value i+1.
-        # Average should be 2.0 (mean of 1, 2, 3).
-        q_base = torch.zeros(total_tokens, q_dim)
-        # We'll override _sparse_q_captures per layer after building.
         runner, sched = _build_mock_runner(
             req_ids=["r0"],
             num_prompt_tokens=[2],
@@ -757,14 +770,16 @@ class TestCollectSparseFeatures:
 
         _, qv, _ = runner._collect_sparse_features(sched, 1)
         assert qv is not None
-        # Expected: mean(1, 2, 3) = 2.0 across all Q heads → [HEAD_SIZE]
-        expected = np.full(HEAD_SIZE, 2.0, dtype=np.float32)
-        np.testing.assert_allclose(qv["r0"], expected, rtol=1e-4)
+        for i, ln in enumerate(
+            runner.kv_cache_config.kv_cache_groups[0].layer_names
+        ):
+            expected = np.full(HEAD_SIZE, float(i + 1), dtype=np.float32)
+            np.testing.assert_allclose(qv["r0"][ln], expected, rtol=1e-4)
 
-    # ── 4f: K averaging across layers ────────────────────────────────────────
+    # ── 4f: K block features per layer (no cross-layer mean) ────────────────
 
-    def test_k_averaging_across_layers(self):
-        """block_features must be the average of K across all sparse layers."""
+    def test_k_distinct_per_layer(self):
+        """Each layer's block_features use only that layer's KV cache."""
         n_layers = 2
         n_blocks = 2
         bs, hs, nh = BLOCK_SIZE, HEAD_SIZE, NUM_KV_HEADS
@@ -779,7 +794,6 @@ class TestCollectSparseFeatures:
             blocks_per_req=[list(range(n_blocks))],
             n_layers=n_layers,
         )
-        # Override KV caches: layer 0 has K=1.0, layer 1 has K=3.0.
         for i, ln in enumerate(
             runner.kv_cache_config.kv_cache_groups[0].layer_names
         ):
@@ -788,9 +802,13 @@ class TestCollectSparseFeatures:
 
         bf, _, _ = runner._collect_sparse_features(sched, 1)
         assert bf is not None
-        # Average of 1.0 and 3.0 = 2.0
-        np.testing.assert_allclose(bf["r0"], np.full((n_blocks, hs), 2.0),
-                                   rtol=1e-4)
+        for i, ln in enumerate(
+            runner.kv_cache_config.kv_cache_groups[0].layer_names
+        ):
+            val = float(i * 2 + 1)
+            np.testing.assert_allclose(
+                bf["r0"][ln], np.full((n_blocks, hs), val), rtol=1e-4
+            )
 
     # ── 4g: multi-request batch ───────────────────────────────────────────────
 
@@ -903,7 +921,7 @@ class TestFullPrefillDecodeCycle:
                             new_block_features=None,
                             mgr=mgr)
 
-        assert req_id in mgr._cluster_centres, "Cluster index must be built"
+        assert req_id in mgr._layer_states, "Cluster index must be built"
         assert mgr._prefill_topk_ready[req_id] is True
         assert len(mgr._prefill_selected[req_id]) > 0
 
@@ -918,7 +936,8 @@ class TestFullPrefillDecodeCycle:
                             block_features={req_id: rand_feats(12, seed=1)},
                             query_vectors={req_id: rand_vec(2)},
                             new_block_features=None)
-        initial_count = len(mgr._all_block_features[req_id])
+        st0 = mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_LAYER]
+        initial_count = len(st0.all_block_features)
 
         # Decode step 1.
         self._simulate_step(kvcm, mgr,
@@ -926,7 +945,10 @@ class TestFullPrefillDecodeCycle:
                             query_vectors={req_id: rand_vec(3)},
                             new_block_features={req_id: rand_vec(4)})
 
-        assert len(mgr._all_block_features[req_id]) == initial_count + 1
+        assert (
+            len(mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_LAYER].all_block_features)
+            == initial_count + 1
+        )
 
     def test_decode_query_vector_updated_each_step(self):
         """Each decode step must replace the pending query vector."""
@@ -945,14 +967,18 @@ class TestFullPrefillDecodeCycle:
                             block_features=None,
                             query_vectors={req_id: q1},
                             new_block_features={req_id: rand_vec(20)})
-        np.testing.assert_array_equal(mgr.get_pending_query(req_id), q1)
+        pq1 = mgr.get_pending_query(req_id)
+        assert pq1 is not None
+        np.testing.assert_array_equal(pq1[SPARSE_LEGACY_FLAT_LAYER], q1)
 
         q2 = rand_vec(seed=11)
         self._simulate_step(kvcm, mgr,
                             block_features=None,
                             query_vectors={req_id: q2},
                             new_block_features={req_id: rand_vec(21)})
-        np.testing.assert_array_equal(mgr.get_pending_query(req_id), q2)
+        pq2 = mgr.get_pending_query(req_id)
+        assert pq2 is not None
+        np.testing.assert_array_equal(pq2[SPARSE_LEGACY_FLAT_LAYER], q2)
 
     # ── 5b: rebalance order ───────────────────────────────────────────────────
 
@@ -1051,9 +1077,8 @@ class TestFullPrefillDecodeCycle:
             new_block_features=None,
         )
         # Each request has its own cluster state.
-        assert "r0" in mgr._cluster_centres
-        assert "r1" in mgr._cluster_centres
-        assert mgr._cluster_centres["r0"].shape != () or True  # just exists
+        assert "r0" in mgr._layer_states
+        assert "r1" in mgr._layer_states
 
         # Select must return non-overlapping-by-state blocks.
         sel_r0 = mgr.select("r0", rand_vec(5), num_blocks=8)
@@ -1075,18 +1100,18 @@ class TestFullPrefillDecodeCycle:
                             query_vectors={req_id: rand_vec()},
                             new_block_features=None)
         # Verify state exists.
-        assert req_id in mgr._cluster_centres
+        assert req_id in mgr._layer_states
 
         # Free the request.
         mgr.free(req_id)
 
         # All sparse dictionaries must be cleared.
         for attr in (
-            "_cluster_centres", "_cluster_value_sum", "_cluster_size",
-            "_block_to_cluster", "_all_block_features", "_all_value_features",
-            "_mean_key", "_pending_query", "_selected_block_indices",
-            "_prefill_topk_ready", "_prefill_selected",
-            "_decode_block_buffer", "_decode_value_buffer",
+            "_layer_states",
+            "_pending_query",
+            "_selected_block_indices",
+            "_prefill_topk_ready",
+            "_prefill_selected",
         ):
             d = getattr(mgr, attr)
             assert req_id not in d, f"{attr} still contains {req_id} after free()"
@@ -1108,7 +1133,7 @@ class TestFullPrefillDecodeCycle:
                             block_features=None,   # mid-chunk: NOT emitted
                             query_vectors=None,
                             new_block_features=None)
-        assert req_id not in mgr._cluster_centres, (
+        assert req_id not in mgr._layer_states, (
             "No clusters should exist mid-prefill"
         )
 
@@ -1117,7 +1142,7 @@ class TestFullPrefillDecodeCycle:
                             block_features={req_id: rand_feats(16)},
                             query_vectors={req_id: rand_vec()},
                             new_block_features=None)
-        assert req_id in mgr._cluster_centres, (
+        assert req_id in mgr._layer_states, (
             "Clusters must be built after prefill completes"
         )
 

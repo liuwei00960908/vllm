@@ -7,23 +7,24 @@ Algorithm (matches RetroInfer, adapted for vLLM's paged block layout)
 ----------------------------------------------------------------------
 
 Prefill
-  1. Model runner extracts **block-level key features**:
-       ``block_features[b]`` = mean K over all tokens in block b  → ``[D]``
-     and the last-N query vectors for prefill TopK caching:
-       ``query_vectors[req_id]`` = mean Q per KV-head group for last N prompt
-     tokens → ``[N, D]`` (or ``[D]`` if N=1).
+  1. Model runner extracts **block-level key features** per attention layer
+     (same ``SparseAttentionSpec`` group): ``layer → [num_blocks, D]`` mean K
+     per block (tokens and KV-heads averaged within the layer).  Query vectors
+     are likewise **per layer** (mean Q per layer).  A legacy path still accepts
+     a single ``[num_blocks, D]`` / ``[D]`` array (treated as one synthetic
+     layer ``__flat__``).
 
   2. ``indexing(req_id, block_features, mean_value_features)``
-     - Mean-centers the block features:  ``feat -= feat.mean(axis=0)``
-     - Runs **Segment K-Means** over the blocks (``n_segment`` position
-       segments, ``num_clusters`` centroids distributed evenly).
-     - Restores centering before storing centroids.
-     - Also stores ``_cluster_value_sum`` (sum of mean-V per cluster).
-       This is the hook for the Estimation Zone (currently unused).
+     - For **each layer** independently: mean-center that layer's block
+       features, run **Segment K-Means**, restore centroids, accumulate value
+       sums.  Cluster ids and centroids are not shared across layers.
 
-  3. ``select(req_id, query_vec, ...)`` is called immediately after indexing
-     (with the prefill query) to compute and **cache** the block selection.
-     The cache is reused for all subsequent decode steps.
+  3. ``select(req_id, query_vec, ...)`` merges per-layer TopK retrieve zones
+     (union of blocks selected by each layer's ``q · centroid`` scores), then
+     applies the global ``max_selected_blocks`` budget by dropping non-steady
+     blocks with the lowest **max layer-wise** cluster scores.  One physical
+     block table is still shared, so this union is the set of blocks loaded for
+     all layers.
 
 Decode
   - The cached selection from prefill is used directly → no per-token TopK.
@@ -70,14 +71,13 @@ To enable the Estimation Zone:
 from __future__ import annotations
 
 import os
-from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
@@ -88,6 +88,25 @@ if TYPE_CHECKING:
     pass
 
 logger = init_logger(__name__)
+
+# Single-array API (tests / callers that pass one ``[num_blocks, D]`` matrix)
+# is stored under this synthetic layer name.
+SPARSE_LEGACY_FLAT_LAYER = "__flat__"
+
+
+@dataclass
+class _SparseLayerIndexState:
+    """Per-(request, attention-layer) clustering and feature buffers."""
+
+    cluster_centres: np.ndarray
+    cluster_value_sum: np.ndarray
+    cluster_size: np.ndarray
+    block_to_cluster: list[int]
+    all_block_features: list[np.ndarray] = field(default_factory=list)
+    all_value_features: list[np.ndarray] = field(default_factory=list)
+    mean_key: np.ndarray | None = None
+    decode_block_buffer: list[np.ndarray] = field(default_factory=list)
+    decode_value_buffer: list[np.ndarray] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -233,19 +252,14 @@ class SparseKVManager(FullAttentionManager):
 
     Per-request CPU state
     ---------------------
-    ``_cluster_centres``      [n_total_clusters, D] – uncentered centroids.
-    ``_cluster_value_sum``    [n_total_clusters, D] – sum of block mean-V per cluster.
-                               (stored for Estimation Zone; currently unused).
-    ``_cluster_size``         [n_total_clusters] int – blocks per cluster.
-    ``_block_to_cluster``     list[int] – logical block index → cluster id.
-    ``_all_block_features``   list[np.ndarray] – accumulated block key features.
-    ``_all_value_features``   list[np.ndarray] – accumulated block mean-V features.
-    ``_mean_key``             [D] – global key mean subtracted before clustering.
-    ``_pending_query``        [D] – last decoded/prefill query for next select().
-    ``_selected_block_indices`` list[int] – blocks chosen for next decode step.
-    ``_prefill_topk_ready``   bool – whether prefill TopK cache is valid.
-    ``_decode_block_buffer``  list[np.ndarray] – features buffered for index update.
-    ``_decode_value_buffer``  list[np.ndarray] – value features buffered for update.
+    ``_layer_states``         ``layer_name → _SparseLayerIndexState`` – per-layer
+                              centroids, ``block_to_cluster``, feature lists,
+                              and decode buffers for dynamic K-Means updates.
+    ``_pending_query``        ``layer_name → [D]`` – last Q vectors per layer.
+    ``_selected_block_indices`` list[int] – merged logical blocks for the next
+                              decode step (union across layers, budget-capped).
+    ``_prefill_topk_ready``   bool – whether merged prefill TopK cache is valid.
+    ``_prefill_selected``     cached merged selection after prefill.
     """
 
     def __init__(
@@ -268,34 +282,17 @@ class SparseKVManager(FullAttentionManager):
         assert isinstance(kv_cache_spec, SparseAttentionSpec)
         self._spec: SparseAttentionSpec = kv_cache_spec
 
-        # ── per-request clustering state (all CPU numpy) ──────────────────
-        self._cluster_centres: dict[str, np.ndarray] = {}
-        # TODO(estimation-zone): _cluster_value_sum is stored but not yet
-        # consumed by any attention computation.  See module docstring for
-        # the steps needed to enable the Estimation Zone.
-        self._cluster_value_sum: dict[str, np.ndarray] = {}
-        self._cluster_size: dict[str, np.ndarray] = {}
-        # logical block index → cluster id (grows as decode blocks arrive)
-        self._block_to_cluster: dict[str, list[int]] = {}
-        # all block key/value features accumulated since prefill
-        self._all_block_features: dict[str, list[np.ndarray]] = {}
-        self._all_value_features: dict[str, list[np.ndarray]] = {}
-        # mean key used for centering (restored before storing centroids)
-        self._mean_key: dict[str, np.ndarray] = {}
+        # ── per-request, per-attention-layer clustering (CPU numpy) ───────
+        self._layer_states: dict[str, dict[str, _SparseLayerIndexState]] = {}
 
         # ── selection state ───────────────────────────────────────────────
-        self._pending_query: dict[str, np.ndarray] = {}
+        self._pending_query: dict[str, dict[str, np.ndarray]] = {}
         self._selected_block_indices: dict[str, list[int]] = {}
         # Per-step retrieve-zone logical block indices (steady-zone excluded).
         self._selected_retrieve_block_indices: dict[str, list[int]] = {}
         # prefill TopK cache
         self._prefill_topk_ready: dict[str, bool] = {}
         self._prefill_selected: dict[str, list[int]] = {}
-
-        # ── dynamic index update state ────────────────────────────────────
-        # buffer for decode-phase blocks pending a fresh segment K-Means
-        self._decode_block_buffer: dict[str, list[np.ndarray]] = {}
-        self._decode_value_buffer: dict[str, list[np.ndarray]] = {}
 
         self._current_step: int = 0
 
@@ -538,20 +535,12 @@ class SparseKVManager(FullAttentionManager):
         self._last_num_tokens_main_model.pop(request_id, None)
 
         super().free(request_id)
-        self._cluster_centres.pop(request_id, None)
-        self._cluster_value_sum.pop(request_id, None)
-        self._cluster_size.pop(request_id, None)
-        self._block_to_cluster.pop(request_id, None)
-        self._all_block_features.pop(request_id, None)
-        self._all_value_features.pop(request_id, None)
-        self._mean_key.pop(request_id, None)
+        self._layer_states.pop(request_id, None)
         self._pending_query.pop(request_id, None)
         self._selected_block_indices.pop(request_id, None)
         self._selected_retrieve_block_indices.pop(request_id, None)
         self._prefill_topk_ready.pop(request_id, None)
         self._prefill_selected.pop(request_id, None)
-        self._decode_block_buffer.pop(request_id, None)
-        self._decode_value_buffer.pop(request_id, None)
         self._step_trace.pop(request_id, None)
 
     def _estimate_decode_tokens_this_step(
@@ -595,139 +584,239 @@ class SparseKVManager(FullAttentionManager):
     # Called by KVCacheManager which is called by the Scheduler.
     # ------------------------------------------------------------------
 
-    def indexing(
+    @staticmethod
+    def _normalize_block_features_map(
+        block_features: np.ndarray | dict[str, np.ndarray],
+        block_value_features: np.ndarray | dict[str, np.ndarray] | None,
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
+        if isinstance(block_features, np.ndarray):
+            bf = {SPARSE_LEGACY_FLAT_LAYER: block_features}
+            bv = (
+                None
+                if block_value_features is None
+                else {SPARSE_LEGACY_FLAT_LAYER: block_value_features}
+            )
+            return bf, bv
+        if block_value_features is not None and not isinstance(
+            block_value_features, dict
+        ):
+            raise ValueError(
+                "sparse block_value_features must be a dict[str, ndarray] "
+                "when block_features is per-layer dict"
+            )
+        return dict(block_features), (
+            None if block_value_features is None else dict(block_value_features)
+        )
+
+    def _layer_map_for_request(
+        self, request_id: str
+    ) -> dict[str, _SparseLayerIndexState]:
+        return self._layer_states.setdefault(request_id, {})
+
+    def _total_blocks(self, request_id: str) -> int:
+        ls = self._layer_states.get(request_id, {})
+        if not ls:
+            return 0
+        return len(next(iter(ls.values())).all_block_features)
+
+    def _coerce_query_by_layer(
         self,
         request_id: str,
-        block_features: np.ndarray,
-        block_value_features: np.ndarray | None = None,
-    ) -> None:
-        """
-        Build the cluster index from prefill block features.
+        query_vector: np.ndarray | dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        ls = self._layer_states.get(request_id, {})
+        if isinstance(query_vector, dict):
+            return {k: np.asarray(v, dtype=np.float32) for k, v in query_vector.items()}
+        q = np.asarray(query_vector, dtype=np.float32)
+        if not ls:
+            return {SPARSE_LEGACY_FLAT_LAYER: q}
+        return {layer: q for layer in ls}
 
-        Called once after prefill completes.  The model runner extracts
-        per-block key features (mean K over tokens in the block) and passes
-        them as ``block_features``.
-
-        Steps
-        -----
-        1. Compute global mean; mean-center the features.
-        2. Run Segment K-Means to get centroids and assignments.
-        3. Restore centering (add mean back to centroids).
-        4. Compute per-cluster value_sum (for future Estimation Zone).
-        5. Mark prefill TopK as not yet ready (will be triggered by
-           ``sparse_update_query_vectors`` immediately after).
-
-        Args:
-            request_id:
-                The request ID.
-            block_features:
-                ``[num_blocks, D]`` float32 CPU array – mean K per block.
-                D may be ``head_dim`` (averaged across KV heads) or
-                ``num_kv_heads * head_dim`` (flattened per-head features).
-            block_value_features:
-                ``[num_blocks, D]`` float32 CPU array – mean V per block
-                (optional; stored for the Estimation Zone TODO).
-        """
-        num_blocks, D = block_features.shape
-        if num_blocks == 0:
-            logger.debug("sparse indexing: req %s has 0 blocks – skipped", request_id)
-            return
-
-        feat = block_features.astype(np.float32)
-        # --- 1. Mean-center ---
-        mean_key = feat.mean(axis=0)          # [D]
-        centered = feat - mean_key            # [num_blocks, D]
-
-        # --- 2. Segment K-Means on centered features ---
-        k = min(self._spec.num_clusters, num_blocks)
-        centres, labels, sizes = _segment_kmeans(
-            centered,
-            n_clusters=k,
-            n_segments=min(self._spec.n_segment, num_blocks),
+    def _retrieve_zone_one_layer(
+        self,
+        st: _SparseLayerIndexState,
+        q: np.ndarray,
+    ) -> tuple[set[int], dict[int, float]]:
+        centres = st.cluster_centres
+        b2c = st.block_to_cluster
+        if len(centres) == 0 or not b2c:
+            return set(), {}
+        q = np.asarray(q, dtype=np.float32)
+        d = int(q.shape[-1])
+        scores_c = (q @ centres.T) / np.sqrt(max(d, 1))
+        nprobe = min(self._spec.nprobe, len(centres))
+        top_cluster_ids = set(
+            int(c) for c in np.argpartition(scores_c, -nprobe)[-nprobe:]
         )
+        retrieve: set[int] = set()
+        block_scores: dict[int, float] = {}
+        for bidx, cid in enumerate(b2c):
+            if cid in top_cluster_ids:
+                retrieve.add(bidx)
+                block_scores[bidx] = float(scores_c[cid])
+        return retrieve, block_scores
 
-        # --- 3. Restore centering ---
-        centres = centres + mean_key          # uncentered centroids
-
-        # --- 4. Value sum per cluster (TODO: Estimation Zone) ---
-        n_k = len(centres)
-        if block_value_features is not None:
-            vfeat = block_value_features.astype(np.float32)
-        else:
-            vfeat = np.zeros_like(feat)
-        value_sum = np.zeros((n_k, D), dtype=np.float32)
-        np.add.at(value_sum, labels, vfeat)
-
-        # --- 5. Store ---
-        self._cluster_centres[request_id] = centres          # [n_k, D]
-        self._cluster_value_sum[request_id] = value_sum      # [n_k, D]
-        self._cluster_size[request_id] = sizes               # [n_k]
-        self._block_to_cluster[request_id] = labels.tolist() # [num_blocks]
-        self._all_block_features[request_id] = [feat[i] for i in range(num_blocks)]
-        self._all_value_features[request_id] = [vfeat[i] for i in range(num_blocks)]
-        self._mean_key[request_id] = mean_key
-        # Remove the key so that update_query_vector knows it needs to
-        # compute the prefill TopK for the first time.  Setting it to False
-        # here would be indistinguishable from the "invalidated by dynamic
-        # update" state, which must NOT retrigger _compute_prefill_topk.
-        self._prefill_topk_ready.pop(request_id, None)
-        self._decode_block_buffer[request_id] = []
-        self._decode_value_buffer[request_id] = []
-        self._debug_log_state(
-            request_id,
-            "indexing_done",
-            num_blocks=num_blocks,
-            num_clusters=n_k,
-            prefill_topk_ready=self._prefill_topk_ready.get(request_id, None),
-        )
-
-        logger.debug(
-            "sparse indexing: req %s – %d blocks → %d clusters (%d segments)",
-            request_id, num_blocks, n_k, self._spec.n_segment,
-        )
-
-    def select(
+    def _merge_fresh_topk(
         self,
         request_id: str,
-        query_vector: np.ndarray,
+        query_by_layer: dict[str, np.ndarray],
         num_blocks: int,
     ) -> list[int]:
-        """
-        Choose the block indices to load for the next decode step.
+        total_blocks = self._total_blocks(request_id)
+        if total_blocks == 0:
+            return []
 
-        Selection logic
-        ---------------
-        1. **Steady zone** (always included): first ``n_sink_blocks`` and last
-           ``n_recent_blocks`` logical block indices.
-        2. **Prefill TopK cache** (if valid): return the cached selection from
-           after-prefill (merged with the current steady zone).
-        3. **Fresh TopK search**: compute attention scores
-           ``score[c] = q · centroid[c] / sqrt(D)`` and take the top
-           ``nprobe`` clusters; collect all their block indices.
-        4. **Budget cap**: if total > ``num_blocks``, keep the steady zone and
-           trim the retrieve zone by cluster score.
-
-        Args:
-            request_id: The request ID.
-            query_vector:
-                ``[D]`` float32 query (typically the last token's mean Q
-                across the KV-head group, averaged over heads).
-            num_blocks:
-                Hard cap on the returned list length.
-
-        Returns:
-            Sorted list of **logical** block indices (0-based).
-        """
-        total_blocks = len(self._all_block_features.get(request_id, []))
-
-        # ── Steady zone ────────────────────────────────────────────────
         n_sink = self._spec.n_sink_blocks
         n_recent = self._spec.n_recent_blocks
         sink_set = set(range(min(n_sink, total_blocks)))
         recent_set = set(range(max(0, total_blocks - n_recent), total_blocks))
         steady_set = sink_set | recent_set
 
-        # ── Prefill TopK cache ─────────────────────────────────────────
+        layers = self._layer_states.get(request_id, {})
+        if not layers or all(
+            len(st.cluster_centres) == 0 for st in layers.values()
+        ):
+            fallback = set(range(max(0, total_blocks - num_blocks), total_blocks))
+            return sorted(fallback | steady_set)[:num_blocks]
+
+        all_retrieve: set[int] = set()
+        best_block_score: dict[int, float] = {}
+        for layer_name, st in layers.items():
+            q = query_by_layer.get(layer_name)
+            if q is None:
+                continue
+            retr, bs = self._retrieve_zone_one_layer(st, q)
+            all_retrieve |= retr
+            for bidx, sc in bs.items():
+                prev = best_block_score.get(bidx)
+                if prev is None or sc > prev:
+                    best_block_score[bidx] = sc
+
+        combined = steady_set | all_retrieve
+        if len(combined) > num_blocks:
+            non_steady = sorted(
+                all_retrieve - steady_set,
+                key=lambda b: best_block_score.get(b, float("-inf")),
+                reverse=True,
+            )
+            budget = max(0, num_blocks - len(steady_set))
+            combined = steady_set | set(non_steady[:budget])
+        return sorted(combined)
+
+    def _indexing_one_layer(
+        self,
+        request_id: str,
+        layer_name: str,
+        block_features: np.ndarray,
+        block_value_features: np.ndarray | None,
+    ) -> int:
+        num_blocks, d = block_features.shape
+        feat = block_features.astype(np.float32)
+        mean_key = feat.mean(axis=0)
+        centered = feat - mean_key
+        k = min(self._spec.num_clusters, num_blocks)
+        centres, labels, sizes = _segment_kmeans(
+            centered,
+            n_clusters=k,
+            n_segments=min(self._spec.n_segment, num_blocks),
+        )
+        centres = centres + mean_key
+        n_k = len(centres)
+        if block_value_features is not None:
+            vfeat = block_value_features.astype(np.float32)
+        else:
+            vfeat = np.zeros_like(feat)
+        value_sum = np.zeros((n_k, d), dtype=np.float32)
+        np.add.at(value_sum, labels, vfeat)
+
+        state = _SparseLayerIndexState(
+            cluster_centres=centres,
+            cluster_value_sum=value_sum,
+            cluster_size=sizes,
+            block_to_cluster=labels.tolist(),
+            all_block_features=[feat[i].copy() for i in range(num_blocks)],
+            all_value_features=[vfeat[i].copy() for i in range(num_blocks)],
+            mean_key=mean_key,
+        )
+        self._layer_map_for_request(request_id)[layer_name] = state
+        return n_k
+
+    def indexing(
+        self,
+        request_id: str,
+        block_features: np.ndarray | dict[str, np.ndarray],
+        block_value_features: np.ndarray | dict[str, np.ndarray] | None = None,
+    ) -> None:
+        """
+        Build per-layer cluster indices from prefill block features.
+
+        ``block_features`` may be a single ``[num_blocks, D]`` array (legacy)
+        or ``layer_name → [num_blocks, D]`` so each attention layer clusters
+        its own mean-K features independently.
+        """
+        bf_map, bv_map = self._normalize_block_features_map(
+            block_features, block_value_features
+        )
+        if not bf_map:
+            return
+        n_per_layer = {name: arr.shape[0] for name, arr in bf_map.items()}
+        if len(set(n_per_layer.values())) != 1:
+            raise ValueError(
+                f"sparse indexing: inconsistent num_blocks across layers "
+                f"for req {request_id}: {n_per_layer!r}"
+            )
+        num_blocks = next(iter(n_per_layer.values()))
+        if num_blocks == 0:
+            logger.debug("sparse indexing: req %s has 0 blocks – skipped", request_id)
+            return
+
+        self._layer_states[request_id] = {}
+        total_k = 0
+        for layer_name, feat_arr in bf_map.items():
+            v_layer = None if bv_map is None else bv_map.get(layer_name)
+            total_k += self._indexing_one_layer(
+                request_id, layer_name, feat_arr, v_layer
+            )
+
+        self._prefill_topk_ready.pop(request_id, None)
+        self._debug_log_state(
+            request_id,
+            "indexing_done",
+            num_blocks=num_blocks,
+            num_clusters=total_k,
+            prefill_topk_ready=self._prefill_topk_ready.get(request_id, None),
+        )
+
+        logger.debug(
+            "sparse indexing: req %s – %d blocks × %d layers → %d total clusters "
+            "(%d segments/layer)",
+            request_id,
+            num_blocks,
+            len(bf_map),
+            total_k,
+            self._spec.n_segment,
+        )
+
+    def select(
+        self,
+        request_id: str,
+        query_vector: np.ndarray | dict[str, np.ndarray],
+        num_blocks: int,
+    ) -> list[int]:
+        """
+        Choose logical block indices for the next decode step.
+
+        With per-layer indices, each layer runs its own cluster TopK; results
+        are merged as the **union** of retrieve-zone blocks, then capped by
+        ``num_blocks`` using the best per-block cluster score across layers.
+        """
+        total_blocks = self._total_blocks(request_id)
+        n_sink = self._spec.n_sink_blocks
+        n_recent = self._spec.n_recent_blocks
+        sink_set = set(range(min(n_sink, total_blocks)))
+        recent_set = set(range(max(0, total_blocks - n_recent), total_blocks))
+        steady_set = sink_set | recent_set
+
         used_prefill_cache = False
         if self._prefill_topk_ready.get(request_id, False):
             cached = self._prefill_selected.get(request_id, [])
@@ -751,57 +840,11 @@ class SparseKVManager(FullAttentionManager):
                 )
                 return result
 
-        # ── Fresh TopK search ──────────────────────────────────────────
-        centres = self._cluster_centres.get(request_id)
-        block_to_cluster = self._block_to_cluster.get(request_id)
-
-        if centres is None or block_to_cluster is None or len(centres) == 0:
-            # No clustering yet (edge case: very short prompt).  Fall back to
-            # the most-recent blocks plus the steady zone.
-            fallback = set(range(max(0, total_blocks - num_blocks), total_blocks))
-            result = sorted(fallback | steady_set)[:num_blocks]
-            self._selected_block_indices[request_id] = result
-            self._selected_retrieve_block_indices[request_id] = sorted(
-                set(result) - steady_set
-            )
-            return result
-
-        # Attention-score TopK: q · centroid / sqrt(D)
-        # This matches RetroInfer's batch_gemm_softmax intent.  We skip the
-        # softmax here because we only need relative ordering, not probabilities.
-        q = query_vector.astype(np.float32)
-        D = q.shape[-1]
-        scores = (q @ centres.T) / np.sqrt(max(D, 1))  # [n_clusters]
-
-        # Select top-nprobe clusters (retrieve zone).
-        nprobe = min(self._spec.nprobe, len(centres))
-        # argpartition is O(n) vs O(n log n) for argsort; fine for small n_clusters.
-        top_cluster_ids = set(
-            int(c) for c in np.argpartition(scores, -nprobe)[-nprobe:]
-        )
-
-        retrieve_blocks = {
-            bidx
-            for bidx, cid in enumerate(block_to_cluster)
-            if cid in top_cluster_ids
-        }
-
-        # ── Budget cap ────────────────────────────────────────────────
-        combined = steady_set | retrieve_blocks
-        if len(combined) > num_blocks:
-            # Keep all steady-zone blocks; trim non-steady by cluster score.
-            non_steady = sorted(
-                retrieve_blocks - steady_set,
-                key=lambda b: scores[block_to_cluster[b]],
-                reverse=True,
-            )
-            budget = max(0, num_blocks - len(steady_set))
-            combined = steady_set | set(non_steady[:budget])
-
-        result = sorted(combined)
+        q_by_layer = self._coerce_query_by_layer(request_id, query_vector)
+        result = self._merge_fresh_topk(request_id, q_by_layer, num_blocks)
         self._selected_block_indices[request_id] = result
         self._selected_retrieve_block_indices[request_id] = sorted(
-            combined - steady_set
+            set(result) - steady_set
         )
         self._debug_log_state(
             request_id,
@@ -818,178 +861,132 @@ class SparseKVManager(FullAttentionManager):
     def update_query_vector(
         self,
         request_id: str,
-        query_vec: np.ndarray,
+        query_vec: np.ndarray | dict[str, np.ndarray],
     ) -> None:
         """
-        Store the query vector produced at the current step for use in the
-        **next** step's ``select()`` call.
+        Store per-layer query vectors for the next ``select()`` call.
 
-        If the prefill TopK window is enabled and ``indexing()`` has already
-        run for this request but the TopK cache is not yet ready, this call
-        also computes and caches the prefill selection.
-
-        Args:
-            request_id: The request ID.
-            query_vec:  ``[D]`` float32 query (mean Q per KV-head group).
+        ``query_vec`` may be a single ``[D]`` vector (broadcast to all indexed
+        layers) or ``layer_name → [D]``.
         """
-        self._pending_query[request_id] = query_vec
+        q_by_layer = self._coerce_query_by_layer(request_id, query_vec)
+        self._pending_query[request_id] = q_by_layer
+        q0 = next(iter(q_by_layer.values()))
         self._debug_log_state(
             request_id,
             "query_updated",
-            query_dim=int(query_vec.shape[-1]) if query_vec.ndim > 0 else 0,
-            has_index=(request_id in self._cluster_centres),
+            query_dim=int(q0.shape[-1]) if q0.ndim > 0 else 0,
+            has_index=(request_id in self._layer_states),
             prefill_topk_ready=self._prefill_topk_ready.get(request_id, None),
         )
 
-        # If indexing completed but prefill TopK hasn't been computed yet
-        # (key is absent — set by indexing() via pop), compute it now.
-        # When the key is False it means a dynamic update explicitly invalidated
-        # the cache; we must NOT re-cache it here so that fresh select() is
-        # used on subsequent decode steps.
         if (
-            request_id in self._cluster_centres
+            request_id in self._layer_states
             and request_id not in self._prefill_topk_ready
             and self._spec.prefill_topk_query_window > 0
         ):
-            self._compute_prefill_topk(request_id, query_vec)
+            self._compute_prefill_topk(request_id, q_by_layer)
 
-    def get_pending_query(self, request_id: str) -> np.ndarray | None:
-        """Return the pending query vector, or ``None`` if not yet set."""
+    def get_pending_query(
+        self, request_id: str
+    ) -> dict[str, np.ndarray] | None:
+        """Return pending per-layer query vectors, or ``None``."""
         return self._pending_query.get(request_id)
 
     def rebalance(
         self,
         request_id: str,
-        new_block_feature: np.ndarray,
-        new_block_value_feature: np.ndarray | None = None,
+        new_block_feature: np.ndarray | dict[str, np.ndarray],
+        new_block_value_feature: np.ndarray | dict[str, np.ndarray] | None = None,
     ) -> None:
         """
-        Absorb a newly generated decode block into the sparse index.
+        Absorb a new decode block into **each** layer's sparse index.
 
-        The new block's feature is buffered.  Once ``update_threshold_blocks``
-        blocks have accumulated, a fresh Segment K-Means is run on the buffer
-        and the resulting centroids are appended to the existing index
-        (matching RetroInfer's ``_update_kv_cache`` logic).
-
-        After a dynamic update the prefill TopK cache is invalidated, and
-        ``select()`` will re-compute from scratch on the next decode step
-        (i.e., the selection is refreshed using the current query).
-
-        Args:
-            request_id:
-                The request ID.
-            new_block_feature:
-                ``[D]`` float32 mean-K feature of the newly written block.
-            new_block_value_feature:
-                ``[D]`` float32 mean-V feature (optional; stored for TODO).
+        Pass a dict ``layer_name → [D]`` for layer-specific mean-K (and V), or
+        a single vector to broadcast to every indexed layer (legacy).
         """
-        feat = new_block_feature.astype(np.float32)
-        vfeat = (
-            new_block_value_feature.astype(np.float32)
-            if new_block_value_feature is not None
-            else np.zeros_like(feat)
-        )
+        ls = self._layer_states.get(request_id, {})
+        if not ls:
+            return
 
-        # Always register the new block in the global feature lists.
-        self._all_block_features.setdefault(request_id, []).append(feat)
-        self._all_value_features.setdefault(request_id, []).append(vfeat)
+        if isinstance(new_block_feature, np.ndarray):
+            feat_map = {ln: new_block_feature for ln in ls}
+            v_map = (
+                None
+                if new_block_value_feature is None
+                else {ln: new_block_value_feature for ln in ls}
+            )
+        else:
+            feat_map = dict(new_block_feature)
+            v_map = new_block_value_feature
 
-        # Buffer the feature for the pending bulk update.
-        buf = self._decode_block_buffer.setdefault(request_id, [])
-        vbuf = self._decode_value_buffer.setdefault(request_id, [])
-        buf.append(feat)
-        vbuf.append(vfeat)
+        max_buf = 0
+        for layer_name, st in ls.items():
+            feat = feat_map.get(layer_name)
+            if feat is None:
+                continue
+            vfeat = None if v_map is None else v_map.get(layer_name)
+            max_buf = max(
+                max_buf,
+                self._rebalance_one_layer(request_id, layer_name, st, feat, vfeat),
+            )
+
         self._debug_log_state(
             request_id,
             "rebalance_buffered",
-            buffered_blocks=len(buf),
+            buffered_blocks=max_buf,
             threshold=self._spec.update_threshold_blocks,
-            total_blocks=len(self._all_block_features.get(request_id, [])),
+            total_blocks=self._total_blocks(request_id),
         )
 
-        # Assign to nearest existing cluster (for block_to_cluster bookkeeping).
-        centres = self._cluster_centres.get(request_id)
-        b2c = self._block_to_cluster.get(request_id)
-        if centres is not None and b2c is not None and len(centres) > 0:
-            mean_key = self._mean_key.get(request_id, np.zeros(feat.shape))
-            centered_feat = feat - mean_key
-            centred_C = centres - mean_key
-            nearest = int(np.argmax(centered_feat @ centred_C.T))
-            b2c.append(nearest)
-        else:
-            # Fallback: assign to cluster 0 (index will be rebuilt shortly).
-            b2c_list = self._block_to_cluster.setdefault(request_id, [])
-            b2c_list.append(0)
-
-        # ── Trigger bulk index update ─────────────────────────────────
         threshold = self._spec.update_threshold_blocks
-        if len(buf) >= threshold:
-            self._dynamic_update(request_id)
+        for layer_name, st in ls.items():
+            if len(st.decode_block_buffer) >= threshold:
+                self._dynamic_update_layer(request_id, layer_name, st)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _compute_prefill_topk(
-        self, request_id: str, query_vec: np.ndarray
-    ) -> None:
-        """
-        Compute and cache the prefill cluster selection using the provided
-        query vector.
+    def _rebalance_one_layer(
+        self,
+        request_id: str,
+        layer_name: str,
+        st: _SparseLayerIndexState,
+        new_block_feature: np.ndarray,
+        new_block_value_feature: np.ndarray | None,
+    ) -> int:
+        feat = np.asarray(new_block_feature, dtype=np.float32)
+        vfeat = (
+            np.asarray(new_block_value_feature, dtype=np.float32)
+            if new_block_value_feature is not None
+            else np.zeros_like(feat)
+        )
+        st.all_block_features.append(feat.copy())
+        st.all_value_features.append(vfeat.copy())
+        st.decode_block_buffer.append(feat.copy())
+        st.decode_value_buffer.append(vfeat.copy())
 
-        In RetroInfer this uses an average of the last
-        ``prefill_topk_query_window`` prompt query vectors.  Here we receive
-        a single pre-averaged vector from the model runner (the averaging is
-        done on the GPU side, which is more efficient than passing N vectors).
-
-        The cached selection is stored in ``_prefill_selected`` and the flag
-        ``_prefill_topk_ready`` is set to ``True``.
-
-        NOTE: This method intentionally does NOT call ``self.select()`` to
-        avoid a double ``select()`` invocation in callers that will explicitly
-        call ``select()`` afterwards (e.g. ``sparse_update_query_vectors``).
-        The selection logic below mirrors the fresh-TopK path in ``select()``.
-        """
-        total_blocks = len(self._all_block_features.get(request_id, []))
-        cap = self._spec.max_selected_blocks
-
-        # Steady zone (identical to select()).
-        n_sink = self._spec.n_sink_blocks
-        n_recent = self._spec.n_recent_blocks
-        sink_set = set(range(min(n_sink, total_blocks)))
-        recent_set = set(range(max(0, total_blocks - n_recent), total_blocks))
-        steady_set = sink_set | recent_set
-
-        centres = self._cluster_centres.get(request_id)
-        block_to_cluster = self._block_to_cluster.get(request_id)
-
-        if centres is None or block_to_cluster is None or len(centres) == 0:
-            fallback = set(range(max(0, total_blocks - cap), total_blocks))
-            selected = sorted(fallback | steady_set)[:cap]
+        centres = st.cluster_centres
+        b2c = st.block_to_cluster
+        if len(centres) > 0 and b2c is not None:
+            mean_key = st.mean_key if st.mean_key is not None else np.zeros_like(feat)
+            centered_feat = feat - mean_key
+            centred_c = centres - mean_key
+            nearest = int(np.argmax(centered_feat @ centred_c.T))
+            b2c.append(nearest)
         else:
-            q = query_vec.astype(np.float32)
-            D = q.shape[-1]
-            scores = (q @ centres.T) / np.sqrt(max(D, 1))
-            nprobe = min(self._spec.nprobe, len(centres))
-            top_cluster_ids = set(
-                int(c) for c in np.argpartition(scores, -nprobe)[-nprobe:]
-            )
-            retrieve_blocks = {
-                bidx
-                for bidx, cid in enumerate(block_to_cluster)
-                if cid in top_cluster_ids
-            }
-            combined = steady_set | retrieve_blocks
-            if len(combined) > cap:
-                non_steady = sorted(
-                    retrieve_blocks - steady_set,
-                    key=lambda b: scores[block_to_cluster[b]],
-                    reverse=True,
-                )
-                budget = max(0, cap - len(steady_set))
-                combined = steady_set | set(non_steady[:budget])
-            selected = sorted(combined)
+            b2c.append(0)
 
+        return len(st.decode_block_buffer)
+
+    def _compute_prefill_topk(
+        self,
+        request_id: str,
+        query_by_layer: dict[str, np.ndarray],
+    ) -> None:
+        cap = self._spec.max_selected_blocks
+        selected = self._merge_fresh_topk(request_id, query_by_layer, cap)
         self._prefill_selected[request_id] = selected
         self._prefill_topk_ready[request_id] = True
         self._debug_log_state(
@@ -1005,93 +1002,72 @@ class SparseKVManager(FullAttentionManager):
             len(selected),
         )
 
-    def _dynamic_update(self, request_id: str) -> None:
-        """
-        Re-run Segment K-Means on the accumulated decode block buffer and
-        append the resulting centroids to the existing index.
-
-        This mirrors RetroInfer's ``_update_kv_cache``:
-          - Extract the buffered block features.
-          - Mean-center, cluster, restore.
-          - Append new centroids / value_sum / sizes / block_to_cluster entries.
-          - Invalidate the prefill TopK cache so the next ``select()`` does a
-            fresh search with the newly added centroids.
-        """
-        buf = self._decode_block_buffer.get(request_id, [])
-        vbuf = self._decode_value_buffer.get(request_id, [])
+    def _dynamic_update_layer(
+        self,
+        request_id: str,
+        layer_name: str,
+        st: _SparseLayerIndexState,
+    ) -> None:
+        buf = st.decode_block_buffer
+        vbuf = st.decode_value_buffer
         if not buf:
             return
 
-        feat = np.stack(buf, axis=0).astype(np.float32)  # [M, D]
+        feat = np.stack(buf, axis=0).astype(np.float32)
         vfeat = np.stack(vbuf, axis=0).astype(np.float32)
-        M, D = feat.shape
+        m, d = feat.shape
 
         mean_key_new = feat.mean(axis=0)
         centered = feat - mean_key_new
 
-        k_new = max(1, M // 16)  # ~16 blocks per cluster, like RetroInfer
-        k_new = (k_new // max(1, 32)) * 32  # round to multiple of 32
+        k_new = max(1, m // 16)
+        k_new = (k_new // max(1, 32)) * 32
         k_new = max(k_new, 1)
-        k_new = min(k_new, M)
+        k_new = min(k_new, m)
 
         centres_new, labels_new, sizes_new = _segment_kmeans(
             centered, n_clusters=k_new, n_segments=1
         )
-        centres_new = centres_new + mean_key_new  # restore centering
+        centres_new = centres_new + mean_key_new
 
         n_k_new = len(centres_new)
-        vsum_new = np.zeros((n_k_new, D), dtype=np.float32)
+        vsum_new = np.zeros((n_k_new, d), dtype=np.float32)
         np.add.at(vsum_new, labels_new, vfeat)
 
-        # ── Append to existing index ──────────────────────────────────
-        existing_centres = self._cluster_centres.get(request_id)
-        if existing_centres is not None:
-            n_existing = len(existing_centres)
-            self._cluster_centres[request_id] = np.vstack(
-                [existing_centres, centres_new]
-            )
-            self._cluster_value_sum[request_id] = np.vstack([
-                self._cluster_value_sum[request_id], vsum_new
-            ])
-            self._cluster_size[request_id] = np.concatenate([
-                self._cluster_size[request_id], sizes_new
-            ])
-            # The last M entries of block_to_cluster were placeholders; update.
-            b2c = self._block_to_cluster[request_id]
-            n_total = len(self._all_block_features[request_id])
-            for i, lbl in enumerate(labels_new.tolist()):
-                idx = n_total - M + i
-                if idx < len(b2c):
-                    b2c[idx] = n_existing + lbl
-                else:
-                    b2c.append(n_existing + lbl)
-        else:
-            # First time (shouldn't happen, but be safe).
-            self._cluster_centres[request_id] = centres_new
-            self._cluster_value_sum[request_id] = vsum_new
-            self._cluster_size[request_id] = sizes_new
-            self._block_to_cluster[request_id] = labels_new.tolist()
+        n_existing = len(st.cluster_centres)
+        st.cluster_centres = np.vstack([st.cluster_centres, centres_new])
+        st.cluster_value_sum = np.vstack([st.cluster_value_sum, vsum_new])
+        st.cluster_size = np.concatenate([st.cluster_size, sizes_new])
 
-        # Clear buffer.
-        self._decode_block_buffer[request_id] = []
-        self._decode_value_buffer[request_id] = []
+        b2c = st.block_to_cluster
+        n_total = len(st.all_block_features)
+        for i, lbl in enumerate(labels_new.tolist()):
+            idx = n_total - m + i
+            if idx < len(b2c):
+                b2c[idx] = n_existing + lbl
+            else:
+                b2c.append(n_existing + lbl)
 
-        # Invalidate prefill TopK so next select() searches fresh.
+        st.decode_block_buffer = []
+        st.decode_value_buffer = []
+
         self._prefill_topk_ready[request_id] = False
         self._prefill_selected.pop(request_id, None)
         self._debug_log_state(
             request_id,
             "dynamic_update_done",
-            buffered_blocks=M,
+            buffered_blocks=m,
             added_clusters=n_k_new,
-            total_clusters=len(self._cluster_centres[request_id]),
+            total_clusters=len(st.cluster_centres),
             prefill_topk_ready=self._prefill_topk_ready.get(request_id),
+            layer=layer_name,
         )
 
         logger.debug(
-            "sparse dynamic update: req %s – added %d clusters "
-            "(total %d), prefill TopK invalidated",
+            "sparse dynamic update: req %s layer=%s – added %d clusters "
+            "(total %d for layer), prefill TopK invalidated",
             request_id,
+            layer_name,
             n_k_new,
-            len(self._cluster_centres[request_id]),
+            len(st.cluster_centres),
         )

@@ -6747,9 +6747,9 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         num_reqs: int,
     ) -> tuple[
-        "dict[str, np.ndarray] | None",
-        "dict[str, np.ndarray] | None",
-        "dict[str, np.ndarray] | None",
+        "dict[str, dict[str, np.ndarray]] | None",
+        "dict[str, dict[str, np.ndarray]] | None",
+        "dict[str, dict[str, np.ndarray]] | None",
     ]:
         """Extract block-level K features and per-request Q vectors.
 
@@ -6758,27 +6758,24 @@ class GPUModelRunner(
 
         Feature convention
         ------------------
-        * ``feature_dim = head_size`` – all per-head vectors are averaged over
-          the KV-head (or Q-head) dimension.  This matches the default assumed
-          by ``SparseKVManager``.
-        * Block K features are averaged over all attention layers that share
-          the same ``SparseAttentionSpec`` group.
-        * Q features are averaged over all those layers and over Q-heads.
+        * ``feature_dim = head_size`` – per-head vectors are averaged over the
+          KV-head (or Q-head) dimension within each attention layer.
+        * Block K features and Q vectors are **per layer** (each layer that
+          shares the same ``SparseAttentionSpec`` group gets its own vector /
+          matrix).  ``SparseKVManager`` runs K-Means and TopK independently
+          per layer and merges block selections for the shared block table.
 
         Returns
         -------
         sparse_block_features
-            ``req_id → [num_blocks, head_size]`` CPU float32; emitted only for
-            requests that are *completing prefill* this step
-            (``num_output_tokens_before == 0`` **and** all prompt tokens
-            have been processed).
+            ``req_id → layer_name → [num_blocks, head_size]`` CPU float32;
+            emitted only when prefill completes this step.
         sparse_query_vectors
-            ``req_id → [head_size]`` CPU float32; emitted for every request
-            scheduled in this step (both completing-prefill and decode).
+            ``req_id → layer_name → [head_size]`` CPU float32; every scheduled
+            request (prefill completion or decode).
         sparse_new_block_features
-            ``req_id → [head_size]`` CPU float32; emitted for decode steps –
-            the mean-K of the *last* KV block (which is being filled with
-            decode tokens).
+            ``req_id → layer_name → [head_size]`` CPU float32; decode steps –
+            mean-K of the last KV block per layer.
         """
         if not self._has_sparse_attn:
             return None, None, None
@@ -6800,9 +6797,9 @@ class GPUModelRunner(
         for idx, rid in enumerate(cached.req_ids):
             num_output_map[rid] = cached.num_output_tokens[idx]
 
-        sparse_block_features: dict[str, np.ndarray] = {}
-        sparse_query_vectors: dict[str, np.ndarray] = {}
-        sparse_new_block_features: dict[str, np.ndarray] = {}
+        sparse_block_features: dict[str, dict[str, np.ndarray]] = {}
+        sparse_query_vectors: dict[str, dict[str, np.ndarray]] = {}
+        sparse_new_block_features: dict[str, dict[str, np.ndarray]] = {}
 
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
@@ -6836,20 +6833,17 @@ class GPUModelRunner(
             tok_end = int(self.query_start_loc.np[req_idx + 1])
             last_tok_idx = tok_end - 1  # last token of this request
 
-            # ── Q vector: average over sparse layers and Q-heads ─────────────
-            q_layer_vecs: list[torch.Tensor] = []
+            # ── Q vectors: one row per sparse attention layer (mean over Q-heads)
+            q_per_layer: dict[str, np.ndarray] = {}
             for _, grp in sparse_groups:
                 for layer_name in grp.layer_names:
                     q_raw = self._sparse_q_captures.get(layer_name)
                     if q_raw is None or last_tok_idx >= q_raw.shape[0]:
                         continue
-                    q_tok = q_raw[last_tok_idx]  # [num_q_heads * head_size] or
-                    #                               [num_q_heads, head_size]
+                    q_tok = q_raw[last_tok_idx]
                     if q_tok.dim() == 2:
-                        # 3-D input: [num_q_heads, head_size] → [head_size]
                         q_tok = q_tok.mean(dim=0)
                     else:
-                        # 2-D (flattened): reshape then average over q-heads
                         attn_mod = (
                             self.compilation_config.static_forward_context.get(
                                 layer_name
@@ -6859,27 +6853,26 @@ class GPUModelRunner(
                             q_tok = q_tok.view(
                                 attn_mod.num_heads, attn_mod.head_size
                             ).mean(dim=0)
-                        # else: leave as-is (best-effort)
-                    q_layer_vecs.append(q_tok.float())
+                    q_per_layer[layer_name] = q_tok.float().cpu().numpy()
 
-            if q_layer_vecs:
-                q_feat = torch.stack(q_layer_vecs, dim=0).mean(dim=0)
-                sparse_query_vectors[req_id] = q_feat.cpu().numpy()
+            if q_per_layer:
+                sparse_query_vectors[req_id] = q_per_layer
 
-            # ── K block features from KV cache ───────────────────────────────
+            # ── K block features from KV cache (per layer, no cross-layer mean)
             for gid, grp in sparse_groups:
                 block_table = self.input_batch.block_table[gid]
                 num_blocks = int(block_table.num_blocks_per_row[req_idx])
                 if num_blocks == 0:
                     continue
 
-                # CPU block IDs for this request.
                 block_ids_np = block_table.block_table.np[
                     req_idx, :num_blocks
                 ].copy()
                 block_ids_t = torch.from_numpy(block_ids_np).to(self.device)
 
-                layer_k_feats: list[torch.Tensor] = []
+                block_feats_req = sparse_block_features.setdefault(req_id, {})
+                new_blk_req = sparse_new_block_features.setdefault(req_id, {})
+
                 for layer_name in grp.layer_names:
                     attn_mod = (
                         self.compilation_config.static_forward_context.get(
@@ -6893,31 +6886,12 @@ class GPUModelRunner(
                     ):
                         continue
                     kv = attn_mod.kv_cache[0]
-                    # kv: [2, total_blocks, block_size, num_kv_heads, head_size]
-                    # Index 0 = K, index 1 = V.
                     k_blocks = kv[0][block_ids_t]
-                    # k_blocks: [num_blocks, block_size, num_kv_heads, head_size]
-                    # Average over tokens (dim=1) then over KV heads (dim=1).
-                    k_feat = k_blocks.mean(dim=1).mean(dim=1)
-                    # k_feat: [num_blocks, head_size]
-                    layer_k_feats.append(k_feat.float())
-
-                if not layer_k_feats:
-                    continue
-
-                # Average over attention layers.
-                block_feat = torch.stack(layer_k_feats, dim=0).mean(dim=0)
-                # block_feat: [num_blocks, head_size]
-
-                if is_prefill_done:
-                    sparse_block_features[req_id] = (
-                        block_feat.cpu().numpy()
-                    )
-                if is_decode:
-                    # Emit last block's mean-K as the "new decode block" feature.
-                    sparse_new_block_features[req_id] = (
-                        block_feat[-1].cpu().numpy()
-                    )
+                    k_feat = k_blocks.mean(dim=1).mean(dim=1).float()
+                    if is_prefill_done:
+                        block_feats_req[layer_name] = k_feat.cpu().numpy()
+                    if is_decode:
+                        new_blk_req[layer_name] = k_feat[-1].cpu().numpy()
 
         return (
             sparse_block_features or None,

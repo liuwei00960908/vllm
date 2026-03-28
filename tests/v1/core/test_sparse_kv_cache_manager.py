@@ -27,6 +27,7 @@ import torch
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.sparse_kv_cache_manager import (
+    SPARSE_LEGACY_FLAT_LAYER,
     SparseKVManager,
     _kmeans_dot,
     _segment_kmeans,
@@ -98,6 +99,11 @@ def _register_new_request(mgr: SparseKVManager, req_id: str) -> None:
     (i.e. after prefill has allocated some blocks)."""
     mgr.req_to_blocks[req_id] = []
     mgr.num_cached_block[req_id] = 0
+
+
+def _flat(mgr: SparseKVManager, req_id: str):
+    """Legacy single-matrix indexing uses synthetic layer ``__flat__``."""
+    return mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_LAYER]
 
 
 # ---------------------------------------------------------------------------
@@ -257,21 +263,22 @@ class TestIndexing:
         mgr = make_manager(spec)
         feat = random_features(32)
         mgr.indexing("req0", feat)
-        assert len(mgr._cluster_centres["req0"]) <= spec.num_clusters
+        assert len(_flat(mgr, "req0").cluster_centres) <= spec.num_clusters
 
     def test_block_to_cluster_length_matches_n_blocks(self):
         mgr = make_manager()
         feat = random_features(20)
         mgr.indexing("req0", feat)
-        assert len(mgr._block_to_cluster["req0"]) == 20
+        assert len(_flat(mgr, "req0").block_to_cluster) == 20
 
     def test_block_to_cluster_ids_in_range(self):
         mgr = make_manager()
         n_blocks = 24
         feat = random_features(n_blocks)
         mgr.indexing("req0", feat)
-        n_clusters = len(mgr._cluster_centres["req0"])
-        b2c = mgr._block_to_cluster["req0"]
+        st = _flat(mgr, "req0")
+        n_clusters = len(st.cluster_centres)
+        b2c = st.block_to_cluster
         assert all(0 <= c < n_clusters for c in b2c)
 
     def test_cluster_sizes_sum_to_n_blocks(self):
@@ -279,14 +286,14 @@ class TestIndexing:
         n_blocks = 32
         feat = random_features(n_blocks)
         mgr.indexing("req0", feat)
-        assert int(mgr._cluster_size["req0"].sum()) == n_blocks
+        assert int(_flat(mgr, "req0").cluster_size.sum()) == n_blocks
 
     def test_mean_key_stored(self):
         mgr = make_manager()
         feat = random_features(16)
         mgr.indexing("req0", feat)
         expected_mean = feat.mean(axis=0)
-        np.testing.assert_allclose(mgr._mean_key["req0"], expected_mean,
+        np.testing.assert_allclose(_flat(mgr, "req0").mean_key, expected_mean,
                                    rtol=1e-5, atol=1e-5)
 
     def test_centroids_near_group_means(self):
@@ -300,7 +307,7 @@ class TestIndexing:
         mgr.indexing("req0", feat)
         # With 2 clusters on clearly separated data the centroid norms should
         # differ – a basic sanity check that centering was restored.
-        centres = mgr._cluster_centres["req0"]  # uncentered
+        centres = _flat(mgr, "req0").cluster_centres  # uncentered
         assert centres.shape[0] == 2
         norms = np.linalg.norm(centres, axis=1)
         assert abs(norms[0] - norms[1]) > 1.0  # should differ substantially
@@ -311,15 +318,16 @@ class TestIndexing:
         feat = random_features(16)
         vfeat = random_features(16, seed=99)
         mgr.indexing("req0", feat, block_value_features=vfeat)
-        centres = mgr._cluster_centres["req0"]
-        vsum = mgr._cluster_value_sum["req0"]
+        st = _flat(mgr, "req0")
+        centres = st.cluster_centres
+        vsum = st.cluster_value_sum
         assert vsum.shape == centres.shape
 
     def test_empty_features_noop(self):
         mgr = make_manager()
         feat = np.zeros((0, HEAD_DIM), dtype=np.float32)
         mgr.indexing("req0", feat)
-        assert "req0" not in mgr._cluster_centres
+        assert "req0" not in mgr._layer_states
 
     def test_prefill_topk_ready_is_false_after_indexing(self):
         """Prefill TopK must not be marked ready until a query is provided."""
@@ -332,15 +340,16 @@ class TestIndexing:
         n = 20
         feat = random_features(n)
         mgr.indexing("req0", feat)
-        assert len(mgr._all_block_features["req0"]) == n
+        assert len(_flat(mgr, "req0").all_block_features) == n
 
     def test_decode_buffers_cleared_on_reindex(self):
         mgr = make_manager()
         feat = random_features(16)
         mgr.indexing("req0", feat)
         # Buffers should be empty after fresh indexing.
-        assert mgr._decode_block_buffer["req0"] == []
-        assert mgr._decode_value_buffer["req0"] == []
+        st = _flat(mgr, "req0")
+        assert st.decode_block_buffer == []
+        assert st.decode_value_buffer == []
 
 
 # ---------------------------------------------------------------------------
@@ -416,14 +425,12 @@ class TestSelect:
         returned = mgr.select("req0", q, num_blocks=16)
         assert mgr._selected_block_indices["req0"] == returned
 
-    def test_fallback_on_missing_clusters(self):
-        """select() before indexing must not crash; fallback to recent blocks."""
+    def test_select_before_indexing_returns_empty(self):
+        """With no per-layer state, there are no logical blocks to select."""
         mgr = make_manager()
-        mgr._all_block_features["req0"] = [np.zeros(HEAD_DIM)] * 20
         q = np.ones(HEAD_DIM, dtype=np.float32)
         result = mgr.select("req0", q, num_blocks=8)
-        assert len(result) <= 8
-        assert all(0 <= b < 20 for b in result)
+        assert result == []
 
     def test_prefill_topk_cache_is_used(self):
         """After update_query_vector() triggers TopK cache, select must use it."""
@@ -463,8 +470,9 @@ class TestUpdateQueryVector:
         mgr = make_manager()
         q = np.ones(HEAD_DIM, dtype=np.float32)
         mgr.update_query_vector("req0", q)
-        assert mgr.get_pending_query("req0") is not None
-        np.testing.assert_array_equal(mgr.get_pending_query("req0"), q)
+        pq = mgr.get_pending_query("req0")
+        assert pq is not None
+        np.testing.assert_array_equal(pq[SPARSE_LEGACY_FLAT_LAYER], q)
 
     def test_triggers_prefill_topk_after_indexing(self):
         mgr = make_manager()
@@ -499,10 +507,10 @@ class TestRebalance:
     def test_new_block_appended_to_all_features(self):
         mgr = make_manager()
         _do_indexing(mgr, "req0", n_blocks=16)
-        n_before = len(mgr._all_block_features["req0"])
+        n_before = len(_flat(mgr, "req0").all_block_features)
         feat = np.ones(HEAD_DIM, dtype=np.float32)
         mgr.rebalance("req0", feat)
-        assert len(mgr._all_block_features["req0"]) == n_before + 1
+        assert len(_flat(mgr, "req0").all_block_features) == n_before + 1
 
     def test_buffer_grows_until_threshold(self):
         threshold = 4
@@ -514,7 +522,7 @@ class TestRebalance:
         for i in range(threshold - 1):
             feat = np.ones(HEAD_DIM, dtype=np.float32) * i
             mgr.rebalance("req0", feat)
-            assert len(mgr._decode_block_buffer["req0"]) == i + 1
+            assert len(_flat(mgr, "req0").decode_block_buffer) == i + 1
 
     def test_dynamic_update_triggered_at_threshold(self):
         threshold = 4
@@ -522,7 +530,7 @@ class TestRebalance:
                          n_segment=2)
         mgr = make_manager(spec)
         _do_indexing(mgr, "req0", n_blocks=16)
-        n_clusters_before = len(mgr._cluster_centres["req0"])
+        n_clusters_before = len(_flat(mgr, "req0").cluster_centres)
 
         for _ in range(threshold):
             mgr.rebalance("req0",
@@ -530,9 +538,9 @@ class TestRebalance:
                               HEAD_DIM).astype(np.float32))
 
         # Buffer should be cleared after the update.
-        assert mgr._decode_block_buffer["req0"] == []
+        assert _flat(mgr, "req0").decode_block_buffer == []
         # New centroids must have been appended.
-        assert len(mgr._cluster_centres["req0"]) > n_clusters_before
+        assert len(_flat(mgr, "req0").cluster_centres) > n_clusters_before
 
     def test_prefill_topk_invalidated_after_dynamic_update(self):
         threshold = 4
@@ -555,16 +563,16 @@ class TestRebalance:
     def test_block_to_cluster_grows(self):
         mgr = make_manager()
         _do_indexing(mgr, "req0", n_blocks=16)
-        n_before = len(mgr._block_to_cluster["req0"])
+        n_before = len(_flat(mgr, "req0").block_to_cluster)
         mgr.rebalance("req0", np.zeros(HEAD_DIM, dtype=np.float32))
-        assert len(mgr._block_to_cluster["req0"]) == n_before + 1
+        assert len(_flat(mgr, "req0").block_to_cluster) == n_before + 1
 
     def test_rebalance_without_prior_indexing(self):
-        """rebalance() before indexing must not crash."""
+        """rebalance() before indexing is a no-op (no layer state yet)."""
         mgr = make_manager()
         feat = np.ones(HEAD_DIM, dtype=np.float32)
         mgr.rebalance("req0", feat)  # should not raise
-        assert len(mgr._all_block_features["req0"]) == 1
+        assert "req0" not in mgr._layer_states
 
 
 # ---------------------------------------------------------------------------
@@ -704,19 +712,11 @@ class TestFree:
 
         mgr.free("req0")
 
-        assert "req0" not in mgr._cluster_centres
-        assert "req0" not in mgr._cluster_value_sum
-        assert "req0" not in mgr._cluster_size
-        assert "req0" not in mgr._block_to_cluster
-        assert "req0" not in mgr._all_block_features
-        assert "req0" not in mgr._all_value_features
-        assert "req0" not in mgr._mean_key
+        assert "req0" not in mgr._layer_states
         assert "req0" not in mgr._pending_query
         assert "req0" not in mgr._selected_block_indices
         assert "req0" not in mgr._prefill_topk_ready
         assert "req0" not in mgr._prefill_selected
-        assert "req0" not in mgr._decode_block_buffer
-        assert "req0" not in mgr._decode_value_buffer
 
     def test_free_is_idempotent(self):
         """Calling free() twice must not raise."""
@@ -763,7 +763,7 @@ class TestIntegrationCycle:
         decode_feat = np.random.default_rng(7).standard_normal(
             HEAD_DIM).astype(np.float32)
         mgr.rebalance("req0", decode_feat)
-        assert len(mgr._all_block_features["req0"]) == n_blocks + 1
+        assert len(_flat(mgr, "req0").all_block_features) == n_blocks + 1
 
         # Second decode select with the same query; cache still valid.
         sel2 = mgr.select("req0", q, num_blocks=12)
@@ -793,7 +793,7 @@ class TestIntegrationCycle:
         # select() now does a fresh search; result may differ.
         sel_after = mgr.select("req0", q, num_blocks=12)
         # The result is still valid (sorted, within range, within budget).
-        n_total = len(mgr._all_block_features["req0"])
+        n_total = len(_flat(mgr, "req0").all_block_features)
         assert all(0 <= b < n_total for b in sel_after)
         assert sel_after == sorted(sel_after)
         assert len(sel_after) <= 12
@@ -821,4 +821,4 @@ class TestIntegrationCycle:
         # Freeing one request must not affect the other.
         _register_new_request(mgr, "req_a")
         mgr.free("req_a")
-        assert "req_b" in mgr._cluster_centres
+        assert "req_b" in mgr._layer_states

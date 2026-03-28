@@ -259,36 +259,36 @@ class ModelRunnerOutput:
     # All arrays are CPU numpy to minimise serialisation cost.            #
     # ------------------------------------------------------------------ #
 
-    # req_id -> np.ndarray[num_blocks, feature_dim]
+    # req_id -> layer_name -> np.ndarray[num_blocks, feature_dim]
     # Emitted after prefill completes; used by SparseKVManager.indexing().
     # feature_dim is typically head_dim or a projection thereof.
-    sparse_block_features: "dict[str, np.ndarray] | None" = None
+    sparse_block_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
-    # req_id -> np.ndarray[feature_dim]
-    # The projected query vector of the last computed token.
+    # req_id -> layer_name -> np.ndarray[feature_dim]
+    # The projected query vector of the last computed token per layer.
     # • For prefill completions: query of the last prompt token (seeds the
     #   first decode-step select()).
     # • For decode steps: query of the newly generated token (used for the
     #   *next* decode step's select()).
-    sparse_query_vectors: "dict[str, np.ndarray] | None" = None
+    sparse_query_vectors: "dict[str, dict[str, np.ndarray]] | None" = None
 
-    # req_id -> np.ndarray[feature_dim]
-    # Mean K feature of the block written during this decode step.
+    # req_id -> layer_name -> np.ndarray[feature_dim]
+    # Mean K feature of the block written during this decode step (per layer).
     # Used by SparseKVManager.rebalance() to update cluster structure.
-    sparse_new_block_features: "dict[str, np.ndarray] | None" = None
+    sparse_new_block_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
-    # req_id -> np.ndarray[feature_dim]
+    # req_id -> layer_name -> np.ndarray[feature_dim]
     # Mean V feature of the block written during this decode step.
     # TODO(estimation-zone): Used for value_sum accumulation.
     # When the Estimation Zone is enabled, the model runner should also
     # populate this field alongside sparse_new_block_features.
-    sparse_new_value_features: "dict[str, np.ndarray] | None" = None
+    sparse_new_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
-    # req_id -> np.ndarray[num_blocks, feature_dim]
+    # req_id -> layer_name -> np.ndarray[num_blocks, feature_dim]
     # Mean V feature per block; emitted after prefill alongside
     # sparse_block_features.
     # TODO(estimation-zone): populate from model runner for Estimation Zone.
-    sparse_block_value_features: "dict[str, np.ndarray] | None" = None
+    sparse_block_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.
