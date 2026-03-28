@@ -6979,6 +6979,45 @@ class GPUModelRunner(
             sparse_new_block_features or None,
         )
 
+    def _sparse_layer_decode_phys_row(
+        self,
+        req_id: str,
+        kv_cache_gid: int,
+        layer_name: str,
+    ) -> list[int] | None:
+        """Physical KV block ids (history then decode slot) for one sparse decode layer.
+
+        Must stay in sync with ``_build_sparse_layer_block_table_tensor``; the
+        length of this row is the sparse block-table width used for
+        ``seq_lens`` capping so FlashAttention never reads past allocated pages.
+        """
+        rs = self.requests.get(req_id)
+        if rs is None or len(rs.output_token_ids) == 0:
+            return None
+        merged = self._sparse_merged_logical.get(req_id)
+        if not merged:
+            return None
+        bid_row = rs.block_ids[kv_cache_gid]
+        if len(bid_row) < 2:
+            return None
+        phys_hist = [int(x) for x in bid_row[:-1]]
+        decode_id = int(bid_row[-1])
+        logical_to_phys: dict[int, int] = {}
+        for log, phys in zip(merged, phys_hist):
+            logical_to_phys[int(log)] = int(phys)
+        by_l = self._sparse_by_layer_logical.get(req_id)
+        if by_l and layer_name in by_l:
+            logical_order = [int(x) for x in by_l[layer_name]]
+        else:
+            logical_order = [int(x) for x in merged]
+        row: list[int] = []
+        for lg in logical_order:
+            p = logical_to_phys.get(lg)
+            if p is not None:
+                row.append(p)
+        row.append(decode_id)
+        return row
+
     def _sparse_decode_num_blocks_np(
         self,
         kv_cache_gid: int,
@@ -6986,22 +7025,13 @@ class GPUModelRunner(
         num_reqs: int,
         num_reqs_padded: int,
     ) -> np.ndarray:
-        """Per-request sparse table length (history + decode block) for one layer."""
+        """Per-request sparse table width (in blocks) for one layer; matches GPU row."""
         out = np.full(num_reqs_padded, -1, dtype=np.int32)
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
-            rs = self.requests.get(req_id)
-            if rs is None or len(rs.output_token_ids) == 0:
-                continue
-            merged = self._sparse_merged_logical.get(req_id)
-            if not merged:
-                continue
-            by_l = self._sparse_by_layer_logical.get(req_id)
-            if by_l and layer_name in by_l:
-                logicals = by_l[layer_name]
-            else:
-                logicals = merged
-            out[req_idx] = int(len(logicals) + 1)
+            row = self._sparse_layer_decode_phys_row(req_id, kv_cache_gid, layer_name)
+            if row is not None:
+                out[req_idx] = int(len(row))
         return out
 
     def _build_sparse_layer_block_table_tensor(
@@ -7014,35 +7044,12 @@ class GPUModelRunner(
     ) -> torch.Tensor:
         """Shrink each sparse-decode row to this layer's logical block subset."""
         out = union_bt.clone()
-        max_blocks = int(out.shape[1])
         pad_id = -1
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
-            rs = self.requests.get(req_id)
-            if rs is None or len(rs.output_token_ids) == 0:
+            row = self._sparse_layer_decode_phys_row(req_id, kv_cache_gid, layer_name)
+            if row is None:
                 continue
-            merged = self._sparse_merged_logical.get(req_id)
-            if not merged:
-                continue
-            bid_row = rs.block_ids[kv_cache_gid]
-            if len(bid_row) < 2:
-                continue
-            phys_hist = [int(x) for x in bid_row[:-1]]
-            decode_id = int(bid_row[-1])
-            logical_to_phys: dict[int, int] = {}
-            for log, phys in zip(merged, phys_hist):
-                logical_to_phys[int(log)] = int(phys)
-            by_l = self._sparse_by_layer_logical.get(req_id)
-            if by_l and layer_name in by_l:
-                logical_order = [int(x) for x in by_l[layer_name]]
-            else:
-                logical_order = [int(x) for x in merged]
-            row: list[int] = []
-            for lg in logical_order:
-                p = logical_to_phys.get(lg)
-                if p is not None:
-                    row.append(p)
-            row.append(decode_id)
             out[req_idx].fill_(pad_id)
             row_t = torch.tensor(row, dtype=torch.int32, device=out.device)
             out[req_idx, : row_t.shape[0]] = row_t
