@@ -19,15 +19,16 @@ Prefill
        features, run **Segment K-Means**, restore centroids, accumulate value
        sums.  Cluster ids and centroids are not shared across layers.
 
-  3. ``select(req_id, query_vec, ...)`` merges per-layer TopK retrieve zones
-     (union of blocks selected by each layer's ``q · centroid`` scores), then
-     applies the global ``max_selected_blocks`` budget by dropping non-steady
-     blocks with the lowest **max layer-wise** cluster scores.  One physical
-     block table is still shared, so this union is the set of blocks loaded for
-     all layers.
+  3. ``select(req_id, query_vec, ...)`` runs TopK **independently per layer**:
+     each layer gets ``steady_zone ∪ retrieve_zone`` capped by
+     ``max_selected_blocks`` using **that layer's** cluster scores only.
+     The **union** of all per-layer logical indices is stored for
+     ``allocate_new_blocks`` so every layer's chosen history blocks are
+     resident in GPU memory; the model runner builds a **per-layer** sparse
+     block table so each forward only attends within that layer's subset.
 
 Decode
-  - The cached selection from prefill is used directly → no per-token TopK.
+  - The cached per-layer selection from prefill is used directly → no per-token TopK.
   - ``rebalance(req_id, new_block_feature, new_block_value_feature)`` tracks
     newly written decode blocks.  After ``update_threshold_blocks`` new blocks
     accumulate, a fresh Segment K-Means is run on them and new centroids are
@@ -256,10 +257,13 @@ class SparseKVManager(FullAttentionManager):
                               centroids, ``block_to_cluster``, feature lists,
                               and decode buffers for dynamic K-Means updates.
     ``_pending_query``        ``layer_name → [D]`` – last Q vectors per layer.
-    ``_selected_block_indices`` list[int] – merged logical blocks for the next
-                              decode step (union across layers, budget-capped).
-    ``_prefill_topk_ready``   bool – whether merged prefill TopK cache is valid.
-    ``_prefill_selected``     cached merged selection after prefill.
+    ``_selected_block_indices`` list[int] – **union** of per-layer logical blocks
+                              for the next decode step (for physical allocation).
+    ``_selected_block_indices_by_layer`` ``layer → list[int]`` – per-layer
+                              capped selection used by the model runner.
+    ``_prefill_topk_ready``   bool – whether per-layer prefill TopK cache is valid.
+    ``_prefill_selected``     cached **union** selection (compat / allocation).
+    ``_prefill_selected_by_layer`` cached per-layer selection after prefill.
     """
 
     def __init__(
@@ -288,11 +292,16 @@ class SparseKVManager(FullAttentionManager):
         # ── selection state ───────────────────────────────────────────────
         self._pending_query: dict[str, dict[str, np.ndarray]] = {}
         self._selected_block_indices: dict[str, list[int]] = {}
+        self._selected_block_indices_by_layer: dict[str, dict[str, list[int]]] = {}
         # Per-step retrieve-zone logical block indices (steady-zone excluded).
         self._selected_retrieve_block_indices: dict[str, list[int]] = {}
+        self._selected_retrieve_block_indices_by_layer: dict[
+            str, dict[str, list[int]]
+        ] = {}
         # prefill TopK cache
         self._prefill_topk_ready: dict[str, bool] = {}
         self._prefill_selected: dict[str, list[int]] = {}
+        self._prefill_selected_by_layer: dict[str, dict[str, list[int]]] = {}
 
         self._current_step: int = 0
 
@@ -538,9 +547,12 @@ class SparseKVManager(FullAttentionManager):
         self._layer_states.pop(request_id, None)
         self._pending_query.pop(request_id, None)
         self._selected_block_indices.pop(request_id, None)
+        self._selected_block_indices_by_layer.pop(request_id, None)
         self._selected_retrieve_block_indices.pop(request_id, None)
+        self._selected_retrieve_block_indices_by_layer.pop(request_id, None)
         self._prefill_topk_ready.pop(request_id, None)
         self._prefill_selected.pop(request_id, None)
+        self._prefill_selected_by_layer.pop(request_id, None)
         self._step_trace.pop(request_id, None)
 
     def _estimate_decode_tokens_this_step(
@@ -656,15 +668,60 @@ class SparseKVManager(FullAttentionManager):
                 block_scores[bidx] = float(scores_c[cid])
         return retrieve, block_scores
 
-    def _merge_fresh_topk(
+    @staticmethod
+    def _union_sorted_block_indices(
+        by_layer: dict[str, list[int]],
+    ) -> list[int]:
+        return sorted({b for blocks in by_layer.values() for b in blocks})
+
+    def _select_one_layer_topk(
+        self,
+        total_blocks: int,
+        steady_set: set[int],
+        st: _SparseLayerIndexState,
+        q: np.ndarray,
+        num_blocks: int,
+    ) -> tuple[list[int], list[int]]:
+        """
+        Steady zone + retrieve zone for one layer, capped by ``num_blocks``.
+
+        Returns:
+            (sorted full selection, sorted retrieve-only logical indices).
+        """
+        if len(st.cluster_centres) == 0 or not st.block_to_cluster:
+            fallback = set(range(max(0, total_blocks - num_blocks), total_blocks))
+            combined = fallback | steady_set
+            sel = sorted(combined)[:num_blocks]
+            return sel, sorted(set(sel) - steady_set)
+
+        retr, block_scores = self._retrieve_zone_one_layer(st, q)
+        combined = steady_set | retr
+        if len(combined) > num_blocks:
+            non_steady = sorted(
+                retr - steady_set,
+                key=lambda b: block_scores.get(b, float("-inf")),
+                reverse=True,
+            )
+            budget = max(0, num_blocks - len(steady_set))
+            combined = steady_set | set(non_steady[:budget])
+        sel = sorted(combined)
+        return sel, sorted(retr - steady_set)
+
+    def _per_layer_fresh_topk(
         self,
         request_id: str,
         query_by_layer: dict[str, np.ndarray],
         num_blocks: int,
-    ) -> list[int]:
+    ) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+        """
+        Independent TopK + budget per attention layer.
+
+        Returns:
+            (selected_by_layer, retrieve_only_by_layer).
+        """
         total_blocks = self._total_blocks(request_id)
         if total_blocks == 0:
-            return []
+            return {}, {}
 
         n_sink = self._spec.n_sink_blocks
         n_recent = self._spec.n_recent_blocks
@@ -673,35 +730,55 @@ class SparseKVManager(FullAttentionManager):
         steady_set = sink_set | recent_set
 
         layers = self._layer_states.get(request_id, {})
-        if not layers or all(
-            len(st.cluster_centres) == 0 for st in layers.values()
-        ):
-            fallback = set(range(max(0, total_blocks - num_blocks), total_blocks))
-            return sorted(fallback | steady_set)[:num_blocks]
+        if not layers:
+            return {}, {}
 
-        all_retrieve: set[int] = set()
-        best_block_score: dict[int, float] = {}
+        if all(len(st.cluster_centres) == 0 for st in layers.values()):
+            fallback = set(range(max(0, total_blocks - num_blocks), total_blocks))
+            sel = sorted(fallback | steady_set)[:num_blocks]
+            retr = sorted(set(sel) - steady_set)
+            return {ln: list(sel) for ln in layers}, {ln: list(retr) for ln in layers}
+
+        selected_by_layer: dict[str, list[int]] = {}
+        retrieve_by_layer: dict[str, list[int]] = {}
         for layer_name, st in layers.items():
             q = query_by_layer.get(layer_name)
             if q is None:
                 continue
-            retr, bs = self._retrieve_zone_one_layer(st, q)
-            all_retrieve |= retr
-            for bidx, sc in bs.items():
-                prev = best_block_score.get(bidx)
-                if prev is None or sc > prev:
-                    best_block_score[bidx] = sc
-
-        combined = steady_set | all_retrieve
-        if len(combined) > num_blocks:
-            non_steady = sorted(
-                all_retrieve - steady_set,
-                key=lambda b: best_block_score.get(b, float("-inf")),
-                reverse=True,
+            sel, retr = self._select_one_layer_topk(
+                total_blocks, steady_set, st, q, num_blocks
             )
-            budget = max(0, num_blocks - len(steady_set))
-            combined = steady_set | set(non_steady[:budget])
-        return sorted(combined)
+            selected_by_layer[layer_name] = sel
+            retrieve_by_layer[layer_name] = retr
+        return selected_by_layer, retrieve_by_layer
+
+    def _apply_steady_and_cap_per_layer(
+        self,
+        request_id: str,
+        cached_by_layer: dict[str, list[int]],
+        num_blocks: int,
+    ) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+        """Re-merge steady zone and trim using each layer's cached prefill selection."""
+        total_blocks = self._total_blocks(request_id)
+        n_sink = self._spec.n_sink_blocks
+        n_recent = self._spec.n_recent_blocks
+        sink_set = set(range(min(n_sink, total_blocks)))
+        recent_set = set(range(max(0, total_blocks - n_recent), total_blocks))
+        steady_set = sink_set | recent_set
+
+        selected_by_layer: dict[str, list[int]] = {}
+        retrieve_by_layer: dict[str, list[int]] = {}
+        for layer_name, cached in cached_by_layer.items():
+            combined = set(cached) | steady_set
+            if len(combined) <= num_blocks:
+                sel = sorted(combined)
+            else:
+                non_steady = sorted(combined - steady_set)
+                budget = max(0, num_blocks - len(steady_set))
+                sel = sorted(steady_set | set(non_steady[:budget]))
+            selected_by_layer[layer_name] = sel
+            retrieve_by_layer[layer_name] = sorted(set(sel) - steady_set)
+        return selected_by_layer, retrieve_by_layer
 
     def _indexing_one_layer(
         self,
@@ -806,9 +883,10 @@ class SparseKVManager(FullAttentionManager):
         """
         Choose logical block indices for the next decode step.
 
-        With per-layer indices, each layer runs its own cluster TopK; results
-        are merged as the **union** of retrieve-zone blocks, then capped by
-        ``num_blocks`` using the best per-block cluster score across layers.
+        Each attention layer gets an independent TopK + ``num_blocks`` cap; the
+        return value is the sorted **union** of all per-layer selections for
+        physical allocation.  Per-layer lists are stored in
+        ``_selected_block_indices_by_layer``.
         """
         total_blocks = self._total_blocks(request_id)
         n_sink = self._spec.n_sink_blocks
@@ -819,10 +897,14 @@ class SparseKVManager(FullAttentionManager):
 
         used_prefill_cache = False
         if self._prefill_topk_ready.get(request_id, False):
-            cached = self._prefill_selected.get(request_id, [])
-            if cached:
-                result = sorted(set(cached) | steady_set)
-                result = result[:num_blocks]
+            cached_bl = self._prefill_selected_by_layer.get(request_id, {})
+            if cached_bl:
+                sel_bl, retr_bl = self._apply_steady_and_cap_per_layer(
+                    request_id, cached_bl, num_blocks
+                )
+                result = self._union_sorted_block_indices(sel_bl)
+                self._selected_block_indices_by_layer[request_id] = sel_bl
+                self._selected_retrieve_block_indices_by_layer[request_id] = retr_bl
                 self._selected_block_indices[request_id] = result
                 self._selected_retrieve_block_indices[request_id] = sorted(
                     set(result) - steady_set
@@ -841,7 +923,12 @@ class SparseKVManager(FullAttentionManager):
                 return result
 
         q_by_layer = self._coerce_query_by_layer(request_id, query_vector)
-        result = self._merge_fresh_topk(request_id, q_by_layer, num_blocks)
+        sel_bl, retr_bl = self._per_layer_fresh_topk(
+            request_id, q_by_layer, num_blocks
+        )
+        result = self._union_sorted_block_indices(sel_bl)
+        self._selected_block_indices_by_layer[request_id] = sel_bl
+        self._selected_retrieve_block_indices_by_layer[request_id] = retr_bl
         self._selected_block_indices[request_id] = result
         self._selected_retrieve_block_indices[request_id] = sorted(
             set(result) - steady_set
@@ -986,20 +1073,23 @@ class SparseKVManager(FullAttentionManager):
         query_by_layer: dict[str, np.ndarray],
     ) -> None:
         cap = self._spec.max_selected_blocks
-        selected = self._merge_fresh_topk(request_id, query_by_layer, cap)
-        self._prefill_selected[request_id] = selected
+        sel_bl, _ = self._per_layer_fresh_topk(request_id, query_by_layer, cap)
+        self._prefill_selected_by_layer[request_id] = sel_bl
+        union_sel = self._union_sorted_block_indices(sel_bl)
+        self._prefill_selected[request_id] = union_sel
         self._prefill_topk_ready[request_id] = True
         self._debug_log_state(
             request_id,
             "prefill_topk_cached",
-            selected_count=len(selected),
-            selected_preview=selected[:16],
+            selected_count=len(union_sel),
+            selected_preview=union_sel[:16],
             prefill_topk_ready=self._prefill_topk_ready.get(request_id),
         )
         logger.debug(
-            "sparse prefill TopK: req %s – cached %d blocks",
+            "sparse prefill TopK: req %s – cached %d layers, %d union blocks",
             request_id,
-            len(selected),
+            len(sel_bl),
+            len(union_sel),
         )
 
     def _dynamic_update_layer(
@@ -1053,6 +1143,7 @@ class SparseKVManager(FullAttentionManager):
 
         self._prefill_topk_ready[request_id] = False
         self._prefill_selected.pop(request_id, None)
+        self._prefill_selected_by_layer.pop(request_id, None)
         self._debug_log_state(
             request_id,
             "dynamic_update_done",

@@ -1110,8 +1110,12 @@ class TestFullPrefillDecodeCycle:
             "_layer_states",
             "_pending_query",
             "_selected_block_indices",
+            "_selected_block_indices_by_layer",
+            "_selected_retrieve_block_indices",
+            "_selected_retrieve_block_indices_by_layer",
             "_prefill_topk_ready",
             "_prefill_selected",
+            "_prefill_selected_by_layer",
         ):
             d = getattr(mgr, attr)
             assert req_id not in d, f"{attr} still contains {req_id} after free()"

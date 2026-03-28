@@ -1044,6 +1044,7 @@ class Scheduler(SchedulerInterface):
         num_output_tokens: list[int] = []
         sparse_selected_block_indices: dict[str, list[int]] = {}
         sparse_retrieve_block_indices: dict[str, list[int]] = {}
+        sparse_selected_block_indices_by_layer: dict[str, dict[str, list[int]]] = {}
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1081,6 +1082,11 @@ class Scheduler(SchedulerInterface):
             retrieve = self.kv_cache_manager.get_sparse_retrieve_block_indices(req_id)
             if retrieve is not None:
                 sparse_retrieve_block_indices[req_id] = retrieve
+            by_layer = (
+                self.kv_cache_manager.get_sparse_selected_block_indices_by_layer(req_id)
+            )
+            if by_layer is not None:
+                sparse_selected_block_indices_by_layer[req_id] = by_layer
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1096,6 +1102,9 @@ class Scheduler(SchedulerInterface):
             num_output_tokens=num_output_tokens,
             sparse_selected_block_indices=sparse_selected_block_indices or None,
             sparse_retrieve_block_indices=sparse_retrieve_block_indices or None,
+            sparse_selected_block_indices_by_layer=(
+                sparse_selected_block_indices_by_layer or None
+            ),
         )
 
     def _try_schedule_encoder_inputs(

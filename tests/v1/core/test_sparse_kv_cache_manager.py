@@ -432,6 +432,31 @@ class TestSelect:
         result = mgr.select("req0", q, num_blocks=8)
         assert result == []
 
+    def test_per_layer_budget_union_equals_merge(self):
+        """Each layer is capped independently; allocation union is the set merge."""
+        spec = make_spec(
+            nprobe=2,
+            num_clusters=6,
+            n_segment=2,
+            max_selected_blocks=8,
+            static_pattern_start=0,
+            static_pattern_end=0,
+            prefill_topk_query_window=0,
+        )
+        mgr = make_manager(spec)
+        n_blocks = 24
+        rng = np.random.default_rng(7)
+        feat_a = rng.standard_normal((n_blocks, HEAD_DIM)).astype(np.float32)
+        feat_b = rng.standard_normal((n_blocks, HEAD_DIM)).astype(np.float32)
+        mgr.indexing("req0", {"layer_a": feat_a, "layer_b": feat_b})
+        qa = rng.standard_normal(HEAD_DIM).astype(np.float32)
+        qb = rng.standard_normal(HEAD_DIM).astype(np.float32)
+        union = mgr.select("req0", {"layer_a": qa, "layer_b": qb}, num_blocks=8)
+        by_l = mgr._selected_block_indices_by_layer["req0"]
+        assert set(union) == set(by_l["layer_a"]) | set(by_l["layer_b"])
+        assert len(by_l["layer_a"]) <= 8
+        assert len(by_l["layer_b"]) <= 8
+
     def test_prefill_topk_cache_is_used(self):
         """After update_query_vector() triggers TopK cache, select must use it."""
         mgr, feat = self._prepare(n_blocks=32)
@@ -715,8 +740,12 @@ class TestFree:
         assert "req0" not in mgr._layer_states
         assert "req0" not in mgr._pending_query
         assert "req0" not in mgr._selected_block_indices
+        assert "req0" not in mgr._selected_block_indices_by_layer
+        assert "req0" not in mgr._selected_retrieve_block_indices
+        assert "req0" not in mgr._selected_retrieve_block_indices_by_layer
         assert "req0" not in mgr._prefill_topk_ready
         assert "req0" not in mgr._prefill_selected
+        assert "req0" not in mgr._prefill_selected_by_layer
 
     def test_free_is_idempotent(self):
         """Calling free() twice must not raise."""

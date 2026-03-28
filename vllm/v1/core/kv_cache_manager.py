@@ -621,3 +621,15 @@ class KVCacheManager:
         if selected is None:
             return None
         return list(selected)
+
+    def get_sparse_selected_block_indices_by_layer(
+        self, request_id: str
+    ) -> dict[str, list[int]] | None:
+        """Return per-layer sparse logical block indices (decode forward subset)."""
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return None
+        by_layer = mgr._selected_block_indices_by_layer.get(request_id)
+        if not by_layer:
+            return None
+        return {k: list(v) for k, v in by_layer.items()}
