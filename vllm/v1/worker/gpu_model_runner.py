@@ -509,6 +509,11 @@ class GPUModelRunner(
         self._sparse_q_captures: dict[str, torch.Tensor] = {}
         # Hook handles so they can be removed if needed.
         self._sparse_q_hooks: list[torch.utils.hooks.RemovableHandle] = []
+        # Emit sparse branch probe INFO logs only when user explicitly sets
+        # VLLM_LOGGING_LEVEL=DEBUG.
+        self._sparse_probe_info_enabled: bool = (
+            os.getenv("VLLM_LOGGING_LEVEL", "").upper() == "DEBUG"
+        )
         # Optional sparse decode token debug logs.
         self._sparse_debug_decode_tokens: bool = bool(
             int(os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS", "0"))
@@ -6832,9 +6837,12 @@ class GPUModelRunner(
         """
         if not hasattr(self, "kv_cache_config"):
             return
+        sparse_group_count = 0
+        hooked_layers = 0
         for group in self.kv_cache_config.kv_cache_groups:
             if not isinstance(group.kv_cache_spec, SparseAttentionSpec):
                 continue
+            sparse_group_count += 1
             self._has_sparse_attn = True
             for layer_name in group.layer_names:
                 attn_mod = self.compilation_config.static_forward_context.get(
@@ -6859,6 +6867,15 @@ class GPUModelRunner(
                     _make_hook(layer_name)
                 )
                 self._sparse_q_hooks.append(handle)
+                hooked_layers += 1
+        if self._sparse_probe_info_enabled:
+            logger.info(
+                "[SparseProbe] setup_sparse_attention has_sparse_attn=%s "
+                "sparse_groups=%d hooked_layers=%d",
+                self._has_sparse_attn,
+                sparse_group_count,
+                hooked_layers,
+            )
 
     def _maybe_patch_sparse_compact_kv_metadata(
         self,
@@ -7104,6 +7121,16 @@ class GPUModelRunner(
                             block_feats_req[layer_name] = k_feat.cpu().numpy()
                         if is_decode:
                             new_blk_req[layer_name] = k_feat[-1].cpu().numpy()
+
+        if self._sparse_probe_info_enabled:
+            logger.info(
+                "[SparseProbe] collect_sparse_features scheduled_reqs=%d "
+                "prefill_feature_reqs=%d query_reqs=%d decode_new_block_reqs=%d",
+                len(scheduler_output.num_scheduled_tokens),
+                len(sparse_block_features),
+                len(sparse_query_vectors),
+                len(sparse_new_block_features),
+            )
 
         return (
             sparse_block_features or None,

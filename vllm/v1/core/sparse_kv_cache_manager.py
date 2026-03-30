@@ -319,6 +319,10 @@ class SparseKVManager(FullAttentionManager):
         self._debug_state_transitions: bool = bool(
             int(os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS", "0"))
         )
+        # Probe logs visible only when VLLM_LOGGING_LEVEL=DEBUG.
+        self._sparse_probe_info_enabled: bool = (
+            os.getenv("VLLM_LOGGING_LEVEL", "").upper() == "DEBUG"
+        )
         # Per-step compact trace (req_id -> latest key state in this step).
         self._step_trace: dict[str, dict[str, object]] = {}
 
@@ -1073,6 +1077,16 @@ class SparseKVManager(FullAttentionManager):
             total_k,
             self._spec.n_segment,
         )
+        if self._sparse_probe_info_enabled:
+            logger.info(
+                "[SparseProbe] indexing req_id=%s layers=%d units=%d "
+                "total_clusters=%d token_mode=%s",
+                request_id,
+                len(bf_map),
+                num_blocks,
+                total_k,
+                self._token_mode(),
+            )
 
     def select(
         self,
@@ -1143,6 +1157,15 @@ class SparseKVManager(FullAttentionManager):
                     used_prefill_cache=used_prefill_cache,
                     prefill_topk_ready=self._prefill_topk_ready.get(request_id),
                 )
+                if self._sparse_probe_info_enabled:
+                    logger.info(
+                        "[SparseProbe] select req_id=%s used_prefill_cache=%s "
+                        "union_selected=%d per_layer=%d",
+                        request_id,
+                        used_prefill_cache,
+                        len(result),
+                        len(sel_bl),
+                    )
                 return result
 
         q_by_layer = self._coerce_query_by_layer(request_id, query_vector)
@@ -1170,6 +1193,15 @@ class SparseKVManager(FullAttentionManager):
             used_prefill_cache=used_prefill_cache,
             prefill_topk_ready=self._prefill_topk_ready.get(request_id),
         )
+        if self._sparse_probe_info_enabled:
+            logger.info(
+                "[SparseProbe] select req_id=%s used_prefill_cache=%s "
+                "union_selected=%d per_layer=%d",
+                request_id,
+                used_prefill_cache,
+                len(result),
+                len(sel_bl),
+            )
         return result
 
     def update_query_vector(
@@ -1257,6 +1289,14 @@ class SparseKVManager(FullAttentionManager):
             threshold=threshold,
             total_blocks=self._num_index_units(request_id),
         )
+        if self._sparse_probe_info_enabled:
+            logger.info(
+                "[SparseProbe] rebalance req_id=%s layers=%d buffered=%d/%d",
+                request_id,
+                len(ls),
+                max_buf,
+                threshold,
+            )
 
         for layer_name, st in ls.items():
             if len(st.decode_block_buffer) >= threshold:

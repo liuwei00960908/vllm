@@ -510,6 +510,7 @@ def _build_mock_runner(
     bt_obj = SimpleNamespace(
         block_table=SimpleNamespace(np=bt_np),
         num_blocks_per_row=nb_per_row,
+        block_size=block_size,
     )
 
     mt_obj = _MockBlockTableGroup([bt_obj])
