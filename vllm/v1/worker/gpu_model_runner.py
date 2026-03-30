@@ -7071,9 +7071,6 @@ class GPUModelRunner(
                 ].copy()
                 block_ids_t = torch.from_numpy(block_ids_np).to(self.device)
 
-                block_feats_req = sparse_block_features.setdefault(req_id, {})
-                new_blk_req = sparse_new_block_features.setdefault(req_id, {})
-
                 spec = grp.kv_cache_spec
                 token_sparse = isinstance(
                     spec, SparseAttentionSpec
@@ -7109,18 +7106,26 @@ class GPUModelRunner(
                                     break
                             if rows:
                                 tok_feat = torch.stack(rows, dim=0).float()
-                                block_feats_req[layer_name] = tok_feat.cpu().numpy()
+                                sparse_block_features.setdefault(req_id, {})[
+                                    layer_name
+                                ] = tok_feat.cpu().numpy()
                         if is_decode:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
                             k_tok = k_blocks[-1][slot].mean(dim=0).float()
-                            new_blk_req[layer_name] = k_tok.cpu().numpy()
+                            sparse_new_block_features.setdefault(req_id, {})[
+                                layer_name
+                            ] = k_tok.cpu().numpy()
                     else:
                         k_feat = k_blocks.mean(dim=1).mean(dim=1).float()
                         if is_prefill_done:
-                            block_feats_req[layer_name] = k_feat.cpu().numpy()
+                            sparse_block_features.setdefault(req_id, {})[
+                                layer_name
+                            ] = k_feat.cpu().numpy()
                         if is_decode:
-                            new_blk_req[layer_name] = k_feat[-1].cpu().numpy()
+                            sparse_new_block_features.setdefault(req_id, {})[
+                                layer_name
+                            ] = k_feat[-1].cpu().numpy()
 
         if self._sparse_probe_info_enabled:
             logger.info(
