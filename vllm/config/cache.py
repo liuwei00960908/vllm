@@ -168,7 +168,15 @@ class CacheConfig:
     * ``update_threshold_blocks`` (int, default 64) – decode blocks to buffer
       before refreshing the segment K-Means index.
     * ``max_selected_blocks`` (int, default 64) – hard cap on total selected
-      blocks per decode step.
+      blocks per decode step (block-granularity mode).
+    * ``cluster_granularity`` (str, ``"block"`` or ``"token"``) – cluster
+      and Top-K over mean-K per block vs per token; token mode uses
+      ``max_selected_tokens`` (or ``max_selected_blocks * block_size``) as the
+      per-layer token budget.
+    * ``max_selected_tokens`` (int, optional) – token-budget override when
+      ``cluster_granularity`` is ``"token"``.
+    * ``update_threshold_tokens`` (int, default 1024) – buffered decode-token
+      features before a dynamic K-Means refresh in token mode.
 
     Example::
 

@@ -4,6 +4,7 @@
 import copy
 from dataclasses import dataclass, fields, replace
 from math import prod
+from typing import Literal
 
 import torch
 from typing_extensions import Self
@@ -420,6 +421,29 @@ class SparseAttentionSpec(FullAttentionSpec):
     (steady zone + retrieve zone combined).
     """
 
+    cluster_granularity: Literal["block", "token"] = "block"
+    """
+    ``block`` – cluster mean key features per KV block (RetroInfer default).
+    ``token`` – one feature vector per prompt / history token; Top-K and
+    cluster membership are per token.  Selected tokens are mapped to logical
+    blocks for paging; FlashAttention still reads full KV slots inside each
+    loaded block unless a future mask path is added.
+    """
+
+    max_selected_tokens: int | None = None
+    """
+    When ``cluster_granularity == "token"``, caps selected tokens per layer
+    (steady + retrieve).  If ``None``, defaults to
+    ``max_selected_blocks * block_size``.
+    """
+
+    update_threshold_tokens: int = 1024
+    """
+    In token mode, number of new decode token features buffered before
+    ``rebalance`` runs a dynamic segment K-Means (mirrors
+    ``update_threshold_blocks`` in block mode).
+    """
+
     @property
     def n_sink_blocks(self) -> int:
         """Leading blocks permanently in the steady zone (attention sinks)."""
@@ -429,6 +453,28 @@ class SparseAttentionSpec(FullAttentionSpec):
     def n_recent_blocks(self) -> int:
         """Trailing blocks permanently in the steady zone (local window)."""
         return cdiv(self.static_pattern_end, self.block_size)
+
+    @property
+    def effective_max_selected_tokens(self) -> int:
+        """Per-layer token budget when ``cluster_granularity == "token"``."""
+        if self.max_selected_tokens is not None:
+            return int(self.max_selected_tokens)
+        return int(self.max_selected_blocks * self.block_size)
+
+    def sparse_selection_budget(self) -> int:
+        """Cap passed to ``SparseKVManager.select`` (blocks or tokens)."""
+        if self.cluster_granularity == "token":
+            return self.effective_max_selected_tokens
+        return int(self.max_selected_blocks)
+
+    def max_blocks_for_sparse(self) -> int:
+        """Upper bound on logical history blocks per layer after trimming / cache."""
+        if self.cluster_granularity == "token":
+            return max(
+                int(self.max_selected_blocks),
+                cdiv(self.effective_max_selected_tokens, self.block_size),
+            )
+        return int(self.max_selected_blocks)
 
     @classmethod
     def merge(cls, specs: list["SparseAttentionSpec"]) -> "SparseAttentionSpec":  # type: ignore[override]
@@ -453,10 +499,16 @@ class SparseAttentionSpec(FullAttentionSpec):
             prefill_topk_query_window=specs[0].prefill_topk_query_window,
             update_threshold_blocks=specs[0].update_threshold_blocks,
             max_selected_blocks=specs[0].max_selected_blocks,
+            cluster_granularity=specs[0].cluster_granularity,
+            max_selected_tokens=specs[0].max_selected_tokens,
+            update_threshold_tokens=specs[0].update_threshold_tokens,
         )
 
     def max_memory_usage_bytes(self, vllm_config: "VllmConfig") -> int:
         # GPU resident at once: steady zone + retrieve zone + 1 new decode block.
+        if self.cluster_granularity == "token":
+            max_pages = cdiv(self.effective_max_selected_tokens, self.block_size)
+            return (max_pages + 1) * self.page_size_bytes
         return (self.max_selected_blocks + 1) * self.page_size_bytes
 
 
@@ -553,6 +605,9 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 and spec.static_pattern_start == one_spec.static_pattern_start
                 and spec.static_pattern_end == one_spec.static_pattern_end
                 and spec.update_threshold_blocks == one_spec.update_threshold_blocks
+                and spec.cluster_granularity == one_spec.cluster_granularity
+                and spec.max_selected_tokens == one_spec.max_selected_tokens
+                and spec.update_threshold_tokens == one_spec.update_threshold_tokens
                 for spec in kv_cache_specs.values()
             )
         if isinstance(one_spec, FullAttentionSpec):

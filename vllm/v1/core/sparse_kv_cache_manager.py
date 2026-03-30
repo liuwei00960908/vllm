@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-SparseKVManager – RetroInfer-style block-level dynamic sparse attention.
+SparseKVManager – RetroInfer-style dynamic sparse attention (block or token units).
 
-Algorithm (matches RetroInfer, adapted for vLLM's paged block layout)
-----------------------------------------------------------------------
+When ``SparseAttentionSpec.cluster_granularity == "token"``, clustering and
+Top-K run on **per-token** key features; selected tokens are mapped to the
+minimal set of logical KV blocks for paging.  FlashAttention still reads all
+slots inside each loaded block (no per-token mask in the kernel yet), so FLOPs
+per loaded block are unchanged; only **which** blocks are resident changes.
+
+Algorithm (block-granularity default; token mode uses the same pipeline on rows)
+--------------------------------------------------------------------------------
 
 Prefill
   1. Model runner extracts **block-level key features** per attention layer
@@ -79,6 +85,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
@@ -311,6 +318,9 @@ class SparseKVManager(FullAttentionManager):
         )
         # Per-step compact trace (req_id -> latest key state in this step).
         self._step_trace: dict[str, dict[str, object]] = {}
+
+        # Prompt token count at end of prefill (token-granularity indexing only).
+        self._prefill_token_count: dict[str, int] = {}
 
         # ── physical block tracking (Bug 1 fix) ──────────────────────────
         # _prefill_blocks[req_id]: permanent list of all physical blocks
@@ -554,6 +564,7 @@ class SparseKVManager(FullAttentionManager):
         self._prefill_selected.pop(request_id, None)
         self._prefill_selected_by_layer.pop(request_id, None)
         self._step_trace.pop(request_id, None)
+        self._prefill_token_count.pop(request_id, None)
 
     def _estimate_decode_tokens_this_step(
         self, request_id: str, num_tokens_main_model: int
@@ -625,11 +636,69 @@ class SparseKVManager(FullAttentionManager):
     ) -> dict[str, _SparseLayerIndexState]:
         return self._layer_states.setdefault(request_id, {})
 
-    def _total_blocks(self, request_id: str) -> int:
+    def _token_mode(self) -> bool:
+        return self._spec.cluster_granularity == "token"
+
+    def _num_index_units(self, request_id: str) -> int:
+        """Number of clustered rows (blocks or tokens) for this request."""
         ls = self._layer_states.get(request_id, {})
         if not ls:
             return 0
         return len(next(iter(ls.values())).all_block_features)
+
+    @staticmethod
+    def _global_token_to_logical_block(
+        global_tok: int, prefill_tokens: int, block_size: int
+    ) -> int:
+        if global_tok < prefill_tokens:
+            return global_tok // block_size
+        d = global_tok - prefill_tokens
+        n_pb = cdiv(prefill_tokens, block_size)
+        return n_pb + (d // block_size)
+
+    def _tokens_to_history_logical_blocks(
+        self, request_id: str, token_indices: Iterable[int]
+    ) -> list[int]:
+        """Map global token indices to historical logical block ids (decode slot excluded)."""
+        p_count = self._prefill_token_count.get(request_id)
+        if p_count is None:
+            return []
+        bsz = self.block_size
+        pb = self._prefill_blocks.get(request_id, [])
+        out: set[int] = set()
+        if pb:
+            n_hist = len(pb)
+            for g in token_indices:
+                lb = self._global_token_to_logical_block(int(g), p_count, bsz)
+                if lb < n_hist:
+                    out.add(lb)
+        else:
+            for g in token_indices:
+                out.add(self._global_token_to_logical_block(int(g), p_count, bsz))
+        return sorted(out)
+
+    def _steady_block_set(self, request_id: str) -> set[int]:
+        """Logical history blocks that intersect the steady (sink + local) token zones."""
+        n_units = self._num_index_units(request_id)
+        if n_units == 0:
+            return set()
+        bsz = self.block_size
+        if self._token_mode():
+            p_count = self._prefill_token_count.get(request_id, n_units)
+            steady_toks: set[int] = set()
+            head = min(self._spec.static_pattern_start, n_units)
+            steady_toks.update(range(head))
+            tail0 = max(0, n_units - self._spec.static_pattern_end)
+            steady_toks.update(range(tail0, n_units))
+            out: set[int] = set()
+            for t in steady_toks:
+                out.add(self._global_token_to_logical_block(t, p_count, bsz))
+            return out
+        n_sink = self._spec.n_sink_blocks
+        n_recent = self._spec.n_recent_blocks
+        sink_blocks = set(range(min(n_sink, n_units)))
+        recent_blocks = set(range(max(0, n_units - n_recent), n_units))
+        return sink_blocks | recent_blocks
 
     def _coerce_query_by_layer(
         self,
@@ -674,79 +743,147 @@ class SparseKVManager(FullAttentionManager):
     ) -> list[int]:
         return sorted({b for blocks in by_layer.values() for b in blocks})
 
-    def _select_one_layer_topk(
+    def _select_one_layer_topk_blocks(
         self,
         total_blocks: int,
         steady_set: set[int],
         st: _SparseLayerIndexState,
         q: np.ndarray,
-        num_blocks: int,
+        budget: int,
     ) -> tuple[list[int], list[int]]:
         """
-        Steady zone + retrieve zone for one layer, capped by ``num_blocks``.
+        Steady zone + retrieve zone for one layer, capped by ``budget`` blocks.
 
         Returns:
-            (sorted full selection, sorted retrieve-only logical indices).
+            (sorted full selection, sorted retrieve-only logical block indices).
         """
         if len(st.cluster_centres) == 0 or not st.block_to_cluster:
-            fallback = set(range(max(0, total_blocks - num_blocks), total_blocks))
+            fallback = set(range(max(0, total_blocks - budget), total_blocks))
             combined = fallback | steady_set
-            sel = sorted(combined)[:num_blocks]
+            sel = sorted(combined)[:budget]
             return sel, sorted(set(sel) - steady_set)
 
-        retr, block_scores = self._retrieve_zone_one_layer(st, q)
+        retr, unit_scores = self._retrieve_zone_one_layer(st, q)
         combined = steady_set | retr
-        if len(combined) > num_blocks:
+        if len(combined) > budget:
             non_steady = sorted(
                 retr - steady_set,
-                key=lambda b: block_scores.get(b, float("-inf")),
+                key=lambda b: unit_scores.get(b, float("-inf")),
                 reverse=True,
             )
-            budget = max(0, num_blocks - len(steady_set))
-            combined = steady_set | set(non_steady[:budget])
+            cap = max(0, budget - len(steady_set))
+            combined = steady_set | set(non_steady[:cap])
         sel = sorted(combined)
         return sel, sorted(retr - steady_set)
+
+    def _select_one_layer_topk_tokens(
+        self,
+        request_id: str,
+        total_tokens: int,
+        steady_tokens: set[int],
+        st: _SparseLayerIndexState,
+        q: np.ndarray,
+        budget: int,
+    ) -> tuple[list[int], list[int]]:
+        """
+        Token-granularity Top-K; returns **logical block** ids (history only).
+
+        Returns:
+            (sorted selected blocks, sorted retrieve-only blocks).
+        """
+        if len(st.cluster_centres) == 0 or not st.block_to_cluster:
+            fallback = set(range(max(0, total_tokens - budget), total_tokens))
+            combined_t = fallback | steady_tokens
+            sel_t = sorted(combined_t)[:budget]
+            sel_bl = self._tokens_to_history_logical_blocks(request_id, sel_t)
+            retr_bl = self._tokens_to_history_logical_blocks(
+                request_id, set(sel_t) - steady_tokens
+            )
+            return sel_bl, retr_bl
+
+        retr, unit_scores = self._retrieve_zone_one_layer(st, q)
+        combined_t = steady_tokens | retr
+        if len(combined_t) > budget:
+            non_steady = sorted(
+                retr - steady_tokens,
+                key=lambda t: unit_scores.get(t, float("-inf")),
+                reverse=True,
+            )
+            cap = max(0, budget - len(steady_tokens))
+            combined_t = steady_tokens | set(non_steady[:cap])
+        sel_t = sorted(combined_t)
+        retr_t = sorted(retr - steady_tokens)
+        sel_bl = self._tokens_to_history_logical_blocks(request_id, sel_t)
+        retr_bl = self._tokens_to_history_logical_blocks(request_id, retr_t)
+        return sel_bl, retr_bl
 
     def _per_layer_fresh_topk(
         self,
         request_id: str,
         query_by_layer: dict[str, np.ndarray],
-        num_blocks: int,
+        budget: int,
     ) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
         """
         Independent TopK + budget per attention layer.
 
         Returns:
-            (selected_by_layer, retrieve_only_by_layer).
+            (selected_by_layer, retrieve_only_by_layer) as **logical blocks**.
         """
-        total_blocks = self._total_blocks(request_id)
-        if total_blocks == 0:
+        n_units = self._num_index_units(request_id)
+        if n_units == 0:
             return {}, {}
-
-        n_sink = self._spec.n_sink_blocks
-        n_recent = self._spec.n_recent_blocks
-        sink_set = set(range(min(n_sink, total_blocks)))
-        recent_set = set(range(max(0, total_blocks - n_recent), total_blocks))
-        steady_set = sink_set | recent_set
 
         layers = self._layer_states.get(request_id, {})
         if not layers:
             return {}, {}
 
+        if self._token_mode():
+            head = min(self._spec.static_pattern_start, n_units)
+            steady_tokens = set(range(head))
+            steady_tokens.update(
+                range(max(0, n_units - self._spec.static_pattern_end), n_units)
+            )
+            if all(len(st.cluster_centres) == 0 for st in layers.values()):
+                fallback = set(range(max(0, n_units - budget), n_units))
+                sel_t = sorted(fallback | steady_tokens)[:budget]
+                retr_t = sorted(set(sel_t) - steady_tokens)
+                sel_bl = self._tokens_to_history_logical_blocks(request_id, sel_t)
+                retr_bl = self._tokens_to_history_logical_blocks(request_id, retr_t)
+                return {ln: sel_bl for ln in layers}, {ln: retr_bl for ln in layers}
+
+            selected_by_layer: dict[str, list[int]] = {}
+            retrieve_by_layer: dict[str, list[int]] = {}
+            for layer_name, st in layers.items():
+                q = query_by_layer.get(layer_name)
+                if q is None:
+                    continue
+                sel_bl, retr_bl = self._select_one_layer_topk_tokens(
+                    request_id, n_units, steady_tokens, st, q, budget
+                )
+                selected_by_layer[layer_name] = sel_bl
+                retrieve_by_layer[layer_name] = retr_bl
+            return selected_by_layer, retrieve_by_layer
+
+        n_sink = self._spec.n_sink_blocks
+        n_recent = self._spec.n_recent_blocks
+        sink_set = set(range(min(n_sink, n_units)))
+        recent_set = set(range(max(0, n_units - n_recent), n_units))
+        steady_set = sink_set | recent_set
+
         if all(len(st.cluster_centres) == 0 for st in layers.values()):
-            fallback = set(range(max(0, total_blocks - num_blocks), total_blocks))
-            sel = sorted(fallback | steady_set)[:num_blocks]
+            fallback = set(range(max(0, n_units - budget), n_units))
+            sel = sorted(fallback | steady_set)[:budget]
             retr = sorted(set(sel) - steady_set)
             return {ln: list(sel) for ln in layers}, {ln: list(retr) for ln in layers}
 
-        selected_by_layer: dict[str, list[int]] = {}
-        retrieve_by_layer: dict[str, list[int]] = {}
+        selected_by_layer = {}
+        retrieve_by_layer = {}
         for layer_name, st in layers.items():
             q = query_by_layer.get(layer_name)
             if q is None:
                 continue
-            sel, retr = self._select_one_layer_topk(
-                total_blocks, steady_set, st, q, num_blocks
+            sel, retr = self._select_one_layer_topk_blocks(
+                n_units, steady_set, st, q, budget
             )
             selected_by_layer[layer_name] = sel
             retrieve_by_layer[layer_name] = retr
@@ -756,25 +893,20 @@ class SparseKVManager(FullAttentionManager):
         self,
         request_id: str,
         cached_by_layer: dict[str, list[int]],
-        num_blocks: int,
+        block_cap: int,
     ) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
         """Re-merge steady zone and trim using each layer's cached prefill selection."""
-        total_blocks = self._total_blocks(request_id)
-        n_sink = self._spec.n_sink_blocks
-        n_recent = self._spec.n_recent_blocks
-        sink_set = set(range(min(n_sink, total_blocks)))
-        recent_set = set(range(max(0, total_blocks - n_recent), total_blocks))
-        steady_set = sink_set | recent_set
+        steady_set = self._steady_block_set(request_id)
 
         selected_by_layer: dict[str, list[int]] = {}
         retrieve_by_layer: dict[str, list[int]] = {}
         for layer_name, cached in cached_by_layer.items():
             combined = set(cached) | steady_set
-            if len(combined) <= num_blocks:
+            if len(combined) <= block_cap:
                 sel = sorted(combined)
             else:
                 non_steady = sorted(combined - steady_set)
-                budget = max(0, num_blocks - len(steady_set))
+                budget = max(0, block_cap - len(steady_set))
                 sel = sorted(steady_set | set(non_steady[:budget]))
             selected_by_layer[layer_name] = sel
             retrieve_by_layer[layer_name] = sorted(set(sel) - steady_set)
@@ -825,11 +957,11 @@ class SparseKVManager(FullAttentionManager):
         block_value_features: np.ndarray | dict[str, np.ndarray] | None = None,
     ) -> None:
         """
-        Build per-layer cluster indices from prefill block features.
+        Build per-layer cluster indices from prefill features.
 
-        ``block_features`` may be a single ``[num_blocks, D]`` array (legacy)
-        or ``layer_name → [num_blocks, D]`` so each attention layer clusters
-        its own mean-K features independently.
+        ``block_features`` may be a single matrix (legacy) or per-layer dict.
+        Row count is ``num_blocks`` when ``cluster_granularity == "block"``, or
+        ``num_prompt_tokens`` when ``cluster_granularity == "token"``.
         """
         bf_map, bv_map = self._normalize_block_features_map(
             block_features, block_value_features
@@ -854,6 +986,11 @@ class SparseKVManager(FullAttentionManager):
             total_k += self._indexing_one_layer(
                 request_id, layer_name, feat_arr, v_layer
             )
+
+        if self._token_mode():
+            self._prefill_token_count[request_id] = int(num_blocks)
+        else:
+            self._prefill_token_count.pop(request_id, None)
 
         self._prefill_topk_ready.pop(request_id, None)
         self._debug_log_state(
@@ -883,37 +1020,32 @@ class SparseKVManager(FullAttentionManager):
         """
         Choose logical block indices for the next decode step.
 
-        Each attention layer gets an independent TopK + ``num_blocks`` cap; the
-        return value is the sorted **union** of all per-layer selections for
-        physical allocation.  Per-layer lists are stored in
-        ``_selected_block_indices_by_layer``.
+        ``num_blocks`` is the per-layer selection budget: logical **blocks** in
+        block mode, **tokens** when ``cluster_granularity == "token"``.
         """
-        total_blocks = self._total_blocks(request_id)
-        n_sink = self._spec.n_sink_blocks
-        n_recent = self._spec.n_recent_blocks
-        sink_set = set(range(min(n_sink, total_blocks)))
-        recent_set = set(range(max(0, total_blocks - n_recent), total_blocks))
-        steady_set = sink_set | recent_set
+        n_units = self._num_index_units(request_id)
+        steady_blocks = self._steady_block_set(request_id)
+        block_cap = self._spec.max_blocks_for_sparse()
 
         used_prefill_cache = False
         if self._prefill_topk_ready.get(request_id, False):
             cached_bl = self._prefill_selected_by_layer.get(request_id, {})
             if cached_bl:
                 sel_bl, retr_bl = self._apply_steady_and_cap_per_layer(
-                    request_id, cached_bl, num_blocks
+                    request_id, cached_bl, block_cap
                 )
                 result = self._union_sorted_block_indices(sel_bl)
                 self._selected_block_indices_by_layer[request_id] = sel_bl
                 self._selected_retrieve_block_indices_by_layer[request_id] = retr_bl
                 self._selected_block_indices[request_id] = result
                 self._selected_retrieve_block_indices[request_id] = sorted(
-                    set(result) - steady_set
+                    set(result) - steady_blocks
                 )
                 used_prefill_cache = True
                 self._debug_log_state(
                     request_id,
                     "select_done",
-                    total_blocks=total_blocks,
+                    total_blocks=n_units,
                     num_blocks_cap=num_blocks,
                     selected_count=len(result),
                     selected_preview=result[:16],
@@ -931,12 +1063,12 @@ class SparseKVManager(FullAttentionManager):
         self._selected_retrieve_block_indices_by_layer[request_id] = retr_bl
         self._selected_block_indices[request_id] = result
         self._selected_retrieve_block_indices[request_id] = sorted(
-            set(result) - steady_set
+            set(result) - steady_blocks
         )
         self._debug_log_state(
             request_id,
             "select_done",
-            total_blocks=total_blocks,
+            total_blocks=n_units,
             num_blocks_cap=num_blocks,
             selected_count=len(result),
             selected_preview=result[:16],
@@ -1018,15 +1150,19 @@ class SparseKVManager(FullAttentionManager):
                 self._rebalance_one_layer(request_id, layer_name, st, feat, vfeat),
             )
 
+        threshold = (
+            self._spec.update_threshold_tokens
+            if self._token_mode()
+            else self._spec.update_threshold_blocks
+        )
         self._debug_log_state(
             request_id,
             "rebalance_buffered",
             buffered_blocks=max_buf,
-            threshold=self._spec.update_threshold_blocks,
-            total_blocks=self._total_blocks(request_id),
+            threshold=threshold,
+            total_blocks=self._num_index_units(request_id),
         )
 
-        threshold = self._spec.update_threshold_blocks
         for layer_name, st in ls.items():
             if len(st.decode_block_buffer) >= threshold:
                 self._dynamic_update_layer(request_id, layer_name, st)
@@ -1072,7 +1208,7 @@ class SparseKVManager(FullAttentionManager):
         request_id: str,
         query_by_layer: dict[str, np.ndarray],
     ) -> None:
-        cap = self._spec.max_selected_blocks
+        cap = self._spec.sparse_selection_budget()
         sel_bl, _ = self._per_layer_fresh_topk(request_id, query_by_layer, cap)
         self._prefill_selected_by_layer[request_id] = sel_bl
         union_sel = self._union_sorted_block_indices(sel_bl)

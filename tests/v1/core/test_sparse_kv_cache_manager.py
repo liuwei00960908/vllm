@@ -32,6 +32,7 @@ from vllm.v1.core.sparse_kv_cache_manager import (
     _kmeans_dot,
     _segment_kmeans,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SparseAttentionSpec
 
 pytestmark = pytest.mark.cpu_test
@@ -135,7 +136,10 @@ class TestSparseAttentionSpec:
     def test_merge_preserves_sparse_params(self):
         spec = make_spec(num_clusters=16, n_segment=4, nprobe=8,
                          static_pattern_start=32, static_pattern_end=16,
-                         update_threshold_blocks=32)
+                         update_threshold_blocks=32,
+                         cluster_granularity="token",
+                         max_selected_tokens=256,
+                         update_threshold_tokens=512)
         merged = SparseAttentionSpec.merge([spec, spec])
         assert merged.num_clusters == 16
         assert merged.n_segment == 4
@@ -143,11 +147,68 @@ class TestSparseAttentionSpec:
         assert merged.static_pattern_start == 32
         assert merged.static_pattern_end == 16
         assert merged.update_threshold_blocks == 32
+        assert merged.cluster_granularity == "token"
+        assert merged.max_selected_tokens == 256
+        assert merged.update_threshold_tokens == 512
+
+    def test_sparse_selection_budget_token_mode(self):
+        spec = make_spec(
+            cluster_granularity="token",
+            max_selected_blocks=4,
+            max_selected_tokens=None,
+        )
+        assert spec.sparse_selection_budget() == 4 * BLOCK_SIZE
+
+    def test_max_blocks_for_sparse_token_mode(self):
+        spec = make_spec(
+            cluster_granularity="token",
+            max_selected_blocks=8,
+            max_selected_tokens=100,
+        )
+        assert spec.max_blocks_for_sparse() == max(8, cdiv(100, BLOCK_SIZE))
 
     def test_max_memory_usage_proportional_to_selected_blocks(self):
         spec = make_spec(max_selected_blocks=64)
         # should be (64+1) * page_size_bytes
         assert spec.max_memory_usage_bytes(None) == 65 * spec.page_size_bytes
+
+
+class TestTokenGranularitySparse:
+
+    def test_indexing_one_row_per_token(self):
+        spec = make_spec(
+            cluster_granularity="token",
+            num_clusters=4,
+            n_segment=2,
+            max_selected_tokens=24,
+        )
+        mgr = make_manager(spec)
+        n_tok = 40
+        feat = random_features(n_tok, seed=3)
+        mgr.indexing("req0", feat)
+        st = _flat(mgr, "req0")
+        assert len(st.block_to_cluster) == n_tok
+        assert len(st.all_block_features) == n_tok
+
+    def test_select_returns_logical_blocks(self):
+        spec = make_spec(
+            cluster_granularity="token",
+            num_clusters=6,
+            n_segment=2,
+            nprobe=3,
+            max_selected_tokens=10,
+            static_pattern_start=0,
+            static_pattern_end=0,
+        )
+        mgr = make_manager(spec)
+        n_tok = 48
+        feat = random_features(n_tok, seed=1)
+        mgr.indexing("req0", feat)
+        _register_new_request(mgr, "req0")
+        q = np.zeros(HEAD_DIM, dtype=np.float32)
+        sel = mgr.select("req0", q, num_blocks=spec.sparse_selection_budget())
+        assert len(sel) <= spec.max_blocks_for_sparse()
+        assert all(isinstance(x, int) for x in sel)
 
 
 # ---------------------------------------------------------------------------

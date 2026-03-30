@@ -526,6 +526,12 @@ class Attention(nn.Module, AttentionLayerBase):
         # not yet supported).
         sparse_cfg = getattr(vllm_config.cache_config, "sparse_attention", None)
         if sparse_cfg is not None and self.sliding_window is None:
+            _cg = str(sparse_cfg.get("cluster_granularity", "block"))
+            if _cg not in ("block", "token"):
+                raise ValueError(
+                    "cache_config.sparse_attention['cluster_granularity'] must be "
+                    f"'block' or 'token', got {_cg!r}"
+                )
             return SparseAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -549,6 +555,15 @@ class Attention(nn.Module, AttentionLayerBase):
                 ),
                 max_selected_blocks=int(
                     sparse_cfg.get("max_selected_blocks", 64)
+                ),
+                cluster_granularity=_cg,  # type: ignore[arg-type]
+                max_selected_tokens=(
+                    None
+                    if sparse_cfg.get("max_selected_tokens") is None
+                    else int(sparse_cfg["max_selected_tokens"])
+                ),
+                update_threshold_tokens=int(
+                    sparse_cfg.get("update_threshold_tokens", 1024)
                 ),
             )
 

@@ -540,10 +540,11 @@ class KVCacheManager:
 
         Args:
             request_id:           The request ID.
-            block_features:       ``[num_blocks, D]`` float32 numpy – mean K
-                                  per block (extracted by the model runner).
-            block_value_features: ``[num_blocks, D]`` float32 numpy – mean V
-                                  per block (optional; for Estimation Zone).
+            block_features:       ``[num_rows, D]`` float32 numpy – mean K per
+                                  block or per prompt token (see
+                                  ``SparseAttentionSpec.cluster_granularity``).
+            block_value_features: Same leading dimension as ``block_features``
+                                  (optional; for Estimation Zone).
         """
         mgr = self.get_sparse_manager()
         if mgr is not None:
@@ -560,9 +561,9 @@ class KVCacheManager:
         Called by the scheduler in ``update_from_output`` after processing
         model-runner outputs.  For each request in ``query_vectors``:
           1. Store the query via ``update_query_vector()``.
-          2. Immediately run ``select()`` so that ``_selected_block_indices``
-             is ready for the upcoming ``schedule()`` → ``allocate_slots()``
-             call.
+          2. Immediately run ``select()`` with ``sparse_selection_budget()`` so
+             that ``_selected_block_indices`` is ready for the upcoming
+             ``schedule()`` → ``allocate_slots()`` call.
 
         Args:
             query_vectors: req_id → ``[feature_dim]`` float32 numpy array.
@@ -574,7 +575,7 @@ class KVCacheManager:
             if req_id not in mgr.req_to_blocks:
                 continue
             mgr.update_query_vector(req_id, qv)
-            mgr.select(req_id, qv, mgr._spec.max_selected_blocks)
+            mgr.select(req_id, qv, mgr._spec.sparse_selection_budget())
 
     def sparse_post_decode_rebalance(
         self,
