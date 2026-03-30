@@ -101,6 +101,55 @@ logger = init_logger(__name__)
 # is stored under this synthetic layer name.
 SPARSE_LEGACY_FLAT_LAYER = "__flat__"
 
+# Per-KV-head clustering uses ``{layer}##kv{idx}``; per-query-head selection / Q
+# vectors use ``{layer}##qh{idx}``. Plain ``layer`` keys are normalized to
+# ``layer##kv0`` / ``layer##qh0`` for backward compatibility with tests.
+SPARSE_KV_KEY = "##kv"
+SPARSE_QH_KEY = "##qh"
+
+
+def sparse_kv_unit_key(layer: str, kv_idx: int) -> str:
+    return f"{layer}{SPARSE_KV_KEY}{kv_idx}"
+
+
+def sparse_qh_unit_key(layer: str, qh_idx: int) -> str:
+    return f"{layer}{SPARSE_QH_KEY}{qh_idx}"
+
+
+# Normalized keys for the legacy single-matrix ``__flat__`` indexing path.
+SPARSE_LEGACY_FLAT_KV_KEY = sparse_kv_unit_key(SPARSE_LEGACY_FLAT_LAYER, 0)
+SPARSE_LEGACY_FLAT_QH_KEY = sparse_qh_unit_key(SPARSE_LEGACY_FLAT_LAYER, 0)
+
+
+def parse_sparse_kv_key(key: str) -> tuple[str, int] | None:
+    if SPARSE_KV_KEY not in key:
+        return None
+    layer, _, rest = key.partition(SPARSE_KV_KEY)
+    try:
+        return layer, int(rest)
+    except ValueError:
+        return None
+
+
+def parse_sparse_qh_key(key: str) -> tuple[str, int] | None:
+    if SPARSE_QH_KEY not in key:
+        return None
+    layer, _, rest = key.partition(SPARSE_QH_KEY)
+    try:
+        return layer, int(rest)
+    except ValueError:
+        return None
+
+
+def _normalize_kv_feature_map(m: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for k, v in m.items():
+        if SPARSE_KV_KEY in k:
+            out[k] = v
+        else:
+            out[sparse_kv_unit_key(k, 0)] = v
+    return out
+
 
 @dataclass
 class _SparseLayerIndexState:
@@ -622,11 +671,12 @@ class SparseKVManager(FullAttentionManager):
         block_value_features: np.ndarray | dict[str, np.ndarray] | None,
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
         if isinstance(block_features, np.ndarray):
-            bf = {SPARSE_LEGACY_FLAT_LAYER: block_features}
+            u0 = sparse_kv_unit_key(SPARSE_LEGACY_FLAT_LAYER, 0)
+            bf = {u0: block_features}
             bv = (
                 None
                 if block_value_features is None
-                else {SPARSE_LEGACY_FLAT_LAYER: block_value_features}
+                else {u0: block_value_features}
             )
             return bf, bv
         if block_value_features is not None and not isinstance(
@@ -636,9 +686,13 @@ class SparseKVManager(FullAttentionManager):
                 "sparse block_value_features must be a dict[str, ndarray] "
                 "when block_features is per-layer dict"
             )
-        return dict(block_features), (
-            None if block_value_features is None else dict(block_value_features)
+        bf = _normalize_kv_feature_map(dict(block_features))
+        bv = (
+            None
+            if block_value_features is None
+            else _normalize_kv_feature_map(dict(block_value_features))
         )
+        return bf, bv
 
     def _layer_map_for_request(
         self, request_id: str
@@ -720,18 +774,52 @@ class SparseKVManager(FullAttentionManager):
         recent_blocks = set(range(max(0, n_units - n_recent), n_units))
         return sink_blocks | recent_blocks
 
-    def _coerce_query_by_layer(
+    def _coerce_query_by_qh(
         self,
         request_id: str,
         query_vector: np.ndarray | dict[str, np.ndarray],
     ) -> dict[str, np.ndarray]:
+        """Map scheduler / runner query payloads to ``layer##qh{i}`` vectors."""
         ls = self._layer_states.get(request_id, {})
         if isinstance(query_vector, dict):
-            return {k: np.asarray(v, dtype=np.float32) for k, v in query_vector.items()}
+            out: dict[str, np.ndarray] = {}
+            for k, v in query_vector.items():
+                if SPARSE_QH_KEY in k:
+                    out[k] = np.asarray(v, dtype=np.float32)
+                else:
+                    out[sparse_qh_unit_key(k, 0)] = np.asarray(v, dtype=np.float32)
+            return out
         q = np.asarray(query_vector, dtype=np.float32)
         if not ls:
-            return {SPARSE_LEGACY_FLAT_LAYER: q}
-        return {layer: q for layer in ls}
+            return {sparse_qh_unit_key(SPARSE_LEGACY_FLAT_LAYER, 0): q}
+        layers: set[str] = set()
+        for k in ls:
+            pk = parse_sparse_kv_key(k)
+            if pk is not None:
+                layers.add(pk[0])
+            elif SPARSE_QH_KEY not in k and SPARSE_KV_KEY not in k:
+                layers.add(k)
+        if not layers:
+            return {sparse_qh_unit_key(SPARSE_LEGACY_FLAT_LAYER, 0): q}
+        return {sparse_qh_unit_key(layer, 0): q for layer in sorted(layers)}
+
+    @staticmethod
+    def _sorted_kv_indices_for_layer(
+        layer: str, ls: dict[str, _SparseLayerIndexState]
+    ) -> list[int]:
+        idxs: list[int] = []
+        for k in ls:
+            pk = parse_sparse_kv_key(k)
+            if pk is not None and pk[0] == layer:
+                idxs.append(pk[1])
+        return sorted(idxs)
+
+    @staticmethod
+    def _qh_to_kv_index(qh_idx: int, num_q: int, num_kv: int) -> int:
+        if num_kv <= 1:
+            return 0
+        q_per_kv = max(1, num_q // num_kv)
+        return min(qh_idx // q_per_kv, num_kv - 1)
 
     def _retrieve_zone_one_layer(
         self,
@@ -840,24 +928,34 @@ class SparseKVManager(FullAttentionManager):
     def _per_layer_fresh_topk(
         self,
         request_id: str,
-        query_by_layer: dict[str, np.ndarray],
+        query_by_qh: dict[str, np.ndarray],
         budget: int,
     ) -> tuple[
         dict[str, list[int]], dict[str, list[int]], dict[str, list[int]] | None
     ]:
         """
-        Independent TopK + budget per attention layer.
+        Independent TopK + budget per **query head** (``layer##qh{i}`` keys).
 
-        Returns:
-            (selected blocks, retrieve blocks, selected tokens per layer or None).
+        Clustering state remains per **KV head** (``layer##kv{j}``); each query
+        head maps to one KV head via GQA grouping.
         """
         n_units = self._num_index_units(request_id)
         if n_units == 0:
             return {}, {}, None
 
-        layers = self._layer_states.get(request_id, {})
-        if not layers:
+        ls = self._layer_states.get(request_id, {})
+        if not ls:
             return {}, {}, None
+
+        layers_from_qh: dict[str, list[tuple[int, str]]] = {}
+        for qk, _q in query_by_qh.items():
+            parsed = parse_sparse_qh_key(qk)
+            if parsed is None:
+                continue
+            layer_name, qh_idx = parsed
+            layers_from_qh.setdefault(layer_name, []).append((qh_idx, qk))
+        for lst in layers_from_qh.values():
+            lst.sort(key=lambda x: x[0])
 
         if self._token_mode():
             head = min(self._spec.static_pattern_start, n_units)
@@ -865,33 +963,45 @@ class SparseKVManager(FullAttentionManager):
             steady_tokens.update(
                 range(max(0, n_units - self._spec.static_pattern_end), n_units)
             )
-            if all(len(st.cluster_centres) == 0 for st in layers.values()):
+            if all(len(st.cluster_centres) == 0 for st in ls.values()):
                 fallback = set(range(max(0, n_units - budget), n_units))
                 sel_t = sorted(fallback | steady_tokens)[:budget]
                 retr_t = sorted(set(sel_t) - steady_tokens)
                 sel_bl = self._tokens_to_history_logical_blocks(request_id, sel_t)
                 retr_bl = self._tokens_to_history_logical_blocks(request_id, retr_t)
-                tok = {ln: list(sel_t) for ln in layers}
+                tok = {qk: list(sel_t) for qk in query_by_qh}
                 return (
-                    {ln: sel_bl for ln in layers},
-                    {ln: retr_bl for ln in layers},
+                    {qk: sel_bl for qk in query_by_qh},
+                    {qk: retr_bl for qk in query_by_qh},
                     tok,
                 )
 
-            selected_by_layer: dict[str, list[int]] = {}
-            retrieve_by_layer: dict[str, list[int]] = {}
-            tokens_by_layer: dict[str, list[int]] = {}
-            for layer_name, st in layers.items():
-                q = query_by_layer.get(layer_name)
-                if q is None:
+            selected_by_qh: dict[str, list[int]] = {}
+            retrieve_by_qh: dict[str, list[int]] = {}
+            tokens_by_qh: dict[str, list[int]] = {}
+            for layer_name, qh_list in layers_from_qh.items():
+                kv_sorted = self._sorted_kv_indices_for_layer(layer_name, ls)
+                num_kv = len(kv_sorted)
+                if num_kv == 0:
                     continue
-                sel_bl, retr_bl, sel_t = self._select_one_layer_topk_tokens(
-                    request_id, n_units, steady_tokens, st, q, budget
-                )
-                selected_by_layer[layer_name] = sel_bl
-                retrieve_by_layer[layer_name] = retr_bl
-                tokens_by_layer[layer_name] = sel_t
-            return selected_by_layer, retrieve_by_layer, tokens_by_layer
+                num_q = max(qh for qh, _ in qh_list) + 1 if qh_list else 1
+                for qh_idx, qk in qh_list:
+                    q = query_by_qh.get(qk)
+                    if q is None:
+                        continue
+                    kv_slot = self._qh_to_kv_index(qh_idx, num_q, num_kv)
+                    kv_actual = kv_sorted[kv_slot]
+                    st_key = sparse_kv_unit_key(layer_name, kv_actual)
+                    st = ls.get(st_key)
+                    if st is None:
+                        continue
+                    sel_bl, retr_bl, sel_t = self._select_one_layer_topk_tokens(
+                        request_id, n_units, steady_tokens, st, q, budget
+                    )
+                    selected_by_qh[qk] = sel_bl
+                    retrieve_by_qh[qk] = retr_bl
+                    tokens_by_qh[qk] = sel_t
+            return selected_by_qh, retrieve_by_qh, tokens_by_qh
 
         n_sink = self._spec.n_sink_blocks
         n_recent = self._spec.n_recent_blocks
@@ -899,24 +1009,40 @@ class SparseKVManager(FullAttentionManager):
         recent_set = set(range(max(0, n_units - n_recent), n_units))
         steady_set = sink_set | recent_set
 
-        if all(len(st.cluster_centres) == 0 for st in layers.values()):
+        if all(len(st.cluster_centres) == 0 for st in ls.values()):
             fallback = set(range(max(0, n_units - budget), n_units))
             sel = sorted(fallback | steady_set)[:budget]
             retr = sorted(set(sel) - steady_set)
-            return {ln: list(sel) for ln in layers}, {ln: list(retr) for ln in layers}, None
-
-        selected_by_layer = {}
-        retrieve_by_layer = {}
-        for layer_name, st in layers.items():
-            q = query_by_layer.get(layer_name)
-            if q is None:
-                continue
-            sel, retr = self._select_one_layer_topk_blocks(
-                n_units, steady_set, st, q, budget
+            return (
+                {qk: list(sel) for qk in query_by_qh},
+                {qk: list(retr) for qk in query_by_qh},
+                None,
             )
-            selected_by_layer[layer_name] = sel
-            retrieve_by_layer[layer_name] = retr
-        return selected_by_layer, retrieve_by_layer, None
+
+        selected_by_qh: dict[str, list[int]] = {}
+        retrieve_by_qh: dict[str, list[int]] = {}
+        for layer_name, qh_list in layers_from_qh.items():
+            kv_sorted = self._sorted_kv_indices_for_layer(layer_name, ls)
+            num_kv = len(kv_sorted)
+            if num_kv == 0:
+                continue
+            num_q = max(qh for qh, _ in qh_list) + 1 if qh_list else 1
+            for qh_idx, qk in qh_list:
+                q = query_by_qh.get(qk)
+                if q is None:
+                    continue
+                kv_slot = self._qh_to_kv_index(qh_idx, num_q, num_kv)
+                kv_actual = kv_sorted[kv_slot]
+                st_key = sparse_kv_unit_key(layer_name, kv_actual)
+                st = ls.get(st_key)
+                if st is None:
+                    continue
+                sel, retr = self._select_one_layer_topk_blocks(
+                    n_units, steady_set, st, q, budget
+                )
+                selected_by_qh[qk] = sel
+                retrieve_by_qh[qk] = retr
+        return selected_by_qh, retrieve_by_qh, None
 
     def _apply_steady_and_cap_tokens_per_layer(
         self,
@@ -1168,9 +1294,9 @@ class SparseKVManager(FullAttentionManager):
                     )
                 return result
 
-        q_by_layer = self._coerce_query_by_layer(request_id, query_vector)
+        q_by_qh = self._coerce_query_by_qh(request_id, query_vector)
         sel_bl, retr_bl, tok_bl = self._per_layer_fresh_topk(
-            request_id, q_by_layer, num_blocks
+            request_id, q_by_qh, num_blocks
         )
         if tok_bl is not None:
             self._selected_token_indices_by_layer[request_id] = tok_bl
@@ -1215,9 +1341,9 @@ class SparseKVManager(FullAttentionManager):
         ``query_vec`` may be a single ``[D]`` vector (broadcast to all indexed
         layers) or ``layer_name → [D]``.
         """
-        q_by_layer = self._coerce_query_by_layer(request_id, query_vec)
-        self._pending_query[request_id] = q_by_layer
-        q0 = next(iter(q_by_layer.values()))
+        q_by_qh = self._coerce_query_by_qh(request_id, query_vec)
+        self._pending_query[request_id] = q_by_qh
+        q0 = next(iter(q_by_qh.values()))
         self._debug_log_state(
             request_id,
             "query_updated",
@@ -1231,7 +1357,7 @@ class SparseKVManager(FullAttentionManager):
             and request_id not in self._prefill_topk_ready
             and self._spec.prefill_topk_query_window > 0
         ):
-            self._compute_prefill_topk(request_id, q_by_layer)
+            self._compute_prefill_topk(request_id, q_by_qh)
 
     def get_pending_query(
         self, request_id: str
@@ -1256,25 +1382,31 @@ class SparseKVManager(FullAttentionManager):
             return
 
         if isinstance(new_block_feature, np.ndarray):
-            feat_map = {ln: new_block_feature for ln in ls}
+            feat_map = {k: new_block_feature for k in ls}
             v_map = (
                 None
                 if new_block_value_feature is None
-                else {ln: new_block_value_feature for ln in ls}
+                else {k: new_block_value_feature for k in ls}
             )
         else:
-            feat_map = dict(new_block_feature)
-            v_map = new_block_value_feature
+            feat_map = _normalize_kv_feature_map(dict(new_block_feature))
+            v_map = (
+                None
+                if new_block_value_feature is None
+                else _normalize_kv_feature_map(dict(new_block_value_feature))
+            )
 
         max_buf = 0
-        for layer_name, st in ls.items():
-            feat = feat_map.get(layer_name)
+        for unit_key, st in ls.items():
+            if parse_sparse_kv_key(unit_key) is None:
+                continue
+            feat = feat_map.get(unit_key)
             if feat is None:
                 continue
-            vfeat = None if v_map is None else v_map.get(layer_name)
+            vfeat = None if v_map is None else v_map.get(unit_key)
             max_buf = max(
                 max_buf,
-                self._rebalance_one_layer(request_id, layer_name, st, feat, vfeat),
+                self._rebalance_one_layer(request_id, unit_key, st, feat, vfeat),
             )
 
         threshold = (
@@ -1298,9 +1430,11 @@ class SparseKVManager(FullAttentionManager):
                 threshold,
             )
 
-        for layer_name, st in ls.items():
+        for unit_key, st in ls.items():
+            if parse_sparse_kv_key(unit_key) is None:
+                continue
             if len(st.decode_block_buffer) >= threshold:
-                self._dynamic_update_layer(request_id, layer_name, st)
+                self._dynamic_update_layer(request_id, unit_key, st)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1341,10 +1475,10 @@ class SparseKVManager(FullAttentionManager):
     def _compute_prefill_topk(
         self,
         request_id: str,
-        query_by_layer: dict[str, np.ndarray],
+        query_by_qh: dict[str, np.ndarray],
     ) -> None:
         cap = self._spec.sparse_selection_budget()
-        sel_bl, _, tok_bl = self._per_layer_fresh_topk(request_id, query_by_layer, cap)
+        sel_bl, _, tok_bl = self._per_layer_fresh_topk(request_id, query_by_qh, cap)
         self._prefill_selected_by_layer[request_id] = sel_bl
         if tok_bl is not None:
             self._prefill_selected_tokens_by_layer[request_id] = tok_bl

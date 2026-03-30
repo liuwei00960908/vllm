@@ -130,7 +130,11 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager
+from vllm.v1.core.sparse_kv_cache_manager import (
+    SparseKVManager,
+    sparse_kv_unit_key,
+    sparse_qh_unit_key,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -2185,6 +2189,8 @@ class GPUModelRunner(
             *,
             skip_block_table_cache: bool = False,
             layer_names_override: list[str] | None = None,
+            sparse_per_head_block_table: torch.Tensor | None = None,
+            sparse_per_head_seq_lens: torch.Tensor | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
@@ -2255,6 +2261,17 @@ class GPUModelRunner(
                     for_cudagraph_capture=for_cudagraph_capture,
                 )
 
+            if (
+                sparse_per_head_block_table is not None
+                and sparse_per_head_seq_lens is not None
+                and isinstance(attn_metadata_i, FlashAttentionMetadata)
+            ):
+                attn_metadata_i = replace(
+                    attn_metadata_i,
+                    sparse_per_head_block_table=sparse_per_head_block_table,
+                    sparse_per_head_seq_lens=sparse_per_head_seq_lens,
+                )
+
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
@@ -2310,30 +2327,89 @@ class GPUModelRunner(
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 attn_group_i = self.attn_groups[kv_cache_gid][attn_gid]
                 if is_sparse_group:
+                    spec_sp = kv_cache_group.kv_cache_spec
+                    assert isinstance(spec_sp, SparseAttentionSpec)
+                    is_tok_compact = (
+                        spec_sp.cluster_granularity == "token"
+                        and spec_sp.use_compact_kv_gather
+                    )
                     for layer_name in attn_group_i.layer_names:
-                        layer_bt = self._build_sparse_layer_block_table_tensor(
-                            cm_union.block_table_tensor.clone(),
-                            kv_cache_gid,
-                            layer_name,
-                            num_reqs,
-                            num_reqs_padded,
+                        attn_mod_sh = (
+                            self.compilation_config.static_forward_context.get(
+                                layer_name
+                            )
                         )
-                        decode_override = self._sparse_decode_num_blocks_np(
-                            kv_cache_gid,
-                            layer_name,
-                            num_reqs,
-                            num_reqs_padded,
+                        n_heads_sh = (
+                            int(attn_mod_sh.num_heads)
+                            if attn_mod_sh is not None
+                            else 1
                         )
-                        cm_layer = copy(cm)
-                        cm_layer.block_table_tensor = layer_bt
-                        cm_layer = self._override_sparse_seq_lens(
-                            cm_layer,
-                            kv_cache_gid,
-                            num_reqs,
-                            num_reqs_padded,
-                            kv_cache_group.kv_cache_spec.block_size,
-                            decode_num_blocks_override=decode_override,
-                        )
+                        bsz = spec_sp.block_size
+                        sp_bt: torch.Tensor | None = None
+                        sp_sl: torch.Tensor | None = None
+                        if is_tok_compact:
+                            sk0 = sparse_qh_unit_key(layer_name, 0)
+                            layer_bt = self._build_sparse_layer_block_table_tensor(
+                                cm_union.block_table_tensor.clone(),
+                                kv_cache_gid,
+                                sk0,
+                                num_reqs,
+                                num_reqs_padded,
+                            )
+                            decode_override = self._sparse_decode_num_blocks_np(
+                                kv_cache_gid,
+                                sk0,
+                                num_reqs,
+                                num_reqs_padded,
+                            )
+                            cm_layer = copy(cm)
+                            cm_layer.block_table_tensor = layer_bt
+                            cm_layer = self._override_sparse_seq_lens(
+                                cm_layer,
+                                kv_cache_gid,
+                                num_reqs,
+                                num_reqs_padded,
+                                bsz,
+                                decode_num_blocks_override=decode_override,
+                            )
+                        else:
+                            per_bt, per_sl = (
+                                self._build_sparse_per_head_block_table_and_lens(
+                                    cm_union.block_table_tensor,
+                                    cm_union,
+                                    kv_cache_gid,
+                                    layer_name,
+                                    n_heads_sh,
+                                    num_reqs,
+                                    num_reqs_padded,
+                                    bsz,
+                                )
+                            )
+                            if per_bt is not None and per_sl is not None:
+                                cm_layer = copy(cm)
+                                cm_layer.block_table_tensor = per_bt[0]
+                                cm_layer.seq_lens = per_sl[0]
+                                cm_layer._seq_lens_cpu = torch.tensor(
+                                    per_sl[0].cpu().numpy(), dtype=torch.int32
+                                )
+                                if num_reqs > 0:
+                                    cm_layer.max_seq_len = int(
+                                        per_sl[0, :num_reqs].max().item()
+                                    )
+                                sp_bt, sp_sl = per_bt, per_sl
+                            else:
+                                cm_layer = copy(cm)
+                                cm_layer.block_table_tensor = (
+                                    cm_union.block_table_tensor.clone()
+                                )
+                                cm_layer = self._override_sparse_seq_lens(
+                                    cm_layer,
+                                    kv_cache_gid,
+                                    num_reqs,
+                                    num_reqs_padded,
+                                    bsz,
+                                    decode_num_blocks_override=None,
+                                )
                         if ubatch_slices is not None:
                             for ubid, _cm in enumerate(
                                 split_attn_metadata(ubatch_slices, cm_layer)
@@ -2345,6 +2421,8 @@ class GPUModelRunner(
                                     ubid,
                                     skip_block_table_cache=True,
                                     layer_names_override=[layer_name],
+                                    sparse_per_head_block_table=sp_bt,
+                                    sparse_per_head_seq_lens=sp_sl,
                                 )
                         else:
                             _build_attn_group_metadata(
@@ -2354,6 +2432,8 @@ class GPUModelRunner(
                                 None,
                                 skip_block_table_cache=True,
                                 layer_names_override=[layer_name],
+                                sparse_per_head_block_table=sp_bt,
+                                sparse_per_head_seq_lens=sp_sl,
                             )
                 elif ubatch_slices is not None:
                     for ubid, _cm in enumerate(
@@ -6893,53 +6973,72 @@ class GPUModelRunner(
         if for_cudagraph_capture or self.dcp_world_size > 1:
             return attn_metadata_i
 
-        phys: list[int] = []
-        slot_list: list[int] = []
-        cu_k: list[int] = [0]
-
-        for ri in range(num_reqs):
-            rid = self.input_batch.req_ids[ri]
-            if len(self.requests[rid].output_token_ids) == 0:
-                return attn_metadata_i
-            seq_len = int(common_attn_metadata._seq_lens_cpu[ri].item())
-            if seq_len <= 0:
-                return attn_metadata_i
-            g_cur = seq_len - 1
-            p_count = int(self.input_batch.num_prompt_tokens[ri])
-            bsz = spec.block_size
-            chrono = self._sparse_chrono_phys.get(rid, [])
-            toks = self._sparse_token_indices_by_layer.get(rid, {}).get(layer_name)
-            if toks is None or len(chrono) == 0:
-                return attn_metadata_i
-            sel = sorted(set(toks) | {g_cur})
-            sel = [g for g in sel if 0 <= g < seq_len]
-            for g in sel:
-                lb = SparseKVManager._global_token_to_logical_block(
-                    g, p_count, bsz
-                )
-                if lb < 0 or lb >= len(chrono):
-                    return attn_metadata_i
-                g0 = SparseKVManager._logical_block_first_global(lb, p_count, bsz)
-                sl = g - g0
-                if sl < 0 or sl >= bsz:
-                    return attn_metadata_i
-                phys.append(int(chrono[lb]))
-                slot_list.append(int(sl))
-            cu_k.append(cu_k[-1] + len(sel))
-
-        if not phys:
-            return attn_metadata_i
-
+        attn_mod = self.compilation_config.static_forward_context.get(layer_name)
+        num_heads = int(attn_mod.num_heads) if attn_mod is not None else 1
         dev = attn_metadata_i.block_table.device
+
+        def gather_one_head(qh_idx: int) -> tuple[list[int], list[int], list[int]] | None:
+            phys_h: list[int] = []
+            slot_h: list[int] = []
+            cu_h: list[int] = [0]
+            sk = sparse_qh_unit_key(layer_name, qh_idx)
+            for ri in range(num_reqs):
+                rid = self.input_batch.req_ids[ri]
+                if len(self.requests[rid].output_token_ids) == 0:
+                    return None
+                seq_len = int(common_attn_metadata._seq_lens_cpu[ri].item())
+                if seq_len <= 0:
+                    return None
+                g_cur = seq_len - 1
+                p_count = int(self.input_batch.num_prompt_tokens[ri])
+                bsz = spec.block_size
+                chrono = self._sparse_chrono_phys.get(rid, [])
+                tok_map = self._sparse_token_indices_by_layer.get(rid, {})
+                toks = tok_map.get(sk)
+                if toks is None and qh_idx == 0:
+                    toks = tok_map.get(layer_name)
+                if toks is None or len(chrono) == 0:
+                    return None
+                sel = sorted(set(toks) | {g_cur})
+                sel = [g for g in sel if 0 <= g < seq_len]
+                for g in sel:
+                    lb = SparseKVManager._global_token_to_logical_block(
+                        g, p_count, bsz
+                    )
+                    if lb < 0 or lb >= len(chrono):
+                        return None
+                    g0 = SparseKVManager._logical_block_first_global(
+                        lb, p_count, bsz
+                    )
+                    sl = g - g0
+                    if sl < 0 or sl >= bsz:
+                        return None
+                    phys_h.append(int(chrono[lb]))
+                    slot_h.append(int(sl))
+                cu_h.append(cu_h[-1] + len(sel))
+            if not phys_h:
+                return None
+            return phys_h, slot_h, cu_h
+
+        triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for qh in range(num_heads):
+            g = gather_one_head(qh)
+            if g is None:
+                return attn_metadata_i
+            phys_h, slot_h, cu_h = g
+            triples.append(
+                (
+                    torch.tensor(phys_h, dtype=torch.int32, device=dev),
+                    torch.tensor(slot_h, dtype=torch.int32, device=dev),
+                    torch.tensor(cu_h, dtype=torch.int32, device=dev),
+                )
+            )
         return replace(
             attn_metadata_i,
-            sparse_gather_phys=torch.tensor(phys, dtype=torch.int32, device=dev),
-            sparse_gather_slots=torch.tensor(
-                slot_list, dtype=torch.int32, device=dev
-            ),
-            sparse_gather_cu_seqlens_k=torch.tensor(
-                cu_k, dtype=torch.int32, device=dev
-            ),
+            sparse_gather_phys=None,
+            sparse_gather_slots=None,
+            sparse_gather_cu_seqlens_k=None,
+            sparse_q_head_gather=tuple(triples),
         )
 
     def _collect_sparse_features(
@@ -6958,25 +7057,25 @@ class GPUModelRunner(
 
         Feature convention
         ------------------
-        * ``feature_dim = head_size`` – per-head vectors are averaged over the
-          KV-head (or Q-head) dimension within each attention layer.
-        * Block K features and Q vectors are **per layer** (each layer that
-          shares the same ``SparseAttentionSpec`` group gets its own vector /
-          matrix).  ``SparseKVManager`` runs K-Means and TopK independently
-          per layer; the scheduler keeps the **union** of logical blocks for
-          allocation while decode attention uses a **per-layer** block table.
+        * ``feature_dim = head_size`` – one vector per KV head / query head
+          (no averaging across heads).
+        * Keys use ``layer##kv{i}`` for K/V block features (clustering) and
+          ``layer##qh{j}`` for query vectors and TopK selection.  ``SparseKVManager``
+          runs K-Means per KV head and TopK per query head; the scheduler keeps
+          the **union** of logical blocks for allocation while decode attention
+          uses **per-query-head** block tables / compact gathers.
 
         Returns
         -------
         sparse_block_features
-            ``req_id → layer_name → [num_blocks, head_size]`` CPU float32;
+            ``req_id → layer##kv{i} → [num_blocks, head_size]`` CPU float32;
             emitted only when prefill completes this step.
         sparse_query_vectors
-            ``req_id → layer_name → [head_size]`` CPU float32; every scheduled
+            ``req_id → layer##qh{j} → [head_size]`` CPU float32; every scheduled
             request (prefill completion or decode).
         sparse_new_block_features
-            ``req_id → layer_name → [head_size]`` CPU float32; decode steps –
-            mean-K of the last KV block per layer.
+            ``req_id → layer##kv{i} → [head_size]`` CPU float32; decode steps –
+            K vector of the last slot per KV head.
         """
         if not self._has_sparse_attn:
             return None, None, None
@@ -7034,30 +7133,34 @@ class GPUModelRunner(
             tok_end = int(self.query_start_loc.np[req_idx + 1])
             last_tok_idx = tok_end - 1  # last token of this request
 
-            # ── Q vectors: one row per sparse attention layer (mean over Q-heads)
-            q_per_layer: dict[str, np.ndarray] = {}
+            # ── Q vectors: one row per query head (layer##qh{j})
+            q_per_unit: dict[str, np.ndarray] = {}
             for _, grp in sparse_groups:
                 for layer_name in grp.layer_names:
                     q_raw = self._sparse_q_captures.get(layer_name)
                     if q_raw is None or last_tok_idx >= q_raw.shape[0]:
                         continue
-                    q_tok = q_raw[last_tok_idx]
-                    if q_tok.dim() == 2:
-                        q_tok = q_tok.mean(dim=0)
-                    else:
-                        attn_mod = (
-                            self.compilation_config.static_forward_context.get(
-                                layer_name
-                            )
+                    attn_mod = (
+                        self.compilation_config.static_forward_context.get(
+                            layer_name
                         )
-                        if attn_mod is not None and attn_mod.num_heads > 0:
-                            q_tok = q_tok.view(
-                                attn_mod.num_heads, attn_mod.head_size
-                            ).mean(dim=0)
-                    q_per_layer[layer_name] = q_tok.float().cpu().numpy()
+                    )
+                    if attn_mod is None or attn_mod.num_heads <= 0:
+                        continue
+                    q_tok = q_raw[last_tok_idx].float()
+                    head_size = int(attn_mod.head_size)
+                    num_q = int(attn_mod.num_heads)
+                    if q_tok.dim() == 2:
+                        q_heads = q_tok
+                    else:
+                        q_heads = q_tok.view(num_q, head_size)
+                    for qh in range(num_q):
+                        q_per_unit[sparse_qh_unit_key(layer_name, qh)] = (
+                            q_heads[qh].cpu().numpy()
+                        )
 
-            if q_per_layer:
-                sparse_query_vectors[req_id] = q_per_layer
+            if q_per_unit:
+                sparse_query_vectors[req_id] = q_per_unit
 
             # ── K block features from KV cache (per layer, no cross-layer mean)
             for gid, grp in sparse_groups:
@@ -7091,41 +7194,69 @@ class GPUModelRunner(
                         continue
                     kv = attn_mod.kv_cache[0]
                     k_blocks = kv[0][block_ids_t]
+                    num_kv = int(attn_mod.num_kv_heads)
                     if token_sparse:
                         if is_prefill_done:
-                            rows: list[torch.Tensor] = []
                             valid_len = seq_len_after
-                            for bi in range(num_blocks):
-                                kb = k_blocks[bi]
-                                for slot in range(block_size):
-                                    g = bi * block_size + slot
-                                    if g >= valid_len:
+                            for kv_h in range(num_kv):
+                                rows: list[torch.Tensor] = []
+                                for bi in range(num_blocks):
+                                    kb = k_blocks[bi]
+                                    for slot in range(block_size):
+                                        g = bi * block_size + slot
+                                        if g >= valid_len:
+                                            break
+                                        slot_k = kb[slot]
+                                        if num_kv == 1:
+                                            rows.append(slot_k)
+                                        else:
+                                            rows.append(slot_k[kv_h])
+                                    if (bi + 1) * block_size >= valid_len:
                                         break
-                                    rows.append(kb[slot].mean(dim=0))
-                                if (bi + 1) * block_size >= valid_len:
-                                    break
-                            if rows:
-                                tok_feat = torch.stack(rows, dim=0).float()
-                                sparse_block_features.setdefault(req_id, {})[
-                                    layer_name
-                                ] = tok_feat.cpu().numpy()
+                                if rows:
+                                    tok_feat = torch.stack(rows, dim=0).float()
+                                    sparse_block_features.setdefault(req_id, {})[
+                                        sparse_kv_unit_key(layer_name, kv_h)
+                                    ] = tok_feat.cpu().numpy()
                         if is_decode:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
-                            k_tok = k_blocks[-1][slot].mean(dim=0).float()
-                            sparse_new_block_features.setdefault(req_id, {})[
-                                layer_name
-                            ] = k_tok.cpu().numpy()
+                            k_row = k_blocks[-1][slot].float()
+                            for kv_h in range(num_kv):
+                                if num_kv == 1:
+                                    k_vec = k_row
+                                else:
+                                    k_vec = k_row[kv_h]
+                                sparse_new_block_features.setdefault(req_id, {})[
+                                    sparse_kv_unit_key(layer_name, kv_h)
+                                ] = k_vec.cpu().numpy()
                     else:
-                        k_feat = k_blocks.mean(dim=1).mean(dim=1).float()
+                        k_blk = k_blocks.mean(dim=1).float()
                         if is_prefill_done:
-                            sparse_block_features.setdefault(req_id, {})[
-                                layer_name
-                            ] = k_feat.cpu().numpy()
+                            if k_blk.dim() == 2:
+                                assert num_kv == 1, (
+                                    "KV cache layout: expected num_kv_heads==1 "
+                                    "when block mean has rank 2"
+                                )
+                                sparse_block_features.setdefault(req_id, {})[
+                                    sparse_kv_unit_key(layer_name, 0)
+                                ] = k_blk.cpu().numpy()
+                            else:
+                                for kv_h in range(num_kv):
+                                    sparse_block_features.setdefault(req_id, {})[
+                                        sparse_kv_unit_key(layer_name, kv_h)
+                                    ] = k_blk[:, kv_h, :].cpu().numpy()
                         if is_decode:
-                            sparse_new_block_features.setdefault(req_id, {})[
-                                layer_name
-                            ] = k_feat[-1].cpu().numpy()
+                            if k_blk.dim() == 2:
+                                assert num_kv == 1
+                                sparse_new_block_features.setdefault(req_id, {})[
+                                    sparse_kv_unit_key(layer_name, 0)
+                                ] = k_blk[-1].cpu().numpy()
+                            else:
+                                for kv_h in range(num_kv):
+                                    sparse_new_block_features.setdefault(req_id, {})[
+                                        sparse_kv_unit_key(layer_name, kv_h)
+                                    ] = k_blk[-1, kv_h, :].cpu().numpy()
 
         if self._sparse_probe_info_enabled:
             logger.info(
@@ -7147,13 +7278,12 @@ class GPUModelRunner(
         self,
         req_id: str,
         kv_cache_gid: int,
-        layer_name: str,
+        sparse_row_key: str,
     ) -> list[int] | None:
-        """Physical KV block ids (history then decode slot) for one sparse decode layer.
+        """Physical KV block ids (history then decode slot) for one sparse row.
 
-        Must stay in sync with ``_build_sparse_layer_block_table_tensor``; the
-        length of this row is the sparse block-table width used for
-        ``seq_lens`` capping so FlashAttention never reads past allocated pages.
+        ``sparse_row_key`` is ``layer##qh{j}`` (per query head).  When absent
+        from the per-head map, falls back to merged union order (legacy).
         """
         rs = self.requests.get(req_id)
         if rs is None or len(rs.output_token_ids) == 0:
@@ -7170,8 +7300,8 @@ class GPUModelRunner(
         for log, phys in zip(merged, phys_hist):
             logical_to_phys[int(log)] = int(phys)
         by_l = self._sparse_by_layer_logical.get(req_id)
-        if by_l and layer_name in by_l:
-            logical_order = [int(x) for x in by_l[layer_name]]
+        if by_l and sparse_row_key in by_l:
+            logical_order = [int(x) for x in by_l[sparse_row_key]]
         else:
             logical_order = [int(x) for x in merged]
         row: list[int] = []
@@ -7185,15 +7315,17 @@ class GPUModelRunner(
     def _sparse_decode_num_blocks_np(
         self,
         kv_cache_gid: int,
-        layer_name: str,
+        sparse_row_key: str,
         num_reqs: int,
         num_reqs_padded: int,
     ) -> np.ndarray:
-        """Per-request sparse table width (in blocks) for one layer; matches GPU row."""
+        """Per-request sparse table width (in blocks) for one sparse row key."""
         out = np.full(num_reqs_padded, -1, dtype=np.int32)
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
-            row = self._sparse_layer_decode_phys_row(req_id, kv_cache_gid, layer_name)
+            row = self._sparse_layer_decode_phys_row(
+                req_id, kv_cache_gid, sparse_row_key
+            )
             if row is not None:
                 out[req_idx] = int(len(row))
         return out
@@ -7202,16 +7334,18 @@ class GPUModelRunner(
         self,
         union_bt: torch.Tensor,
         kv_cache_gid: int,
-        layer_name: str,
+        sparse_row_key: str,
         num_reqs: int,
         num_reqs_padded: int,
     ) -> torch.Tensor:
-        """Shrink each sparse-decode row to this layer's logical block subset."""
+        """Shrink each sparse-decode row for ``sparse_row_key`` (``layer##qh{j}``)."""
         out = union_bt.clone()
         pad_id = -1
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
-            row = self._sparse_layer_decode_phys_row(req_id, kv_cache_gid, layer_name)
+            row = self._sparse_layer_decode_phys_row(
+                req_id, kv_cache_gid, sparse_row_key
+            )
             if row is None:
                 continue
             out[req_idx].fill_(pad_id)
@@ -7219,6 +7353,67 @@ class GPUModelRunner(
             out[req_idx, : row_t.shape[0]] = row_t
         out[num_reqs:num_reqs_padded].fill_(pad_id)
         return out
+
+    def _build_sparse_per_head_block_table_and_lens(
+        self,
+        union_bt: torch.Tensor,
+        cm: "CommonAttentionMetadata",
+        kv_cache_gid: int,
+        layer_name: str,
+        num_heads: int,
+        num_reqs: int,
+        num_reqs_padded: int,
+        block_size: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Stack per-query-head sparse block tables ``[H, S, max_blocks]`` and seq lens."""
+        _, max_blocks = union_bt.shape
+        device = union_bt.device
+        stacked = torch.full(
+            (num_heads, num_reqs_padded, max_blocks),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        any_sparse = False
+        for qh in range(num_heads):
+            sk = sparse_qh_unit_key(layer_name, qh)
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                row = self._sparse_layer_decode_phys_row(req_id, kv_cache_gid, sk)
+                if row is None:
+                    stacked[qh, req_idx] = union_bt[req_idx]
+                else:
+                    any_sparse = True
+                    row_t = torch.tensor(row, dtype=torch.int32, device=device)
+                    stacked[qh, req_idx, : row_t.shape[0]] = row_t
+        if not any_sparse:
+            return None, None
+        seq_lens_np = cm._seq_lens_cpu.numpy().copy()
+        per_head_lens = np.zeros((num_heads, num_reqs_padded), dtype=np.int32)
+        blk_table = self.input_batch.block_table[kv_cache_gid]
+        for qh in range(num_heads):
+            sk = sparse_qh_unit_key(layer_name, qh)
+            decode_override = self._sparse_decode_num_blocks_np(
+                kv_cache_gid, sk, num_reqs, num_reqs_padded
+            )
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    per_head_lens[qh, req_idx] = int(seq_lens_np[req_idx])
+                    continue
+                if len(req_state.output_token_ids) == 0:
+                    per_head_lens[qh, req_idx] = int(seq_lens_np[req_idx])
+                    continue
+                old_seq_len = int(seq_lens_np[req_idx])
+                num_blocks = int(blk_table.num_blocks_per_row[req_idx])
+                ob = int(decode_override[req_idx])
+                if ob >= 0:
+                    num_blocks = ob
+                sparse_cap = num_blocks * block_size
+                per_head_lens[qh, req_idx] = min(old_seq_len, sparse_cap)
+        seq_t = torch.tensor(per_head_lens, dtype=torch.int32, device=device)
+        return stacked, seq_t
 
     def _override_sparse_seq_lens(
         self,

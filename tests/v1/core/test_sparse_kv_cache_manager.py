@@ -27,7 +27,8 @@ import torch
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.sparse_kv_cache_manager import (
-    SPARSE_LEGACY_FLAT_LAYER,
+    SPARSE_LEGACY_FLAT_KV_KEY,
+    SPARSE_LEGACY_FLAT_QH_KEY,
     SparseKVManager,
     _kmeans_dot,
     _segment_kmeans,
@@ -103,8 +104,8 @@ def _register_new_request(mgr: SparseKVManager, req_id: str) -> None:
 
 
 def _flat(mgr: SparseKVManager, req_id: str):
-    """Legacy single-matrix indexing uses synthetic layer ``__flat__``."""
-    return mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_LAYER]
+    """Legacy single-matrix indexing normalizes to ``__flat__##kv0``."""
+    return mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_KV_KEY]
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +559,7 @@ class TestUpdateQueryVector:
         mgr.update_query_vector("req0", q)
         pq = mgr.get_pending_query("req0")
         assert pq is not None
-        np.testing.assert_array_equal(pq[SPARSE_LEGACY_FLAT_LAYER], q)
+        np.testing.assert_array_equal(pq[SPARSE_LEGACY_FLAT_QH_KEY], q)
 
     def test_triggers_prefill_topk_after_indexing(self):
         mgr = make_manager()

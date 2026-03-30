@@ -128,11 +128,11 @@ class CachedRequestData:
     # Optional sparse debug payload: req_id -> retrieve-zone logical block
     # indices (steady zone excluded) that truly participate in sparse retrieval.
     sparse_retrieve_block_indices: dict[str, list[int]] | None = None
-    # Per-attention-layer sparse selection (logical block indices) for decode.
+    # Per-query-head sparse selection (logical block indices); keys ``layer##qh{j}``.
     sparse_selected_block_indices_by_layer: dict[str, dict[str, list[int]]] | None = (
         None
     )
-    # Token-sparse: per-layer global token indices for compact KV gather.
+    # Token-sparse: per-query-head global token indices for compact KV gather.
     sparse_selected_token_indices_by_layer: dict[str, dict[str, list[int]]] | None = (
         None
     )

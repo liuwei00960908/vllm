@@ -259,21 +259,21 @@ class ModelRunnerOutput:
     # All arrays are CPU numpy to minimise serialisation cost.            #
     # ------------------------------------------------------------------ #
 
-    # req_id -> layer_name -> np.ndarray[num_blocks, feature_dim]
+    # req_id -> (layer##kv{i}) -> np.ndarray[num_blocks, feature_dim]
     # Emitted after prefill completes; used by SparseKVManager.indexing().
-    # feature_dim is typically head_dim or a projection thereof.
+    # Plain layer names are normalized to ``layer##kv0``.
     sparse_block_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
-    # req_id -> layer_name -> np.ndarray[feature_dim]
-    # The projected query vector of the last computed token per layer.
+    # req_id -> (layer##qh{j}) -> np.ndarray[feature_dim]
+    # Query vector of the last computed token per query head.
     # • For prefill completions: query of the last prompt token (seeds the
     #   first decode-step select()).
     # • For decode steps: query of the newly generated token (used for the
     #   *next* decode step's select()).
     sparse_query_vectors: "dict[str, dict[str, np.ndarray]] | None" = None
 
-    # req_id -> layer_name -> np.ndarray[feature_dim]
-    # Mean K feature of the block written during this decode step (per layer).
+    # req_id -> (layer##kv{i}) -> np.ndarray[feature_dim]
+    # K feature of the last written slot during this decode step (per KV head).
     # Used by SparseKVManager.rebalance() to update cluster structure.
     sparse_new_block_features: "dict[str, dict[str, np.ndarray]] | None" = None
 

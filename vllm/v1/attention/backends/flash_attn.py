@@ -238,6 +238,13 @@ class FlashAttentionMetadata:
     sparse_gather_phys: torch.Tensor | None = None
     sparse_gather_slots: torch.Tensor | None = None
     sparse_gather_cu_seqlens_k: torch.Tensor | None = None
+    # Per query-head compact gather: len == num_heads, each (phys, slots, cu_k).
+    sparse_q_head_gather: (
+        tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...] | None
+    ) = None
+    # Per query-head block-table sparse decode: [H, num_seqs, max_blocks], [H, num_seqs].
+    sparse_per_head_block_table: torch.Tensor | None = None
+    sparse_per_head_seq_lens: torch.Tensor | None = None
 
 
 def _get_sliding_window_configs(
@@ -745,15 +752,52 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
-                use_gather = (
-                    attn_metadata.sparse_gather_phys is not None
-                    and attn_metadata.sparse_gather_cu_seqlens_k is not None
+                use_q_head_gather = (
+                    attn_metadata.sparse_q_head_gather is not None
                     and self.alibi_slopes is None
                     and self.sinks is None
                     and sliding_window_size == [-1, -1]
                     and not self.kv_cache_dtype.startswith("fp8")
                 )
-                if use_gather:
+                use_gather = (
+                    attn_metadata.sparse_gather_phys is not None
+                    and attn_metadata.sparse_gather_cu_seqlens_k is not None
+                    and attn_metadata.sparse_q_head_gather is None
+                    and self.alibi_slopes is None
+                    and self.sinks is None
+                    and sliding_window_size == [-1, -1]
+                    and not self.kv_cache_dtype.startswith("fp8")
+                )
+                use_per_head_bt = attn_metadata.sparse_per_head_block_table is not None
+                if use_q_head_gather:
+                    self._forward_per_head_compact_kv_gather(
+                        query[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        output[:num_actual_tokens],
+                        attn_metadata,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        q_descale,
+                        k_descale,
+                        v_descale,
+                    )
+                elif use_per_head_bt:
+                    self._forward_per_head_block_table_sparse(
+                        query[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        output[:num_actual_tokens],
+                        attn_metadata,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        scheduler_metadata,
+                        q_descale,
+                        k_descale,
+                        v_descale,
+                    )
+                elif use_gather:
                     self._forward_compact_kv_gather(
                         query[:num_actual_tokens],
                         key_cache,
@@ -875,6 +919,115 @@ class FlashAttentionImpl(AttentionImpl):
             num_splits=0,
             s_aux=None,
         )
+
+    def _forward_per_head_compact_kv_gather(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        q_descale: torch.Tensor,
+        k_descale: torch.Tensor,
+        v_descale: torch.Tensor,
+    ) -> None:
+        """One compact-KV varlen FA call per query head (token-sparse)."""
+        assert attn_metadata.sparse_q_head_gather is not None
+        win = (
+            list(self.sliding_window)
+            if self.sliding_window is not None
+            else [-1, -1]
+        )
+        for qh, trip in enumerate(attn_metadata.sparse_q_head_gather):
+            phys, slots, cu_k = trip
+            phys64 = phys.to(dtype=torch.int64, device=key_cache.device)
+            slots64 = slots.to(dtype=torch.int64, device=key_cache.device)
+            kv_h = qh // max(self.num_queries_per_kv, 1)
+            k_slice = key_cache[phys64, slots64, kv_h]
+            v_slice = value_cache[phys64, slots64, kv_h]
+            k_compact = k_slice.unsqueeze(1)
+            v_compact = v_slice.unsqueeze(1)
+            k_lens = cu_k[1:] - cu_k[:-1]
+            max_seqlen_k = int(k_lens.max().item())
+            flash_attn_varlen_func(
+                q=query[:, qh : qh + 1, :],
+                k=k_compact,
+                v=v_compact,
+                out=output[:, qh : qh + 1, :],
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_k=cu_k,
+                seqused_k=None,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=None,
+                window_size=win,
+                block_table=None,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=None,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale[:, kv_h : kv_h + 1],
+                k_descale=k_descale[:, kv_h : kv_h + 1],
+                v_descale=v_descale[:, kv_h : kv_h + 1],
+                num_splits=0,
+                s_aux=None,
+            )
+
+    def _forward_per_head_block_table_sparse(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        scheduler_metadata: torch.Tensor | None,
+        q_descale: torch.Tensor,
+        k_descale: torch.Tensor,
+        v_descale: torch.Tensor,
+    ) -> None:
+        """Paged KV with a different block table / seq_len per query head."""
+        assert attn_metadata.sparse_per_head_block_table is not None
+        assert attn_metadata.sparse_per_head_seq_lens is not None
+        H = int(attn_metadata.sparse_per_head_block_table.shape[0])
+        win = (
+            list(self.sliding_window)
+            if self.sliding_window is not None
+            else [-1, -1]
+        )
+        for qh in range(H):
+            bt_h = attn_metadata.sparse_per_head_block_table[qh]
+            sl_h = attn_metadata.sparse_per_head_seq_lens[qh]
+            msk = int(sl_h.max().item()) if sl_h.numel() > 0 else max_seqlen_k
+            kv_h = qh // max(self.num_queries_per_kv, 1)
+            flash_attn_varlen_func(
+                q=query[:, qh : qh + 1, :],
+                k=key_cache,
+                v=value_cache,
+                out=output[:, qh : qh + 1, :],
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=sl_h,
+                max_seqlen_k=msk,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=win,
+                block_table=bt_h,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale[:, kv_h : kv_h + 1],
+                k_descale=k_descale[:, kv_h : kv_h + 1],
+                v_descale=v_descale[:, kv_h : kv_h + 1],
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=self.sinks,
+            )
 
     def do_kv_cache_update(
         self,
