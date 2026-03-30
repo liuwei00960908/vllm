@@ -581,6 +581,7 @@ def _build_mock_runner(
 
     runner = SimpleNamespace(
         _has_sparse_attn=True,
+        _sparse_probe_info_enabled=False,
         kv_cache_config=kv_cache_config,
         input_batch=input_batch,
         seq_lens=seq_lens_buf,
