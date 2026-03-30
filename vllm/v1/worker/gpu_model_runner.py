@@ -6957,7 +6957,7 @@ class GPUModelRunner(
                 token_sparse = isinstance(
                     spec, SparseAttentionSpec
                 ) and spec.cluster_granularity == "token"
-                block_size = int(blk_table.block_size)
+                block_size = int(block_table.block_size)
 
                 for layer_name in grp.layer_names:
                     attn_mod = (
