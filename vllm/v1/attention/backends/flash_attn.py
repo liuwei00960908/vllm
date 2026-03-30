@@ -234,6 +234,11 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    # Optional compact KV gather (token-sparse decode): paged cache indices.
+    sparse_gather_phys: torch.Tensor | None = None
+    sparse_gather_slots: torch.Tensor | None = None
+    sparse_gather_cu_seqlens_k: torch.Tensor | None = None
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -740,29 +745,51 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
-                flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=sliding_window_size,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
+                use_gather = (
+                    attn_metadata.sparse_gather_phys is not None
+                    and attn_metadata.sparse_gather_cu_seqlens_k is not None
+                    and self.alibi_slopes is None
+                    and self.sinks is None
+                    and sliding_window_size == [-1, -1]
+                    and not self.kv_cache_dtype.startswith("fp8")
                 )
+                if use_gather:
+                    self._forward_compact_kv_gather(
+                        query[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        output[:num_actual_tokens],
+                        attn_metadata,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        q_descale,
+                        k_descale,
+                        v_descale,
+                    )
+                else:
+                    flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
                 return output
 
         # Cascade attention (rare case).
@@ -793,6 +820,61 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         return output
+
+    def _forward_compact_kv_gather(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        q_descale: torch.Tensor,
+        k_descale: torch.Tensor,
+        v_descale: torch.Tensor,
+    ) -> None:
+        """Gather selected K/V pages into a contiguous tensor and run varlen FA."""
+        phys = attn_metadata.sparse_gather_phys.to(
+            dtype=torch.int64, device=key_cache.device
+        )
+        slots = attn_metadata.sparse_gather_slots.to(
+            dtype=torch.int64, device=key_cache.device
+        )
+        cu_k = attn_metadata.sparse_gather_cu_seqlens_k
+        k_compact = key_cache[phys, slots]
+        v_compact = value_cache[phys, slots]
+        k_lens = cu_k[1:] - cu_k[:-1]
+        max_seqlen_k = int(k_lens.max().item())
+        win = (
+            list(self.sliding_window)
+            if self.sliding_window is not None
+            else [-1, -1]
+        )
+        flash_attn_varlen_func(
+            q=query,
+            k=k_compact,
+            v=v_compact,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_k=cu_k,
+            seqused_k=None,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=None,
+            window_size=win,
+            block_table=None,
+            softcap=self.logits_soft_cap,
+            scheduler_metadata=None,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=0,
+            s_aux=None,
+        )
 
     def do_kv_cache_update(
         self,

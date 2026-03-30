@@ -444,6 +444,14 @@ class SparseAttentionSpec(FullAttentionSpec):
     ``update_threshold_blocks`` in block mode).
     """
 
+    use_compact_kv_gather: bool = True
+    """
+    When ``cluster_granularity == "token"`` and this is True, decode attention
+    gathers only selected keys/values into a contiguous tensor and runs
+    FlashAttention varlen without a block table.  When False, the legacy
+    sparse block-table path is used.
+    """
+
     @property
     def n_sink_blocks(self) -> int:
         """Leading blocks permanently in the steady zone (attention sinks)."""
@@ -502,6 +510,7 @@ class SparseAttentionSpec(FullAttentionSpec):
             cluster_granularity=specs[0].cluster_granularity,
             max_selected_tokens=specs[0].max_selected_tokens,
             update_threshold_tokens=specs[0].update_threshold_tokens,
+            use_compact_kv_gather=specs[0].use_compact_kv_gather,
         )
 
     def max_memory_usage_bytes(self, vllm_config: "VllmConfig") -> int:
@@ -608,6 +617,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 and spec.cluster_granularity == one_spec.cluster_granularity
                 and spec.max_selected_tokens == one_spec.max_selected_tokens
                 and spec.update_threshold_tokens == one_spec.update_threshold_tokens
+                and spec.use_compact_kv_gather == one_spec.use_compact_kv_gather
                 for spec in kv_cache_specs.values()
             )
         if isinstance(one_spec, FullAttentionSpec):

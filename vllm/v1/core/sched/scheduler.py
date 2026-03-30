@@ -1045,6 +1045,8 @@ class Scheduler(SchedulerInterface):
         sparse_selected_block_indices: dict[str, list[int]] = {}
         sparse_retrieve_block_indices: dict[str, list[int]] = {}
         sparse_selected_block_indices_by_layer: dict[str, dict[str, list[int]]] = {}
+        sparse_selected_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
+        sparse_chrono_phys_block_ids: dict[str, list[int]] = {}
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1087,6 +1089,16 @@ class Scheduler(SchedulerInterface):
             )
             if by_layer is not None:
                 sparse_selected_block_indices_by_layer[req_id] = by_layer
+            tok_by_layer = (
+                self.kv_cache_manager.get_sparse_selected_token_indices_by_layer(
+                    req_id
+                )
+            )
+            if tok_by_layer is not None:
+                sparse_selected_token_indices_by_layer[req_id] = tok_by_layer
+            chrono = self.kv_cache_manager.get_sparse_chrono_phys_block_ids(req_id)
+            if chrono is not None:
+                sparse_chrono_phys_block_ids[req_id] = chrono
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1104,6 +1116,12 @@ class Scheduler(SchedulerInterface):
             sparse_retrieve_block_indices=sparse_retrieve_block_indices or None,
             sparse_selected_block_indices_by_layer=(
                 sparse_selected_block_indices_by_layer or None
+            ),
+            sparse_selected_token_indices_by_layer=(
+                sparse_selected_token_indices_by_layer or None
+            ),
+            sparse_chrono_phys_block_ids=(
+                sparse_chrono_phys_block_ids or None
             ),
         )
 

@@ -121,6 +121,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
@@ -129,6 +130,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -518,6 +520,8 @@ class GPUModelRunner(
         self._sparse_merged_logical: dict[str, list[int]] = {}
         # Per-layer logical selections for building layer-specific sparse block tables.
         self._sparse_by_layer_logical: dict[str, dict[str, list[int]]] = {}
+        self._sparse_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
+        self._sparse_chrono_phys: dict[str, list[int]] = {}
         self._sparse_debug_decode_tokens_max: int = int(
             os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX", "256")
         )
@@ -1219,6 +1223,10 @@ class GPUModelRunner(
         sparse_by_layer_map = (
             req_data.sparse_selected_block_indices_by_layer or {}
         )
+        sparse_tok_by_layer_map = (
+            req_data.sparse_selected_token_indices_by_layer or {}
+        )
+        sparse_chrono_phys_map = req_data.sparse_chrono_phys_block_ids or {}
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
         # Save scheduler-allocated spec lengths before trimming so
@@ -1359,6 +1367,18 @@ class GPUModelRunner(
                         else:
                             self._sparse_merged_logical.pop(req_id, None)
                             self._sparse_by_layer_logical.pop(req_id, None)
+                        stl = sparse_tok_by_layer_map.get(req_id)
+                        if stl is not None:
+                            self._sparse_token_indices_by_layer[req_id] = {
+                                k: list(v) for k, v in stl.items()
+                            }
+                        else:
+                            self._sparse_token_indices_by_layer.pop(req_id, None)
+                        chrono = sparse_chrono_phys_map.get(req_id)
+                        if chrono is not None:
+                            self._sparse_chrono_phys[req_id] = list(chrono)
+                        else:
+                            self._sparse_chrono_phys.pop(req_id, None)
                     else:
                         # Standard: append new blocks to existing IDs.
                         for block_ids, new_ids in zip(
@@ -2210,6 +2230,25 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table and not skip_block_table_cache:
                     cached_attn_metadata[cache_key] = attn_metadata_i
+
+            if (
+                not for_cudagraph_capture
+                and layer_names_override is not None
+                and len(layer_names_override) == 1
+                and isinstance(kv_cache_spec, SparseAttentionSpec)
+                and kv_cache_spec.cluster_granularity == "token"
+                and kv_cache_spec.use_compact_kv_gather
+                and isinstance(attn_metadata_i, FlashAttentionMetadata)
+            ):
+                attn_metadata_i = self._maybe_patch_sparse_compact_kv_metadata(
+                    attn_metadata_i,
+                    kv_cache_gid=kv_cache_gid,
+                    layer_name=layer_names_override[0],
+                    num_reqs=num_reqs,
+                    common_attn_metadata=common_attn_metadata,
+                    spec=kv_cache_spec,
+                    for_cudagraph_capture=for_cudagraph_capture,
+                )
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -6820,6 +6859,71 @@ class GPUModelRunner(
                     _make_hook(layer_name)
                 )
                 self._sparse_q_hooks.append(handle)
+
+    def _maybe_patch_sparse_compact_kv_metadata(
+        self,
+        attn_metadata_i: FlashAttentionMetadata,
+        *,
+        kv_cache_gid: int,
+        layer_name: str,
+        num_reqs: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        spec: SparseAttentionSpec,
+        for_cudagraph_capture: bool,
+    ) -> FlashAttentionMetadata:
+        """Attach paged-cache gather indices for token-sparse compact KV attention."""
+        del kv_cache_gid
+        if for_cudagraph_capture or self.dcp_world_size > 1:
+            return attn_metadata_i
+
+        phys: list[int] = []
+        slot_list: list[int] = []
+        cu_k: list[int] = [0]
+
+        for ri in range(num_reqs):
+            rid = self.input_batch.req_ids[ri]
+            if len(self.requests[rid].output_token_ids) == 0:
+                return attn_metadata_i
+            seq_len = int(common_attn_metadata._seq_lens_cpu[ri].item())
+            if seq_len <= 0:
+                return attn_metadata_i
+            g_cur = seq_len - 1
+            p_count = int(self.input_batch.num_prompt_tokens[ri])
+            bsz = spec.block_size
+            chrono = self._sparse_chrono_phys.get(rid, [])
+            toks = self._sparse_token_indices_by_layer.get(rid, {}).get(layer_name)
+            if toks is None or len(chrono) == 0:
+                return attn_metadata_i
+            sel = sorted(set(toks) | {g_cur})
+            sel = [g for g in sel if 0 <= g < seq_len]
+            for g in sel:
+                lb = SparseKVManager._global_token_to_logical_block(
+                    g, p_count, bsz
+                )
+                if lb < 0 or lb >= len(chrono):
+                    return attn_metadata_i
+                g0 = SparseKVManager._logical_block_first_global(lb, p_count, bsz)
+                sl = g - g0
+                if sl < 0 or sl >= bsz:
+                    return attn_metadata_i
+                phys.append(int(chrono[lb]))
+                slot_list.append(int(sl))
+            cu_k.append(cu_k[-1] + len(sel))
+
+        if not phys:
+            return attn_metadata_i
+
+        dev = attn_metadata_i.block_table.device
+        return replace(
+            attn_metadata_i,
+            sparse_gather_phys=torch.tensor(phys, dtype=torch.int32, device=dev),
+            sparse_gather_slots=torch.tensor(
+                slot_list, dtype=torch.int32, device=dev
+            ),
+            sparse_gather_cu_seqlens_k=torch.tensor(
+                cu_k, dtype=torch.int32, device=dev
+            ),
+        )
 
     def _collect_sparse_features(
         self,

@@ -634,3 +634,29 @@ class KVCacheManager:
         if not by_layer:
             return None
         return {k: list(v) for k, v in by_layer.items()}
+
+    def get_sparse_selected_token_indices_by_layer(
+        self, request_id: str
+    ) -> dict[str, list[int]] | None:
+        """Per-layer global token indices for compact KV gather (token sparse mode)."""
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return None
+        by_layer = mgr._selected_token_indices_by_layer.get(request_id)
+        if not by_layer:
+            return None
+        return {k: list(v) for k, v in by_layer.items()}
+
+    def get_sparse_chrono_phys_block_ids(self, request_id: str) -> list[int] | None:
+        """Chronological physical KV block ids for gather addressing."""
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return None
+        phys = mgr.get_chrono_phys_block_ids(request_id)
+        return phys if phys else None
+
+    def get_sparse_prefill_token_count(self, request_id: str) -> int | None:
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return None
+        return mgr._prefill_token_count.get(request_id)

@@ -565,6 +565,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 update_threshold_tokens=int(
                     sparse_cfg.get("update_threshold_tokens", 1024)
                 ),
+                use_compact_kv_gather=bool(
+                    sparse_cfg.get("use_compact_kv_gather", True)
+                ),
             )
 
         if self.sliding_window is not None:

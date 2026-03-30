@@ -177,6 +177,10 @@ class CacheConfig:
       ``cluster_granularity`` is ``"token"``.
     * ``update_threshold_tokens`` (int, default 1024) – buffered decode-token
       features before a dynamic K-Means refresh in token mode.
+    * ``use_compact_kv_gather`` (bool, default True) – in token mode with
+      FlashAttention, gather selected KV into a compact tensor and run varlen
+      attention instead of paged block-table reads (disabled for fp8 KV,
+      ALiBi, sink, sliding window, or CUDA graph capture).
 
     Example::
 

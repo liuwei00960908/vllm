@@ -309,6 +309,9 @@ class SparseKVManager(FullAttentionManager):
         self._prefill_topk_ready: dict[str, bool] = {}
         self._prefill_selected: dict[str, list[int]] = {}
         self._prefill_selected_by_layer: dict[str, dict[str, list[int]]] = {}
+        # Token-granularity selection (global token indices), per layer.
+        self._selected_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
+        self._prefill_selected_tokens_by_layer: dict[str, dict[str, list[int]]] = {}
 
         self._current_step: int = 0
 
@@ -563,6 +566,8 @@ class SparseKVManager(FullAttentionManager):
         self._prefill_topk_ready.pop(request_id, None)
         self._prefill_selected.pop(request_id, None)
         self._prefill_selected_by_layer.pop(request_id, None)
+        self._prefill_selected_tokens_by_layer.pop(request_id, None)
+        self._selected_token_indices_by_layer.pop(request_id, None)
         self._step_trace.pop(request_id, None)
         self._prefill_token_count.pop(request_id, None)
 
@@ -655,6 +660,17 @@ class SparseKVManager(FullAttentionManager):
         d = global_tok - prefill_tokens
         n_pb = cdiv(prefill_tokens, block_size)
         return n_pb + (d // block_size)
+
+    @staticmethod
+    def _logical_block_first_global(
+        logical_block: int, prefill_tokens: int, block_size: int
+    ) -> int:
+        """Smallest global token index stored in chronological logical block ``logical_block``."""
+        n_pb = cdiv(prefill_tokens, block_size)
+        if logical_block < n_pb:
+            return logical_block * block_size
+        d_block = logical_block - n_pb
+        return prefill_tokens + d_block * block_size
 
     def _tokens_to_history_logical_blocks(
         self, request_id: str, token_indices: Iterable[int]
@@ -784,12 +800,12 @@ class SparseKVManager(FullAttentionManager):
         st: _SparseLayerIndexState,
         q: np.ndarray,
         budget: int,
-    ) -> tuple[list[int], list[int]]:
+    ) -> tuple[list[int], list[int], list[int]]:
         """
-        Token-granularity Top-K; returns **logical block** ids (history only).
+        Token-granularity Top-K.
 
         Returns:
-            (sorted selected blocks, sorted retrieve-only blocks).
+            (selected logical blocks, retrieve-only blocks, sorted global token ids).
         """
         if len(st.cluster_centres) == 0 or not st.block_to_cluster:
             fallback = set(range(max(0, total_tokens - budget), total_tokens))
@@ -799,7 +815,7 @@ class SparseKVManager(FullAttentionManager):
             retr_bl = self._tokens_to_history_logical_blocks(
                 request_id, set(sel_t) - steady_tokens
             )
-            return sel_bl, retr_bl
+            return sel_bl, retr_bl, sel_t
 
         retr, unit_scores = self._retrieve_zone_one_layer(st, q)
         combined_t = steady_tokens | retr
@@ -815,27 +831,29 @@ class SparseKVManager(FullAttentionManager):
         retr_t = sorted(retr - steady_tokens)
         sel_bl = self._tokens_to_history_logical_blocks(request_id, sel_t)
         retr_bl = self._tokens_to_history_logical_blocks(request_id, retr_t)
-        return sel_bl, retr_bl
+        return sel_bl, retr_bl, sel_t
 
     def _per_layer_fresh_topk(
         self,
         request_id: str,
         query_by_layer: dict[str, np.ndarray],
         budget: int,
-    ) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    ) -> tuple[
+        dict[str, list[int]], dict[str, list[int]], dict[str, list[int]] | None
+    ]:
         """
         Independent TopK + budget per attention layer.
 
         Returns:
-            (selected_by_layer, retrieve_only_by_layer) as **logical blocks**.
+            (selected blocks, retrieve blocks, selected tokens per layer or None).
         """
         n_units = self._num_index_units(request_id)
         if n_units == 0:
-            return {}, {}
+            return {}, {}, None
 
         layers = self._layer_states.get(request_id, {})
         if not layers:
-            return {}, {}
+            return {}, {}, None
 
         if self._token_mode():
             head = min(self._spec.static_pattern_start, n_units)
@@ -849,20 +867,27 @@ class SparseKVManager(FullAttentionManager):
                 retr_t = sorted(set(sel_t) - steady_tokens)
                 sel_bl = self._tokens_to_history_logical_blocks(request_id, sel_t)
                 retr_bl = self._tokens_to_history_logical_blocks(request_id, retr_t)
-                return {ln: sel_bl for ln in layers}, {ln: retr_bl for ln in layers}
+                tok = {ln: list(sel_t) for ln in layers}
+                return (
+                    {ln: sel_bl for ln in layers},
+                    {ln: retr_bl for ln in layers},
+                    tok,
+                )
 
             selected_by_layer: dict[str, list[int]] = {}
             retrieve_by_layer: dict[str, list[int]] = {}
+            tokens_by_layer: dict[str, list[int]] = {}
             for layer_name, st in layers.items():
                 q = query_by_layer.get(layer_name)
                 if q is None:
                     continue
-                sel_bl, retr_bl = self._select_one_layer_topk_tokens(
+                sel_bl, retr_bl, sel_t = self._select_one_layer_topk_tokens(
                     request_id, n_units, steady_tokens, st, q, budget
                 )
                 selected_by_layer[layer_name] = sel_bl
                 retrieve_by_layer[layer_name] = retr_bl
-            return selected_by_layer, retrieve_by_layer
+                tokens_by_layer[layer_name] = sel_t
+            return selected_by_layer, retrieve_by_layer, tokens_by_layer
 
         n_sink = self._spec.n_sink_blocks
         n_recent = self._spec.n_recent_blocks
@@ -874,7 +899,7 @@ class SparseKVManager(FullAttentionManager):
             fallback = set(range(max(0, n_units - budget), n_units))
             sel = sorted(fallback | steady_set)[:budget]
             retr = sorted(set(sel) - steady_set)
-            return {ln: list(sel) for ln in layers}, {ln: list(retr) for ln in layers}
+            return {ln: list(sel) for ln in layers}, {ln: list(retr) for ln in layers}, None
 
         selected_by_layer = {}
         retrieve_by_layer = {}
@@ -887,7 +912,44 @@ class SparseKVManager(FullAttentionManager):
             )
             selected_by_layer[layer_name] = sel
             retrieve_by_layer[layer_name] = retr
-        return selected_by_layer, retrieve_by_layer
+        return selected_by_layer, retrieve_by_layer, None
+
+    def _apply_steady_and_cap_tokens_per_layer(
+        self,
+        request_id: str,
+        cached_tokens: dict[str, list[int]],
+        token_cap: int,
+    ) -> dict[str, list[int]]:
+        """Re-merge steady tokens and trim; returns per-layer sorted global token ids."""
+        n_units = self._num_index_units(request_id)
+        head = min(self._spec.static_pattern_start, n_units)
+        steady_tokens = set(range(head))
+        steady_tokens.update(
+            range(max(0, n_units - self._spec.static_pattern_end), n_units)
+        )
+
+        out: dict[str, list[int]] = {}
+        for layer_name, cached in cached_tokens.items():
+            combined = set(cached) | steady_tokens
+            if len(combined) <= token_cap:
+                sel_t = sorted(combined)
+            else:
+                non_steady = sorted(combined - steady_tokens)
+                bud = max(0, token_cap - len(steady_tokens))
+                sel_t = sorted(steady_tokens | set(non_steady[:bud]))
+            out[layer_name] = sel_t
+        return out
+
+    def get_chrono_phys_block_ids(self, request_id: str) -> list[int]:
+        """Chronological physical KV block ids (prefill + finalized decode + active decode)."""
+        out: list[int] = []
+        for b in self._prefill_blocks.get(request_id, []):
+            if not b.is_null:
+                out.append(int(b.block_id))
+        dec = self._decode_block.get(request_id)
+        if dec is not None and not dec.is_null:
+            out.append(int(dec.block_id))
+        return out
 
     def _apply_steady_and_cap_per_layer(
         self,
@@ -993,6 +1055,7 @@ class SparseKVManager(FullAttentionManager):
             self._prefill_token_count.pop(request_id, None)
 
         self._prefill_topk_ready.pop(request_id, None)
+        self._prefill_selected_tokens_by_layer.pop(request_id, None)
         self._debug_log_state(
             request_id,
             "indexing_done",
@@ -1030,10 +1093,38 @@ class SparseKVManager(FullAttentionManager):
         used_prefill_cache = False
         if self._prefill_topk_ready.get(request_id, False):
             cached_bl = self._prefill_selected_by_layer.get(request_id, {})
+            cached_tok = self._prefill_selected_tokens_by_layer.get(request_id, {})
             if cached_bl:
-                sel_bl, retr_bl = self._apply_steady_and_cap_per_layer(
-                    request_id, cached_bl, block_cap
-                )
+                if self._token_mode() and cached_tok:
+                    sel_tok = self._apply_steady_and_cap_tokens_per_layer(
+                        request_id,
+                        cached_tok,
+                        self._spec.sparse_selection_budget(),
+                    )
+                    sel_bl = {
+                        ln: self._tokens_to_history_logical_blocks(request_id, tlist)
+                        for ln, tlist in sel_tok.items()
+                    }
+                    head = min(self._spec.static_pattern_start, n_units)
+                    steady_tok = set(range(head))
+                    steady_tok.update(
+                        range(
+                            max(0, n_units - self._spec.static_pattern_end),
+                            n_units,
+                        )
+                    )
+                    retr_bl = {
+                        ln: self._tokens_to_history_logical_blocks(
+                            request_id, sorted(set(sel_tok[ln]) - steady_tok)
+                        )
+                        for ln in sel_tok
+                    }
+                    self._selected_token_indices_by_layer[request_id] = sel_tok
+                else:
+                    sel_bl, retr_bl = self._apply_steady_and_cap_per_layer(
+                        request_id, cached_bl, block_cap
+                    )
+                    self._selected_token_indices_by_layer.pop(request_id, None)
                 result = self._union_sorted_block_indices(sel_bl)
                 self._selected_block_indices_by_layer[request_id] = sel_bl
                 self._selected_retrieve_block_indices_by_layer[request_id] = retr_bl
@@ -1055,9 +1146,13 @@ class SparseKVManager(FullAttentionManager):
                 return result
 
         q_by_layer = self._coerce_query_by_layer(request_id, query_vector)
-        sel_bl, retr_bl = self._per_layer_fresh_topk(
+        sel_bl, retr_bl, tok_bl = self._per_layer_fresh_topk(
             request_id, q_by_layer, num_blocks
         )
+        if tok_bl is not None:
+            self._selected_token_indices_by_layer[request_id] = tok_bl
+        else:
+            self._selected_token_indices_by_layer.pop(request_id, None)
         result = self._union_sorted_block_indices(sel_bl)
         self._selected_block_indices_by_layer[request_id] = sel_bl
         self._selected_retrieve_block_indices_by_layer[request_id] = retr_bl
@@ -1209,8 +1304,12 @@ class SparseKVManager(FullAttentionManager):
         query_by_layer: dict[str, np.ndarray],
     ) -> None:
         cap = self._spec.sparse_selection_budget()
-        sel_bl, _ = self._per_layer_fresh_topk(request_id, query_by_layer, cap)
+        sel_bl, _, tok_bl = self._per_layer_fresh_topk(request_id, query_by_layer, cap)
         self._prefill_selected_by_layer[request_id] = sel_bl
+        if tok_bl is not None:
+            self._prefill_selected_tokens_by_layer[request_id] = tok_bl
+        else:
+            self._prefill_selected_tokens_by_layer.pop(request_id, None)
         union_sel = self._union_sorted_block_indices(sel_bl)
         self._prefill_selected[request_id] = union_sel
         self._prefill_topk_ready[request_id] = True
@@ -1280,6 +1379,7 @@ class SparseKVManager(FullAttentionManager):
         self._prefill_topk_ready[request_id] = False
         self._prefill_selected.pop(request_id, None)
         self._prefill_selected_by_layer.pop(request_id, None)
+        self._prefill_selected_tokens_by_layer.pop(request_id, None)
         self._debug_log_state(
             request_id,
             "dynamic_update_done",
