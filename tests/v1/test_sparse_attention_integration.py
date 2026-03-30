@@ -1183,3 +1183,86 @@ class TestFullPrefillDecodeCycle:
 
         # Must be equal (cache hit, no dynamic update yet).
         assert sel1 == sel2, "Cached selection must be stable across decode steps"
+
+    def test_real_collect_to_scheduler_long_path(self):
+        """
+        Use real _collect_sparse_features outputs to drive Scheduler sparse hooks:
+          1) mid-chunk prefill: no sparse fields emitted
+          2) prefill done: indexing + query update
+          3) decode x threshold: rebalance + query update
+        and verify dynamic update invalidates prefill cache.
+        """
+        threshold = 3
+        spec = make_spec(
+            update_threshold_blocks=threshold,
+            num_clusters=8,
+            n_segment=4,
+            nprobe=4,
+            prefill_topk_query_window=4,
+            max_selected_blocks=16,
+        )
+        mgr = make_sparse_manager(spec)
+        kvcm = self._make_kvcm(mgr)
+        req_id = "req_real_path"
+        mgr.req_to_blocks[req_id] = []
+
+        n_blocks = 4
+        prompt_len = n_blocks * BLOCK_SIZE
+
+        # Step 1: chunked prefill mid-step -> _collect should emit nothing.
+        runner_mid, sched_mid = _build_mock_runner(
+            req_ids=[req_id],
+            num_prompt_tokens=[prompt_len],
+            seq_lens=[2 * BLOCK_SIZE],  # still mid-prefill
+            query_start_locs=[0, 2 * BLOCK_SIZE],
+            num_output_before=[0],
+            num_scheduled={req_id: 2 * BLOCK_SIZE},
+            blocks_per_req=[list(range(n_blocks))],
+            n_layers=1,
+        )
+        bf, qv, nbf = runner_mid._collect_sparse_features(sched_mid, 1)
+        assert bf is None and qv is None and nbf is None
+        self._simulate_step(kvcm, mgr, bf, qv, nbf)
+        assert req_id not in mgr._layer_states
+
+        # Step 2: prefill done -> indexing + prefill query cache built.
+        runner_prefill, sched_prefill = _build_mock_runner(
+            req_ids=[req_id],
+            num_prompt_tokens=[prompt_len],
+            seq_lens=[prompt_len],
+            query_start_locs=[0, prompt_len],
+            num_output_before=[0],
+            num_scheduled={req_id: prompt_len},
+            blocks_per_req=[list(range(n_blocks))],
+            n_layers=1,
+        )
+        bf, qv, nbf = runner_prefill._collect_sparse_features(sched_prefill, 1)
+        assert bf is not None and qv is not None and nbf is None
+        self._simulate_step(kvcm, mgr, bf, qv, nbf)
+        assert req_id in mgr._layer_states
+        assert mgr._prefill_topk_ready.get(req_id, False) is True
+        initial_cluster_count = len(
+            mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_LAYER].cluster_centres
+        )
+
+        # Decode steps: every step uses real collect output (qv + new block feat).
+        for i in range(threshold):
+            runner_dec, sched_dec = _build_mock_runner(
+                req_ids=[req_id],
+                num_prompt_tokens=[prompt_len],
+                seq_lens=[prompt_len + i + 1],
+                query_start_locs=[0, 1],  # one decode token this step
+                num_output_before=[i + 1],  # already in decode stage
+                num_scheduled={req_id: 1},
+                blocks_per_req=[list(range(n_blocks))],
+                n_layers=1,
+            )
+            bf, qv, nbf = runner_dec._collect_sparse_features(sched_dec, 1)
+            assert bf is None and qv is not None and nbf is not None
+            self._simulate_step(kvcm, mgr, bf, qv, nbf)
+
+        # Dynamic update path must invalidate prefill cache.
+        assert not mgr._prefill_topk_ready.get(req_id, False)
+        final_state = mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_LAYER]
+        assert len(final_state.cluster_centres) > initial_cluster_count
+        assert len(final_state.all_block_features) == n_blocks + threshold

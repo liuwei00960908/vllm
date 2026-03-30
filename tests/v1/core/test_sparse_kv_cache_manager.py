@@ -851,3 +851,75 @@ class TestIntegrationCycle:
         _register_new_request(mgr, "req_a")
         mgr.free("req_a")
         assert "req_b" in mgr._layer_states
+
+    def test_long_decode_path_with_block_rollover_and_dynamic_update(self):
+        """
+        Cover a longer sparse path without server startup:
+          indexing -> prefill TopK cache -> decode select/allocate ->
+          decode-block rollover -> dynamic cluster update -> fresh select.
+        """
+        req_id = "req_long"
+        threshold = 3
+        spec = make_spec(
+            num_clusters=8,
+            n_segment=4,
+            nprobe=4,
+            prefill_topk_query_window=4,
+            update_threshold_blocks=threshold,
+            max_selected_blocks=12,
+        )
+        mgr = make_manager(spec, num_gpu_blocks=512)
+
+        # 1) Prefill indexing (logical history for sparse clustering).
+        n_prefill_blocks = 24
+        mgr.indexing(req_id, random_features(n_prefill_blocks, seed=123))
+        q = np.random.default_rng(99).standard_normal(HEAD_DIM).astype(np.float32)
+        mgr.update_query_vector(req_id, q)
+        assert mgr._prefill_topk_ready.get(req_id, False) is True
+
+        # 2) Simulate prefill physical blocks so decode allocation path is active.
+        prefill_blocks = mgr.block_pool.get_new_blocks(n_prefill_blocks)
+        mgr.req_to_blocks[req_id] = list(prefill_blocks)
+        mgr.num_cached_block[req_id] = 0
+        initial_cluster_count = len(_flat(mgr, req_id).cluster_centres)
+        initial_history_len = len(_flat(mgr, req_id).all_block_features)
+
+        # Keep decode step-size deterministic for rollover checks.
+        mgr._last_num_tokens_main_model[req_id] = 0
+
+        # 3) Three decode steps:
+        #    - step1/2 fill one decode block to capacity
+        #    - step3 forces rollover (old decode block frozen to history)
+        steps_main_tokens = [8, 16, 24]
+        for i, ntok_main in enumerate(steps_main_tokens):
+            selected = mgr.select(req_id, q, num_blocks=spec.max_selected_blocks)
+            assert len(selected) <= spec.max_selected_blocks
+
+            new_req_blocks = mgr.allocate_new_blocks(
+                req_id,
+                num_tokens=1,
+                num_tokens_main_model=ntok_main,
+            )
+            assert len(new_req_blocks) == len(selected) + 1
+            assert mgr.req_to_blocks[req_id][-1] is not None  # active decode block
+
+            decode_feat = np.random.default_rng(100 + i).standard_normal(
+                HEAD_DIM).astype(np.float32)
+            mgr.rebalance(req_id, decode_feat)
+
+        # Rollover should append one finalized decode block into sparse history.
+        assert len(mgr._prefill_blocks[req_id]) == n_prefill_blocks + 1
+
+        # 4) Dynamic update should invalidate prefill cache at threshold.
+        assert not mgr._prefill_topk_ready.get(req_id, False)
+        assert len(_flat(mgr, req_id).cluster_centres) > initial_cluster_count
+        assert len(_flat(mgr, req_id).all_block_features) == initial_history_len + 3
+
+        # 5) Fresh select after invalidation still returns valid, sorted indices.
+        q_new = np.random.default_rng(202).standard_normal(HEAD_DIM).astype(
+            np.float32)
+        sel_after = mgr.select(req_id, q_new, num_blocks=spec.max_selected_blocks)
+        n_total = len(_flat(mgr, req_id).all_block_features)
+        assert sel_after == sorted(sel_after)
+        assert len(sel_after) <= spec.max_selected_blocks
+        assert all(0 <= b < n_total for b in sel_after)
