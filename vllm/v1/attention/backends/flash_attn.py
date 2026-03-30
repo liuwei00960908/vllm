@@ -1005,10 +1005,20 @@ class FlashAttentionImpl(AttentionImpl):
             sl_h = attn_metadata.sparse_per_head_seq_lens[qh]
             msk = int(sl_h.max().item()) if sl_h.numel() > 0 else max_seqlen_k
             kv_h = qh // max(self.num_queries_per_kv, 1)
+            # GQA: Q is sliced to one head; K/V must use the matching KV head only,
+            # otherwise FA requires num_q_heads % num_kv_heads == 0 (fails for 1 vs N).
+            k_h = key_cache[..., kv_h : kv_h + 1, :].contiguous()
+            v_h = value_cache[..., kv_h : kv_h + 1, :].contiguous()
+            alibi_h = self.alibi_slopes
+            if alibi_h is not None and alibi_h.ndim > 0:
+                alibi_h = alibi_h[qh : qh + 1]
+            sinks_h = self.sinks
+            if sinks_h is not None and sinks_h.ndim > 0:
+                sinks_h = sinks_h[qh : qh + 1]
             flash_attn_varlen_func(
                 q=query[:, qh : qh + 1, :],
-                k=key_cache,
-                v=value_cache,
+                k=k_h,
+                v=v_h,
                 out=output[:, qh : qh + 1, :],
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
@@ -1016,7 +1026,7 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k=msk,
                 softmax_scale=self.scale,
                 causal=attn_metadata.causal,
-                alibi_slopes=self.alibi_slopes,
+                alibi_slopes=alibi_h,
                 window_size=win,
                 block_table=bt_h,
                 softcap=self.logits_soft_cap,
@@ -1026,7 +1036,7 @@ class FlashAttentionImpl(AttentionImpl):
                 k_descale=k_descale[:, kv_h : kv_h + 1],
                 v_descale=v_descale[:, kv_h : kv_h + 1],
                 num_splits=attn_metadata.max_num_splits,
-                s_aux=self.sinks,
+                s_aux=sinks_h,
             )
 
     def do_kv_cache_update(
