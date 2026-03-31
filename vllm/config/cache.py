@@ -163,8 +163,12 @@ class CacheConfig:
     * ``nprobe`` (int, default 16) – retrieve-zone cluster count.
     * ``static_pattern_start`` (int, default 0) – attention-sink tokens.
     * ``static_pattern_end`` (int, default 0) – local-window tokens.
-    * ``prefill_topk_query_window`` (int, default 8) – query window for the
-      one-shot prefill cluster selection (0 = disabled).
+    * ``prefill_topk_query_window`` (int, default 8) – when
+      ``refresh_topk_each_decode`` is false, warms a one-shot prefill TopK
+      cache (0 = skip that warmup).
+    * ``refresh_topk_each_decode`` (bool, default True) – if true, every
+      decode step re-runs TopK with the latest query; steady-zone tokens
+      (``static_pattern_start`` / ``static_pattern_end``) stay included.
     * ``update_threshold_blocks`` (int, default 64) – decode blocks to buffer
       before refreshing the segment K-Means index.
     * ``max_selected_blocks`` (int, default 64) – hard cap on total selected

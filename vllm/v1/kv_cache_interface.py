@@ -332,10 +332,13 @@ class SparseAttentionSpec(FullAttentionSpec):
        features are clustered via Segment K-Means (``n_segment`` position
        segments, ``num_clusters`` centroids total).  Mean-centering is applied
        before clustering and restored afterwards.
-    2. **Prefill TopK** – using the last ``prefill_topk_query_window`` prompt
-       query vectors, compute cluster scores once and cache the selection for
-       the entire decode phase.
-    3. **Decode** – reuse the cached cluster selection (no per-token search).
+    2. **Prefill TopK (optional)** – when ``refresh_topk_each_decode`` is False
+       and ``prefill_topk_query_window`` > 0, the first post-indexing query
+       pass can cache per-layer TopK for decode reuse.
+    3. **Decode** – when ``refresh_topk_each_decode`` is True (default), each
+       step uses the **latest** query vector with the current cluster index to
+       re-run TopK (same path as prefill selection). When False, decode reuses
+       the prefill TopK cache until a dynamic index update invalidates it.
        Every ``update_threshold_blocks`` new decode blocks the index is
        refreshed with a fresh segment K-Means on the accumulated decode KV.
     4. **Steady Zone** – the first ``static_pattern_start`` tokens (attention
@@ -359,9 +362,18 @@ class SparseAttentionSpec(FullAttentionSpec):
         Number of trailing tokens kept as the local window (steady zone tail).
         Should be aligned to ``block_size`` for efficiency.
     prefill_topk_query_window:
-        Number of last-prompt query vectors to average when computing the
-        one-shot prefill cluster selection.  Set to 0 to disable prefill
-        caching (run per-token TopK at every decode step instead).
+        Reserved for future multi-query prefill averaging.  When
+        ``refresh_topk_each_decode`` is False and this is > 0, the manager
+        warms a one-shot prefill TopK cache on the first post-indexing query
+        update.  Set to 0 to skip that warmup (selection still runs each
+        ``select()`` when the cache is unused).
+    refresh_topk_each_decode:
+        If True (default), every scheduler ``select()`` after a query update
+        re-scores clusters with the current query (decode uses the same TopK
+        path as prefill).  Steady-zone tokens
+        (``static_pattern_start`` / ``static_pattern_end``) stay merged into the
+        selection.  If False, reuse prefill TopK cache across decode for less
+        CPU work.
     update_threshold_blocks:
         After this many new decode blocks accumulate, re-run segment K-Means
         on them and append new centroids to the index.
@@ -400,11 +412,17 @@ class SparseAttentionSpec(FullAttentionSpec):
     static_pattern_end: int = 0
     """Local window tokens always kept on GPU (trailing tokens)."""
 
-    # ── Prefill TopK caching ─────────────────────────────────────────────
+    # ── Prefill TopK caching (when refresh_topk_each_decode is False) ────
     prefill_topk_query_window: int = 8
     """
-    Average cluster scores from the last N prompt query vectors for the
-    one-shot prefill selection.  0 = disable, do per-token search instead.
+    When ``refresh_topk_each_decode`` is False and this is > 0, warm a
+    one-shot TopK cache on the first query update after indexing.
+    """
+
+    refresh_topk_each_decode: bool = True
+    """
+    Re-run cluster TopK with the latest query every decode step (default).
+    When False, reuse the prefill TopK cache until invalidation.
     """
 
     # ── Dynamic index update ─────────────────────────────────────────────
@@ -505,6 +523,7 @@ class SparseAttentionSpec(FullAttentionSpec):
             static_pattern_start=specs[0].static_pattern_start,
             static_pattern_end=specs[0].static_pattern_end,
             prefill_topk_query_window=specs[0].prefill_topk_query_window,
+            refresh_topk_each_decode=specs[0].refresh_topk_each_decode,
             update_threshold_blocks=specs[0].update_threshold_blocks,
             max_selected_blocks=specs[0].max_selected_blocks,
             cluster_granularity=specs[0].cluster_granularity,
@@ -613,6 +632,9 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 and spec.nprobe == one_spec.nprobe
                 and spec.static_pattern_start == one_spec.static_pattern_start
                 and spec.static_pattern_end == one_spec.static_pattern_end
+                and spec.prefill_topk_query_window == one_spec.prefill_topk_query_window
+                and spec.refresh_topk_each_decode
+                == one_spec.refresh_topk_each_decode
                 and spec.update_threshold_blocks == one_spec.update_threshold_blocks
                 and spec.cluster_granularity == one_spec.cluster_granularity
                 and spec.max_selected_tokens == one_spec.max_selected_tokens

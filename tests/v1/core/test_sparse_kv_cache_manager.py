@@ -59,6 +59,7 @@ def make_spec(**kwargs) -> SparseAttentionSpec:
         static_pattern_start=0,
         static_pattern_end=0,
         prefill_topk_query_window=4,
+        refresh_topk_each_decode=False,
         update_threshold_blocks=8,
         max_selected_blocks=32,
     )
@@ -578,6 +579,43 @@ class TestSelect:
         # select should still return a valid result.
         result = mgr.select("req0", q, num_blocks=16)
         assert len(result) > 0
+
+    def test_refresh_topk_each_decode_skips_prefill_warmup(self):
+        """Default production path: no prefill TopK cache; selection is per-query."""
+        spec = make_spec(refresh_topk_each_decode=True)
+        mgr = make_manager(spec)
+        _do_indexing(mgr, "req0")
+        mgr.update_query_vector("req0", np.ones(HEAD_DIM, dtype=np.float32))
+        assert not mgr._prefill_topk_ready.get("req0", False)
+
+    def test_ignore_prefill_topk_cache_uses_passed_query(self):
+        """Forced fresh select must score with query_vector, not prefill cache."""
+        spec = make_spec(
+            refresh_topk_each_decode=False,
+            nprobe=2,
+            num_clusters=4,
+            n_segment=1,
+            max_selected_blocks=8,
+            static_pattern_start=0,
+            static_pattern_end=0,
+        )
+        mgr = make_manager(spec)
+        # Two clear clusters: early blocks align with +e0, late with -e0.
+        feat = np.zeros((24, HEAD_DIM), dtype=np.float32)
+        feat[:12, 0] = 1.0
+        feat[12:, 0] = -1.0
+        mgr.indexing("req0", feat)
+        q1 = np.zeros(HEAD_DIM, dtype=np.float32)
+        q1[0] = 1.0
+        q2 = np.zeros(HEAD_DIM, dtype=np.float32)
+        q2[0] = -1.0
+        mgr.update_query_vector("req0", q1)
+        assert mgr._prefill_topk_ready["req0"] is True
+        cached_sel = mgr.select("req0", q2, num_blocks=8)
+        fresh_sel = mgr.select(
+            "req0", q2, num_blocks=8, ignore_prefill_topk_cache=True
+        )
+        assert cached_sel != fresh_sel
 
 
 # ---------------------------------------------------------------------------

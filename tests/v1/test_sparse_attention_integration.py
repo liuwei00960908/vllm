@@ -79,6 +79,7 @@ def make_spec(**kw) -> SparseAttentionSpec:
         static_pattern_start=0,
         static_pattern_end=0,
         prefill_topk_query_window=4,
+        refresh_topk_each_decode=False,
         update_threshold_blocks=4,
         max_selected_blocks=32,
     )
@@ -439,6 +440,21 @@ class TestKVCacheManagerGetSparseManager:
         KVCacheManager.sparse_update_query_vectors(kvcm,
                                                    {"req0": rand_vec()})
         assert mgr._prefill_topk_ready.get("req0") is True
+
+    def test_update_query_vectors_refresh_topk_skips_prefill_ready(self):
+        """Default refresh_topk_each_decode: no prefill TopK cache after update."""
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+        mgr = make_sparse_manager(make_spec(refresh_topk_each_decode=True))
+        kvcm = MagicMock()
+        kvcm.get_sparse_manager.return_value = mgr
+        mgr.req_to_blocks["req0"] = []
+        mgr.indexing("req0", rand_feats(12))
+
+        KVCacheManager.sparse_update_query_vectors(
+            kvcm, {"req0": rand_vec()}
+        )
+        assert not mgr._prefill_topk_ready.get("req0", False)
 
     def test_post_decode_rebalance_grows_block_buffer(self):
         """rebalance() must append to _all_block_features."""

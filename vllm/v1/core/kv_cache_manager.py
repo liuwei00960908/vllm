@@ -583,7 +583,12 @@ class KVCacheManager:
             if req_id not in mgr.req_to_blocks:
                 continue
             mgr.update_query_vector(req_id, qv)
-            mgr.select(req_id, qv, mgr._spec.sparse_selection_budget())
+            mgr.select(
+                req_id,
+                qv,
+                mgr._spec.sparse_selection_budget(),
+                ignore_prefill_topk_cache=mgr._spec.refresh_topk_each_decode,
+            )
 
     def sparse_post_decode_rebalance(
         self,

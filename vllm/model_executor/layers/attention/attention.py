@@ -550,6 +550,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 prefill_topk_query_window=int(
                     sparse_cfg.get("prefill_topk_query_window", 8)
                 ),
+                refresh_topk_each_decode=bool(
+                    sparse_cfg.get("refresh_topk_each_decode", True)
+                ),
                 update_threshold_blocks=int(
                     sparse_cfg.get("update_threshold_blocks", 64)
                 ),

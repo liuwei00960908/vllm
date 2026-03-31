@@ -34,7 +34,12 @@ Prefill
      block table so each forward only attends within that layer's subset.
 
 Decode
-  - The cached per-layer selection from prefill is used directly → no per-token TopK.
+  - When ``SparseAttentionSpec.refresh_topk_each_decode`` is True (default),
+    each step's query vector re-runs TopK against the current cluster index
+    (same as prefill), always merging the steady zone
+    (``static_pattern_start`` / ``static_pattern_end``).
+  - When ``refresh_topk_each_decode`` is False, the cached prefill TopK
+    selection can be reused until a dynamic index update invalidates it.
   - ``rebalance(req_id, new_block_feature, new_block_value_feature)`` tracks
     newly written decode blocks.  After ``update_threshold_blocks`` new blocks
     accumulate, a fresh Segment K-Means is run on them and new centroids are
@@ -1258,19 +1263,27 @@ class SparseKVManager(FullAttentionManager):
         request_id: str,
         query_vector: np.ndarray | dict[str, np.ndarray],
         num_blocks: int,
+        *,
+        ignore_prefill_topk_cache: bool = False,
     ) -> list[int]:
         """
         Choose logical block indices for the next decode step.
 
         ``num_blocks`` is the per-layer selection budget: logical **blocks** in
         block mode, **tokens** when ``cluster_granularity == "token"``.
+
+        When ``ignore_prefill_topk_cache`` is True, any valid prefill TopK
+        cache is skipped and selection uses ``query_vector`` (decode path
+        aligned with prefill TopK).
         """
         n_units = self._num_index_units(request_id)
         steady_blocks = self._steady_block_set(request_id)
         block_cap = self._spec.max_blocks_for_sparse()
 
         used_prefill_cache = False
-        if self._prefill_topk_ready.get(request_id, False):
+        if self._prefill_topk_ready.get(request_id, False) and (
+            not ignore_prefill_topk_cache
+        ):
             cached_bl = self._prefill_selected_by_layer.get(request_id, {})
             cached_tok = self._prefill_selected_tokens_by_layer.get(request_id, {})
             if cached_bl:
@@ -1395,6 +1408,7 @@ class SparseKVManager(FullAttentionManager):
             request_id in self._layer_states
             and request_id not in self._prefill_topk_ready
             and self._spec.prefill_topk_query_window > 0
+            and not self._spec.refresh_topk_each_decode
         ):
             self._compute_prefill_topk(request_id, q_by_qh)
 
