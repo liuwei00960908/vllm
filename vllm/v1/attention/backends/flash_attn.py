@@ -1012,10 +1012,11 @@ class FlashAttentionImpl(AttentionImpl):
             # otherwise FA requires num_q_heads % num_kv_heads == 0 (fails for 1 vs N).
             kv_pair = kv_head_cache.get(kv_h)
             if kv_pair is None:
-                # Keep a strided view here to avoid per-head contiguous copies.
+                # Conservative path: keep contiguous K/V once per KV head, then
+                # reuse in all query heads mapped to this KV head.
                 kv_pair = (
-                    key_cache[..., kv_h : kv_h + 1, :],
-                    value_cache[..., kv_h : kv_h + 1, :],
+                    key_cache[..., kv_h : kv_h + 1, :].contiguous(),
+                    value_cache[..., kv_h : kv_h + 1, :].contiguous(),
                 )
                 kv_head_cache[kv_h] = kv_pair
             k_h, v_h = kv_pair
