@@ -130,6 +130,10 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sparse_kmeans_torch import (
+    prefill_cluster_meta_from_features_torch,
+    sparse_prefill_cluster_use_device_kmeans,
+)
 from vllm.v1.core.sparse_kv_cache_manager import (
     SparseKVManager,
     sparse_kv_unit_key,
@@ -4418,6 +4422,7 @@ class GPUModelRunner(
                 sparse_block_features,
                 sparse_query_vectors,
                 sparse_new_block_features,
+                sparse_prefill_cluster_meta,
             ) = self._collect_sparse_features(
                 scheduler_output, self.input_batch.num_reqs
             )
@@ -4440,6 +4445,7 @@ class GPUModelRunner(
                 sparse_block_features=sparse_block_features,
                 sparse_query_vectors=sparse_query_vectors,
                 sparse_new_block_features=sparse_new_block_features,
+                sparse_prefill_cluster_meta=sparse_prefill_cluster_meta,
             )
 
         if not self.use_async_scheduling:
@@ -7050,6 +7056,48 @@ class GPUModelRunner(
             sparse_q_head_gather=tuple(triples),
         )
 
+    def _sparse_store_prefill_block_features(
+        self,
+        req_id: str,
+        unit_key: str,
+        k_feat: torch.Tensor,
+        spec: SparseAttentionSpec,
+        sparse_block_features: dict[str, dict[str, np.ndarray]],
+        sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]],
+    ) -> None:
+        """Copy prefill K features to CPU and optionally run K-Means on device."""
+        if sparse_prefill_cluster_use_device_kmeans(k_feat):
+            raw = prefill_cluster_meta_from_features_torch(
+                k_feat,
+                num_clusters=spec.num_clusters,
+                n_segment=spec.n_segment,
+            )
+            sparse_prefill_cluster_meta.setdefault(req_id, {})[unit_key] = {
+                "cluster_centres": raw["cluster_centres"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False),
+                "block_to_cluster": raw["block_to_cluster"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.int32, copy=False),
+                "cluster_size": raw["cluster_size"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.int32, copy=False),
+                "mean_key": raw["mean_key"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False),
+            }
+        sparse_block_features.setdefault(req_id, {})[unit_key] = (
+            k_feat.detach().cpu().numpy().astype(np.float32, copy=False)
+        )
+
     def _collect_sparse_features(
         self,
         scheduler_output: "SchedulerOutput",
@@ -7058,6 +7106,7 @@ class GPUModelRunner(
         "dict[str, dict[str, np.ndarray]] | None",
         "dict[str, dict[str, np.ndarray]] | None",
         "dict[str, dict[str, np.ndarray]] | None",
+        "dict[str, dict[str, dict[str, np.ndarray]]] | None",
     ]:
         """Extract block-level K features and per-request Q vectors.
 
@@ -7085,9 +7134,11 @@ class GPUModelRunner(
         sparse_new_block_features
             ``req_id → layer##kv{i} → [head_size]`` CPU float32; decode steps –
             K vector of the last slot per KV head.
+        sparse_prefill_cluster_meta
+            Optional GPU-computed K-Means metadata per ``layer##kv{i}`` (CPU numpy).
         """
         if not self._has_sparse_attn:
-            return None, None, None
+            return None, None, None, None
 
         sparse_groups = [
             (gid, grp)
@@ -7095,7 +7146,7 @@ class GPUModelRunner(
             if isinstance(grp.kv_cache_spec, SparseAttentionSpec)
         ]
         if not sparse_groups:
-            return None, None, None
+            return None, None, None, None
 
         # Build req_id → num_output_tokens_before_this_step mapping.
         # New requests (scheduled_new_reqs) always have 0 output tokens.
@@ -7109,6 +7160,7 @@ class GPUModelRunner(
         sparse_block_features: dict[str, dict[str, np.ndarray]] = {}
         sparse_query_vectors: dict[str, dict[str, np.ndarray]] = {}
         sparse_new_block_features: dict[str, dict[str, np.ndarray]] = {}
+        sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]] = {}
 
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
@@ -7213,15 +7265,24 @@ class GPUModelRunner(
                                     :valid_len
                                 ].float()
                                 if num_kv == 1:
-                                    sparse_block_features.setdefault(req_id, {})[
-                                        sparse_kv_unit_key(layer_name, 0)
-                                    ] = k_flat.cpu().numpy()
+                                    self._sparse_store_prefill_block_features(
+                                        req_id,
+                                        sparse_kv_unit_key(layer_name, 0),
+                                        k_flat,
+                                        spec,
+                                        sparse_block_features,
+                                        sparse_prefill_cluster_meta,
+                                    )
                                 else:
-                                    k_flat_np = k_flat.cpu().numpy()
                                     for kv_h in range(num_kv):
-                                        sparse_block_features.setdefault(req_id, {})[
-                                            sparse_kv_unit_key(layer_name, kv_h)
-                                        ] = k_flat_np[:, kv_h, :]
+                                        self._sparse_store_prefill_block_features(
+                                            req_id,
+                                            sparse_kv_unit_key(layer_name, kv_h),
+                                            k_flat[:, kv_h, :],
+                                            spec,
+                                            sparse_block_features,
+                                            sparse_prefill_cluster_meta,
+                                        )
                         if is_decode:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
@@ -7242,15 +7303,24 @@ class GPUModelRunner(
                                     "KV cache layout: expected num_kv_heads==1 "
                                     "when block mean has rank 2"
                                 )
-                                sparse_block_features.setdefault(req_id, {})[
-                                    sparse_kv_unit_key(layer_name, 0)
-                                ] = k_blk.cpu().numpy()
+                                self._sparse_store_prefill_block_features(
+                                    req_id,
+                                    sparse_kv_unit_key(layer_name, 0),
+                                    k_blk,
+                                    spec,
+                                    sparse_block_features,
+                                    sparse_prefill_cluster_meta,
+                                )
                             else:
-                                k_blk_np = k_blk.cpu().numpy()
                                 for kv_h in range(num_kv):
-                                    sparse_block_features.setdefault(req_id, {})[
-                                        sparse_kv_unit_key(layer_name, kv_h)
-                                    ] = k_blk_np[:, kv_h, :]
+                                    self._sparse_store_prefill_block_features(
+                                        req_id,
+                                        sparse_kv_unit_key(layer_name, kv_h),
+                                        k_blk[:, kv_h, :],
+                                        spec,
+                                        sparse_block_features,
+                                        sparse_prefill_cluster_meta,
+                                    )
                         if is_decode:
                             if k_blk.dim() == 2:
                                 assert num_kv == 1
@@ -7278,6 +7348,7 @@ class GPUModelRunner(
             sparse_block_features or None,
             sparse_query_vectors or None,
             sparse_new_block_features or None,
+            sparse_prefill_cluster_meta or None,
         )
 
     def _sparse_layer_decode_phys_row(

@@ -1555,9 +1555,13 @@ class Scheduler(SchedulerInterface):
             )
         if model_runner_output.sparse_block_features:
             vfeat_map = model_runner_output.sparse_block_value_features or {}
+            meta_map = model_runner_output.sparse_prefill_cluster_meta or {}
             for req_id, feats in model_runner_output.sparse_block_features.items():
                 self.kv_cache_manager.sparse_notify_prefill_done(
-                    req_id, feats, vfeat_map.get(req_id)
+                    req_id,
+                    feats,
+                    vfeat_map.get(req_id),
+                    prefill_cluster_meta=meta_map.get(req_id),
                 )
         if model_runner_output.sparse_query_vectors:
             self.kv_cache_manager.sparse_update_query_vectors(

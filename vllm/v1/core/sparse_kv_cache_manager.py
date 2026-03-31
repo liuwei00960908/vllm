@@ -342,7 +342,8 @@ class SparseKVManager(FullAttentionManager):
         assert isinstance(kv_cache_spec, SparseAttentionSpec)
         self._spec: SparseAttentionSpec = kv_cache_spec
 
-        # ── per-request, per-attention-layer clustering (CPU numpy) ───────
+        # ── per-request, per-attention-layer clustering (CPU state; prefill
+        #    K-Means may run on GPU in the model runner) ───────────────────
         self._layer_states: dict[str, dict[str, _SparseLayerIndexState]] = {}
 
         # ── selection state ───────────────────────────────────────────────
@@ -1110,31 +1111,58 @@ class SparseKVManager(FullAttentionManager):
         layer_name: str,
         block_features: np.ndarray,
         block_value_features: np.ndarray | None,
+        precomputed: dict[str, np.ndarray] | None = None,
     ) -> int:
         num_blocks, d = block_features.shape
         feat = block_features.astype(np.float32)
-        mean_key = feat.mean(axis=0)
-        centered = feat - mean_key
-        k = min(self._spec.num_clusters, num_blocks)
-        centres, labels, sizes = _segment_kmeans(
-            centered,
-            n_clusters=k,
-            n_segments=min(self._spec.n_segment, num_blocks),
-        )
-        centres = centres + mean_key
-        n_k = len(centres)
+        if precomputed is not None:
+            centres = np.asarray(precomputed["cluster_centres"], dtype=np.float32)
+            labels_arr = np.asarray(precomputed["block_to_cluster"], dtype=np.int32)
+            sizes = np.asarray(precomputed["cluster_size"], dtype=np.int32)
+            mean_key = np.asarray(precomputed["mean_key"], dtype=np.float32)
+            if centres.ndim != 2 or centres.shape[1] != d:
+                raise ValueError(
+                    f"sparse indexing: bad cluster_centres shape for "
+                    f"{layer_name!r}: {centres.shape} vs D={d}"
+                )
+            if mean_key.shape != (d,):
+                raise ValueError(
+                    f"sparse indexing: bad mean_key shape for {layer_name!r}"
+                )
+            if labels_arr.shape != (num_blocks,):
+                raise ValueError(
+                    f"sparse indexing: block_to_cluster length mismatch for "
+                    f"{layer_name!r}: {labels_arr.shape[0]} vs num_blocks={num_blocks}"
+                )
+            n_k = centres.shape[0]
+            if sizes.shape != (n_k,):
+                raise ValueError(
+                    f"sparse indexing: cluster_size length mismatch for "
+                    f"{layer_name!r}: {sizes.shape[0]} vs K={n_k}"
+                )
+        else:
+            mean_key = feat.mean(axis=0)
+            centered = feat - mean_key
+            k = min(self._spec.num_clusters, num_blocks)
+            centres, labels_arr, sizes = _segment_kmeans(
+                centered,
+                n_clusters=k,
+                n_segments=min(self._spec.n_segment, num_blocks),
+            )
+            centres = centres + mean_key
+            n_k = len(centres)
         if block_value_features is not None:
             vfeat = block_value_features.astype(np.float32)
         else:
             vfeat = np.zeros_like(feat)
         value_sum = np.zeros((n_k, d), dtype=np.float32)
-        np.add.at(value_sum, labels, vfeat)
+        np.add.at(value_sum, labels_arr, vfeat)
 
         state = _SparseLayerIndexState(
             cluster_centres=centres,
             cluster_value_sum=value_sum,
             cluster_size=sizes,
-            block_to_cluster=labels.tolist(),
+            block_to_cluster=labels_arr.tolist(),
             all_block_features=[feat[i].copy() for i in range(num_blocks)],
             all_value_features=[vfeat[i].copy() for i in range(num_blocks)],
             mean_key=mean_key,
@@ -1147,6 +1175,8 @@ class SparseKVManager(FullAttentionManager):
         request_id: str,
         block_features: np.ndarray | dict[str, np.ndarray],
         block_value_features: np.ndarray | dict[str, np.ndarray] | None = None,
+        *,
+        prefill_cluster_meta: dict[str, dict[str, np.ndarray]] | None = None,
     ) -> None:
         """
         Build per-layer cluster indices from prefill features.
@@ -1154,6 +1184,10 @@ class SparseKVManager(FullAttentionManager):
         ``block_features`` may be a single matrix (legacy) or per-layer dict.
         Row count is ``num_blocks`` when ``cluster_granularity == "block"``, or
         ``num_prompt_tokens`` when ``cluster_granularity == "token"``.
+
+        If ``prefill_cluster_meta`` provides per-layer centroids and labels
+        (e.g. from GPU K-Means in the model runner), CPU K-Means is skipped
+        for those layers.
         """
         bf_map, bv_map = self._normalize_block_features_map(
             block_features, block_value_features
@@ -1175,8 +1209,13 @@ class SparseKVManager(FullAttentionManager):
         total_k = 0
         for layer_name, feat_arr in bf_map.items():
             v_layer = None if bv_map is None else bv_map.get(layer_name)
+            pmeta = (
+                None
+                if prefill_cluster_meta is None
+                else prefill_cluster_meta.get(layer_name)
+            )
             total_k += self._indexing_one_layer(
-                request_id, layer_name, feat_arr, v_layer
+                request_id, layer_name, feat_arr, v_layer, precomputed=pmeta
             )
 
         if self._token_mode():

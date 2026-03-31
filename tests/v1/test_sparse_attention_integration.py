@@ -129,11 +129,12 @@ class TestModelRunnerOutputSparseFields:
         )
 
     def test_sparse_fields_default_none(self):
-        """All four sparse fields must be None by default."""
+        """Sparse optional fields must be None by default."""
         out = self._empty_output()
         assert out.sparse_block_features is None
         assert out.sparse_query_vectors is None
         assert out.sparse_new_block_features is None
+        assert out.sparse_prefill_cluster_meta is None
         assert out.sparse_block_value_features is None
 
     def test_sparse_block_features_assignment(self):
@@ -231,7 +232,9 @@ class TestSchedulerSparseHooks:
         feats = rand_feats(4)
         with patch.object(mgr, "indexing") as mock_idx:
             KVCacheManager.sparse_notify_prefill_done(kvcm, "req0", feats)
-            mock_idx.assert_called_once_with("req0", feats, None)
+            mock_idx.assert_called_once_with(
+                "req0", feats, None, prefill_cluster_meta=None
+            )
 
     def test_prefill_done_with_value_features(self):
         from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -245,7 +248,9 @@ class TestSchedulerSparseHooks:
         with patch.object(mgr, "indexing") as mock_idx:
             KVCacheManager.sparse_notify_prefill_done(kvcm, "req0", feats,
                                                       vfeats)
-            mock_idx.assert_called_once_with("req0", feats, vfeats)
+            mock_idx.assert_called_once_with(
+                "req0", feats, vfeats, prefill_cluster_meta=None
+            )
 
     def test_update_query_vectors_calls_update_and_select(self):
         from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -316,9 +321,14 @@ class TestSchedulerSparseHooks:
                 KVCacheManager.sparse_post_decode_rebalance(
                     kvcm, out.sparse_new_block_features)
             if out.sparse_block_features:
+                meta_map = out.sparse_prefill_cluster_meta or {}
                 for req_id, feats in out.sparse_block_features.items():
                     KVCacheManager.sparse_notify_prefill_done(
-                        kvcm, req_id, feats)
+                        kvcm,
+                        req_id,
+                        feats,
+                        prefill_cluster_meta=meta_map.get(req_id),
+                    )
             if out.sparse_query_vectors:
                 KVCacheManager.sparse_update_query_vectors(
                     kvcm, out.sparse_query_vectors)
@@ -618,7 +628,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": 32},
         )
         runner._has_sparse_attn = False
-        bf, qv, nbf = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
         assert bf is None and qv is None and nbf is None
 
     # ── 4b: prefill completing ────────────────────────────────────────────────
@@ -635,7 +645,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": n_blocks * BLOCK_SIZE},
             blocks_per_req=[list(range(n_blocks))],
         )
-        bf, qv, nbf = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
 
         assert bf is not None, "block_features must be emitted at prefill done"
         assert "r0" in bf
@@ -676,7 +686,7 @@ class TestCollectSparseFeatures:
             kv_data=kv,
             n_layers=1,
         )
-        bf, _, _ = runner._collect_sparse_features(sched, 1)
+        bf, _, _, _ = runner._collect_sparse_features(sched, 1)
         assert bf is not None
         ln0 = runner.kv_cache_config.kv_cache_groups[0].layer_names[0]
         # block 0: all K = 1.0; block 1: all K = 2.0 (same for every KV head)
@@ -702,7 +712,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": chunk_len},
             blocks_per_req=[list(range(2))],
         )
-        bf, qv, nbf = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
         assert bf is None and qv is None and nbf is None
 
     # ── 4d: decode step ───────────────────────────────────────────────────────
@@ -719,7 +729,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": 1},
             blocks_per_req=[list(range(n_blocks))],
         )
-        bf, qv, nbf = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
 
         assert bf is None, "block_features should NOT be emitted during decode"
         assert qv is not None, "query_vectors must be emitted during decode"
@@ -750,7 +760,7 @@ class TestCollectSparseFeatures:
             kv_data=kv,
             n_layers=1,
         )
-        _, _, nbf = runner._collect_sparse_features(sched, 1)
+        _, _, nbf, _ = runner._collect_sparse_features(sched, 1)
         assert nbf is not None
         ln0 = runner.kv_cache_config.kv_cache_groups[0].layer_names[0]
         for kv_h in range(nh):
@@ -785,7 +795,7 @@ class TestCollectSparseFeatures:
                 (total_tokens, q_dim), float(i + 1)
             )
 
-        _, qv, _ = runner._collect_sparse_features(sched, 1)
+        _, qv, _, _ = runner._collect_sparse_features(sched, 1)
         assert qv is not None
         for i, ln in enumerate(
             runner.kv_cache_config.kv_cache_groups[0].layer_names
@@ -820,7 +830,7 @@ class TestCollectSparseFeatures:
             kv = torch.full((2, n_blocks, bs, nh, hs), float(i * 2 + 1))
             runner.compilation_config.static_forward_context[ln].kv_cache = [kv]
 
-        bf, _, _ = runner._collect_sparse_features(sched, 1)
+        bf, _, _, _ = runner._collect_sparse_features(sched, 1)
         assert bf is not None
         for i, ln in enumerate(
             runner.kv_cache_config.kv_cache_groups[0].layer_names
@@ -849,7 +859,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": n_blocks * BLOCK_SIZE, "r1": 1},
             blocks_per_req=[list(range(n_blocks)), list(range(n_blocks))],
         )
-        bf, qv, nbf = runner._collect_sparse_features(sched, 2)
+        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 2)
 
         assert bf is not None and "r0" in bf
         assert "r1" not in (bf or {})
@@ -872,7 +882,7 @@ class TestCollectSparseFeatures:
         )
         runner._sparse_q_captures.clear()  # simulate hook not firing
 
-        bf, qv, nbf = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
         # block_features can still be extracted from KV cache
         assert bf is not None and "r0" in bf
         # query_vectors should be absent (no Q captured)
@@ -901,6 +911,8 @@ class TestFullPrefillDecodeCycle:
         block_features: dict[str, np.ndarray] | None,
         query_vectors: dict[str, np.ndarray] | None,
         new_block_features: dict[str, np.ndarray] | None,
+        prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]]
+        | None = None,
     ) -> None:
         """
         Mirror what scheduler.update_from_output() does with the sparse hooks.
@@ -912,9 +924,14 @@ class TestFullPrefillDecodeCycle:
             KVCacheManager.sparse_post_decode_rebalance(
                 kv_mgr_mock, new_block_features)
         if block_features:
+            pcm = prefill_cluster_meta or {}
             for req_id, feats in block_features.items():
                 KVCacheManager.sparse_notify_prefill_done(
-                    kv_mgr_mock, req_id, feats)
+                    kv_mgr_mock,
+                    req_id,
+                    feats,
+                    prefill_cluster_meta=pcm.get(req_id),
+                )
         if query_vectors:
             KVCacheManager.sparse_update_query_vectors(
                 kv_mgr_mock, query_vectors)
@@ -1243,9 +1260,9 @@ class TestFullPrefillDecodeCycle:
             blocks_per_req=[list(range(n_blocks))],
             n_layers=1,
         )
-        bf, qv, nbf = runner_mid._collect_sparse_features(sched_mid, 1)
+        bf, qv, nbf, pcm = runner_mid._collect_sparse_features(sched_mid, 1)
         assert bf is None and qv is None and nbf is None
-        self._simulate_step(kvcm, mgr, bf, qv, nbf)
+        self._simulate_step(kvcm, mgr, bf, qv, nbf, pcm)
         assert req_id not in mgr._layer_states
 
         # Step 2: prefill done -> indexing + prefill query cache built.
@@ -1259,9 +1276,11 @@ class TestFullPrefillDecodeCycle:
             blocks_per_req=[list(range(n_blocks))],
             n_layers=1,
         )
-        bf, qv, nbf = runner_prefill._collect_sparse_features(sched_prefill, 1)
+        bf, qv, nbf, pcm = runner_prefill._collect_sparse_features(
+            sched_prefill, 1
+        )
         assert bf is not None and qv is not None and nbf is None
-        self._simulate_step(kvcm, mgr, bf, qv, nbf)
+        self._simulate_step(kvcm, mgr, bf, qv, nbf, pcm)
         assert req_id in mgr._layer_states
         assert mgr._prefill_topk_ready.get(req_id, False) is True
         initial_cluster_count = len(
@@ -1280,9 +1299,9 @@ class TestFullPrefillDecodeCycle:
                 blocks_per_req=[list(range(n_blocks))],
                 n_layers=1,
             )
-            bf, qv, nbf = runner_dec._collect_sparse_features(sched_dec, 1)
+            bf, qv, nbf, pcm = runner_dec._collect_sparse_features(sched_dec, 1)
             assert bf is None and qv is not None and nbf is not None
-            self._simulate_step(kvcm, mgr, bf, qv, nbf)
+            self._simulate_step(kvcm, mgr, bf, qv, nbf, pcm)
 
         # Dynamic update path must invalidate prefill cache.
         assert not mgr._prefill_topk_ready.get(req_id, False)

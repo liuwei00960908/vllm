@@ -284,6 +284,14 @@ class ModelRunnerOutput:
     # populate this field alongside sparse_new_block_features.
     sparse_new_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
+    # req_id -> (layer##kv{i}) -> K-Means metadata dict (CPU numpy), optional.
+    # When set, ``SparseKVManager.indexing()`` skips CPU numpy K-Means.
+    # Per-layer keys: ``cluster_centres``, ``block_to_cluster``, ``cluster_size``,
+    # ``mean_key``.
+    sparse_prefill_cluster_meta: (
+        "dict[str, dict[str, dict[str, np.ndarray]]] | None"
+    ) = None
+
     # req_id -> layer_name -> np.ndarray[num_blocks, feature_dim]
     # Mean V feature per block; emitted after prefill alongside
     # sparse_block_features.

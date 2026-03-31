@@ -413,6 +413,39 @@ class TestIndexing:
         assert st.decode_block_buffer == []
         assert st.decode_value_buffer == []
 
+    def test_prefill_cluster_meta_matches_internal_kmeans(self):
+        """GPU-runner-style precomputed meta should match CPU indexing."""
+        mgr = make_manager()
+        feat = random_features(32, seed=5)
+        req = "req_meta"
+        mean_key = feat.mean(axis=0)
+        centered = feat - mean_key
+        k = min(mgr._spec.num_clusters, feat.shape[0])
+        centres_c, labels, sizes = _segment_kmeans(
+            centered,
+            n_clusters=k,
+            n_segments=min(mgr._spec.n_segment, feat.shape[0]),
+        )
+        centres = (centres_c + mean_key).astype(np.float32)
+        meta = {
+            "cluster_centres": centres,
+            "block_to_cluster": labels.astype(np.int32),
+            "cluster_size": sizes.astype(np.int32),
+            "mean_key": mean_key.astype(np.float32),
+        }
+        mgr.indexing(
+            req,
+            feat,
+            prefill_cluster_meta={SPARSE_LEGACY_FLAT_KV_KEY: meta},
+        )
+        st_meta = _flat(mgr, req)
+        mgr2 = make_manager()
+        mgr2.indexing(req, feat)
+        st_ref = _flat(mgr2, req)
+        np.testing.assert_allclose(st_meta.cluster_centres, st_ref.cluster_centres)
+        assert st_meta.block_to_cluster == st_ref.block_to_cluster
+        np.testing.assert_array_equal(st_meta.cluster_size, st_ref.cluster_size)
+
 
 # ---------------------------------------------------------------------------
 # SparseKVManager.select()

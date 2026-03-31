@@ -532,23 +532,31 @@ class KVCacheManager:
     def sparse_notify_prefill_done(
         self,
         request_id: str,
-        block_features: np.ndarray,
-        block_value_features: np.ndarray | None = None,
+        block_features: np.ndarray | dict[str, np.ndarray],
+        block_value_features: np.ndarray | dict[str, np.ndarray] | None = None,
+        prefill_cluster_meta: dict[str, dict[str, np.ndarray]] | None = None,
     ) -> None:
         """
         Trigger ``SparseKVManager.indexing()`` after prefill completes.
 
         Args:
             request_id:           The request ID.
-            block_features:       ``[num_rows, D]`` float32 numpy – mean K per
-                                  block or per prompt token (see
+            block_features:       Per-layer dict or legacy ``[num_rows, D]`` –
+                                  mean K per block or per prompt token (see
                                   ``SparseAttentionSpec.cluster_granularity``).
-            block_value_features: Same leading dimension as ``block_features``
+            block_value_features: Same keys / leading dimension as features
                                   (optional; for Estimation Zone).
+            prefill_cluster_meta: Optional per-layer K-Means outputs (centroids,
+                                  labels, sizes, mean_key) to skip CPU clustering.
         """
         mgr = self.get_sparse_manager()
         if mgr is not None:
-            mgr.indexing(request_id, block_features, block_value_features)
+            mgr.indexing(
+                request_id,
+                block_features,
+                block_value_features,
+                prefill_cluster_meta=prefill_cluster_meta,
+            )
 
     def sparse_update_query_vectors(
         self,
