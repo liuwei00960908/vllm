@@ -1000,6 +1000,9 @@ class FlashAttentionImpl(AttentionImpl):
             if self.sliding_window is not None
             else [-1, -1]
         )
+        # Cache per-KV-head views to avoid repeated re-slicing/re-packing in the
+        # hot per-query-head loop.
+        kv_head_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for qh in range(H):
             bt_h = attn_metadata.sparse_per_head_block_table[qh]
             sl_h = attn_metadata.sparse_per_head_seq_lens[qh]
@@ -1007,8 +1010,15 @@ class FlashAttentionImpl(AttentionImpl):
             kv_h = qh // max(self.num_queries_per_kv, 1)
             # GQA: Q is sliced to one head; K/V must use the matching KV head only,
             # otherwise FA requires num_q_heads % num_kv_heads == 0 (fails for 1 vs N).
-            k_h = key_cache[..., kv_h : kv_h + 1, :].contiguous()
-            v_h = value_cache[..., kv_h : kv_h + 1, :].contiguous()
+            kv_pair = kv_head_cache.get(kv_h)
+            if kv_pair is None:
+                # Keep a strided view here to avoid per-head contiguous copies.
+                kv_pair = (
+                    key_cache[..., kv_h : kv_h + 1, :],
+                    value_cache[..., kv_h : kv_h + 1, :],
+                )
+                kv_head_cache[kv_h] = kv_pair
+            k_h, v_h = kv_pair
             alibi_h = self.alibi_slopes
             if alibi_h is not None and alibi_h.ndim > 0:
                 alibi_h = alibi_h[qh : qh + 1]
