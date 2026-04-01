@@ -1297,6 +1297,9 @@ class TestFullPrefillDecodeCycle:
             blocks_per_req=[list(range(n_blocks))],
             n_layers=1,
         )
+        layer0 = runner_prefill.kv_cache_config.kv_cache_groups[0].layer_names[0]
+        # Real collect path keys features as layer##kv{h}, not legacy __flat__##kv0.
+        sparse_rep_key = sparse_kv_unit_key(layer0, 0)
         bf, qv, nbf, pcm = runner_prefill._collect_sparse_features(
             sched_prefill, 1
         )
@@ -1305,7 +1308,7 @@ class TestFullPrefillDecodeCycle:
         assert req_id in mgr._layer_states
         assert mgr._prefill_topk_ready.get(req_id, False) is True
         initial_cluster_count = len(
-            mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_KV_KEY].cluster_centres
+            mgr._layer_states[req_id][sparse_rep_key].cluster_centres
         )
 
         # Decode steps: every step uses real collect output (qv + new block feat).
@@ -1326,6 +1329,6 @@ class TestFullPrefillDecodeCycle:
 
         # Dynamic update path must invalidate prefill cache.
         assert not mgr._prefill_topk_ready.get(req_id, False)
-        final_state = mgr._layer_states[req_id][SPARSE_LEGACY_FLAT_KV_KEY]
+        final_state = mgr._layer_states[req_id][sparse_rep_key]
         assert len(final_state.cluster_centres) > initial_cluster_count
         assert len(final_state.all_block_features) == n_blocks + threshold
