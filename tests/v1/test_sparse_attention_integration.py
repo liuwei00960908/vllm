@@ -621,8 +621,13 @@ def _build_mock_runner(
         device=torch.device("cpu"),
     )
 
-    # Bind the unbound method to the runner namespace so it can be called.
+    # Bind unbound methods so self is the mock runner (SimpleNamespace has no
+    # GPUModelRunner instance methods by default).
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner._sparse_store_prefill_block_features = (
+        GPUModelRunner._sparse_store_prefill_block_features.__get__(runner)
+    )
     runner._collect_sparse_features = (
         GPUModelRunner._collect_sparse_features.__get__(runner)
     )
