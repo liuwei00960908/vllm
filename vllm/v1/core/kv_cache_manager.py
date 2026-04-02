@@ -315,12 +315,6 @@ class KVCacheManager:
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
 
-        pre_alloc_group_lens: list[int] | None = None
-        if num_external_computed_tokens > 0:
-            pre_alloc_group_lens = [
-                len(group) for group in self.coordinator.get_blocks(request.request_id)
-            ]
-
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
         num_local_computed_tokens = (
@@ -355,25 +349,6 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
-        if num_external_computed_tokens > 0:
-            logger.error(
-                "KV allocate_slots debug(before_alloc): req_id=%s "
-                "num_external_computed_tokens=%d num_new_tokens=%d "
-                "num_new_computed_tokens=%d num_lookahead_tokens=%d "
-                "num_tokens_need_slot=%d num_tokens_main_model=%d "
-                "num_blocks_to_allocate=%d num_free_blocks=%d "
-                "pre_alloc_group_lens=%s",
-                request.request_id,
-                num_external_computed_tokens,
-                num_new_tokens,
-                num_new_computed_tokens,
-                num_lookahead_tokens,
-                num_tokens_need_slot,
-                num_tokens_main_model,
-                num_blocks_to_allocate,
-                self.block_pool.get_num_free_blocks(),
-                pre_alloc_group_lens,
-            )
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
@@ -398,18 +373,6 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
-        if num_external_computed_tokens > 0:
-            new_group_lens = [len(group) for group in new_blocks]
-            post_alloc_group_lens = [
-                len(group) for group in self.coordinator.get_blocks(request.request_id)
-            ]
-            logger.error(
-                "KV allocate_slots debug(after_alloc): req_id=%s "
-                "new_block_group_lens=%s post_alloc_group_lens=%s",
-                request.request_id,
-                new_group_lens,
-                post_alloc_group_lens,
-            )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

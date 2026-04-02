@@ -69,31 +69,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _summarize_block_ids_shape(block_ids: Any) -> str:
-    """Return a compact shape summary for block_ids debugging."""
-    if block_ids is None:
-        return "block_ids=None"
-    if not isinstance(block_ids, (list, tuple)):
-        return f"block_ids_type={type(block_ids).__name__}"
-    outer_len = len(block_ids)
-    if outer_len == 0:
-        return f"block_ids_type={type(block_ids).__name__},outer_len=0"
-    first_elem = block_ids[0]
-    nested = isinstance(first_elem, (list, tuple))
-    if not nested:
-        return (
-            f"block_ids_type={type(block_ids).__name__},outer_len={outer_len},"
-            "nested=False"
-        )
-    group_lens = [len(group) for group in block_ids]
-    sample_lens = group_lens[:8]
-    return (
-        f"block_ids_type={type(block_ids).__name__},outer_len={outer_len},"
-        f"nested=True,total_nested_blocks={sum(group_lens)},"
-        f"group_lens_sample={sample_lens},group_lens_count={len(group_lens)}"
-    )
-
-
 def _sort_unique_prompt_token_indices(indices: list[int]) -> list[int]:
     """Deduplicate and sort ascending (0-based positions in the prompt/sequence).
 
@@ -337,30 +312,6 @@ class RequestTracker:
             # sched/scheduler.py#L943),
             # only one KVCacheGroup is supported in connector for now.
             unfolded_block_ids = raw_block_ids[0].copy()
-
-        # Debug aid for sparse+LMCache load mismatch:
-        # if a request is expected to load many external tokens but only gets
-        # a tiny number of block ids, slot_mapping will be much shorter later.
-        if lmcache_cached_tokens > 0:
-            raw_outer_len = len(raw_block_ids)
-            raw_is_nested = bool(raw_block_ids) and isinstance(raw_block_ids[0], list)
-            first_group_len = len(raw_block_ids[0]) if raw_is_nested else raw_outer_len
-            logger.error(
-                "LMCache new_request debug: req_id=%s num_tokens_to_compute=%d "
-                "prompt_len=%d lmcache_cached_tokens=%d "
-                "raw_block_ids_shape=%s "
-                "raw_block_ids_outer_len=%d raw_block_ids_nested=%s "
-                "raw_first_group_len=%d unfolded_block_ids_len=%d",
-                new_request.req_id,
-                num_tokens_to_compute,
-                len(new_request.prompt_token_ids or []),
-                lmcache_cached_tokens,
-                _summarize_block_ids_shape(raw_block_ids),
-                raw_outer_len,
-                raw_is_nested,
-                first_group_len,
-                len(unfolded_block_ids),
-            )
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -1663,21 +1614,6 @@ class LMCacheConnectorV1Impl:
             if load_spec is not None:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
             request_priority = self._requests_priority.pop(request.req_id, 0)
-            if load_spec is not None and load_spec.can_load:
-                logger.error(
-                    "LMCache scheduled_new_reqs debug: req_id=%s "
-                    "scheduled_block_ids_shape=%s num_computed_tokens=%d "
-                    "num_scheduled_tokens=%d num_tokens_to_compute=%d "
-                    "load_spec(vllm_cached_tokens=%d lmcache_cached_tokens=%d can_load=%s)",
-                    request.req_id,
-                    _summarize_block_ids_shape(request.block_ids),
-                    request.num_computed_tokens,
-                    scheduler_output.num_scheduled_tokens[request.req_id],
-                    num_tokens_to_compute,
-                    load_spec.vllm_cached_tokens,
-                    load_spec.lmcache_cached_tokens,
-                    load_spec.can_load,
-                )
 
             skip_save = force_skip_save or (
                 self.config.priority_limit is not None
