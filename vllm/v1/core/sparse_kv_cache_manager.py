@@ -383,6 +383,8 @@ class SparseKVManager(FullAttentionManager):
 
         # Prompt token count at end of prefill (token-granularity indexing only).
         self._prefill_token_count: dict[str, int] = {}
+        # One-shot sparse probe per request to avoid log spam.
+        self._first_select_probe_done: set[str] = set()
 
         # ── physical block tracking (Bug 1 fix) ──────────────────────────
         # _prefill_blocks[req_id]: permanent list of all physical blocks
@@ -635,6 +637,7 @@ class SparseKVManager(FullAttentionManager):
         self._selected_token_indices_by_layer.pop(request_id, None)
         self._step_trace.pop(request_id, None)
         self._prefill_token_count.pop(request_id, None)
+        self._first_select_probe_done.discard(request_id)
 
     def _estimate_decode_tokens_this_step(
         self, request_id: str, num_tokens_main_model: int
@@ -1386,6 +1389,50 @@ class SparseKVManager(FullAttentionManager):
                 len(result),
                 len(sel_bl),
             )
+            if request_id not in self._first_select_probe_done:
+                self._first_select_probe_done.add(request_id)
+                if self._token_mode():
+                    tok_by_layer = self._selected_token_indices_by_layer.get(
+                        request_id, {}
+                    )
+                    n_units_i = int(n_units)
+                    tail_start = max(0, n_units_i - 256)
+                    layer_items = sorted(tok_by_layer.items())
+                    preview_layers = layer_items[:2]
+                    if preview_layers:
+                        layer_probe = "; ".join(
+                            (
+                                f"{ln}:sel={len(toks)} "
+                                f"tail256={sum(1 for t in toks if t >= tail_start)} "
+                                f"min={int(min(toks)) if toks else -1} "
+                                f"max={int(max(toks)) if toks else -1}"
+                            )
+                            for ln, toks in preview_layers
+                        )
+                    else:
+                        layer_probe = "no_token_selection"
+                    logger.info(
+                        "[SparseProbe:first_select] req_id=%s token_mode=1 "
+                        "n_units=%d query_heads=%d selected_heads=%d "
+                        "union_blocks=%d %s",
+                        request_id,
+                        n_units_i,
+                        len(q_by_qh),
+                        len(sel_bl),
+                        len(result),
+                        layer_probe,
+                    )
+                else:
+                    logger.info(
+                        "[SparseProbe:first_select] req_id=%s token_mode=0 "
+                        "n_units=%d query_heads=%d selected_heads=%d "
+                        "union_blocks=%d",
+                        request_id,
+                        int(n_units),
+                        len(q_by_qh),
+                        len(sel_bl),
+                        len(result),
+                    )
         return result
 
     def update_query_vector(
