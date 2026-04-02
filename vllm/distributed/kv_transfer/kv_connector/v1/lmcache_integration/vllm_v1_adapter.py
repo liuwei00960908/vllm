@@ -311,6 +311,29 @@ class RequestTracker:
             # only one KVCacheGroup is supported in connector for now.
             unfolded_block_ids = new_request.block_ids[0].copy()
 
+        # Debug aid for sparse+LMCache load mismatch:
+        # if a request is expected to load many external tokens but only gets
+        # a tiny number of block ids, slot_mapping will be much shorter later.
+        if lmcache_cached_tokens > 0:
+            raw_block_ids = new_request.block_ids
+            raw_outer_len = len(raw_block_ids)
+            raw_is_nested = isinstance(raw_block_ids[0], list)
+            first_group_len = len(raw_block_ids[0]) if raw_is_nested else raw_outer_len
+            logger.error(
+                "LMCache new_request debug: req_id=%s num_tokens_to_compute=%d "
+                "prompt_len=%d lmcache_cached_tokens=%d "
+                "raw_block_ids_outer_len=%d raw_block_ids_nested=%s "
+                "raw_first_group_len=%d unfolded_block_ids_len=%d",
+                new_request.req_id,
+                num_tokens_to_compute,
+                len(new_request.prompt_token_ids or []),
+                lmcache_cached_tokens,
+                raw_outer_len,
+                raw_is_nested,
+                first_group_len,
+                len(unfolded_block_ids),
+            )
+
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
 
@@ -1626,6 +1649,23 @@ class LMCacheConnectorV1Impl:
                 skip_save,
             )
             self._request_trackers[request.req_id] = request_tracker
+
+            if load_spec is not None and load_spec.can_load:
+                logger.error(
+                    "LMCache build_meta debug: req_id=%s num_computed_tokens=%d "
+                    "num_scheduled_tokens=%d num_tokens_to_compute=%d "
+                    "load_spec(vllm_cached_tokens=%d lmcache_cached_tokens=%d can_load=%s) "
+                    "tracker(token_ids_len=%d allocated_block_ids_len=%d)",
+                    request.req_id,
+                    request.num_computed_tokens,
+                    scheduler_output.num_scheduled_tokens[request.req_id],
+                    num_tokens_to_compute,
+                    load_spec.vllm_cached_tokens,
+                    load_spec.lmcache_cached_tokens,
+                    load_spec.can_load,
+                    len(request_tracker.token_ids),
+                    len(request_tracker.allocated_block_ids),
+                )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
