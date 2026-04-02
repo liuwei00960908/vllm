@@ -64,6 +64,14 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _summarize_grouped_block_ids(block_ids: tuple[list[int], ...]) -> str:
+    group_lens = [len(group) for group in block_ids]
+    return (
+        f"outer_len={len(block_ids)},total_blocks={sum(group_lens)},"
+        f"group_lens={group_lens[:8]}"
+    )
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -798,6 +806,19 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
+                if request.num_computed_tokens > 0:
+                    scheduled_block_ids = req_to_new_blocks[request_id].get_block_ids()
+                    logger.error(
+                        "Scheduler new_req debug: req_id=%s status=%s "
+                        "num_computed_tokens=%d num_new_tokens=%d "
+                        "num_external_computed_tokens=%d scheduled_block_ids_shape=%s",
+                        request_id,
+                        request.status.name,
+                        num_computed_tokens,
+                        num_new_tokens,
+                        num_external_computed_tokens,
+                        _summarize_grouped_block_ids(scheduled_block_ids),
+                    )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -867,6 +888,16 @@ class Scheduler(SchedulerInterface):
                 )
                 for req in scheduled_new_reqs
             ]
+        for req_data in new_reqs_data:
+            if req_data.num_computed_tokens > 0:
+                logger.error(
+                    "Scheduler NewRequestData debug: req_id=%s "
+                    "num_computed_tokens=%d prompt_len=%d block_ids_shape=%s",
+                    req_data.req_id,
+                    req_data.num_computed_tokens,
+                    len(req_data.prompt_token_ids or []),
+                    _summarize_grouped_block_ids(req_data.block_ids),
+                )
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
