@@ -485,14 +485,31 @@ class ReqMeta:
 
         if len(token_ids) > num_blocks * block_size:
             logger.error(
-                "The number of tokens is more than the number of blocks."
-                "Something might be wrong in scheduling logic!"
+                "LMCache v1 adapter length mismatch (tokens > blocks*block_size)."
+                " Scheduling logic likely inconsistent."
             )
+            load_debug = ""
+            if load_spec is not None:
+                load_debug = (
+                    f" load_spec(can_load={load_spec.can_load}, "
+                    f"lmcache_cached_tokens={load_spec.lmcache_cached_tokens}, "
+                    f"vllm_cached_tokens={load_spec.vllm_cached_tokens})"
+                )
             logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
+                "req_id=%s num_tokens=%d num_blocks=%d block_size=%d "
+                "expected_max_slots=%d input_token_len=%d num_saved_tokens=%d "
+                "is_last_prefill=%s is_decode_phase=%s skip_save=%s%s",
+                tracker.req_id,
                 len(token_ids),
                 num_blocks,
                 block_size,
+                num_blocks * block_size,
+                input_token_len,
+                tracker.num_saved_tokens,
+                is_last_prefill,
+                tracker.is_decode_phase,
+                tracker.skip_save,
+                load_debug,
             )
 
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
@@ -980,7 +997,51 @@ class LMCacheConnectorV1Impl:
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.cuda()
-            assert len(tokens) == len(slot_mapping)
+            if len(tokens) != len(slot_mapping):
+                # Print minimal but actionable info before fatal error.
+                add_kw = getattr(forward_context, "additional_kwargs", None) or {}
+                override_req = (
+                    "lmcache_per_head_token_indices_by_req_id" in add_kw
+                    and request.req_id in (add_kw.get("lmcache_per_head_token_indices_by_req_id") or {})
+                )
+                override_layer = (
+                    "lmcache_per_head_token_indices_by_layer_by_req_id" in add_kw
+                    and request.req_id
+                    in (add_kw.get("lmcache_per_head_token_indices_by_layer_by_req_id") or {})
+                )
+                head_rows_nonempty = (
+                    request.per_head_token_indices is not None
+                    and any(len(r) > 0 for r in request.per_head_token_indices)
+                )
+                head_by_layer_nonempty = (
+                    request.per_head_token_indices_by_layer is not None
+                    and any(
+                        any(len(r) > 0 for r in rows)
+                        for rows in request.per_head_token_indices_by_layer.values()
+                    )
+                )
+                load_spec = request.load_spec
+                logger.error(
+                    "LMCache v1 start_load_kv length mismatch: req_id=%s "
+                    "len(tokens)=%d len(slot_mapping)=%d "
+                    "load_spec(can_load=%s lmcache_cached_tokens=%d vllm_cached_tokens=%d) "
+                    "sparse_override(req_level=%s layer_level=%s) "
+                    "per_head_indices_nonempty=%s per_head_by_layer_nonempty=%s",
+                    request.req_id,
+                    len(tokens),
+                    len(slot_mapping),
+                    load_spec.can_load,
+                    load_spec.lmcache_cached_tokens,
+                    load_spec.vllm_cached_tokens,
+                    override_req,
+                    override_layer,
+                    head_rows_nonempty,
+                    head_by_layer_nonempty,
+                )
+                raise AssertionError(
+                    f"len(tokens)({len(tokens)}) != len(slot_mapping)({len(slot_mapping)}) "
+                    f"for req_id={request.req_id}"
+                )
 
             self._stats_monitor.update_interval_vllm_hit_tokens(
                 request.load_spec.vllm_cached_tokens
@@ -1626,7 +1687,7 @@ class LMCacheConnectorV1Impl:
         return meta
 
     @_lmcache_nvtx_annotate
-    def request_finished(
+def request_finished(
         self,
         request: "Request",
         block_ids: list[int],
