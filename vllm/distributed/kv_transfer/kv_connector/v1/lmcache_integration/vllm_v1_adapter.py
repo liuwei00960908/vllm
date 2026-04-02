@@ -997,6 +997,14 @@ class LMCacheConnectorV1Impl:
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.cuda()
+            print("### ADAPTER_FILE ###", __file__, flush=True)
+            print(
+                "### DEBUG_REACHED_START_LOAD_KV_MISMATCH_CHECK ###",
+                f"req_id={request.req_id}",
+                f"len(tokens)={len(tokens)}",
+                f"len(slot_mapping)={len(slot_mapping)}",
+                flush=True,
+            )
             if len(tokens) != len(slot_mapping):
                 # Print minimal but actionable info before fatal error.
                 add_kw = getattr(forward_context, "additional_kwargs", None) or {}
@@ -1039,8 +1047,9 @@ class LMCacheConnectorV1Impl:
                     head_by_layer_nonempty,
                 )
                 raise AssertionError(
+                    "### MISMATCH_ASSERT_REACHED ### "
                     f"len(tokens)({len(tokens)}) != len(slot_mapping)({len(slot_mapping)}) "
-                    f"for req_id={request.req_id}"
+                    f"for req_id={request.req_id} file={__file__}"
                 )
 
             self._stats_monitor.update_interval_vllm_hit_tokens(
