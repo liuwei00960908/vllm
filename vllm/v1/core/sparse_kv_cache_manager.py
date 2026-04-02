@@ -548,17 +548,22 @@ class SparseKVManager(FullAttentionManager):
         # New (prefill) request: sparse attention ignores prefix hits.
         req_blocks = self.req_to_blocks[request_id]
         assert len(req_blocks) == 0
-        self.num_cached_block[request_id] = 0
+        # Keep this request in prefill mode for allocate_new_blocks().
+        # If we set num_cached_block here, sparse manager will treat it as decode
+        # immediately and only allocate one active decode block, which is wrong
+        # for "new request + external computed tokens" load path.
+        #
+        # Transition to decode is handled later by cache_blocks(), after the
+        # prefill-stage allocation has created enough slots.
         if num_external_computed_tokens > 0:
             logger.error(
                 "SparseKV allocate_new_computed_blocks: req_id=%s "
                 "num_local_computed_tokens=%d num_external_computed_tokens=%d "
-                "new_computed_blocks=%d set_num_cached_block=%d",
+                "new_computed_blocks=%d keep_prefill_mode=True",
                 request_id,
                 num_local_computed_tokens,
                 num_external_computed_tokens,
                 len(new_computed_blocks),
-                self.num_cached_block[request_id],
             )
 
     def allocate_new_blocks(
