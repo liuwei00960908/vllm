@@ -477,13 +477,27 @@ class SparseKVManager(FullAttentionManager):
     ) -> int:
         if request_id not in self.num_cached_block:
             # Prefill: standard page-aligned calculation.
-            return super().get_num_blocks_to_allocate(
+            num_blocks = super().get_num_blocks_to_allocate(
                 request_id,
                 num_tokens,
                 new_computed_blocks,
                 total_computed_tokens,
                 num_tokens_main_model,
             )
+            if total_computed_tokens > 0:
+                logger.error(
+                    "SparseKV get_num_blocks_to_allocate(prefill): req_id=%s "
+                    "num_tokens=%d num_tokens_main_model=%d total_computed_tokens=%d "
+                    "existing_req_blocks=%d new_computed_blocks=%d result=%d",
+                    request_id,
+                    num_tokens,
+                    num_tokens_main_model,
+                    total_computed_tokens,
+                    len(self.req_to_blocks.get(request_id, [])),
+                    len(new_computed_blocks),
+                    num_blocks,
+                )
+            return num_blocks
         # Decode: allocate a new block only when there is no active decode
         # block, or when the active decode block does not have enough room.
         step_tokens = self._estimate_decode_tokens_this_step(
@@ -491,10 +505,34 @@ class SparseKVManager(FullAttentionManager):
         )
         cur_decode = self._decode_block.get(request_id)
         if cur_decode is None or cur_decode.is_null:
+            logger.error(
+                "SparseKV get_num_blocks_to_allocate(decode): req_id=%s "
+                "num_tokens=%d num_tokens_main_model=%d total_computed_tokens=%d "
+                "step_tokens=%d decode_block_state=none result=1",
+                request_id,
+                num_tokens,
+                num_tokens_main_model,
+                total_computed_tokens,
+                step_tokens,
+            )
             return 1
         fill = self._decode_block_fill.get(request_id, 0)
         remaining = max(0, self.block_size - fill)
-        return 1 if step_tokens > remaining else 0
+        result = 1 if step_tokens > remaining else 0
+        logger.error(
+            "SparseKV get_num_blocks_to_allocate(decode): req_id=%s "
+            "num_tokens=%d num_tokens_main_model=%d total_computed_tokens=%d "
+            "step_tokens=%d decode_fill=%d remaining=%d result=%d",
+            request_id,
+            num_tokens,
+            num_tokens_main_model,
+            total_computed_tokens,
+            step_tokens,
+            fill,
+            remaining,
+            result,
+        )
+        return result
 
     def allocate_new_computed_blocks(
         self,
@@ -511,6 +549,17 @@ class SparseKVManager(FullAttentionManager):
         req_blocks = self.req_to_blocks[request_id]
         assert len(req_blocks) == 0
         self.num_cached_block[request_id] = 0
+        if num_external_computed_tokens > 0:
+            logger.error(
+                "SparseKV allocate_new_computed_blocks: req_id=%s "
+                "num_local_computed_tokens=%d num_external_computed_tokens=%d "
+                "new_computed_blocks=%d set_num_cached_block=%d",
+                request_id,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+                len(new_computed_blocks),
+                self.num_cached_block[request_id],
+            )
 
     def allocate_new_blocks(
         self,
@@ -585,6 +634,18 @@ class SparseKVManager(FullAttentionManager):
 
         # Return the FULL new block list so the model runner can rebuild
         # the block table row via add_row (not just append the new block).
+        logger.error(
+            "SparseKV allocate_new_blocks(decode): req_id=%s "
+            "num_tokens=%d num_tokens_main_model=%d selected_logical=%d "
+            "physical_selected=%d decode_fill_after=%d return_blocks=%d",
+            request_id,
+            num_tokens,
+            num_tokens_main_model,
+            len(selected),
+            len(physical_selected),
+            self._decode_block_fill[request_id],
+            len(req_blocks),
+        )
         return list(req_blocks)
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
