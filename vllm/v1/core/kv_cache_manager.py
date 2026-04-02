@@ -651,7 +651,7 @@ class KVCacheManager:
     def get_sparse_selected_token_indices_by_layer(
         self, request_id: str
     ) -> dict[str, list[int]] | None:
-        """Per-layer global token indices for compact KV gather (token sparse mode)."""
+        """Global token indices per query-head key (``layer##qh{i}``, token sparse mode)."""
         mgr = self.get_sparse_manager()
         if mgr is None:
             return None
