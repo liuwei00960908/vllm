@@ -89,6 +89,31 @@ class DisaggSpec:
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 
 
+def _summarize_block_ids_shape(block_ids: Any) -> str:
+    """Return a compact shape summary for block_ids debugging."""
+    if block_ids is None:
+        return "block_ids=None"
+    if not isinstance(block_ids, (list, tuple)):
+        return f"block_ids_type={type(block_ids).__name__}"
+    outer_len = len(block_ids)
+    if outer_len == 0:
+        return f"block_ids_type={type(block_ids).__name__},outer_len=0"
+    first_elem = block_ids[0]
+    nested = isinstance(first_elem, (list, tuple))
+    if not nested:
+        return (
+            f"block_ids_type={type(block_ids).__name__},outer_len={outer_len},"
+            "nested=False"
+        )
+    group_lens = [len(group) for group in block_ids]
+    sample_lens = group_lens[:8]
+    return (
+        f"block_ids_type={type(block_ids).__name__},outer_len={outer_len},"
+        f"nested=True,total_nested_blocks={sum(group_lens)},"
+        f"group_lens_sample={sample_lens},group_lens_count={len(group_lens)}"
+    )
+
+
 def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
     request_configs = None
     if sampling_params and sampling_params.extra_args is not None:
@@ -164,10 +189,12 @@ class RequestTracker:
         # tuple[list[int]]
         # Need to check the type of request.block_ids
 
+        raw_block_ids = new_request.block_ids
         unfolded_block_ids = []
-
-        if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
+        if not raw_block_ids:
+            unfolded_block_ids = []
+        elif not isinstance(raw_block_ids[0], list):
+            unfolded_block_ids = raw_block_ids.copy()
         else:
             # According to the vLLM code
             # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
@@ -177,12 +204,11 @@ class RequestTracker:
             # TODO: Please support multiple KVCacheGroup in connector.
             # NOTE: Also, `update` method in RequestTracker should be
             # updated accordingly.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+            unfolded_block_ids = raw_block_ids[0].copy()
 
         if lmcache_cached_tokens > 0:
-            raw_block_ids = new_request.block_ids
             raw_outer_len = len(raw_block_ids)
-            raw_is_nested = isinstance(raw_block_ids[0], list)
+            raw_is_nested = bool(raw_block_ids) and isinstance(raw_block_ids[0], list)
             first_group_len = len(raw_block_ids[0]) if raw_is_nested else raw_outer_len
             print(
                 "### LMCache_NEW_REQUEST_DEBUG ###",
@@ -190,6 +216,7 @@ class RequestTracker:
                 f"num_tokens_to_compute={num_tokens_to_compute}",
                 f"prompt_len={len(new_request.prompt_token_ids)}",
                 f"lmcache_cached_tokens={lmcache_cached_tokens}",
+                f"raw_block_ids_shape={_summarize_block_ids_shape(raw_block_ids)}",
                 f"raw_block_ids_outer_len={raw_outer_len}",
                 f"raw_block_ids_nested={raw_is_nested}",
                 f"raw_first_group_len={first_group_len}",
@@ -1544,6 +1571,18 @@ class LMCacheConnectorV1Impl:
             if load_spec is not None:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
             request_priority = self._requests_priority.pop(request.req_id, 0)
+            if load_spec is not None and load_spec.can_load:
+                print(
+                    "### LMCache_SCHED_NEW_REQ_DEBUG ###",
+                    f"req_id={request.req_id}",
+                    f"scheduled_block_ids_shape={_summarize_block_ids_shape(request.block_ids)}",
+                    f"num_computed_tokens={request.num_computed_tokens}",
+                    f"num_scheduled_tokens={scheduler_output.num_scheduled_tokens[request.req_id]}",
+                    f"num_tokens_to_compute={num_tokens_to_compute}",
+                    f"load_spec_lmcache_cached_tokens={load_spec.lmcache_cached_tokens}",
+                    f"load_spec_vllm_cached_tokens={load_spec.vllm_cached_tokens}",
+                    flush=True,
+                )
 
             skip_save = force_skip_save or (
                 self.config.priority_limit is not None
