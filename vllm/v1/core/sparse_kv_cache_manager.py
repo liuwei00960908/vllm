@@ -1016,6 +1016,27 @@ class SparseKVManager(FullAttentionManager):
                     selected_by_qh[qk] = sel_bl
                     retrieve_by_qh[qk] = retr_bl
                     tokens_by_qh[qk] = sel_t
+            if self._sparse_probe_info_enabled and request_id not in self._first_select_probe_done:
+                qh_items = list(tokens_by_qh.items())
+                n_heads = len(qh_items)
+                if n_heads > 0:
+                    tail_start = max(0, n_units - 256)
+                    tail_cov_heads = sum(
+                        1 for _, toks in qh_items if any(t >= tail_start for t in toks)
+                    )
+                    tok_lens = [len(toks) for _, toks in qh_items]
+                    logger.info(
+                        "[SparseProbe:first_recall] req_id=%s token_mode=1 "
+                        "index_units=%d qh_selected=%d tail256_heads=%d "
+                        "tok_per_head(min/avg/max)=%d/%.1f/%d",
+                        request_id,
+                        int(n_units),
+                        n_heads,
+                        tail_cov_heads,
+                        int(min(tok_lens)),
+                        float(sum(tok_lens)) / float(max(1, n_heads)),
+                        int(max(tok_lens)),
+                    )
             return selected_by_qh, retrieve_by_qh, tokens_by_qh
 
         n_sink = self._spec.n_sink_blocks
