@@ -502,6 +502,25 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             request_id = request.request_id
+            selected_probe = self.kv_cache_manager.get_sparse_selected_block_indices(
+                request_id
+            )
+            retrieve_probe = self.kv_cache_manager.get_sparse_retrieve_block_indices(
+                request_id
+            )
+            new_block_lens_probe = [len(g) for g in new_blocks.get_block_ids()]
+            if (selected_probe is not None and len(selected_probe) > 0) or any(
+                new_block_lens_probe
+            ):
+                logger.info(
+                    "[SparseProbe] sched_alloc_source req_id=%s "
+                    "selected_logical_blocks=%d retrieve_logical_blocks=%d "
+                    "alloc_new_block_ids_lens=%s",
+                    request_id,
+                    0 if selected_probe is None else len(selected_probe),
+                    0 if retrieve_probe is None else len(retrieve_probe),
+                    new_block_lens_probe,
+                )
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
@@ -798,6 +817,30 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
+                selected_probe = self.kv_cache_manager.get_sparse_selected_block_indices(
+                    request_id
+                )
+                retrieve_probe = self.kv_cache_manager.get_sparse_retrieve_block_indices(
+                    request_id
+                )
+                rebuilt_probe = req_to_new_blocks[request_id].get_block_ids(
+                    allow_none=True
+                )
+                rebuilt_lens_probe = (
+                    [] if rebuilt_probe is None else [len(g) for g in rebuilt_probe]
+                )
+                if (selected_probe is not None and len(selected_probe) > 0) or any(
+                    rebuilt_lens_probe
+                ):
+                    logger.info(
+                        "[SparseProbe] sched_resume_source req_id=%s "
+                        "selected_logical_blocks=%d retrieve_logical_blocks=%d "
+                        "source_new_block_ids_lens=%s",
+                        request_id,
+                        0 if selected_probe is None else len(selected_probe),
+                        0 if retrieve_probe is None else len(retrieve_probe),
+                        rebuilt_lens_probe,
+                    )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
