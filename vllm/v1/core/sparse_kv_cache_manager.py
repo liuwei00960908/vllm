@@ -554,38 +554,30 @@ class SparseKVManager(FullAttentionManager):
             for i in selected
             if i < len(prefill_blocks)
         ]
-        if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
-            if selected:
-                max_sel = max(int(i) for i in selected)
-                min_sel = min(int(i) for i in selected)
-            else:
-                max_sel = -1
-                min_sel = -1
+        if self._sparse_probe_info_enabled:
+            idx_units = int(self._num_index_units(request_id))
             logger.info(
-                "[SparseProbe] select_to_physical_map req_id=%s "
-                "selected_count=%d selected_range=[%d,%d] "
-                "prefill_blocks=%d physical_selected=%d req_blocks_before=%d "
-                "num_index_units=%d token_mode=%s prefill_token_count=%s",
+                "[SparseProbe] alloc_map_state req_id=%s "
+                "selected=%d prefill_blocks=%d physical_selected=%d "
+                "req_blocks_before=%d index_units=%d decode_fill=%d",
                 request_id,
                 len(selected),
-                min_sel,
-                max_sel,
                 len(prefill_blocks),
                 len(physical_selected),
                 len(req_blocks),
-                int(self._num_index_units(request_id)),
-                self._token_mode(),
-                str(self._prefill_token_count.get(request_id)),
+                idx_units,
+                int(self._decode_block_fill.get(request_id, 0)),
             )
-            if selected and len(physical_selected) == 0:
+            if len(selected) > 0 and len(physical_selected) <= 1:
                 logger.warning(
-                    "[SparseProbe] select_to_physical_miss req_id=%s "
-                    "selected_count=%d selected_range=[%d,%d] prefill_blocks=%d",
+                    "[SparseProbe] alloc_map_skew req_id=%s "
+                    "selected=%d prefill_blocks=%d physical_selected=%d "
+                    "req_blocks_before=%d",
                     request_id,
                     len(selected),
-                    min_sel,
-                    max_sel,
                     len(prefill_blocks),
+                    len(physical_selected),
+                    len(req_blocks),
                 )
 
         step_tokens = self._estimate_decode_tokens_this_step(
@@ -602,6 +594,14 @@ class SparseKVManager(FullAttentionManager):
             cur_decode = new_decode
             fill = 0
             allocated_new_decode = True
+            if self._sparse_probe_info_enabled:
+                logger.info(
+                    "[SparseProbe] alloc_decode_switch req_id=%s reason=new_or_null "
+                    "new_decode_block_id=%d prefill_blocks=%d",
+                    request_id,
+                    int(cur_decode.block_id),
+                    len(self._prefill_blocks.get(request_id, [])),
+                )
         elif fill + step_tokens > self.block_size:
             # Current decode block is full for this step; freeze it into
             # sparse-selectable history and start a fresh decode block.
@@ -612,12 +612,20 @@ class SparseKVManager(FullAttentionManager):
             cur_decode = new_decode
             fill = 0
             allocated_new_decode = True
+            if self._sparse_probe_info_enabled:
+                logger.info(
+                    "[SparseProbe] alloc_decode_switch req_id=%s reason=rollover "
+                    "new_decode_block_id=%d prefill_blocks=%d",
+                    request_id,
+                    int(cur_decode.block_id),
+                    len(self._prefill_blocks.get(request_id, [])),
+                )
 
         # Rebuild req_to_blocks: [selected prefill blocks..., decode block].
         req_blocks.clear()
         req_blocks.extend(physical_selected)
         req_blocks.append(cur_decode)
-        if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
+        if self._sparse_probe_info_enabled:
             logger.info(
                 "[SparseProbe] req_blocks_rebuilt req_id=%s rebuilt_len=%d "
                 "decode_block_id=%d",
