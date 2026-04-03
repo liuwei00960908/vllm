@@ -1350,6 +1350,23 @@ class GPUModelRunner(
                             req_state.block_ids[gid].extend(new_ids_for_group)
                         selected_logical_blocks = sparse_selected_map.get(req_id)
                         retrieve_logical_blocks = sparse_retrieve_map.get(req_id)
+                        if self._sparse_probe_info_enabled:
+                            new_ids_lens = [len(ids) for ids in new_block_ids]
+                            row_lens_after = [len(ids) for ids in req_state.block_ids]
+                            logger.info(
+                                "[SparseProbe] block_ids_update req_id=%s "
+                                "selected_logical=%d retrieve_logical=%d "
+                                "new_ids_lens=%s row_lens_after=%s",
+                                req_id,
+                                0
+                                if selected_logical_blocks is None
+                                else len(selected_logical_blocks),
+                                0
+                                if retrieve_logical_blocks is None
+                                else len(retrieve_logical_blocks),
+                                new_ids_lens,
+                                row_lens_after,
+                            )
                         if retrieve_logical_blocks is not None:
                             self._debug_log_sparse_selected_kv_tokens(
                                 req_id=req_id,
