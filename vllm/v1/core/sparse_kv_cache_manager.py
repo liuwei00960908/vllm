@@ -1374,16 +1374,12 @@ class SparseKVManager(FullAttentionManager):
                 if self._sparse_probe_info_enabled:
                     logger.info(
                         "[SparseProbe] select req_id=%s used_prefill_cache=%s "
-                        "union_selected=%d per_layer=%d",
+                        "union_selected=%d per_layer=%d "
+                        "selected_logical_blocks=%d retrieve_logical_blocks=%d",
                         request_id,
                         used_prefill_cache,
                         len(result),
                         len(sel_bl),
-                    )
-                    logger.info(
-                        "[SparseProbe] selected_logical_blocks req_id=%s "
-                        "selected_logical_blocks=%d retrieve_logical_blocks=%d",
-                        request_id,
                         len(result),
                         len(self._selected_retrieve_block_indices.get(request_id, [])),
                     )
@@ -1421,16 +1417,12 @@ class SparseKVManager(FullAttentionManager):
         if self._sparse_probe_info_enabled:
             logger.info(
                 "[SparseProbe] select req_id=%s used_prefill_cache=%s "
-                "union_selected=%d per_layer=%d",
+                "union_selected=%d per_layer=%d "
+                "selected_logical_blocks=%d retrieve_logical_blocks=%d",
                 request_id,
                 used_prefill_cache,
                 len(result),
                 len(sel_bl),
-            )
-            logger.info(
-                "[SparseProbe] selected_logical_blocks req_id=%s "
-                "selected_logical_blocks=%d retrieve_logical_blocks=%d",
-                request_id,
                 len(result),
                 len(self._selected_retrieve_block_indices.get(request_id, [])),
             )
