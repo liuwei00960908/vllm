@@ -554,7 +554,7 @@ class SparseKVManager(FullAttentionManager):
             for i in selected
             if i < len(prefill_blocks)
         ]
-        if self._sparse_probe_info_enabled:
+        if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
             if selected:
                 max_sel = max(int(i) for i in selected)
                 min_sel = min(int(i) for i in selected)
@@ -617,7 +617,7 @@ class SparseKVManager(FullAttentionManager):
         req_blocks.clear()
         req_blocks.extend(physical_selected)
         req_blocks.append(cur_decode)
-        if self._sparse_probe_info_enabled:
+        if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
             logger.info(
                 "[SparseProbe] req_blocks_rebuilt req_id=%s rebuilt_len=%d "
                 "decode_block_id=%d",
