@@ -2371,6 +2371,7 @@ class GPUModelRunner(
                         bsz = spec_sp.block_size
                         sp_bt: torch.Tensor | None = None
                         sp_sl: torch.Tensor | None = None
+                        decode_override: np.ndarray | None = None
                         if is_tok_compact:
                             sk0 = sparse_qh_unit_key(layer_name, 0)
                             layer_bt = self._build_sparse_layer_block_table_tensor(
@@ -2434,6 +2435,36 @@ class GPUModelRunner(
                                     bsz,
                                     decode_num_blocks_override=None,
                                 )
+                        if (
+                            (self._sparse_probe_info_enabled
+                             or self._sparse_debug_decode_tokens)
+                            and num_reqs > 0
+                        ):
+                            req0 = self.input_batch.req_ids[0]
+                            blk0 = int(
+                                self.input_batch.block_table[
+                                    kv_cache_gid
+                                ].num_blocks_per_row[0]
+                            )
+                            seq0 = int(cm_layer._seq_lens_cpu[0].item())
+                            ov0 = (
+                                -1
+                                if decode_override is None
+                                else int(decode_override[0])
+                            )
+                            logger.info(
+                                "[SparseProbe] seq_lens_bridge req_id=%s "
+                                "layer=%s is_tok_compact=%s "
+                                "decode_num_blocks_override=%d "
+                                "num_blocks_per_row=%d seq_len_cpu=%d block_size=%d",
+                                req0,
+                                layer_name,
+                                is_tok_compact,
+                                ov0,
+                                blk0,
+                                seq0,
+                                int(bsz),
+                            )
                         if ubatch_slices is not None:
                             for ubid, _cm in enumerate(
                                 split_attn_metadata(ubatch_slices, cm_layer)
