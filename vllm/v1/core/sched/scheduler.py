@@ -502,25 +502,6 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             request_id = request.request_id
-            selected_probe = self.kv_cache_manager.get_sparse_selected_block_indices(
-                request_id
-            )
-            retrieve_probe = self.kv_cache_manager.get_sparse_retrieve_block_indices(
-                request_id
-            )
-            new_block_lens_probe = [len(g) for g in new_blocks.get_block_ids()]
-            if (selected_probe is not None and len(selected_probe) > 0) or any(
-                new_block_lens_probe
-            ):
-                logger.info(
-                    "[SparseProbe] sched_alloc_source req_id=%s "
-                    "selected_logical_blocks=%d retrieve_logical_blocks=%d "
-                    "alloc_new_block_ids_lens=%s",
-                    request_id,
-                    0 if selected_probe is None else len(selected_probe),
-                    0 if retrieve_probe is None else len(retrieve_probe),
-                    new_block_lens_probe,
-                )
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
@@ -1118,50 +1099,44 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
             selected = self.kv_cache_manager.get_sparse_selected_block_indices(req_id)
-            if selected is not None:
-                sparse_selected_block_indices[req_id] = selected
             retrieve = self.kv_cache_manager.get_sparse_retrieve_block_indices(req_id)
-            if retrieve is not None:
-                sparse_retrieve_block_indices[req_id] = retrieve
             by_layer = (
                 self.kv_cache_manager.get_sparse_selected_block_indices_by_layer(req_id)
             )
-            if by_layer is not None:
-                sparse_selected_block_indices_by_layer[req_id] = by_layer
             tok_by_layer = (
                 self.kv_cache_manager.get_sparse_selected_token_indices_by_layer(
                     req_id
                 )
             )
+            chrono = self.kv_cache_manager.get_sparse_chrono_phys_block_ids(req_id)
+            is_sparse_decode_req = (
+                self.kv_cache_manager.get_sparse_manager() is not None
+                and (req.num_output_tokens + req.num_output_placeholders) > 0
+            )
+            if is_sparse_decode_req:
+                # Sparse decode worker expects a FULL row (selected history +
+                # decode tail). Incremental allocation payload ([] / [1] on
+                # rollover) would be misinterpreted as full-row replacement.
+                block_ids_payload = self.kv_cache_manager.get_blocks(
+                    req_id
+                ).get_block_ids(allow_none=True)
+            else:
+                block_ids_payload = req_to_new_blocks[req_id].get_block_ids(
+                    allow_none=True
+                )
+            new_block_ids.append(block_ids_payload)
+
+            if selected is not None:
+                sparse_selected_block_indices[req_id] = selected
+            if retrieve is not None:
+                sparse_retrieve_block_indices[req_id] = retrieve
+            if by_layer is not None:
+                sparse_selected_block_indices_by_layer[req_id] = by_layer
             if tok_by_layer is not None:
                 sparse_selected_token_indices_by_layer[req_id] = tok_by_layer
-            chrono = self.kv_cache_manager.get_sparse_chrono_phys_block_ids(req_id)
             if chrono is not None:
                 sparse_chrono_phys_block_ids[req_id] = chrono
-            cur_new_blocks = new_block_ids[-1]
-            if cur_new_blocks is None:
-                cur_new_lens: list[int] = []
-            else:
-                cur_new_lens = [len(g) for g in cur_new_blocks]
-            sel_cnt = 0 if selected is None else len(selected)
-            ret_cnt = 0 if retrieve is None else len(retrieve)
-            chrono_cnt = 0 if chrono is None else len(chrono)
-            if sel_cnt > 0 or cur_new_lens:
-                logger.info(
-                    "[SparseProbe] sched_cached_pack req_id=%s "
-                    "selected_logical_blocks=%d retrieve_logical_blocks=%d "
-                    "chrono_phys_blocks=%d new_block_ids_lens=%s resumed=%s",
-                    req_id,
-                    sel_cnt,
-                    ret_cnt,
-                    chrono_cnt,
-                    cur_new_lens,
-                    req_id in resumed_req_ids,
-                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders

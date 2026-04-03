@@ -1269,30 +1269,6 @@ class GPUModelRunner(
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
-            if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
-                selected_logical_blocks_dbg = sparse_selected_map.get(req_id)
-                retrieve_logical_blocks_dbg = sparse_retrieve_map.get(req_id)
-                incoming_row_lens_dbg = (
-                    [] if new_block_ids is None else [len(ids) for ids in new_block_ids]
-                )
-                prev_row_lens_dbg = [len(ids) for ids in req_state.block_ids]
-                logger.info(
-                    "[SparseProbe] worker_cached_recv req_id=%s "
-                    "selected_logical_blocks=%d retrieve_logical_blocks=%d "
-                    "incoming_row_lens=%s prev_row_lens=%s "
-                    "num_output_tokens=%d resumed=%s",
-                    req_id,
-                    0
-                    if selected_logical_blocks_dbg is None
-                    else len(selected_logical_blocks_dbg),
-                    0
-                    if retrieve_logical_blocks_dbg is None
-                    else len(retrieve_logical_blocks_dbg),
-                    incoming_row_lens_dbg,
-                    prev_row_lens_dbg,
-                    num_output_tokens,
-                    resumed_from_preemption,
-                )
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
                 # prev_num_draft_len is used in async scheduling mode with
@@ -1384,24 +1360,6 @@ class GPUModelRunner(
                 and num_output_tokens > 0
                 and not sparse_row_collapse_guard
             )
-            if (
-                (self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens)
-                and self._has_sparse_attn
-                and num_output_tokens > 0
-            ):
-                logger.info(
-                    "[SparseProbe] worker_sparse_decision req_id=%s "
-                    "sparse_should_replace_row=%s sparse_row_collapse_guard=%s "
-                    "selected_count=%d retrieve_count=%d "
-                    "incoming_row_lens=%s prev_row_lens=%s",
-                    req_id,
-                    sparse_should_replace_row,
-                    sparse_row_collapse_guard,
-                    selected_count,
-                    retrieve_count,
-                    incoming_row_lens,
-                    prev_row_lens,
-                )
 
             # Update the block IDs.
             # For sparse decode requests we usually REPLACE the entire block
