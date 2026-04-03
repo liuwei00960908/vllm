@@ -1099,6 +1099,26 @@ class Scheduler(SchedulerInterface):
             chrono = self.kv_cache_manager.get_sparse_chrono_phys_block_ids(req_id)
             if chrono is not None:
                 sparse_chrono_phys_block_ids[req_id] = chrono
+            cur_new_blocks = new_block_ids[-1]
+            if cur_new_blocks is None:
+                cur_new_lens: list[int] = []
+            else:
+                cur_new_lens = [len(g) for g in cur_new_blocks]
+            sel_cnt = 0 if selected is None else len(selected)
+            ret_cnt = 0 if retrieve is None else len(retrieve)
+            chrono_cnt = 0 if chrono is None else len(chrono)
+            if sel_cnt > 0 or cur_new_lens:
+                logger.info(
+                    "[SparseProbe] sched_cached_pack req_id=%s "
+                    "selected_logical_blocks=%d retrieve_logical_blocks=%d "
+                    "chrono_phys_blocks=%d new_block_ids_lens=%s resumed=%s",
+                    req_id,
+                    sel_cnt,
+                    ret_cnt,
+                    chrono_cnt,
+                    cur_new_lens,
+                    req_id in resumed_req_ids,
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
