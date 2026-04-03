@@ -554,7 +554,7 @@ class SparseKVManager(FullAttentionManager):
             for i in selected
             if i < len(prefill_blocks)
         ]
-        if self._sparse_probe_info_enabled:
+        if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
             idx_units = int(self._num_index_units(request_id))
             logger.info(
                 "[SparseProbe] alloc_map_state req_id=%s "
@@ -594,7 +594,7 @@ class SparseKVManager(FullAttentionManager):
             cur_decode = new_decode
             fill = 0
             allocated_new_decode = True
-            if self._sparse_probe_info_enabled:
+            if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
                 logger.info(
                     "[SparseProbe] alloc_decode_switch req_id=%s reason=new_or_null "
                     "new_decode_block_id=%d prefill_blocks=%d",
@@ -612,7 +612,7 @@ class SparseKVManager(FullAttentionManager):
             cur_decode = new_decode
             fill = 0
             allocated_new_decode = True
-            if self._sparse_probe_info_enabled:
+            if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
                 logger.info(
                     "[SparseProbe] alloc_decode_switch req_id=%s reason=rollover "
                     "new_decode_block_id=%d prefill_blocks=%d",
@@ -625,6 +625,19 @@ class SparseKVManager(FullAttentionManager):
         req_blocks.clear()
         req_blocks.extend(physical_selected)
         req_blocks.append(cur_decode)
+        if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
+            cur_decode_id = -1 if cur_decode.is_null else int(cur_decode.block_id)
+            logger.info(
+                "[SparseProbe] alloc_decode_state req_id=%s cur_decode_block_id=%d "
+                "decode_fill_before=%d step_tokens=%d allocated_new_decode=%s "
+                "prefill_blocks=%d",
+                request_id,
+                cur_decode_id,
+                int(fill),
+                int(step_tokens),
+                allocated_new_decode,
+                len(self._prefill_blocks.get(request_id, [])),
+            )
         if self._sparse_probe_info_enabled:
             logger.info(
                 "[SparseProbe] req_blocks_rebuilt req_id=%s rebuilt_len=%d "
