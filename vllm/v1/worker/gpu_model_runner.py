@@ -1332,24 +1332,54 @@ class GPUModelRunner(
                     )
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
+            selected_logical_blocks = sparse_selected_map.get(req_id)
+            retrieve_logical_blocks = sparse_retrieve_map.get(req_id)
+            selected_count = (
+                0 if selected_logical_blocks is None else len(selected_logical_blocks)
+            )
+            retrieve_count = (
+                0 if retrieve_logical_blocks is None else len(retrieve_logical_blocks)
+            )
+            incoming_row_lens = (
+                [] if new_block_ids is None else [len(ids) for ids in new_block_ids]
+            )
+            prev_row_lens = [len(ids) for ids in req_state.block_ids]
+            sparse_row_collapse_guard = (
+                self._has_sparse_attn
+                and num_output_tokens > 0
+                and new_block_ids is not None
+                and len(prev_row_lens) > 0
+                and len(incoming_row_lens) > 0
+                and max(prev_row_lens) > 1
+                and max(incoming_row_lens) <= 1
+                and selected_count == 0
+                and retrieve_count == 0
+            )
+            sparse_should_replace_row = (
+                self._has_sparse_attn
+                and num_output_tokens > 0
+                and not sparse_row_collapse_guard
+            )
+
             # Update the block IDs.
-            # For sparse decode requests we must REPLACE the entire block
+            # For sparse decode requests we usually REPLACE the entire block
             # table row (not append) because the sparse manager rebuilds
-            # req_to_blocks from scratch each step (Bug 1 fix).
+            # req_to_blocks from scratch each step (Bug 1 fix).  But when
+            # sparse selection unexpectedly goes empty while the request had
+            # long history, replacing with a single decode block would collapse
+            # seq_lens to one block and permanently poison subsequent steps.
             is_sparse_decode = (
                 self._has_sparse_attn and num_output_tokens > 0
             )
             if not resumed_from_preemption:
                 if new_block_ids is not None:
-                    if is_sparse_decode:
+                    if is_sparse_decode and sparse_should_replace_row:
                         # Sparse decode: replace block IDs in-place so
                         # that any subsequent resumption uses the correct
                         # (sparse) block set.
                         for gid, new_ids_for_group in enumerate(new_block_ids):
                             req_state.block_ids[gid].clear()
                             req_state.block_ids[gid].extend(new_ids_for_group)
-                        selected_logical_blocks = sparse_selected_map.get(req_id)
-                        retrieve_logical_blocks = sparse_retrieve_map.get(req_id)
                         if (
                             self._sparse_probe_info_enabled
                             or self._sparse_debug_decode_tokens
@@ -1412,6 +1442,31 @@ class GPUModelRunner(
                             self._sparse_chrono_phys[req_id] = list(chrono)
                         else:
                             self._sparse_chrono_phys.pop(req_id, None)
+                    elif is_sparse_decode:
+                        # Guard against sparse-row collapse. Keep historical
+                        # row shape and append truly new blocks only.
+                        for block_ids, new_ids in zip(
+                            req_state.block_ids, new_block_ids
+                        ):
+                            for bid in new_ids:
+                                if not block_ids or block_ids[-1] != bid:
+                                    block_ids.append(bid)
+                        if (
+                            self._sparse_probe_info_enabled
+                            or self._sparse_debug_decode_tokens
+                        ):
+                            row_lens_after = [len(ids) for ids in req_state.block_ids]
+                            logger.warning(
+                                "[SparseProbe] block_ids_update_guard req_id=%s "
+                                "selected_logical_blocks=%d retrieve_logical_blocks=%d "
+                                "incoming_row_lens=%s prev_row_lens=%s row_lens_after=%s",
+                                req_id,
+                                selected_count,
+                                retrieve_count,
+                                incoming_row_lens,
+                                prev_row_lens,
+                                row_lens_after,
+                            )
                     else:
                         # Standard: append new blocks to existing IDs.
                         for block_ids, new_ids in zip(
@@ -1445,11 +1500,15 @@ class GPUModelRunner(
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                if is_sparse_decode:
+                if is_sparse_decode and sparse_should_replace_row:
                     # Sparse decode: rebuild the entire row (not append)
                     # because the sparse manager provides the full new block
                     # list (selected history + decode block).
                     self.input_batch.block_table.add_row(
+                        new_block_ids, req_index
+                    )
+                elif is_sparse_decode:
+                    self.input_batch.block_table.append_row(
                         new_block_ids, req_index
                     )
                 else:
