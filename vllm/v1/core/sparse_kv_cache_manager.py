@@ -409,6 +409,8 @@ class SparseKVManager(FullAttentionManager):
         for key in (
             "prefill_topk_ready",
             "selected_count",
+            "selected_logical_blocks",
+            "retrieve_logical_blocks",
             "selected_preview",
             "used_prefill_cache",
             "total_blocks",
@@ -1361,6 +1363,10 @@ class SparseKVManager(FullAttentionManager):
                     total_blocks=n_units,
                     num_blocks_cap=num_blocks,
                     selected_count=len(result),
+                    selected_logical_blocks=len(result),
+                    retrieve_logical_blocks=len(
+                        self._selected_retrieve_block_indices.get(request_id, [])
+                    ),
                     selected_preview=result[:16],
                     used_prefill_cache=used_prefill_cache,
                     prefill_topk_ready=self._prefill_topk_ready.get(request_id),
@@ -1404,6 +1410,10 @@ class SparseKVManager(FullAttentionManager):
             total_blocks=n_units,
             num_blocks_cap=num_blocks,
             selected_count=len(result),
+            selected_logical_blocks=len(result),
+            retrieve_logical_blocks=len(
+                self._selected_retrieve_block_indices.get(request_id, [])
+            ),
             selected_preview=result[:16],
             used_prefill_cache=used_prefill_cache,
             prefill_topk_ready=self._prefill_topk_ready.get(request_id),
