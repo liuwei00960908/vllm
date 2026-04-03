@@ -1410,6 +1410,13 @@ class SparseKVManager(FullAttentionManager):
                 len(result),
                 len(sel_bl),
             )
+            logger.info(
+                "[SparseProbe] selected_logical_blocks req_id=%s "
+                "selected_logical_blocks=%d retrieve_logical_blocks=%d",
+                request_id,
+                len(result),
+                len(self._selected_retrieve_block_indices.get(request_id, [])),
+            )
             if request_id not in self._first_select_probe_done:
                 self._first_select_probe_done.add(request_id)
                 if self._token_mode():
