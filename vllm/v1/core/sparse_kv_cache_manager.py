@@ -1374,6 +1374,13 @@ class SparseKVManager(FullAttentionManager):
                         len(result),
                         len(sel_bl),
                     )
+                    logger.info(
+                        "[SparseProbe] selected_logical_blocks req_id=%s "
+                        "selected_logical_blocks=%d retrieve_logical_blocks=%d",
+                        request_id,
+                        len(result),
+                        len(self._selected_retrieve_block_indices.get(request_id, [])),
+                    )
                 return result
 
         q_by_qh = self._coerce_query_by_qh(request_id, query_vector)
