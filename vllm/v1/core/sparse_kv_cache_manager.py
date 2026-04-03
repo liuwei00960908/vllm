@@ -554,28 +554,39 @@ class SparseKVManager(FullAttentionManager):
             for i in selected
             if i < len(prefill_blocks)
         ]
-        if (
-            self._sparse_probe_info_enabled
-            and selected
-            and len(physical_selected) == 0
-        ):
-            max_sel = max(int(i) for i in selected)
-            min_sel = min(int(i) for i in selected)
-            logger.warning(
-                "[SparseProbe] select_to_physical_miss req_id=%s "
+        if self._sparse_probe_info_enabled:
+            if selected:
+                max_sel = max(int(i) for i in selected)
+                min_sel = min(int(i) for i in selected)
+            else:
+                max_sel = -1
+                min_sel = -1
+            logger.info(
+                "[SparseProbe] select_to_physical_map req_id=%s "
                 "selected_count=%d selected_range=[%d,%d] "
-                "prefill_blocks=%d req_blocks_before=%d "
+                "prefill_blocks=%d physical_selected=%d req_blocks_before=%d "
                 "num_index_units=%d token_mode=%s prefill_token_count=%s",
                 request_id,
                 len(selected),
                 min_sel,
                 max_sel,
                 len(prefill_blocks),
+                len(physical_selected),
                 len(req_blocks),
                 int(self._num_index_units(request_id)),
                 self._token_mode(),
                 str(self._prefill_token_count.get(request_id)),
             )
+            if selected and len(physical_selected) == 0:
+                logger.warning(
+                    "[SparseProbe] select_to_physical_miss req_id=%s "
+                    "selected_count=%d selected_range=[%d,%d] prefill_blocks=%d",
+                    request_id,
+                    len(selected),
+                    min_sel,
+                    max_sel,
+                    len(prefill_blocks),
+                )
 
         step_tokens = self._estimate_decode_tokens_this_step(
             request_id, num_tokens_main_model
@@ -606,6 +617,14 @@ class SparseKVManager(FullAttentionManager):
         req_blocks.clear()
         req_blocks.extend(physical_selected)
         req_blocks.append(cur_decode)
+        if self._sparse_probe_info_enabled:
+            logger.info(
+                "[SparseProbe] req_blocks_rebuilt req_id=%s rebuilt_len=%d "
+                "decode_block_id=%d",
+                request_id,
+                len(req_blocks),
+                int(cur_decode.block_id),
+            )
 
         if allocated_new_decode:
             self.new_block_ids.append(cur_decode.block_id)
