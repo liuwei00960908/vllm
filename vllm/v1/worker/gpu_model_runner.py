@@ -2092,11 +2092,12 @@ class GPUModelRunner(
         if self._has_sparse_attn and (
             self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens
         ):
+            pp_enabled = bool(get_pp_group().world_size > 1)
             logger.info(
                 "[SparseRC] runtime_mode use_async_scheduling=%s use_pp=%s "
                 "use_spec_decode=%s num_reqs=%d total_num_scheduled_tokens=%d",
                 self.use_async_scheduling,
-                self.use_pp,
+                pp_enabled,
                 use_spec_decode,
                 num_reqs,
                 total_num_scheduled_tokens,
