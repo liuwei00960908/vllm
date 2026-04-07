@@ -7253,7 +7253,10 @@ class GPUModelRunner(
                     else:
                         if lb in logical_to_phys:
                             phys_bid = int(logical_to_phys[lb])
-                        elif g == g_cur and decode_phys is not None:
+                        elif decode_phys is not None:
+                            # Fallback row layout is [selected history..., decode].
+                            # Any token mapped to a non-selected logical block may
+                            # still belong to the active decode block, not only g_cur.
                             phys_bid = int(decode_phys)
                         else:
                             gather_fail_reason = (
