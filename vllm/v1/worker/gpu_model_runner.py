@@ -7220,6 +7220,7 @@ class GPUModelRunner(
                 sel = [g for g in sel if 0 <= g < seq_len]
                 logical_to_phys: dict[int, int] = {}
                 decode_phys: int | None = None
+                decode_lb: int | None = None
                 if len(chrono) == 0:
                     row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
                     if row is None or len(row) == 0:
@@ -7228,6 +7229,9 @@ class GPUModelRunner(
                         )
                         return None
                     decode_phys = int(row[-1])
+                    decode_lb = SparseKVManager._global_token_to_logical_block(
+                        g_cur, p_count, bsz
+                    )
                     hist_phys = [int(x) for x in row[:-1]]
                     by_l = self._sparse_by_layer_logical.get(rid)
                     if by_l and sk in by_l:
@@ -7253,10 +7257,15 @@ class GPUModelRunner(
                     else:
                         if lb in logical_to_phys:
                             phys_bid = int(logical_to_phys[lb])
-                        elif decode_phys is not None:
+                        elif (
+                            decode_phys is not None
+                            and decode_lb is not None
+                            and lb == decode_lb
+                        ):
                             # Fallback row layout is [selected history..., decode].
-                            # Any token mapped to a non-selected logical block may
-                            # still belong to the active decode block, not only g_cur.
+                            # Map only tokens in the active decode logical block
+                            # to decode_phys; never alias arbitrary missing logical
+                            # blocks to decode KV pages.
                             phys_bid = int(decode_phys)
                         else:
                             gather_fail_reason = (
