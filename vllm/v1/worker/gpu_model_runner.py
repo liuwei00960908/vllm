@@ -1241,6 +1241,18 @@ class GPUModelRunner(
         )
         sparse_chrono_phys_map = req_data.sparse_chrono_phys_block_ids or {}
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        token_sparse_async_real_tokens = False
+        if self.use_async_scheduling and self._has_sparse_attn and hasattr(
+            self, "kv_cache_config"
+        ):
+            for group in self.kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                if (
+                    isinstance(spec, SparseAttentionSpec)
+                    and spec.cluster_granularity == "token"
+                ):
+                    token_sparse_async_real_tokens = True
+                    break
 
         # Save scheduler-allocated spec lengths before trimming so
         # prev_num_draft_len keeps the optimistic count for rejection correction.
@@ -1292,7 +1304,21 @@ class GPUModelRunner(
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
                     num_rejected = req_state.prev_num_draft_len - num_accepted
                     num_computed_tokens -= num_rejected
-                    req_state.output_token_ids.extend([-1] * num_accepted)
+                    if (
+                        token_sparse_async_real_tokens
+                        and num_accepted > 0
+                        and self.input_batch.prev_sampled_token_ids is not None
+                    ):
+                        accepted_tid = int(
+                            self.input_batch.prev_sampled_token_ids[
+                                prev_req_index, 0
+                            ].item()
+                        )
+                        req_state.output_token_ids.extend(
+                            [accepted_tid] * num_accepted
+                        )
+                    else:
+                        req_state.output_token_ids.extend([-1] * num_accepted)
 
                     if is_ngram_gpu and num_accepted > 0 and req_index is not None:
                         self.input_batch.num_tokens_no_spec[req_index] += num_accepted
