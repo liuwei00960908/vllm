@@ -7242,6 +7242,23 @@ class GPUModelRunner(
                         ]
                     for lg, ph in zip(logical_order, hist_phys):
                         logical_to_phys[int(lg)] = int(ph)
+                    # Token selections may contain entries whose logical block
+                    # is absent from this fallback row (e.g., transient
+                    # per-head/token cap mismatch). Drop those tokens here so
+                    # one stale token does not disable compact gather for the
+                    # whole head.
+                    allowed_lbs = set(logical_to_phys.keys())
+                    if decode_lb is not None:
+                        allowed_lbs.add(int(decode_lb))
+                    if allowed_lbs:
+                        sel = [
+                            g
+                            for g in sel
+                            if SparseKVManager._global_token_to_logical_block(
+                                g, p_count, bsz
+                            )
+                            in allowed_lbs
+                        ]
                 for g in sel:
                     lb = SparseKVManager._global_token_to_logical_block(
                         g, p_count, bsz
