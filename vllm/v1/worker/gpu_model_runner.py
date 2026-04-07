@@ -7244,6 +7244,17 @@ class GPUModelRunner(
                         logical_order = [int(x) for x in by_l[sk]]
                     else:
                         logical_order = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
+                    if (
+                        not logical_order
+                        and decode_lb is not None
+                        and len(hist_phys) > 0
+                    ):
+                        # Robust fallback for the first decode boundary: infer a
+                        # contiguous logical history immediately before decode_lb
+                        # when scheduler-side logical metadata is transiently
+                        # unavailable.
+                        st = max(0, int(decode_lb) - len(hist_phys))
+                        logical_order = list(range(st, int(decode_lb)))
                     for lg, ph in zip(logical_order, hist_phys):
                         logical_to_phys[int(lg)] = int(ph)
                     if toks is None:
@@ -7684,9 +7695,7 @@ class GPUModelRunner(
         rs = self.requests.get(req_id)
         if rs is None:
             return None
-        merged = self._sparse_merged_logical.get(req_id)
-        if not merged:
-            return None
+        merged = self._sparse_merged_logical.get(req_id, [])
         bid_row = rs.block_ids[kv_cache_gid]
         if len(bid_row) < 2:
             return None
@@ -7700,6 +7709,10 @@ class GPUModelRunner(
             logical_order = [int(x) for x in by_l[sparse_row_key]]
         else:
             logical_order = [int(x) for x in merged]
+        if not logical_order:
+            # Keep row available across prefill->decode boundary even when
+            # logical metadata is not yet populated for this step.
+            return [*phys_hist, decode_id]
         row: list[int] = []
         for lg in logical_order:
             p = logical_to_phys.get(lg)
