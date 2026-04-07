@@ -2089,6 +2089,18 @@ class GPUModelRunner(
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        if self._has_sparse_attn and (
+            self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens
+        ):
+            logger.info(
+                "[SparseRC] runtime_mode use_async_scheduling=%s use_pp=%s "
+                "use_spec_decode=%s num_reqs=%d total_num_scheduled_tokens=%d",
+                self.use_async_scheduling,
+                self.use_pp,
+                use_spec_decode,
+                num_reqs,
+                total_num_scheduled_tokens,
+            )
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -2523,6 +2535,18 @@ class GPUModelRunner(
                                 blk0,
                                 seq0,
                                 int(bsz),
+                            )
+                            logger.info(
+                                "[SparseRC] layer_bridge req_id=%s layer=%s gid=%d "
+                                "union_seq_len=%d layer_seq_len=%d "
+                                "union_blocks=%d layer_override_blocks=%d",
+                                req0,
+                                layer_name,
+                                kv_cache_gid,
+                                int(cm_union._seq_lens_cpu[0].item()),
+                                seq0,
+                                blk0,
+                                ov0,
                             )
                         if ubatch_slices is not None:
                             for ubid, _cm in enumerate(
@@ -7651,6 +7675,28 @@ class GPUModelRunner(
             # sequence length.
             new_seq_len = min(old_seq_len, sparse_cap_seq_len)
             seq_lens_np[req_idx] = new_seq_len
+            if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
+                override_blocks = -1
+                if decode_num_blocks_override is not None and req_idx < len(
+                    decode_num_blocks_override
+                ):
+                    override_blocks = int(decode_num_blocks_override[req_idx])
+                logger.info(
+                    "[SparseRC] seq_lens req_id=%s gid=%d req_idx=%d "
+                    "old_seq_len=%d new_seq_len=%d sparse_cap_seq_len=%d "
+                    "num_blocks=%d block_size=%d decode_override=%d "
+                    "num_output_tokens=%d",
+                    req_id,
+                    kv_cache_gid,
+                    req_idx,
+                    old_seq_len,
+                    new_seq_len,
+                    sparse_cap_seq_len,
+                    num_blocks,
+                    block_size,
+                    override_blocks,
+                    num_output_tokens,
+                )
             # Diagnostic: sparse capacity can be larger than materialized
             # tokens while the decode block is not yet full. This is expected
             # as long as we keep applied seq_len equal to old_seq_len.
@@ -7742,6 +7788,22 @@ class GPUModelRunner(
             shown_token_ids,
             token_pieces,
             decoded_text,
+        )
+        tail_has_neg1 = any(tid == -1 for tid in shown_token_ids)
+        first_neg1_rel = next(
+            (idx for idx, tid in enumerate(shown_token_ids) if tid == -1),
+            -1,
+        )
+        logger.info(
+            "[SparseRC] token_tail req_id=%s req_idx=%d seq_len=%d shown=%d "
+            "tail_has_neg1=%s first_neg1_rel=%d tail=%s",
+            req_id,
+            req_idx,
+            seq_len,
+            len(shown_token_ids),
+            tail_has_neg1,
+            first_neg1_rel,
+            shown_token_ids,
         )
 
     def _debug_log_sparse_selected_kv_tokens(
@@ -8035,6 +8097,23 @@ class GPUModelRunner(
                     fill_offsets = np.minimum(fill_offsets, block_size - 1)
                     blk_table.slot_mapping.np[tok_start:tok_end] = (
                         base_slot + fill_offsets
+                    )
+                if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
+                    mapped = blk_table.slot_mapping.np[tok_start:tok_end].tolist()
+                    logger.info(
+                        "[SparseRC] slot_map req_id=%s gid=%d req_idx=%d "
+                        "tok_start=%d tok_end=%d num_sched=%d "
+                        "decode_block_id=%d base_slot=%d fill_offset=%d mapped=%s",
+                        req_id,
+                        gid,
+                        req_idx,
+                        tok_start,
+                        tok_end,
+                        num_sched,
+                        decode_block_id,
+                        base_slot,
+                        fill_offset,
+                        mapped,
                     )
                 if num_sched > 1:
                     logger.warning_once(
