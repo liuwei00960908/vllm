@@ -7195,6 +7195,7 @@ class GPUModelRunner(
         gather_fail_reason: str | None = None
 
         def gather_one_head(qh_idx: int) -> tuple[list[int], list[int], list[int]] | None:
+            nonlocal gather_fail_reason
             phys_h: list[int] = []
             slot_h: list[int] = []
             cu_h: list[int] = [0]
@@ -7272,7 +7273,6 @@ class GPUModelRunner(
                             in allowed_lbs
                         ]
                 elif toks is None:
-                    nonlocal gather_fail_reason
                     gather_fail_reason = (
                         f"missing_tok_or_chrono rid={rid} "
                         f"has_toks=False chrono_len={len(chrono)}"
