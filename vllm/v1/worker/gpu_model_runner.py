@@ -7201,7 +7201,15 @@ class GPUModelRunner(
             cu_h: list[int] = [0]
             sk = sparse_qh_unit_key(layer_name, qh_idx)
             for rid, seq_len, p_count, chrono, tok_map in req_ctx:
-                if len(self.requests[rid].output_token_ids) == 0:
+                rs = self.requests.get(rid)
+                if rs is None:
+                    return None
+                # Decode-step readiness should be inferred from sparse row shape
+                # (history + active decode block), not from output_token_ids.
+                if (
+                    kv_cache_gid >= len(rs.block_ids)
+                    or len(rs.block_ids[kv_cache_gid]) < 2
+                ):
                     return None
                 if seq_len <= 0:
                     return None
@@ -7674,7 +7682,7 @@ class GPUModelRunner(
         from the per-head map, falls back to merged union order (legacy).
         """
         rs = self.requests.get(req_id)
-        if rs is None or len(rs.output_token_ids) == 0:
+        if rs is None:
             return None
         merged = self._sparse_merged_logical.get(req_id)
         if not merged:
