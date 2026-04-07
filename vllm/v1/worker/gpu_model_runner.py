@@ -7340,6 +7340,38 @@ class GPUModelRunner(
                     phys_h.append(phys_bid)
                     slot_h.append(int(sl))
                 cu_h.append(cu_h[-1] + len(sel))
+                if (
+                    (self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens)
+                    and qh_idx == 0
+                ):
+                    gen_count = max(0, seq_len - p_count)
+                    if gen_count <= 2:
+                        preview_n = min(24, len(sel))
+                        sel_preview = sel[:preview_n]
+                        lb_preview = [
+                            SparseKVManager._global_token_to_logical_block(g, p_count, bsz)
+                            for g in sel_preview
+                        ]
+                        phys_preview = phys_h[max(0, len(phys_h) - len(sel)):][:preview_n]
+                        slot_preview = slot_h[max(0, len(slot_h) - len(sel)):][:preview_n]
+                        logger.info(
+                            "[SparseRC:first_decode_map] layer=%s req_id=%s "
+                            "gen_count=%d seq_len=%d p_count=%d decode_lb=%s "
+                            "logical_order_len=%d sel_n=%d "
+                            "g_preview=%s lb_preview=%s phys_preview=%s slot_preview=%s",
+                            layer_name,
+                            rid,
+                            gen_count,
+                            seq_len,
+                            p_count,
+                            -1 if decode_lb is None else int(decode_lb),
+                            len(logical_order),
+                            len(sel),
+                            sel_preview,
+                            lb_preview,
+                            phys_preview,
+                            slot_preview,
+                        )
             if not phys_h:
                 gather_fail_reason = "empty_phys_after_selection"
                 return None
