@@ -7193,6 +7193,8 @@ class GPUModelRunner(
                 )
             )
 
+        gather_fail_reason: str | None = None
+
         def gather_one_head(qh_idx: int) -> tuple[list[int], list[int], list[int]] | None:
             phys_h: list[int] = []
             slot_h: list[int] = []
@@ -7209,6 +7211,11 @@ class GPUModelRunner(
                 if toks is None and qh_idx == 0:
                     toks = tok_map.get(layer_name)
                 if toks is None or len(chrono) == 0:
+                    nonlocal gather_fail_reason
+                    gather_fail_reason = (
+                        f"missing_tok_or_chrono rid={rid} "
+                        f"has_toks={toks is not None} chrono_len={len(chrono)}"
+                    )
                     return None
                 sel = sorted(set(toks) | {g_cur})
                 sel = [g for g in sel if 0 <= g < seq_len]
@@ -7217,17 +7224,25 @@ class GPUModelRunner(
                         g, p_count, bsz
                     )
                     if lb < 0 or lb >= len(chrono):
+                        gather_fail_reason = (
+                            f"logical_block_oob rid={rid} g={g} lb={lb} "
+                            f"chrono_len={len(chrono)} seq_len={seq_len}"
+                        )
                         return None
                     g0 = SparseKVManager._logical_block_first_global(
                         lb, p_count, bsz
                     )
                     sl = g - g0
                     if sl < 0 or sl >= bsz:
+                        gather_fail_reason = (
+                            f"slot_oob rid={rid} g={g} slot={sl} bsz={bsz}"
+                        )
                         return None
                     phys_h.append(int(chrono[lb]))
                     slot_h.append(int(sl))
                 cu_h.append(cu_h[-1] + len(sel))
             if not phys_h:
+                gather_fail_reason = "empty_phys_after_selection"
                 return None
             return phys_h, slot_h, cu_h
 
@@ -7235,6 +7250,15 @@ class GPUModelRunner(
         for qh in range(num_heads):
             g = gather_one_head(qh)
             if g is None:
+                if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
+                    req0 = self.input_batch.req_ids[0] if num_reqs > 0 else "<none>"
+                    logger.info(
+                        "[SparseRC] compact_gather layer=%s req_id=%s "
+                        "enabled=0 reason=%s",
+                        layer_name,
+                        req0,
+                        gather_fail_reason or "unknown",
+                    )
                 return attn_metadata_i
             phys_h, slot_h, cu_h = g
             triples.append(
@@ -7243,6 +7267,17 @@ class GPUModelRunner(
                     torch.tensor(slot_h, dtype=torch.int32, device=dev),
                     torch.tensor(cu_h, dtype=torch.int32, device=dev),
                 )
+            )
+        if (
+            self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens
+        ) and num_reqs > 0:
+            logger.info(
+                "[SparseRC] compact_gather layer=%s req_id=%s enabled=1 "
+                "num_heads=%d qh0_tokens=%d",
+                layer_name,
+                self.input_batch.req_ids[0],
+                num_heads,
+                int(triples[0][0].numel()) if triples else 0,
             )
         return replace(
             attn_metadata_i,
