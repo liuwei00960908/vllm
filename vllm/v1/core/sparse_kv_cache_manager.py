@@ -1344,6 +1344,20 @@ class SparseKVManager(FullAttentionManager):
                         for ln in sel_tok
                     }
                     self._selected_token_indices_by_layer[request_id] = sel_tok
+                elif self._token_mode():
+                    # Token-sparse decode requires per-layer token indices for
+                    # compact gather. If prefill cache has block-level entries
+                    # but token-level cache is unavailable, recompute TopK from
+                    # current query vectors instead of silently degrading to
+                    # block-only selection.
+                    q_by_qh = self._coerce_query_by_qh(request_id, query_vector)
+                    sel_bl, retr_bl, tok_bl = self._per_layer_fresh_topk(
+                        request_id, q_by_qh, num_blocks
+                    )
+                    if tok_bl is not None:
+                        self._selected_token_indices_by_layer[request_id] = tok_bl
+                    else:
+                        self._selected_token_indices_by_layer.pop(request_id, None)
                 else:
                     sel_bl, retr_bl = self._apply_steady_and_cap_per_layer(
                         request_id, cached_bl, block_cap
