@@ -3704,6 +3704,12 @@ class GPUModelRunner(
                     ):
                         force_real_sampled_ids = True
                         break
+            if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
+                logger.info(
+                    "[SparseRC] async_sampled_ids mode=%s has_sparse_attn=%s",
+                    "real" if force_real_sampled_ids else "placeholder",
+                    self._has_sparse_attn,
+                )
 
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
