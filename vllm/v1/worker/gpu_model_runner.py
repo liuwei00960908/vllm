@@ -535,6 +535,8 @@ class GPUModelRunner(
         self._sparse_by_layer_logical: dict[str, dict[str, list[int]]] = {}
         self._sparse_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
         self._sparse_chrono_phys: dict[str, list[int]] = {}
+        # One-shot diagnostics for logical/physical length mismatch.
+        self._sparse_mismatch_logged: set[tuple[str, str, int]] = set()
         self._sparse_debug_decode_tokens_max: int = int(
             os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX", "256")
         )
@@ -7254,6 +7256,55 @@ class GPUModelRunner(
                         logical_order = [int(x) for x in by_l[sk]]
                     else:
                         logical_order = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
+                    if (
+                        decode_lb is not None
+                        and len(hist_phys) > 0
+                        and len(logical_order) != len(hist_phys)
+                    ):
+                        key = (rid, layer_name, qh_idx)
+                        if (
+                            key not in self._sparse_mismatch_logged
+                            and (
+                                self._sparse_probe_info_enabled
+                                or self._sparse_debug_decode_tokens
+                            )
+                        ):
+                            self._sparse_mismatch_logged.add(key)
+                            logger.info(
+                                "[SparseRC:mismatch] req_id=%s layer=%s qh=%d "
+                                "seq_len=%d p_count=%d g_cur=%d decode_lb=%d "
+                                "logical_order_len=%d hist_phys_len=%d "
+                                "logical_order_head=%s hist_phys_head=%s sel_head=%s",
+                                rid,
+                                layer_name,
+                                qh_idx,
+                                seq_len,
+                                p_count,
+                                g_cur,
+                                int(decode_lb),
+                                len(logical_order),
+                                len(hist_phys),
+                                logical_order[:8],
+                                hist_phys[:8],
+                                sel[:8],
+                            )
+                        # Resolve first-decode stale-order mismatch: rebuild
+                        # history logical-block order from the actually selected
+                        # token set for this head, excluding decode logical block.
+                        hist_lbs = sorted(
+                            {
+                                SparseKVManager._global_token_to_logical_block(
+                                    g, p_count, bsz
+                                )
+                                for g in sel
+                                if SparseKVManager._global_token_to_logical_block(
+                                    g, p_count, bsz
+                                )
+                                != int(decode_lb)
+                            }
+                        )
+                        if len(hist_lbs) >= len(hist_phys):
+                            logical_order = hist_lbs[-len(hist_phys) :]
                     for lg, ph in zip(logical_order, hist_phys):
                         logical_to_phys[int(lg)] = int(ph)
                 for g in sel:
@@ -7303,38 +7354,6 @@ class GPUModelRunner(
                     phys_h.append(phys_bid)
                     slot_h.append(int(sl))
                 cu_h.append(cu_h[-1] + len(sel))
-                if (
-                    (self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens)
-                    and qh_idx == 0
-                ):
-                    gen_count = max(0, seq_len - p_count)
-                    if gen_count <= 2:
-                        preview_n = min(24, len(sel))
-                        sel_preview = sel[:preview_n]
-                        lb_preview = [
-                            SparseKVManager._global_token_to_logical_block(g, p_count, bsz)
-                            for g in sel_preview
-                        ]
-                        phys_preview = phys_h[max(0, len(phys_h) - len(sel)):][:preview_n]
-                        slot_preview = slot_h[max(0, len(slot_h) - len(sel)):][:preview_n]
-                        logger.info(
-                            "[SparseRC:first_decode_map] layer=%s req_id=%s "
-                            "gen_count=%d seq_len=%d p_count=%d decode_lb=%s "
-                            "logical_order_len=%d sel_n=%d "
-                            "g_preview=%s lb_preview=%s phys_preview=%s slot_preview=%s",
-                            layer_name,
-                            rid,
-                            gen_count,
-                            seq_len,
-                            p_count,
-                            -1 if decode_lb is None else int(decode_lb),
-                            len(logical_order),
-                            len(sel),
-                            sel_preview,
-                            lb_preview,
-                            phys_preview,
-                            slot_preview,
-                        )
             if not phys_h:
                 gather_fail_reason = "empty_phys_after_selection"
                 return None
