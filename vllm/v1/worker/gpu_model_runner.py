@@ -7288,23 +7288,27 @@ class GPUModelRunner(
                                 hist_phys[:8],
                                 sel[:8],
                             )
-                        # Resolve first-decode stale-order mismatch: rebuild
-                        # history logical-block order from the actually selected
-                        # token set for this head, excluding decode logical block.
-                        hist_lbs = sorted(
-                            {
-                                SparseKVManager._global_token_to_logical_block(
-                                    g, p_count, bsz
-                                )
-                                for g in sel
-                                if SparseKVManager._global_token_to_logical_block(
-                                    g, p_count, bsz
-                                )
-                                != int(decode_lb)
-                            }
-                        )
-                        if len(hist_lbs) >= len(hist_phys):
-                            logical_order = hist_lbs[-len(hist_phys) :]
+                        # Prefer deterministic alignment with the actual
+                        # physical history row shape.
+                        if len(logical_order) > len(hist_phys):
+                            logical_order = logical_order[-len(hist_phys) :]
+                        else:
+                            # logical_order is shorter than physical history:
+                            # rebuild from selected-token-derived history blocks.
+                            hist_lbs = sorted(
+                                {
+                                    SparseKVManager._global_token_to_logical_block(
+                                        g, p_count, bsz
+                                    )
+                                    for g in sel
+                                    if SparseKVManager._global_token_to_logical_block(
+                                        g, p_count, bsz
+                                    )
+                                    != int(decode_lb)
+                                }
+                            )
+                            if len(hist_lbs) >= len(hist_phys):
+                                logical_order = hist_lbs[-len(hist_phys) :]
                     for lg, ph in zip(logical_order, hist_phys):
                         logical_to_phys[int(lg)] = int(ph)
                 for g in sel:
