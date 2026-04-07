@@ -7224,7 +7224,8 @@ class GPUModelRunner(
                     toks = tok_map.get(layer_name)
                 if toks is None:
                     gather_fail_reason = (
-                        f"missing_tok_or_chrono rid={rid} "
+                        f"missing_tok_or_chrono rid={rid} qh={qh_idx} sk={sk} "
+                        f"seq_len={seq_len} p_count={p_count} "
                         f"has_toks=False chrono_len={len(chrono)}"
                     )
                     return None
@@ -7238,7 +7239,9 @@ class GPUModelRunner(
                     row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
                     if row is None or len(row) == 0:
                         gather_fail_reason = (
-                            f"missing_layer_row rid={rid} sk={sk} seq_len={seq_len}"
+                            f"missing_layer_row rid={rid} qh={qh_idx} sk={sk} "
+                            f"seq_len={seq_len} p_count={p_count} "
+                            f"merged_len={len(self._sparse_merged_logical.get(rid, []))}"
                         )
                         return None
                     decode_phys = int(row[-1])
@@ -7280,8 +7283,12 @@ class GPUModelRunner(
                             phys_bid = int(decode_phys)
                         else:
                             gather_fail_reason = (
-                                f"logical_not_selected rid={rid} g={g} lb={lb} "
-                                f"selected={len(logical_to_phys)}"
+                                f"logical_not_selected rid={rid} qh={qh_idx} sk={sk} "
+                                f"g={g} lb={lb} g_cur={g_cur} "
+                                f"decode_lb={-1 if decode_lb is None else int(decode_lb)} "
+                                f"selected={len(logical_to_phys)} "
+                                f"logical_order_len={len(logical_order)} "
+                                f"chrono_len={len(chrono)}"
                             )
                             return None
                     g0 = SparseKVManager._logical_block_first_global(
