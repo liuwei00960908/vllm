@@ -3668,6 +3668,16 @@ class GPUModelRunner(
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
+            force_real_sampled_ids = False
+            if self._has_sparse_attn and hasattr(self, "kv_cache_config"):
+                for group in self.kv_cache_config.kv_cache_groups:
+                    spec = group.kv_cache_spec
+                    if (
+                        isinstance(spec, SparseAttentionSpec)
+                        and spec.cluster_granularity == "token"
+                    ):
+                        force_real_sampled_ids = True
+                        break
 
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
@@ -3690,7 +3700,12 @@ class GPUModelRunner(
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
-                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
+                if req_idx in invalid_req_indices_set:
+                    sampled_ids = None
+                elif force_real_sampled_ids:
+                    sampled_ids = [int(sampled_token_ids[req_idx, 0].item())]
+                else:
+                    sampled_ids = [-1]
             else:
                 sampled_ids = valid_sampled_token_ids[req_idx]
 
@@ -4637,15 +4652,29 @@ class GPUModelRunner(
         # can map req_id -> previous batch row
         discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
         discard_req_indices_set = set(discard_req_indices)
+        force_real_sampled_ids = False
+        if self._has_sparse_attn and hasattr(self, "kv_cache_config"):
+            for group in self.kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                if (
+                    isinstance(spec, SparseAttentionSpec)
+                    and spec.cluster_granularity == "token"
+                ):
+                    force_real_sampled_ids = True
+                    break
         prev_req_id_to_index: dict[str, int] = {}
         for i, req_id in enumerate(self.input_batch.req_ids):
             if i in discard_req_indices_set:
                 continue
             prev_req_id_to_index[req_id] = i
             # PP+async scheduling: advance per-request local cached output length by
-            # appending a placeholder (-1) token id.
+            # appending a placeholder token id. For token-sparse mode, keep
+            # the real sampled token id to avoid polluting token traces with -1.
             if (req_state := self.requests.get(req_id)) is not None:
-                req_state.output_token_ids.append(-1)
+                if force_real_sampled_ids:
+                    req_state.output_token_ids.append(int(recv[i, 0].item()))
+                else:
+                    req_state.output_token_ids.append(-1)
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
