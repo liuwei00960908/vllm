@@ -7171,7 +7171,6 @@ class GPUModelRunner(
         for_cudagraph_capture: bool,
     ) -> FlashAttentionMetadata:
         """Attach paged-cache gather indices for token-sparse compact KV attention."""
-        del kv_cache_gid
         if for_cudagraph_capture or self.dcp_world_size > 1:
             return attn_metadata_i
 
@@ -7210,25 +7209,58 @@ class GPUModelRunner(
                 toks = tok_map.get(sk)
                 if toks is None and qh_idx == 0:
                     toks = tok_map.get(layer_name)
-                if toks is None or len(chrono) == 0:
+                if toks is None:
                     nonlocal gather_fail_reason
                     gather_fail_reason = (
                         f"missing_tok_or_chrono rid={rid} "
-                        f"has_toks={toks is not None} chrono_len={len(chrono)}"
+                        f"has_toks=False chrono_len={len(chrono)}"
                     )
                     return None
                 sel = sorted(set(toks) | {g_cur})
                 sel = [g for g in sel if 0 <= g < seq_len]
+                logical_to_phys: dict[int, int] = {}
+                decode_phys: int | None = None
+                if len(chrono) == 0:
+                    row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
+                    if row is None or len(row) == 0:
+                        gather_fail_reason = (
+                            f"missing_layer_row rid={rid} sk={sk} seq_len={seq_len}"
+                        )
+                        return None
+                    decode_phys = int(row[-1])
+                    hist_phys = [int(x) for x in row[:-1]]
+                    by_l = self._sparse_by_layer_logical.get(rid)
+                    if by_l and sk in by_l:
+                        logical_order = [int(x) for x in by_l[sk]]
+                    else:
+                        logical_order = [
+                            int(x) for x in self._sparse_merged_logical.get(rid, [])
+                        ]
+                    for lg, ph in zip(logical_order, hist_phys):
+                        logical_to_phys[int(lg)] = int(ph)
                 for g in sel:
                     lb = SparseKVManager._global_token_to_logical_block(
                         g, p_count, bsz
                     )
-                    if lb < 0 or lb >= len(chrono):
-                        gather_fail_reason = (
-                            f"logical_block_oob rid={rid} g={g} lb={lb} "
-                            f"chrono_len={len(chrono)} seq_len={seq_len}"
-                        )
-                        return None
+                    if len(chrono) > 0:
+                        if lb < 0 or lb >= len(chrono):
+                            gather_fail_reason = (
+                                f"logical_block_oob rid={rid} g={g} lb={lb} "
+                                f"chrono_len={len(chrono)} seq_len={seq_len}"
+                            )
+                            return None
+                        phys_bid = int(chrono[lb])
+                    else:
+                        if lb in logical_to_phys:
+                            phys_bid = int(logical_to_phys[lb])
+                        elif g == g_cur and decode_phys is not None:
+                            phys_bid = int(decode_phys)
+                        else:
+                            gather_fail_reason = (
+                                f"logical_not_selected rid={rid} g={g} lb={lb} "
+                                f"selected={len(logical_to_phys)}"
+                            )
+                            return None
                     g0 = SparseKVManager._logical_block_first_global(
                         lb, p_count, bsz
                     )
@@ -7238,7 +7270,7 @@ class GPUModelRunner(
                             f"slot_oob rid={rid} g={g} slot={sl} bsz={bsz}"
                         )
                         return None
-                    phys_h.append(int(chrono[lb]))
+                    phys_h.append(phys_bid)
                     slot_h.append(int(sl))
                 cu_h.append(cu_h[-1] + len(sel))
             if not phys_h:
