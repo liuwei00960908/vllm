@@ -7207,20 +7207,17 @@ class GPUModelRunner(
                 g_cur = seq_len - 1
                 bsz = spec.block_size
                 toks = tok_map.get(sk)
-                if toks is None and qh_idx == 0:
-                    toks = tok_map.get(layer_name)
                 if toks is None:
-                    nonlocal gather_fail_reason
-                    gather_fail_reason = (
-                        f"missing_tok_or_chrono rid={rid} "
-                        f"has_toks=False chrono_len={len(chrono)}"
-                    )
-                    return None
-                sel = sorted(set(toks) | {g_cur})
-                sel = [g for g in sel if 0 <= g < seq_len]
+                    # Legacy / transient map may only carry layer-level keys.
+                    toks = tok_map.get(layer_name)
+                sel: list[int] = []
+                if toks is not None:
+                    sel = sorted(set(toks) | {g_cur})
+                    sel = [g for g in sel if 0 <= g < seq_len]
                 logical_to_phys: dict[int, int] = {}
                 decode_phys: int | None = None
                 decode_lb: int | None = None
+                logical_order: list[int] = []
                 if len(chrono) == 0:
                     row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
                     if row is None or len(row) == 0:
@@ -7237,11 +7234,26 @@ class GPUModelRunner(
                     if by_l and sk in by_l:
                         logical_order = [int(x) for x in by_l[sk]]
                     else:
-                        logical_order = [
-                            int(x) for x in self._sparse_merged_logical.get(rid, [])
-                        ]
+                        logical_order = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
                     for lg, ph in zip(logical_order, hist_phys):
                         logical_to_phys[int(lg)] = int(ph)
+                    if toks is None:
+                        # First decode step can occasionally miss token TopK
+                        # payloads. Reconstruct token candidates from the
+                        # available sparse row (selected history + decode block)
+                        # instead of disabling compact gather for the whole layer.
+                        lbs = list(logical_order)
+                        if decode_lb is not None:
+                            lbs.append(int(decode_lb))
+                        sel_set: set[int] = {int(g_cur)}
+                        for lb_i in lbs:
+                            g0 = SparseKVManager._logical_block_first_global(
+                                int(lb_i), p_count, bsz
+                            )
+                            g1 = min(g0 + bsz, seq_len)
+                            if g1 > g0:
+                                sel_set.update(range(g0, g1))
+                        sel = sorted(sel_set)
                     # Token selections may contain entries whose logical block
                     # is absent from this fallback row (e.g., transient
                     # per-head/token cap mismatch). Drop those tokens here so
@@ -7259,6 +7271,13 @@ class GPUModelRunner(
                             )
                             in allowed_lbs
                         ]
+                elif toks is None:
+                    nonlocal gather_fail_reason
+                    gather_fail_reason = (
+                        f"missing_tok_or_chrono rid={rid} "
+                        f"has_toks=False chrono_len={len(chrono)}"
+                    )
+                    return None
                 for g in sel:
                     lb = SparseKVManager._global_token_to_logical_block(
                         g, p_count, bsz
