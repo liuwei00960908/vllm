@@ -7953,6 +7953,17 @@ class GPUModelRunner(
         slot_t = torch.tensor(slot, dtype=torch.long, device=dev)
         k_sel = k_cache[phys_t, slot_t, 0].detach().cpu()
         v_sel = v_cache[phys_t, slot_t, 0].detach().cpu()
+        last_tok_id = -1
+        last_tok_text = ""
+        if out_before > 0 and out_before - 1 < len(rs.output_token_ids):
+            t = int(rs.output_token_ids[out_before - 1])
+            if t >= 0:
+                last_tok_id = t
+                if self._sparse_debug_tokenizer is not None:
+                    try:
+                        last_tok_text = self._sparse_debug_tokenizer.decode([t])
+                    except Exception:
+                        last_tok_text = ""
         payload = {
             "mode": mode,
             "req_id": req_id,
@@ -7960,6 +7971,8 @@ class GPUModelRunner(
             "kv_cache_gid": int(kv_cache_gid),
             "seq_len": int(seq_len),
             "out_before": int(out_before),
+            "last_tok_id": int(last_tok_id),
+            "last_tok_text": last_tok_text,
             "phys": [int(x) for x in phys],
             "slot": [int(x) for x in slot],
             "k": k_sel,
@@ -7969,10 +7982,13 @@ class GPUModelRunner(
         try:
             torch.save(payload, path)
             logger.info(
-                "[AttnAB:fa_dump] mode=%s req_id=%s out_before=%d tokens=%d path=%s",
+                "[AttnAB:fa_dump] mode=%s req_id=%s out_before=%d "
+                "last_tok_id=%d last_tok=%r tokens=%d path=%s",
                 mode,
                 req_id,
                 int(out_before),
+                int(last_tok_id),
+                last_tok_text,
                 len(phys),
                 path,
             )
