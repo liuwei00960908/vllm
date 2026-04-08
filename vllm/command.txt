@@ -1,1 +1,1 @@
-grep -nE "boundary_disable_sparse|SparseFirstTok:sample|compact_gather layer=.*enabled=1|compact_gather layer=.*enabled=0 reason=" vllm_server.log
+grep -nE "boundary_disable_sparse|decode_boundary_uncommitted|SparseFirstTok:sample|compact_gather layer=.*enabled=1|compact_gather layer=.*enabled=0 reason=" vllm_server.log
