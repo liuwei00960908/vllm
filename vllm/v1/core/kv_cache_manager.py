@@ -590,29 +590,45 @@ class KVCacheManager:
                 ignore_prefill_topk_cache=mgr._spec.refresh_topk_each_decode,
             )
 
-    def sparse_ensure_decode_selection(self, request_id: str) -> bool:
+    def sparse_ensure_decode_selection(self, request_id: str) -> tuple[bool, str]:
         """Best-effort on-demand sparse selection refresh for decode bridging.
 
-        Returns True if a selection attempt was executed, False otherwise.
+        Returns:
+            (did_run_select, reason)
         """
         mgr = self.get_sparse_manager()
         if mgr is None:
-            return False
+            return False, "no_sparse_mgr"
         # Already selected for this request in this step.
         if mgr._selected_block_indices_by_layer.get(request_id):
-            return False
+            return False, "already_selected"
         if not mgr.req_to_blocks.get(request_id):
-            return False
+            return False, "no_req_blocks"
+        if request_id not in mgr._layer_states or not mgr._layer_states.get(request_id):
+            return False, "no_layer_state"
+        if mgr._num_index_units(request_id) <= 0:
+            return False, "no_index_units"
         qv = mgr.get_pending_query(request_id)
         if qv is None:
-            return False
+            return False, "no_pending_query"
+        if len(qv) == 0:
+            return False, "empty_pending_query"
         mgr.select(
             request_id,
             qv,
             mgr._spec.sparse_selection_budget(),
             ignore_prefill_topk_cache=mgr._spec.refresh_topk_each_decode,
         )
-        return True
+        sel = mgr._selected_block_indices_by_layer.get(request_id)
+        if not sel:
+            return True, "select_empty"
+        tok = mgr._selected_token_indices_by_layer.get(request_id)
+        if mgr._token_mode() and (not tok):
+            return True, "token_mode_no_tok"
+        chrono = mgr.get_chrono_phys_block_ids(request_id)
+        if len(chrono) == 0:
+            return True, "empty_chrono"
+        return True, "ok"
 
     def sparse_post_decode_rebalance(
         self,

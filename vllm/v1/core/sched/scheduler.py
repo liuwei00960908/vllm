@@ -1121,9 +1121,12 @@ class Scheduler(SchedulerInterface):
                 # Decode-phase invariant: sparse metadata must be ready before
                 # packaging CachedRequestData. Re-run selection from pending
                 # query to resolve first-decode transition races.
+                ensure_reason = "not_needed"
                 if missing_sparse_meta:
-                    refreshed = self.kv_cache_manager.sparse_ensure_decode_selection(
+                    refreshed, ensure_reason = (
+                        self.kv_cache_manager.sparse_ensure_decode_selection(
                         req_id
+                        )
                     )
                     if refreshed:
                         selected = (
@@ -1163,7 +1166,7 @@ class Scheduler(SchedulerInterface):
                         "missing by_layer=%s tok=%s chrono=%s "
                         "selected_len=%d retrieve_len=%d "
                         "num_output_tokens=%d num_placeholders=%d "
-                        "payload_row_lens=%s",
+                        "ensure_reason=%s payload_row_lens=%s",
                         req_id,
                         by_layer is None,
                         tok_by_layer is None,
@@ -1172,6 +1175,7 @@ class Scheduler(SchedulerInterface):
                         0 if retrieve is None else len(retrieve),
                         req.num_output_tokens,
                         req.num_output_placeholders,
+                        ensure_reason,
                         (
                             []
                             if block_ids_payload is None
