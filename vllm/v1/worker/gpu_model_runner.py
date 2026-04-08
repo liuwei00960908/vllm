@@ -8169,6 +8169,59 @@ class GPUModelRunner(
                     sel_detok,
                     len(phys_h),
                 )
+                # Step-5 focused comparison: inspect why the 5th sampled token
+                # diverges by comparing sparse-selected token coverage against
+                # full-history coverage in the same forward.
+                out_before_dbg = self._sparse_output_tokens_before_step.get(
+                    rid0,
+                    len(rs0.output_token_ids) if rs0 is not None else 0,
+                )
+                if out_before_dbg == 4 and rs0 is not None:
+                    expected_all = list(range(max(0, int(seq_len))))
+                    sel_set = set(debug_sel_all)
+                    exp_set = set(expected_all)
+                    missing = sorted(exp_set - sel_set)
+                    extra = sorted(sel_set - exp_set)
+                    miss_detok: list[str] = []
+                    extra_detok: list[str] = []
+                    p0 = int(self.input_batch.num_prompt_tokens[0])
+
+                    def _tok_text(gidx: int) -> str:
+                        tid: int | None = None
+                        if gidx < p0:
+                            if 0 <= gidx < len(rs0.prompt_token_ids):
+                                tid = int(rs0.prompt_token_ids[gidx])
+                        else:
+                            di = int(gidx - p0)
+                            if 0 <= di < len(rs0.output_token_ids):
+                                tdi = int(rs0.output_token_ids[di])
+                                if tdi >= 0:
+                                    tid = tdi
+                        if tid is None or self._sparse_debug_tokenizer is None:
+                            return "<na>"
+                        try:
+                            return self._sparse_debug_tokenizer.decode([tid])
+                        except Exception:
+                            return "<dec_err>"
+
+                    for g in missing[:16]:
+                        miss_detok.append(f"{g}:{_tok_text(int(g))!r}")
+                    for g in extra[:16]:
+                        extra_detok.append(f"{g}:{_tok_text(int(g))!r}")
+                    logger.info(
+                        "[SparseRC:step5_cmp] req_id=%s seq_len=%d out_before=%d "
+                        "sel_n=%d exp_n=%d missing_n=%d extra_n=%d "
+                        "missing_head=%s extra_head=%s",
+                        rid0,
+                        int(seq_len),
+                        int(out_before_dbg),
+                        len(debug_sel_all),
+                        len(expected_all),
+                        len(missing),
+                        len(extra),
+                        miss_detok,
+                        extra_detok,
+                    )
             return phys_h, slot_h, cu_h
 
         _sparse_compact_layer_verbose = (
