@@ -550,6 +550,8 @@ class GPUModelRunner(
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
         self._sparse_output_tokens_before_step: dict[str, int] = {}
+        # One-shot FA input dumps for A/B checks.
+        self._attnab_dump_done: set[str] = set()
         # Defer hard-stop to next execute_model entry so current step can
         # finish producing ModelRunnerOutput and scheduler sparse hooks.
         self._sparse_hard_stop_pending: tuple[str, int, int] | None = None
@@ -2572,6 +2574,38 @@ class GPUModelRunner(
                     common_attn_metadata=common_attn_metadata,
                     spec=kv_cache_spec,
                     for_cudagraph_capture=for_cudagraph_capture,
+                )
+            elif (
+                not for_cudagraph_capture
+                and isinstance(attn_metadata_i, FlashAttentionMetadata)
+                and layer_names_override is not None
+                and len(layer_names_override) == 1
+                and not self._has_sparse_attn
+                and num_reqs > 0
+                and layer_names_override[0].endswith("layers.0.self_attn.attn")
+            ):
+                req0 = self.input_batch.req_ids[0]
+                seq0 = int(common_attn_metadata._seq_lens_cpu[0].item())
+                blk = self.input_batch.block_table[kv_cache_gid]
+                nblk0 = int(blk.num_blocks_per_row[0])
+                bsz0 = int(blk.block_size)
+                row0 = blk.block_table.np[0, :nblk0]
+                phys0: list[int] = []
+                slot0: list[int] = []
+                for g in range(max(0, seq0)):
+                    lb = int(g // bsz0)
+                    if lb >= nblk0:
+                        break
+                    phys0.append(int(row0[lb]))
+                    slot0.append(int(g % bsz0))
+                self._dump_fa_inputs_once(
+                    mode="full",
+                    req_id=req0,
+                    layer_name=layer_names_override[0],
+                    kv_cache_gid=kv_cache_gid,
+                    seq_len=seq0,
+                    phys=phys0,
+                    slot=slot0,
                 )
 
             if (
@@ -7855,6 +7889,67 @@ class GPUModelRunner(
             top_txt,
         )
 
+    def _dump_fa_inputs_once(
+        self,
+        *,
+        mode: str,
+        req_id: str,
+        layer_name: str,
+        kv_cache_gid: int,
+        seq_len: int,
+        phys: list[int],
+        slot: list[int],
+    ) -> None:
+        if mode in self._attnab_dump_done:
+            return
+        rs = self.requests.get(req_id)
+        if rs is None or not phys or len(phys) != len(slot):
+            return
+        if not layer_name.endswith("layers.0.self_attn.attn"):
+            return
+        # Focus exactly on divergence neighborhood.
+        out_before = len(rs.output_token_ids)
+        target = 4 if mode == "sparse" else 5
+        if out_before != target:
+            return
+        attn_mod = self.compilation_config.static_forward_context.get(layer_name)
+        if attn_mod is None or not attn_mod.kv_cache or attn_mod.kv_cache[0] is None:
+            return
+        kv = attn_mod.kv_cache[0]
+        k_cache = kv[0]
+        v_cache = kv[1]
+        dev = k_cache.device
+        phys_t = torch.tensor(phys, dtype=torch.long, device=dev)
+        slot_t = torch.tensor(slot, dtype=torch.long, device=dev)
+        k_sel = k_cache[phys_t, slot_t, 0].detach().cpu()
+        v_sel = v_cache[phys_t, slot_t, 0].detach().cpu()
+        payload = {
+            "mode": mode,
+            "req_id": req_id,
+            "layer": layer_name,
+            "kv_cache_gid": int(kv_cache_gid),
+            "seq_len": int(seq_len),
+            "out_before": int(out_before),
+            "phys": [int(x) for x in phys],
+            "slot": [int(x) for x in slot],
+            "k": k_sel,
+            "v": v_sel,
+        }
+        path = os.path.join(os.getcwd(), f"fa_dump_{mode}.pt")
+        try:
+            torch.save(payload, path)
+            logger.info(
+                "[AttnAB:fa_dump] mode=%s req_id=%s out_before=%d tokens=%d path=%s",
+                mode,
+                req_id,
+                int(out_before),
+                len(phys),
+                path,
+            )
+            self._attnab_dump_done.add(mode)
+        except Exception as e:
+            logger.warning("[AttnAB:fa_dump] mode=%s failed: %s", mode, e)
+
     def _maybe_patch_sparse_compact_kv_metadata(
         self,
         attn_metadata_i: FlashAttentionMetadata,
@@ -8298,6 +8393,20 @@ class GPUModelRunner(
                 self.input_batch.req_ids[0],
                 num_heads,
                 int(triples[0][0].numel()) if triples else 0,
+            )
+        if num_reqs > 0 and triples:
+            req0 = self.input_batch.req_ids[0]
+            seq0 = int(common_attn_metadata._seq_lens_cpu[0].item())
+            phys0 = [int(x) for x in triples[0][0].detach().cpu().tolist()]
+            slot0 = [int(x) for x in triples[0][1].detach().cpu().tolist()]
+            self._dump_fa_inputs_once(
+                mode="sparse",
+                req_id=req0,
+                layer_name=layer_name,
+                kv_cache_gid=kv_cache_gid,
+                seq_len=seq0,
+                phys=phys0,
+                slot=slot0,
             )
         return replace(
             attn_metadata_i,
