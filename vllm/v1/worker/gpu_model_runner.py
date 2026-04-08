@@ -7503,7 +7503,7 @@ class GPUModelRunner(
             and not _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
         ):
             return
-        if req_id in self._sparse_first_token_sample_logged:
+        if req_id in self._sparse_first_token_sample_logged and prev_output_n == 0:
             return
         if not sampled_ids:
             return
