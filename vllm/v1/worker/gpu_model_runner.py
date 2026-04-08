@@ -7651,12 +7651,38 @@ class GPUModelRunner(
                     # Legacy / transient map may only carry layer-level keys.
                     toks = tok_map.get(layer_name)
                 if toks is None:
-                    gather_fail_reason = (
-                        f"missing_tok_or_chrono rid={rid} qh={qh_idx} sk={sk} "
-                        f"seq_len={seq_len} p_count={p_count} "
-                        f"has_toks=False chrono_len={len(chrono)}"
-                    )
-                    return None
+                    # Fallback: if token-level indices are missing, derive
+                    # candidate token ids from selected logical blocks so
+                    # compact gather can still run on decode steps.
+                    # This preserves correctness better than disabling
+                    # compact gather for all layers/heads.
+                    fallback_lbs: list[int] = []
+                    by_l_fb = self._sparse_by_layer_logical.get(rid)
+                    if by_l_fb and sk in by_l_fb:
+                        fallback_lbs = [int(x) for x in by_l_fb[sk]]
+                    else:
+                        fallback_lbs = [
+                            int(x)
+                            for x in self._sparse_merged_logical.get(rid, [])
+                        ]
+                    if fallback_lbs:
+                        fb_toks: list[int] = []
+                        for lb_fb in fallback_lbs:
+                            g0_fb = SparseKVManager._logical_block_first_global(
+                                int(lb_fb), p_count, bsz
+                            )
+                            g1_fb = min(int(g0_fb) + int(bsz), int(seq_len))
+                            if g1_fb > g0_fb:
+                                fb_toks.extend(range(int(g0_fb), int(g1_fb)))
+                        toks = sorted(set(fb_toks))
+                    if toks is None or len(toks) == 0:
+                        gather_fail_reason = (
+                            f"missing_tok_or_chrono rid={rid} qh={qh_idx} sk={sk} "
+                            f"seq_len={seq_len} p_count={p_count} "
+                            f"has_toks=False chrono_len={len(chrono)} "
+                            f"fallback_lbs={len(fallback_lbs)}"
+                        )
+                        return None
                 sel = sorted(set(toks) | {g_cur})
                 sel = [g for g in sel if 0 <= g < seq_len]
                 logical_to_phys: dict[int, int] = {}
