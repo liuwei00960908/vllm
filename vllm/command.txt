@@ -1,0 +1,3 @@
+grep -n "boundary_disable_sparse" <日志文件>
+grep -nE "compact_gather layer=.*enabled=0 reason=not_decode_yet|compact_gather layer=.*enabled=1" <日志文件>
+grep -nE "SparseFirstTok:sample|SparseHardStop" <日志文件>

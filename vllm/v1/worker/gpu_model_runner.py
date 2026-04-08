@@ -2357,6 +2357,7 @@ class GPUModelRunner(
             layer_names_override: list[str] | None = None,
             sparse_per_head_block_table: torch.Tensor | None = None,
             sparse_per_head_seq_lens: torch.Tensor | None = None,
+            disable_token_sparse_boundary: bool = False,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
@@ -2415,6 +2416,7 @@ class GPUModelRunner(
                 and isinstance(kv_cache_spec, SparseAttentionSpec)
                 and kv_cache_spec.cluster_granularity == "token"
                 and kv_cache_spec.use_compact_kv_gather
+                and not disable_token_sparse_boundary
                 and isinstance(attn_metadata_i, FlashAttentionMetadata)
             ):
                 attn_metadata_i = self._maybe_patch_sparse_compact_kv_metadata(
@@ -2470,9 +2472,33 @@ class GPUModelRunner(
             is_sparse_group = isinstance(
                 kv_cache_group.kv_cache_spec, SparseAttentionSpec
             )
+            boundary_disable_sparse = False
+            boundary_req_ids: list[str] = []
+            if is_sparse_group:
+                for req_idx in range(num_reqs):
+                    rid = self.input_batch.req_ids[req_idx]
+                    seq_i = int(cm._seq_lens_cpu[req_idx].item())
+                    p_i = int(self.input_batch.num_prompt_tokens[req_idx])
+                    rs = self.requests.get(rid)
+                    out_n = 0 if rs is None else len(rs.output_token_ids)
+                    if seq_i == p_i and out_n == 0:
+                        boundary_req_ids.append(rid)
+                boundary_disable_sparse = len(boundary_req_ids) > 0
+                if boundary_disable_sparse and (
+                    self._sparse_probe_info_enabled
+                    or self._sparse_debug_decode_tokens
+                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                ):
+                    logger.info(
+                        "[SparseRC] boundary_disable_sparse gid=%d reqs=%d "
+                        "req_id_head=%s",
+                        kv_cache_gid,
+                        len(boundary_req_ids),
+                        boundary_req_ids[:2],
+                    )
             # Union-based seq_lens (used for spec-decode bookkeeping and as the
             # source block table for per-layer sparse slicing).
-            if is_sparse_group:
+            if is_sparse_group and not boundary_disable_sparse:
                 cm_union = self._override_sparse_seq_lens(
                     cm,
                     kv_cache_gid,
@@ -2514,7 +2540,12 @@ class GPUModelRunner(
                         sp_bt: torch.Tensor | None = None
                         sp_sl: torch.Tensor | None = None
                         decode_override: np.ndarray | None = None
-                        if is_tok_compact:
+                        if boundary_disable_sparse:
+                            cm_layer = copy(cm_union)
+                            cm_layer.block_table_tensor = (
+                                cm_union.block_table_tensor.clone()
+                            )
+                        elif is_tok_compact:
                             sk0 = sparse_qh_unit_key(layer_name, 0)
                             layer_bt = self._build_sparse_layer_block_table_tensor(
                                 cm_union.block_table_tensor.clone(),
@@ -2632,6 +2663,7 @@ class GPUModelRunner(
                                     layer_names_override=[layer_name],
                                     sparse_per_head_block_table=sp_bt,
                                     sparse_per_head_seq_lens=sp_sl,
+                                    disable_token_sparse_boundary=boundary_disable_sparse,
                                 )
                         else:
                             _build_attn_group_metadata(
@@ -2643,15 +2675,27 @@ class GPUModelRunner(
                                 layer_names_override=[layer_name],
                                 sparse_per_head_block_table=sp_bt,
                                 sparse_per_head_seq_lens=sp_sl,
+                                disable_token_sparse_boundary=boundary_disable_sparse,
                             )
                 elif ubatch_slices is not None:
                     for ubid, _cm in enumerate(
                         split_attn_metadata(ubatch_slices, cm_union)
                     ):
-                        _build_attn_group_metadata(kv_cache_gid, attn_gid, _cm, ubid)
+                        _build_attn_group_metadata(
+                            kv_cache_gid,
+                            attn_gid,
+                            _cm,
+                            ubid,
+                            disable_token_sparse_boundary=boundary_disable_sparse,
+                        )
 
                 else:
-                    _build_attn_group_metadata(kv_cache_gid, attn_gid, cm_union)
+                    _build_attn_group_metadata(
+                        kv_cache_gid,
+                        attn_gid,
+                        cm_union,
+                        disable_token_sparse_boundary=boundary_disable_sparse,
+                    )
 
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
