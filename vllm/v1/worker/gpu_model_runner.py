@@ -1408,6 +1408,7 @@ class GPUModelRunner(
                 skip_async_token_sparse_trim = (
                     self.use_async_scheduling
                     and self._has_sparse_attn
+                    and num_output_tokens == 0
                     and (
                         (num_output_tokens + 1) == len(req_state.output_token_ids)
                     )
