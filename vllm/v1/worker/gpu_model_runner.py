@@ -1400,41 +1400,15 @@ class GPUModelRunner(
                         )
                 new_token_ids_len = len(new_token_ids)
             elif num_output_tokens < len(req_state.output_token_ids):
-                # Async token-sparse bridge can transiently report a smaller
-                # scheduler-side committed output count while the worker has
-                # already appended a real sampled token in the previous step.
-                # Do not trim worker-local sampled outputs in this transition,
-                # otherwise the next step is re-classified as "step=1".
-                skip_async_token_sparse_trim = (
-                    self.use_async_scheduling
-                    and self._has_sparse_attn
-                    and num_output_tokens == 0
-                    and (
-                        (num_output_tokens + 1) == len(req_state.output_token_ids)
-                    )
-                )
-                if skip_async_token_sparse_trim:
-                    if (
-                        self._sparse_debug_first_token
-                        or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                    ):
-                        logger.info(
-                            "[SparseState:bridge] req_id=%s stage=trim_skip "
-                            "num_output_tokens=%d output_len=%d",
-                            req_id,
-                            int(num_output_tokens),
-                            len(req_state.output_token_ids),
-                        )
-                else:
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
-                    del req_state.output_token_ids[num_output_tokens:]
-                    if req_index is not None:
-                        end_idx = (
-                            self.input_batch.num_prompt_tokens[req_index]
-                            + num_output_tokens
-                        )
-                        self.input_batch.num_tokens_no_spec[req_index] = end_idx
+                del req_state.output_token_ids[num_output_tokens:]
+                if req_index is not None:
+                    end_idx = (
+                        self.input_batch.num_prompt_tokens[req_index]
+                        + num_output_tokens
+                    )
+                    self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             selected_logical_blocks = sparse_selected_map.get(req_id)
             retrieve_logical_blocks = sparse_retrieve_map.get(req_id)
