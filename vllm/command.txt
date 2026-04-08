@@ -1,3 +1,1 @@
-grep -nE "SparseState:trim|SparseState:trim_after|SparseStep:commit|SparseState:invariant|SparseState:bridge|SparseState:sched" vllm_server.log
-
 grep -nE "SparseStep:defer_commit|SparseState:trim|SparseState:trim_after|SparseStep:commit|SparseState:invariant" vllm_server.log

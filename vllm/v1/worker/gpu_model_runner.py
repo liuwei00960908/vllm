@@ -1428,6 +1428,7 @@ class GPUModelRunner(
                         [int(x) for x in tail_before],
                     )
                 del req_state.output_token_ids[num_output_tokens:]
+                self._sparse_step_trace_last.pop(req_id, None)
                 if req_index is not None:
                     end_idx = (
                         self.input_batch.num_prompt_tokens[req_index]
@@ -4090,15 +4091,32 @@ class GPUModelRunner(
         self._sparse_output_tokens_before_step.clear()
         for req_idx in range(num_sampled_tokens):
             req_id = req_ids[req_idx]
+            req_state = self.requests[req_id]
+            prev_output_n = len(req_state.output_token_ids)
+            prompt_n = int(self.input_batch.num_prompt_tokens[req_idx])
+            nspec_before = int(self.input_batch.num_tokens_no_spec[req_idx])
             sparse_context_phase = (
                 self.use_async_scheduling
                 and force_real_sampled_ids
                 and scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
             )
+            # Robust first-step guard: if no committed outputs yet and we're
+            # still exactly at prompt boundary, treat this as uncommitted phase
+            # regardless of scheduler carrier type (new/cached req packaging).
+            sparse_uncommitted_first_step = (
+                self.use_async_scheduling
+                and force_real_sampled_ids
+                and prev_output_n == 0
+                and nspec_before == prompt_n
+            )
             if self.use_async_scheduling:
                 if req_idx in invalid_req_indices_set:
                     sampled_ids = None
-                elif force_real_sampled_ids and not sparse_context_phase:
+                elif (
+                    force_real_sampled_ids
+                    and not sparse_context_phase
+                    and not sparse_uncommitted_first_step
+                ):
                     sampled_ids = [int(sampled_token_ids[req_idx, 0].item())]
                 else:
                     sampled_ids = [-1]
@@ -4110,11 +4128,9 @@ class GPUModelRunner(
             if not sampled_ids:
                 continue
 
-            req_state = self.requests[req_id]
-            prev_output_n = len(req_state.output_token_ids)
             self._sparse_output_tokens_before_step[req_id] = prev_output_n
             if (
-                sparse_context_phase
+                (sparse_context_phase or sparse_uncommitted_first_step)
                 and (self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
             ):
                 raw_tid = int(sampled_token_ids[req_idx, 0].item())
