@@ -1,1 +1,1 @@
-grep -nE "AttnAB:sel_diff" vllm_server.log
+grep -nE "SparseState:sched|SparseState:bridge|SparseStep:commit|SparseState:invariant" vllm_server.log

@@ -550,6 +550,7 @@ class GPUModelRunner(
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
         self._sparse_output_tokens_before_step: dict[str, int] = {}
+        self._sparse_step_trace_last: dict[str, tuple[int, int, int]] = {}
         # One-shot FA input dumps for A/B checks.
         self._attnab_dump_done: set[str] = set()
         # Defer hard-stop to next execute_model entry so current step can
@@ -1676,16 +1677,26 @@ class GPUModelRunner(
                 (self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
                 and self.use_async_scheduling
             ):
+                prompt_n = int(self.input_batch.num_prompt_tokens[req_index])
+                nspec = int(self.input_batch.num_tokens_no_spec[req_index])
+                exp_nspec = prompt_n + int(len(req_state.output_token_ids))
+                tail_ids = self.input_batch.token_ids_cpu[
+                    req_index, max(0, nspec - 2):nspec
+                ].tolist()
                 logger.info(
                     "[SparseState:bridge] req_id=%s stage=persistent "
                     "req_index=%d num_output_tokens=%d output_len=%d "
-                    "num_computed_tokens=%d new_token_ids_len=%d",
+                    "num_computed_tokens=%d new_token_ids_len=%d "
+                    "num_tokens_no_spec=%d expected_no_spec=%d tail_ids=%s",
                     req_id,
                     int(req_index),
                     int(num_output_tokens),
                     len(req_state.output_token_ids),
                     int(num_computed_tokens),
                     int(new_token_ids_len),
+                    nspec,
+                    exp_nspec,
+                    [int(x) for x in tail_ids],
                 )
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
@@ -4073,10 +4084,23 @@ class GPUModelRunner(
                 self._sparse_debug_first_token
                 or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
             ):
+                prompt_n = int(self.input_batch.num_prompt_tokens[req_idx])
+                nspec = int(self.input_batch.num_tokens_no_spec[req_idx])
+                exp_nspec = prompt_n + int(out_n_after)
+                last = self._sparse_step_trace_last.get(req_id)
+                step_regress = False
+                if last is not None:
+                    last_out, last_start, last_end = last
+                    step_regress = (
+                        int(prev_output_n) < int(last_out)
+                        or int(start_idx) < int(last_start)
+                        or int(end_idx) < int(last_end)
+                    )
                 logger.info(
                     "[SparseStep:commit] req_id=%s req_idx=%d sampled_ids=%s "
                     "prev_out=%d out_after=%d start_idx=%d end_idx=%d "
-                    "async=%s force_real=%s",
+                    "async=%s force_real=%s num_tokens_no_spec=%d "
+                    "expected_no_spec=%d",
                     req_id,
                     req_idx,
                     [int(x) for x in sampled_ids],
@@ -4086,6 +4110,27 @@ class GPUModelRunner(
                     int(end_idx),
                     self.use_async_scheduling,
                     force_real_sampled_ids,
+                    nspec,
+                    exp_nspec,
+                )
+                if step_regress or nspec != exp_nspec:
+                    logger.critical(
+                        "[SparseState:invariant] req_id=%s regress=%s "
+                        "prev_out=%d out_after=%d start=%d end=%d "
+                        "num_tokens_no_spec=%d expected=%d",
+                        req_id,
+                        step_regress,
+                        int(prev_output_n),
+                        int(out_n_after),
+                        int(start_idx),
+                        int(end_idx),
+                        nspec,
+                        exp_nspec,
+                    )
+                self._sparse_step_trace_last[req_id] = (
+                    int(out_n_after),
+                    int(start_idx),
+                    int(end_idx),
                 )
             self._sparse_log_sample_step(
                 req_idx=req_idx,
