@@ -229,7 +229,7 @@ logger = init_logger(__name__)
 # and calls os._exit(0) after Nth valid new output token is appended in
 # bookkeeping. Set to False before merge or normal serving.
 # ---------------------------------------------------------------------------
-_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = True
+_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = False
 # Stop after this many valid generated tokens for a request.
 # 1 = first token, 2 = second token (useful for capturing "V" -> "Vo").
 _SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 6
@@ -550,12 +550,8 @@ class GPUModelRunner(
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
         self._sparse_output_tokens_before_step: dict[str, int] = {}
-        self._sparse_step_trace_last: dict[str, tuple[int, int, int]] = {}
         # One-shot FA input dumps for A/B checks.
         self._attnab_dump_done: set[str] = set()
-        # Defer hard-stop to next execute_model entry so current step can
-        # finish producing ModelRunnerOutput and scheduler sparse hooks.
-        self._sparse_hard_stop_pending: tuple[str, int, int] | None = None
         # One-shot diagnostics for logical/physical length mismatch.
         self._sparse_mismatch_logged: set[tuple[str, str, int]] = set()
         self._sparse_debug_decode_tokens_max: int = int(
@@ -1405,57 +1401,13 @@ class GPUModelRunner(
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
-                if (
-                    self._sparse_debug_first_token
-                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                ) and num_output_tokens <= 8:
-                    req_idx_dbg = self.input_batch.req_id_to_index.get(req_id)
-                    tail_before: list[int] = []
-                    if req_idx_dbg is not None:
-                        nspec_before = int(self.input_batch.num_tokens_no_spec[req_idx_dbg])
-                        tail_before = self.input_batch.token_ids_cpu[
-                            req_idx_dbg, max(0, nspec_before - 2):nspec_before
-                        ].tolist()
-                    logger.info(
-                        "[SparseState:trim] req_id=%s reason=sync_kv_load_failure "
-                        "before_output_len=%d target_output_len=%d "
-                        "num_computed_tokens=%d req_index=%s tail_ids_before=%s",
-                        req_id,
-                        int(len(req_state.output_token_ids)),
-                        int(num_output_tokens),
-                        int(num_computed_tokens),
-                        "none" if req_idx_dbg is None else str(int(req_idx_dbg)),
-                        [int(x) for x in tail_before],
-                    )
                 del req_state.output_token_ids[num_output_tokens:]
-                self._sparse_step_trace_last.pop(req_id, None)
                 if req_index is not None:
                     end_idx = (
                         self.input_batch.num_prompt_tokens[req_index]
                         + num_output_tokens
                     )
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
-                if (
-                    self._sparse_debug_first_token
-                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                ) and num_output_tokens <= 8:
-                    req_idx_dbg = self.input_batch.req_id_to_index.get(req_id)
-                    tail_after: list[int] = []
-                    nspec_after = -1
-                    if req_idx_dbg is not None:
-                        nspec_after = int(self.input_batch.num_tokens_no_spec[req_idx_dbg])
-                        tail_after = self.input_batch.token_ids_cpu[
-                            req_idx_dbg, max(0, nspec_after - 2):nspec_after
-                        ].tolist()
-                    logger.info(
-                        "[SparseState:trim_after] req_id=%s output_len_after=%d "
-                        "num_tokens_no_spec_after=%d req_index=%s tail_ids_after=%s",
-                        req_id,
-                        int(len(req_state.output_token_ids)),
-                        int(nspec_after),
-                        "none" if req_idx_dbg is None else str(int(req_idx_dbg)),
-                        [int(x) for x in tail_after],
-                    )
 
             selected_logical_blocks = sparse_selected_map.get(req_id)
             retrieve_logical_blocks = sparse_retrieve_map.get(req_id)
@@ -1680,35 +1632,10 @@ class GPUModelRunner(
                 # scheduled in the previous step and needs to be added again.
 
                 if self.use_async_scheduling and num_output_tokens > 0:
-                    if (
-                        self._sparse_debug_first_token
-                        or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                    ):
-                        logger.info(
-                            "[SparseState:bridge] req_id=%s stage=resumed_before "
-                            "num_output_tokens=%d output_len_before=%d "
-                            "all_token_ids_len=%d",
-                            req_id,
-                            int(num_output_tokens),
-                            len(req_state.output_token_ids),
-                            len(req_data.all_token_ids.get(req_id, [])),
-                        )
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
                     resumed_token_ids = req_data.all_token_ids[req_id]
                     req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
-                    if (
-                        self._sparse_debug_first_token
-                        or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                    ):
-                        logger.info(
-                            "[SparseState:bridge] req_id=%s stage=resumed_after "
-                            "num_output_tokens=%d output_len_after=%d output_tail=%s",
-                            req_id,
-                            int(num_output_tokens),
-                            len(req_state.output_token_ids),
-                            [int(x) for x in req_state.output_token_ids[-8:]],
-                        )
 
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
@@ -1717,31 +1644,6 @@ class GPUModelRunner(
                 continue
 
             # Update the persistent batch.
-            if (
-                (self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
-                and self.use_async_scheduling
-            ):
-                prompt_n = int(self.input_batch.num_prompt_tokens[req_index])
-                nspec = int(self.input_batch.num_tokens_no_spec[req_index])
-                exp_nspec = prompt_n + int(len(req_state.output_token_ids))
-                tail_ids = self.input_batch.token_ids_cpu[
-                    req_index, max(0, nspec - 2):nspec
-                ].tolist()
-                logger.info(
-                    "[SparseState:bridge] req_id=%s stage=persistent "
-                    "req_index=%d num_output_tokens=%d output_len=%d "
-                    "num_computed_tokens=%d new_token_ids_len=%d "
-                    "num_tokens_no_spec=%d expected_no_spec=%d tail_ids=%s",
-                    req_id,
-                    int(req_index),
-                    int(num_output_tokens),
-                    len(req_state.output_token_ids),
-                    int(num_computed_tokens),
-                    int(new_token_ids_len),
-                    nspec,
-                    exp_nspec,
-                    [int(x) for x in tail_ids],
-                )
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
                 if is_sparse_decode and sparse_should_replace_row:
@@ -4133,17 +4035,6 @@ class GPUModelRunner(
                 continue
 
             self._sparse_output_tokens_before_step[req_id] = prev_output_n
-            if should_defer_commit and (
-                self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-            ):
-                raw_tid = int(sampled_token_ids[req_idx, 0].item())
-                logger.info(
-                    "[SparseStep:defer_commit] req_id=%s req_idx=%d "
-                    "raw_sampled_id=%d reason=context_phase_worker_out0",
-                    req_id,
-                    req_idx,
-                    raw_tid,
-                )
             if should_defer_commit:
                 # Do not mutate worker-side token state in uncommitted boundary
                 # phase. The scheduler has not acknowledged output progression
@@ -4164,58 +4055,6 @@ class GPUModelRunner(
 
             req_state.output_token_ids.extend(sampled_ids)
             out_n_after = len(req_state.output_token_ids)
-            if (
-                self._sparse_debug_first_token
-                or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-            ):
-                prompt_n = int(self.input_batch.num_prompt_tokens[req_idx])
-                nspec = int(self.input_batch.num_tokens_no_spec[req_idx])
-                exp_nspec = prompt_n + int(out_n_after)
-                last = self._sparse_step_trace_last.get(req_id)
-                step_regress = False
-                if last is not None:
-                    last_out, last_start, last_end = last
-                    step_regress = (
-                        int(prev_output_n) < int(last_out)
-                        or int(start_idx) < int(last_start)
-                        or int(end_idx) < int(last_end)
-                    )
-                logger.info(
-                    "[SparseStep:commit] req_id=%s req_idx=%d sampled_ids=%s "
-                    "prev_out=%d out_after=%d start_idx=%d end_idx=%d "
-                    "async=%s force_real=%s num_tokens_no_spec=%d "
-                    "expected_no_spec=%d",
-                    req_id,
-                    req_idx,
-                    [int(x) for x in sampled_ids],
-                    int(prev_output_n),
-                    int(out_n_after),
-                    int(start_idx),
-                    int(end_idx),
-                    self.use_async_scheduling,
-                    force_real_sampled_ids,
-                    nspec,
-                    exp_nspec,
-                )
-                if step_regress or nspec != exp_nspec:
-                    logger.critical(
-                        "[SparseState:invariant] req_id=%s regress=%s "
-                        "prev_out=%d out_after=%d start=%d end=%d "
-                        "num_tokens_no_spec=%d expected=%d",
-                        req_id,
-                        step_regress,
-                        int(prev_output_n),
-                        int(out_n_after),
-                        int(start_idx),
-                        int(end_idx),
-                        nspec,
-                        exp_nspec,
-                    )
-                self._sparse_step_trace_last[req_id] = (
-                    int(out_n_after),
-                    int(start_idx),
-                    int(end_idx),
-                )
             self._sparse_log_sample_step(
                 req_idx=req_idx,
                 req_id=req_id,
@@ -4223,40 +4062,6 @@ class GPUModelRunner(
                 sampled_ids=sampled_ids,
                 logits=logits,
             )
-            if _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
-                tok0 = int(sampled_ids[0]) if sampled_ids else -1
-                tok_txt = ""
-                if tok0 >= 0 and self._sparse_debug_tokenizer is not None:
-                    try:
-                        tok_txt = self._sparse_debug_tokenizer.decode([tok0])
-                    except Exception:
-                        tok_txt = ""
-                top3_txt = ""
-                if logits is not None and logits.dim() >= 2 and req_idx < logits.size(0):
-                    row = logits[req_idx]
-                    k = min(3, row.numel())
-                    vals, idx = torch.topk(row, k=k)
-                    parts: list[str] = []
-                    for i in range(k):
-                        tid = int(idx[i].item())
-                        tv = float(vals[i].item())
-                        ttxt = ""
-                        if self._sparse_debug_tokenizer is not None:
-                            try:
-                                ttxt = self._sparse_debug_tokenizer.decode([tid])
-                            except Exception:
-                                ttxt = ""
-                        parts.append(f"{tid}:{tv:.3f}:{ttxt!r}")
-                    top3_txt = " ".join(parts)
-                logger.info(
-                    "[AttnAB:sample] mode=%s req_id=%s step=%d tok_id=%d tok=%r top3=%s",
-                    "sparse" if self._has_sparse_attn else "full",
-                    req_id,
-                    int(prev_output_n + 1),
-                    tok0,
-                    tok_txt,
-                    top3_txt,
-                )
             if (
                 self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
             ) and prev_output_n <= 1:
@@ -4268,21 +4073,6 @@ class GPUModelRunner(
                     logits=logits,
                     spec_decode_metadata=spec_decode_metadata,
                 )
-            if (
-                _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                and out_n_after >= int(_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N)
-            ):
-                t0i = int(sampled_ids[0]) if sampled_ids else -1
-                logger.critical(
-                    "[SparseHardStop] arm deferred-exit after output "
-                    "count=%d req_id=%s tok_id=%d — set "
-                    "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=False in "
-                    "gpu_model_runner.py to disable.",
-                    out_n_after,
-                    req_id,
-                    t0i,
-                )
-                self._sparse_hard_stop_pending = (req_id, t0i, out_n_after)
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -4599,16 +4389,6 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
-        if self._sparse_hard_stop_pending is not None:
-            rid, tok, out_n = self._sparse_hard_stop_pending
-            logger.critical(
-                "[SparseHardStop] deferred os._exit(0) before next execute_model "
-                "req_id=%s tok_id=%d out_n=%d",
-                rid,
-                tok,
-                out_n,
-            )
-            os._exit(0)
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -8279,26 +8059,7 @@ class GPUModelRunner(
                         )
                         return None
                 sel = sorted(set(toks) | {g_cur})
-                # In async token-sparse decode, selection payload can lag by a
-                # couple of newest history tokens. Enforce the local recency
-                # invariant at materialization time so FA input always contains
-                # the two latest context tokens before current decode token.
-                if seq_len >= 2:
-                    sel.append(seq_len - 2)
-                if seq_len >= 3:
-                    sel.append(seq_len - 3)
-                sel = sorted(set(sel))
                 sel = [g for g in sel if 0 <= g < seq_len]
-                # Enforce FA input cardinality equivalence with full history
-                # for the same step. Keep recency by trimming oldest tokens
-                # first while always preserving current decode token.
-                if len(sel) > seq_len:
-                    sel = sorted(set(sel) | {g_cur})
-                    if len(sel) > seq_len:
-                        trim_n = len(sel) - seq_len
-                        removable = [g for g in sel if g != g_cur]
-                        drop = set(removable[:trim_n])
-                        sel = [g for g in sel if g not in drop]
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
                     debug_sel_all = [int(x) for x in sel]
                     debug_lb_all = [

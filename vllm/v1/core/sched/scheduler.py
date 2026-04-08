@@ -1243,26 +1243,6 @@ class Scheduler(SchedulerInterface):
                     req.num_output_placeholders,
                     num_output_for_worker,
                 )
-            if is_sparse_decode_req and (
-                req.num_output_tokens + req.num_output_placeholders <= 8
-            ):
-                logger.info(
-                    "[SparseState:sched] req_id=%s decode_phase=%s "
-                    "num_output_tokens=%d num_placeholders=%d "
-                    "worker_num_output_tokens=%d num_computed_tokens=%d "
-                    "phase_gate=%s gate_reason=%s token_sparse_async=%s "
-                    "all_token_ids_len=%d",
-                    req_id,
-                    decode_phase,
-                    req.num_output_tokens,
-                    req.num_output_placeholders,
-                    num_output_for_worker,
-                    req.num_computed_tokens,
-                    phase_gate_sparse_meta,
-                    phase_gate_reason or "none",
-                    token_sparse_async,
-                    len(req.all_token_ids),
-                )
             num_output_tokens.append(num_output_for_worker)
 
         return CachedRequestData(
