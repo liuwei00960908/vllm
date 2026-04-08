@@ -232,7 +232,7 @@ logger = init_logger(__name__)
 _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = True
 # Stop after this many valid generated tokens for a request.
 # 1 = first token, 2 = second token (useful for capturing "V" -> "Vo").
-_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 4
+_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 5
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -3954,18 +3954,17 @@ class GPUModelRunner(
                 _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
                 and out_n_after >= int(_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N)
             ):
-                t0i = int(sampled_ids[0])
-                if t0i >= 0:
-                    logger.critical(
-                        "[SparseHardStop] arm deferred-exit after valid output "
-                        "count=%d req_id=%s tok_id=%d — set "
-                        "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=False in "
-                        "gpu_model_runner.py to disable.",
-                        out_n_after,
-                        req_id,
-                        t0i,
-                    )
-                    self._sparse_hard_stop_pending = (req_id, t0i, out_n_after)
+                t0i = int(sampled_ids[0]) if sampled_ids else -1
+                logger.critical(
+                    "[SparseHardStop] arm deferred-exit after output "
+                    "count=%d req_id=%s tok_id=%d — set "
+                    "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=False in "
+                    "gpu_model_runner.py to disable.",
+                    out_n_after,
+                    req_id,
+                    t0i,
+                )
+                self._sparse_hard_stop_pending = (req_id, t0i, out_n_after)
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
