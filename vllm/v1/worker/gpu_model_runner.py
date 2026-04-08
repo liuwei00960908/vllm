@@ -8043,13 +8043,22 @@ class GPUModelRunner(
             )
             seq_len_after = int(self.seq_lens.np[req_idx])
 
+            # Boundary case: first decode output is still pending (async/placeholders),
+            # but seq_len may already exceed prompt length in this forward.
+            # We still must emit prefill indexing features (prompt range only)
+            # and query vectors so scheduler can produce sparse selections for
+            # the next step.
             is_prefill_done = (
                 num_output_before == 0
-                and seq_len_after == num_prompt_tokens
+                and seq_len_after >= num_prompt_tokens
             )
-            is_decode = num_output_before > 0
+            is_first_decode_boundary = (
+                num_output_before == 0
+                and seq_len_after > num_prompt_tokens
+            )
+            is_decode = num_output_before > 0 or is_first_decode_boundary
 
-            if not (is_prefill_done or is_decode):
+            if not is_prefill_done and not is_decode:
                 # Mid-prefill chunk – nothing to emit yet.
                 continue
 
@@ -8123,7 +8132,8 @@ class GPUModelRunner(
                     num_kv = int(attn_mod.num_kv_heads)
                     if token_sparse:
                         if is_prefill_done:
-                            valid_len = seq_len_after
+                            # Keep prefill index aligned to prompt tokens only.
+                            valid_len = num_prompt_tokens
                             if valid_len > 0:
                                 k_flat = k_blocks.reshape(-1, *k_blocks.shape[2:])[
                                     :valid_len
