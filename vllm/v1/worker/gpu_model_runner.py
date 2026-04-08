@@ -232,7 +232,7 @@ logger = init_logger(__name__)
 _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = True
 # Stop after this many valid generated tokens for a request.
 # 1 = first token, 2 = second token (useful for capturing "V" -> "Vo").
-_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 5
+_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 6
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
