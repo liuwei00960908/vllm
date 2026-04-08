@@ -229,10 +229,10 @@ logger = init_logger(__name__)
 # and calls os._exit(0) after Nth valid new output token is appended in
 # bookkeeping. Set to False before merge or normal serving.
 # ---------------------------------------------------------------------------
-_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = False
+_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = True
 # Stop after this many valid generated tokens for a request.
 # 1 = first token, 2 = second token (useful for capturing "V" -> "Vo").
-_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 2
+_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 4
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -8133,6 +8133,9 @@ class GPUModelRunner(
                 num_output_before == 0
                 and seq_len_after > num_prompt_tokens
             )
+            # Treat decode as committed only when output existed before this
+            # step. Boundary forwards (including async placeholder transitions)
+            # should not emit decode new-block features.
             # Treat decode as committed only when output existed before this
             # step. Boundary forwards (including async placeholder transitions)
             # should not emit decode new-block features.
