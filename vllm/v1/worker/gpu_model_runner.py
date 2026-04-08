@@ -7757,6 +7757,17 @@ class GPUModelRunner(
                         f"out_tokens={len(rs.output_token_ids)}"
                     )
                     return None
+                out_before_step = self._sparse_output_tokens_before_step.get(
+                    rid, len(rs.output_token_ids)
+                )
+                if out_before_step <= 0:
+                    gather_fail_reason = (
+                        f"decode_boundary_uncommitted rid={rid} qh={qh_idx} "
+                        f"sk={sk} seq_len={seq_len} p_count={p_count} "
+                        f"out_before={int(out_before_step)} "
+                        f"out_tokens={len(rs.output_token_ids)}"
+                    )
+                    return None
                 g_cur = seq_len - 1
                 bsz = spec.block_size
                 toks = tok_map.get(sk)
@@ -8122,7 +8133,11 @@ class GPUModelRunner(
                 num_output_before == 0
                 and seq_len_after > num_prompt_tokens
             )
-            is_decode = num_output_before > 0 or is_first_decode_boundary
+            # Treat decode as committed only when output existed before this
+            # step. Boundary forwards (including async placeholder transitions)
+            # should not emit decode new-block features.
+            is_decode_committed = num_output_before > 0
+            is_decode = is_decode_committed or is_first_decode_boundary
 
             if not is_prefill_done and not is_decode:
                 # Mid-prefill chunk – nothing to emit yet.
@@ -8223,7 +8238,7 @@ class GPUModelRunner(
                                             sparse_block_features,
                                             sparse_prefill_cluster_meta,
                                         )
-                        if is_decode:
+                        if is_decode_committed:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
                             k_row_np = k_blocks[-1][slot].float().cpu().numpy()
@@ -8261,7 +8276,7 @@ class GPUModelRunner(
                                         sparse_block_features,
                                         sparse_prefill_cluster_meta,
                                     )
-                        if is_decode:
+                        if is_decode_committed:
                             if k_blk.dim() == 2:
                                 assert num_kv == 1
                                 sparse_new_block_features.setdefault(req_id, {})[
