@@ -546,6 +546,10 @@ class GPUModelRunner(
         self._sparse_by_layer_logical: dict[str, dict[str, list[int]]] = {}
         self._sparse_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
         self._sparse_chrono_phys: dict[str, list[int]] = {}
+        # Snapshot of per-request output length BEFORE this step appends sampled
+        # tokens. Used by sparse feature collection to classify prefill/decode
+        # boundary correctly.
+        self._sparse_output_tokens_before_step: dict[str, int] = {}
         # Defer hard-stop to next execute_model entry so current step can
         # finish producing ModelRunnerOutput and scheduler sparse hooks.
         self._sparse_hard_stop_pending: tuple[str, int, int] | None = None
@@ -3894,6 +3898,7 @@ class GPUModelRunner(
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
+        self._sparse_output_tokens_before_step.clear()
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
                 if req_idx in invalid_req_indices_set:
@@ -3913,6 +3918,7 @@ class GPUModelRunner(
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             prev_output_n = len(req_state.output_token_ids)
+            self._sparse_output_tokens_before_step[req_id] = prev_output_n
 
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]
             end_idx = start_idx + num_sampled_ids
@@ -8054,10 +8060,14 @@ class GPUModelRunner(
             req_state = self.requests.get(req_id)
             if req_state is None:
                 continue
-            # IMPORTANT: use worker-side committed outputs instead of scheduler
-            # num_output_tokens (may include async placeholders), otherwise the
-            # prefill->decode transition can be misclassified and skip indexing.
-            num_output_before = len(req_state.output_token_ids)
+            # IMPORTANT: classify phase using output length BEFORE this step
+            # appends sampled ids. `_collect_sparse_features` runs after
+            # `_bookkeeping_sync`, so reading current `output_token_ids` would
+            # incorrectly treat the first decode step as already-decoded and
+            # skip prefill indexing.
+            num_output_before = self._sparse_output_tokens_before_step.get(
+                req_id, len(req_state.output_token_ids)
+            )
 
             num_prompt_tokens = int(
                 self.input_batch.num_prompt_tokens[req_idx]
