@@ -1,3 +1,2 @@
-grep -n "boundary_disable_sparse" <日志文件>
-grep -nE "compact_gather layer=.*enabled=0 reason=not_decode_yet|compact_gather layer=.*enabled=1" <日志文件>
-grep -nE "SparseFirstTok:sample|SparseHardStop" <日志文件>
+grep -nE "SparseFirstTok:sample|SparseHardStop|boundary_disable_sparse" vllm_server.log
+grep -nE "compact_gather layer=.*enabled=0 reason=|compact_gather layer=.*enabled=1|SparseRC:mismatch|logical_phys_mismatch|logical_not_selected" vllm_server.log

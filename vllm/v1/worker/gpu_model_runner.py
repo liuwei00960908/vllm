@@ -226,10 +226,13 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 # Sparse first-decode hard debug (NO env vars).
 # When True: prints SparseFirstTok kv/sample lines (if sparse attention is on)
-# and calls os._exit(0) immediately after the first valid new output token
-# is appended in bookkeeping.  Set to False before merge or normal serving.
+# and calls os._exit(0) after Nth valid new output token is appended in
+# bookkeeping. Set to False before merge or normal serving.
 # ---------------------------------------------------------------------------
 _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = True
+# Stop after this many valid generated tokens for a request.
+# 1 = first token, 2 = second token (useful for capturing "V" -> "Vo").
+_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 2
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -598,7 +601,8 @@ class GPUModelRunner(
         if _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
             logger.critical(
                 "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=True: process will "
-                "os._exit(0) after the first valid sampled output token."
+                "os._exit(0) after valid output token count reaches %d.",
+                int(_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N),
             )
 
         # mm_hash ->  encoder_output
@@ -3851,24 +3855,30 @@ class GPUModelRunner(
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
             req_state.output_token_ids.extend(sampled_ids)
+            out_n_after = len(req_state.output_token_ids)
             if (
                 self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-            ) and prev_output_n == 0:
+            ) and prev_output_n <= 1:
                 self._sparse_log_first_sampled_token(
                     req_idx=req_idx,
                     req_id=req_id,
+                    prev_output_n=prev_output_n,
                     sampled_ids=sampled_ids,
                     logits=logits,
                     spec_decode_metadata=spec_decode_metadata,
                 )
-            if _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN and prev_output_n == 0:
+            if (
+                _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                and out_n_after >= int(_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N)
+            ):
                 t0i = int(sampled_ids[0])
                 if t0i >= 0:
                     logger.critical(
-                        "[SparseHardStop] os._exit(0) after first valid output "
-                        "token req_id=%s tok_id=%d — set "
+                        "[SparseHardStop] os._exit(0) after valid output "
+                        "count=%d req_id=%s tok_id=%d — set "
                         "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=False in "
                         "gpu_model_runner.py to disable.",
+                        out_n_after,
                         req_id,
                         t0i,
                     )
@@ -7481,6 +7491,7 @@ class GPUModelRunner(
         *,
         req_idx: int,
         req_id: str,
+        prev_output_n: int,
         sampled_ids: list[int],
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
@@ -7531,7 +7542,7 @@ class GPUModelRunner(
         kv_same_step = req_id in self._sparse_ft_pending_sample
         logger.info(
             "[SparseFirstTok:sample] req_id=%s req_idx=%d tok_id=%d tok=%r "
-            "top8=%s top5_detok=%s kv_same_step=%s pp_rank=%s/%s %s",
+            "top8=%s top5_detok=%s kv_same_step=%s out_before=%d pp_rank=%s/%s %s",
             req_id,
             req_idx,
             tok,
@@ -7539,11 +7550,13 @@ class GPUModelRunner(
             top_pairs,
             top_txt,
             kv_same_step,
+            int(prev_output_n),
             get_pp_group().rank_in_group,
             get_pp_group().world_size,
             spec_hint,
         )
-        self._sparse_first_token_sample_logged.add(req_id)
+        if prev_output_n == 0:
+            self._sparse_first_token_sample_logged.add(req_id)
 
     def _maybe_patch_sparse_compact_kv_metadata(
         self,
