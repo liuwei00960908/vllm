@@ -1173,6 +1173,12 @@ class Scheduler(SchedulerInterface):
                         req_id
                     ).get_block_ids(allow_none=True)
                 if by_layer is None or tok_by_layer is None or chrono is None:
+                    # Keep scheduler/worker chrono view consistent with the
+                    # payload row when sparse selection is present but chrono
+                    # map is transiently missing.
+                    if chrono is None and not phase_gate_sparse_meta and block_ids_payload:
+                        if len(block_ids_payload) > 0 and len(block_ids_payload[0]) > 0:
+                            chrono = list(block_ids_payload[0])
                     logger.warning(
                         "[SparseRC:bridge_sched] req_id=%s "
                         "missing by_layer=%s tok=%s chrono=%s "

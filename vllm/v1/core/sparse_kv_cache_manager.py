@@ -1117,6 +1117,14 @@ class SparseKVManager(FullAttentionManager):
         dec = self._decode_block.get(request_id)
         if dec is not None and not dec.is_null:
             out.append(int(dec.block_id))
+        # Phase-transition safety: if decode bookkeeping has not materialized
+        # (_prefill_blocks/_decode_block still empty) but req_to_blocks already
+        # carries a valid sparse row, use that row as chronological fallback.
+        if not out:
+            row = self.req_to_blocks.get(request_id, [])
+            for b in row:
+                if not b.is_null:
+                    out.append(int(b.block_id))
         return out
 
     def _apply_steady_and_cap_per_layer(
