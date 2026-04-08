@@ -8160,6 +8160,16 @@ class GPUModelRunner(
                     sel.append(seq_len - 3)
                 sel = sorted(set(sel))
                 sel = [g for g in sel if 0 <= g < seq_len]
+                # Enforce FA input cardinality equivalence with full history
+                # for the same step. Keep recency by trimming oldest tokens
+                # first while always preserving current decode token.
+                if len(sel) > seq_len:
+                    sel = sorted(set(sel) | {g_cur})
+                    if len(sel) > seq_len:
+                        trim_n = len(sel) - seq_len
+                        removable = [g for g in sel if g != g_cur]
+                        drop = set(removable[:trim_n])
+                        sel = [g for g in sel if g not in drop]
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
                     debug_sel_all = [int(x) for x in sel]
                     debug_lb_all = [
