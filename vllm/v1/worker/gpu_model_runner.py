@@ -540,12 +540,28 @@ class GPUModelRunner(
         self._sparse_debug_decode_tokens_max: int = int(
             os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX", "256")
         )
+        # One-shot KV + logits diagnostics for the first decode step only
+        # (reduces log volume vs full per-layer compact_gather tracing).
+        self._sparse_debug_first_token: bool = bool(
+            int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN", "0"))
+        )
+        self._sparse_debug_first_token_all_layers: bool = bool(
+            int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN_ALL_LAYERS", "0"))
+        )
+        self._sparse_debug_first_token_os_exit: bool = bool(
+            int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN_OS_EXIT", "0"))
+        )
+        # Cleared at the start of each _build_attention_metadata call.
+        self._sparse_first_token_forward_rid_this_step: set[str] = set()
+        self._sparse_ft_kv_layer_pair_this_step: set[tuple[str, str]] = set()
+        self._sparse_ft_pending_sample: set[str] = set()
+        self._sparse_first_token_sample_logged: set[str] = set()
         # <= 0 means "no cap" (print all selected blocks).
         self._sparse_debug_max_blocks: int = int(
             os.getenv("VLLM_SPARSE_DEBUG_MAX_BLOCKS", "0")
         )
         self._sparse_debug_tokenizer = None
-        if self._sparse_debug_decode_tokens:
+        if self._sparse_debug_decode_tokens or self._sparse_debug_first_token:
             try:
                 self._sparse_debug_tokenizer = cached_tokenizer_from_config(
                     self.model_config
@@ -555,6 +571,7 @@ class GPUModelRunner(
                     "Failed to initialize tokenizer for sparse decode debug logs: %s",
                     e,
                 )
+        if self._sparse_debug_decode_tokens:
             logger.info(
                 "Sparse decode debug logging enabled: "
                 "VLLM_SPARSE_DEBUG_DECODE_TOKENS=1 "
@@ -562,6 +579,13 @@ class GPUModelRunner(
                 "VLLM_SPARSE_DEBUG_MAX_BLOCKS=%d",
                 self._sparse_debug_decode_tokens_max,
                 self._sparse_debug_max_blocks,
+            )
+        if self._sparse_debug_first_token:
+            logger.info(
+                "Sparse first-token debug enabled: VLLM_SPARSE_DEBUG_FIRST_TOKEN=1 "
+                "optional ALL_LAYERS=%d OS_EXIT=%d",
+                int(self._sparse_debug_first_token_all_layers),
+                int(self._sparse_debug_first_token_os_exit),
             )
 
         # mm_hash ->  encoder_output
@@ -2209,6 +2233,11 @@ class GPUModelRunner(
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
 
+        if self._sparse_debug_first_token:
+            self._sparse_first_token_forward_rid_this_step.clear()
+            self._sparse_ft_kv_layer_pair_this_step.clear()
+            self._sparse_ft_pending_sample.clear()
+
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
@@ -3748,6 +3777,10 @@ class GPUModelRunner(
             if not sampled_ids:
                 continue
 
+            req_id = req_ids[req_idx]
+            req_state = self.requests[req_id]
+            prev_output_n = len(req_state.output_token_ids)
+
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]
             end_idx = start_idx + num_sampled_ids
             assert end_idx <= self.max_model_len, (
@@ -3760,9 +3793,22 @@ class GPUModelRunner(
             self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
-            req_id = req_ids[req_idx]
-            req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+            if (
+                self._sparse_debug_first_token
+                and prev_output_n == 0
+                and int(sampled_ids[0]) >= 0
+            ):
+                n_prompt = int(self.input_batch.num_prompt_tokens[req_idx])
+                n_comp = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                if n_comp >= n_prompt:
+                    self._sparse_log_first_sampled_token(
+                        req_idx=req_idx,
+                        req_id=req_id,
+                        sampled_ids=sampled_ids,
+                        logits=logits,
+                        spec_decode_metadata=spec_decode_metadata,
+                    )
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -7161,6 +7207,278 @@ class GPUModelRunner(
                 hooked_layers,
             )
 
+    def _sparse_simulate_compact_gather_one_req(
+        self,
+        *,
+        rid: str,
+        seq_len: int,
+        p_count: int,
+        chrono: list[int],
+        tok_map: dict[str, list[int]],
+        sk: str,
+        layer_name: str,
+        kv_cache_gid: int,
+        spec: SparseAttentionSpec,
+    ) -> tuple[bool, str]:
+        """Mirror gather_one_head logic for a single request (diagnostics only)."""
+        rs = self.requests.get(rid)
+        if rs is None:
+            return False, "no_req_state"
+        if kv_cache_gid >= len(rs.block_ids) or len(rs.block_ids[kv_cache_gid]) < 2:
+            return False, "block_ids_row_short"
+        if seq_len <= 0 or seq_len <= p_count:
+            return False, "not_decode"
+        bsz = spec.block_size
+        g_cur = seq_len - 1
+        toks = tok_map.get(sk)
+        if toks is None:
+            toks = tok_map.get(layer_name)
+        if toks is None:
+            return (
+                False,
+                f"missing_tok_or_chrono seq_len={seq_len} p_count={p_count} "
+                f"chrono_len={len(chrono)}",
+            )
+        sel = sorted(set(toks) | {g_cur})
+        sel = [g for g in sel if 0 <= g < seq_len]
+        logical_to_phys: dict[int, int] = {}
+        decode_phys: int | None = None
+        decode_lb: int | None = None
+        logical_order: list[int] = []
+        if len(chrono) == 0:
+            row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
+            if row is None or len(row) == 0:
+                return False, "missing_layer_row"
+            decode_phys = int(row[-1])
+            decode_lb = SparseKVManager._global_token_to_logical_block(
+                g_cur, p_count, bsz
+            )
+            hist_phys = [int(x) for x in row[:-1]]
+            by_l = self._sparse_by_layer_logical.get(rid)
+            if by_l and sk in by_l:
+                logical_order = [int(x) for x in by_l[sk]]
+            else:
+                logical_order = [
+                    int(x) for x in self._sparse_merged_logical.get(rid, [])
+                ]
+            if (
+                decode_lb is not None
+                and len(hist_phys) > 0
+                and len(logical_order) != len(hist_phys)
+            ):
+                return (
+                    False,
+                    f"logical_phys_mismatch logical_order_len={len(logical_order)} "
+                    f"hist_phys_len={len(hist_phys)}",
+                )
+            for lg, ph in zip(logical_order, hist_phys):
+                logical_to_phys[int(lg)] = int(ph)
+        for g in sel:
+            lb = SparseKVManager._global_token_to_logical_block(g, p_count, bsz)
+            if len(chrono) > 0:
+                if lb < 0 or lb >= len(chrono):
+                    return False, f"logical_block_oob lb={lb} chrono_len={len(chrono)}"
+                _phys_bid = int(chrono[lb])
+            else:
+                if lb in logical_to_phys:
+                    _phys_bid = int(logical_to_phys[lb])
+                elif (
+                    decode_phys is not None
+                    and decode_lb is not None
+                    and lb == decode_lb
+                ):
+                    _phys_bid = int(decode_phys)
+                else:
+                    return (
+                        False,
+                        f"logical_not_selected g={g} lb={lb} g_cur={g_cur} "
+                        f"decode_lb={decode_lb} mapped={len(logical_to_phys)} "
+                        f"logical_order_len={len(logical_order)}",
+                    )
+            g0 = SparseKVManager._logical_block_first_global(lb, p_count, bsz)
+            sl = g - g0
+            if sl < 0 or sl >= bsz:
+                return False, f"slot_oob g={g} slot={sl}"
+        return True, f"ok sel_len={len(sel)}"
+
+    def _sparse_log_first_decode_kv_snapshot(
+        self,
+        *,
+        layer_name: str,
+        kv_cache_gid: int,
+        num_reqs: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        spec: SparseAttentionSpec,
+    ) -> None:
+        if not self._sparse_debug_first_token or not self._has_sparse_attn:
+            return
+        bsz = spec.block_size
+        for ri in range(num_reqs):
+            rid = self.input_batch.req_ids[ri]
+            if self._sparse_debug_first_token_all_layers:
+                dedup_key = (rid, layer_name)
+                if dedup_key in self._sparse_ft_kv_layer_pair_this_step:
+                    continue
+            else:
+                if rid in self._sparse_first_token_forward_rid_this_step:
+                    continue
+            seq_len = int(common_attn_metadata._seq_lens_cpu[ri].item())
+            p_count = int(self.input_batch.num_prompt_tokens[ri])
+            n_comp = int(
+                common_attn_metadata._num_computed_tokens_cpu[ri].item()
+            )
+            rs = self.requests.get(rid)
+            if rs is None or seq_len <= p_count:
+                continue
+            if len(rs.output_token_ids) > 0:
+                continue
+            chrono = self._sparse_chrono_phys.get(rid, [])
+            merged = self._sparse_merged_logical.get(rid, [])
+            by_l = self._sparse_by_layer_logical.get(rid, {})
+            tok_all = self._sparse_token_indices_by_layer.get(rid, {})
+            sk0 = sparse_qh_unit_key(layer_name, 0)
+            toks0 = tok_all.get(sk0)
+            if toks0 is None:
+                toks0 = tok_all.get(layer_name)
+            bid_row = (
+                list(rs.block_ids[kv_cache_gid])
+                if kv_cache_gid < len(rs.block_ids)
+                else []
+            )
+            g_cur = seq_len - 1
+            decode_lb = SparseKVManager._global_token_to_logical_block(
+                g_cur, p_count, bsz
+            )
+            row0 = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk0)
+            ok_sim, sim_reason = self._sparse_simulate_compact_gather_one_req(
+                rid=rid,
+                seq_len=seq_len,
+                p_count=p_count,
+                chrono=list(chrono),
+                tok_map=tok_all,
+                sk=sk0,
+                layer_name=layer_name,
+                kv_cache_gid=kv_cache_gid,
+                spec=spec,
+            )
+            tok_txt = ""
+            if self._sparse_debug_tokenizer is not None and rs.prompt_token_ids:
+                try:
+                    if g_cur >= p_count > 0:
+                        last_ctx = p_count - 1
+                    else:
+                        last_ctx = min(g_cur, len(rs.prompt_token_ids) - 1)
+                    if 0 <= last_ctx < len(rs.prompt_token_ids):
+                        tid = int(rs.prompt_token_ids[last_ctx])
+                        tok_txt = self._sparse_debug_tokenizer.decode([tid])
+                except Exception:
+                    tok_txt = ""
+            logger.info(
+                "[SparseFirstTok:kv] req_id=%s layer=%s gid=%d "
+                "seq_len=%d p_count=%d n_comp=%d g_cur=%d decode_lb=%d "
+                "chrono_len=%d merged_len=%d by_layer_keys=%d tok_map_keys=%d "
+                "block_ids_len=%d hist_phys_len=%d row0_len=%d "
+                "qh0_toks_head=%s merged_head=%s chrono_head=%s bid_hist_head=%s "
+                "row0_head=%s query_tok_decode=%r compact_qh0_ok=%s compact_qh0=%s",
+                rid,
+                layer_name,
+                kv_cache_gid,
+                seq_len,
+                p_count,
+                n_comp,
+                g_cur,
+                int(decode_lb),
+                len(chrono),
+                len(merged),
+                len(by_l),
+                len(tok_all),
+                len(bid_row),
+                max(0, len(bid_row) - 1),
+                -1 if row0 is None else len(row0),
+                (toks0 or [])[:12],
+                list(merged)[:12],
+                list(chrono)[:12],
+                bid_row[:-1][:12] if len(bid_row) > 1 else [],
+                (row0 or [])[:12],
+                tok_txt,
+                ok_sim,
+                sim_reason,
+            )
+            self._sparse_ft_pending_sample.add(rid)
+            if self._sparse_debug_first_token_all_layers:
+                self._sparse_ft_kv_layer_pair_this_step.add((rid, layer_name))
+            else:
+                self._sparse_first_token_forward_rid_this_step.add(rid)
+
+    def _sparse_log_first_sampled_token(
+        self,
+        *,
+        req_idx: int,
+        req_id: str,
+        sampled_ids: list[int],
+        logits: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        if not self._sparse_debug_first_token or not self._has_sparse_attn:
+            return
+        if not get_pp_group().is_last_rank:
+            return
+        if req_id in self._sparse_first_token_sample_logged:
+            return
+        if not sampled_ids:
+            return
+        tok = int(sampled_ids[0])
+        top_txt = ""
+        top_pairs: list[tuple[int, float]] = []
+        if logits is not None and logits.dim() >= 2 and req_idx < logits.size(0):
+            row = logits[req_idx]
+            k = min(8, row.numel())
+            vals, idx = torch.topk(row, k=k)
+            top_pairs = [
+                (int(idx[i].item()), float(vals[i].item())) for i in range(k)
+            ]
+            if self._sparse_debug_tokenizer is not None:
+                try:
+                    parts = []
+                    for tid, val in top_pairs[:5]:
+                        t = self._sparse_debug_tokenizer.decode([tid])
+                        parts.append(f"{tid}:{val:.3f}:{t!r}")
+                    top_txt = " ".join(parts)
+                except Exception:
+                    top_txt = str(top_pairs[:5])
+        sampled_txt = ""
+        if self._sparse_debug_tokenizer is not None:
+            try:
+                sampled_txt = self._sparse_debug_tokenizer.decode([tok])
+            except Exception:
+                sampled_txt = ""
+        spec_hint = (
+            "spec_decode"
+            if spec_decode_metadata is not None
+            else "no_spec_decode"
+        )
+        kv_same_step = req_id in self._sparse_ft_pending_sample
+        logger.info(
+            "[SparseFirstTok:sample] req_id=%s req_idx=%d tok_id=%d tok=%r "
+            "top8=%s top5_detok=%s kv_same_step=%s %s",
+            req_id,
+            req_idx,
+            tok,
+            sampled_txt,
+            top_pairs,
+            top_txt,
+            kv_same_step,
+            spec_hint,
+        )
+        self._sparse_first_token_sample_logged.add(req_id)
+        if self._sparse_debug_first_token_os_exit:
+            logger.critical(
+                "[SparseFirstTok] OS exit after first sampled token "
+                "(VLLM_SPARSE_DEBUG_FIRST_TOKEN_OS_EXIT=1). "
+                "Use single-worker / local runs only."
+            )
+            os._exit(0)
+
     def _maybe_patch_sparse_compact_kv_metadata(
         self,
         attn_metadata_i: FlashAttentionMetadata,
@@ -7175,6 +7493,14 @@ class GPUModelRunner(
         """Attach paged-cache gather indices for token-sparse compact KV attention."""
         if for_cudagraph_capture or self.dcp_world_size > 1:
             return attn_metadata_i
+
+        self._sparse_log_first_decode_kv_snapshot(
+            layer_name=layer_name,
+            kv_cache_gid=kv_cache_gid,
+            num_reqs=num_reqs,
+            common_attn_metadata=common_attn_metadata,
+            spec=spec,
+        )
 
         attn_mod = self.compilation_config.static_forward_context.get(layer_name)
         num_heads = int(attn_mod.num_heads) if attn_mod is not None else 1
@@ -7267,6 +7593,7 @@ class GPUModelRunner(
                             and (
                                 self._sparse_probe_info_enabled
                                 or self._sparse_debug_decode_tokens
+                                or self._sparse_debug_first_token
                             )
                         ):
                             self._sparse_mismatch_logged.add(key)
@@ -7348,11 +7675,17 @@ class GPUModelRunner(
                 return None
             return phys_h, slot_h, cu_h
 
+        _sparse_compact_layer_verbose = (
+            self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens
+        ) and not (
+            self._sparse_debug_first_token and not self._sparse_debug_decode_tokens
+        )
+
         triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for qh in range(num_heads):
             g = gather_one_head(qh)
             if g is None:
-                if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
+                if _sparse_compact_layer_verbose:
                     req0 = self.input_batch.req_ids[0] if num_reqs > 0 else "<none>"
                     logger.info(
                         "[SparseRC] compact_gather layer=%s req_id=%s "
@@ -7370,9 +7703,7 @@ class GPUModelRunner(
                     torch.tensor(cu_h, dtype=torch.int32, device=dev),
                 )
             )
-        if (
-            self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens
-        ) and num_reqs > 0:
+        if _sparse_compact_layer_verbose and num_reqs > 0:
             logger.info(
                 "[SparseRC] compact_gather layer=%s req_id=%s enabled=1 "
                 "num_heads=%d qh0_tokens=%d",
