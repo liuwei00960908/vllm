@@ -1,2 +1,3 @@
 
 grep -nE "SparseState:sched|SparseState:bridge|SparseStep:commit|SparseStep:consume|SparseStep:sample|SparseHardStop" vllm_server.log
+grep -nE "SparseProbe:select_tokens|SparseRC:map_dbg" vllm_server.log

@@ -8123,17 +8123,50 @@ class GPUModelRunner(
                     or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
                 )
             ):
+                sel_detok: list[str] = []
+                rid0 = self.input_batch.req_ids[0]
+                rs0 = self.requests.get(rid0)
+                if (
+                    rs0 is not None
+                    and self._sparse_debug_tokenizer is not None
+                ):
+                    p0 = 0
+                    try:
+                        p0 = int(self.input_batch.num_prompt_tokens[0])
+                    except Exception:
+                        p0 = len(rs0.prompt_token_ids)
+                    for g in debug_sel_all[:24]:
+                        tid: int | None = None
+                        if g < p0:
+                            if 0 <= g < len(rs0.prompt_token_ids):
+                                tid = int(rs0.prompt_token_ids[g])
+                        else:
+                            di = int(g - p0)
+                            if 0 <= di < len(rs0.output_token_ids):
+                                tdi = int(rs0.output_token_ids[di])
+                                if tdi >= 0:
+                                    tid = tdi
+                        if tid is None:
+                            sel_detok.append(f"{g}:<na>")
+                            continue
+                        try:
+                            txt = self._sparse_debug_tokenizer.decode([tid])
+                        except Exception:
+                            txt = "<dec_err>"
+                        sel_detok.append(f"{g}:{tid}:{txt!r}")
                 logger.info(
                     "[SparseRC:map_dbg] layer=%s req_id=%s qh=%d "
-                    "sel_all=%s lb_all=%s decode_lb=%d phys_all=%s slot_all=%s total=%d",
+                    "sel_all=%s lb_all=%s decode_lb=%d phys_all=%s slot_all=%s "
+                    "sel_detok=%s total=%d",
                     layer_name,
-                    self.input_batch.req_ids[0],
+                    rid0,
                     qh_idx,
                     debug_sel_all,
                     debug_lb_all,
                     debug_decode_lb,
                     [int(x) for x in phys_h],
                     [int(x) for x in slot_h],
+                    sel_detok,
                     len(phys_h),
                 )
             return phys_h, slot_h, cu_h
