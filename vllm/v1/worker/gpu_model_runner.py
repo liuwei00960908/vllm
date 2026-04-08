@@ -7939,7 +7939,7 @@ class GPUModelRunner(
             return
         # Focus on exact same generation stage for A/B comparability.
         out_before = len(rs.output_token_ids)
-        target_out_before = 4
+        target_out_before = 5
         if out_before != target_out_before:
             return
         attn_mod = self.compilation_config.static_forward_context.get(layer_name)
@@ -7965,13 +7965,10 @@ class GPUModelRunner(
                     except Exception:
                         last_tok_text = ""
         if last_tok_id < 0:
-            # Full-attention async path may keep placeholder ids in
-            # output_token_ids; recover last committed token from the batch
-            # token buffer instead.
+            # Prefer the actual context tail token of this forward.
             req_idx = self.input_batch.req_id_to_index.get(req_id)
-            if req_idx is not None and out_before > 0:
-                p = int(self.input_batch.num_prompt_tokens[req_idx])
-                pos = p + int(out_before) - 1
+            if req_idx is not None and seq_len > 0:
+                pos = int(seq_len) - 1
                 if 0 <= pos < self.input_batch.token_ids_cpu.shape[1]:
                     tid = int(self.input_batch.token_ids_cpu[req_idx, pos])
                     if tid >= 0:
