@@ -7553,6 +7553,9 @@ class GPUModelRunner(
             for rid, seq_len, p_count, chrono, tok_map in req_ctx:
                 rs = self.requests.get(rid)
                 if rs is None:
+                    gather_fail_reason = (
+                        f"missing_req_state rid={rid} qh={qh_idx} sk={sk}"
+                    )
                     return None
                 # Decode-step readiness should be inferred from sparse row shape
                 # (history + active decode block), not from output_token_ids.
@@ -7560,11 +7563,29 @@ class GPUModelRunner(
                     kv_cache_gid >= len(rs.block_ids)
                     or len(rs.block_ids[kv_cache_gid]) < 2
                 ):
+                    row_len = (
+                        -1
+                        if kv_cache_gid >= len(rs.block_ids)
+                        else len(rs.block_ids[kv_cache_gid])
+                    )
+                    gather_fail_reason = (
+                        f"block_row_short rid={rid} qh={qh_idx} sk={sk} "
+                        f"gid={kv_cache_gid} row_len={row_len}"
+                    )
                     return None
                 if seq_len <= 0:
+                    gather_fail_reason = (
+                        f"non_positive_seq_len rid={rid} qh={qh_idx} sk={sk} "
+                        f"seq_len={seq_len}"
+                    )
                     return None
                 # Do not run decode compact-gather on pure prefill steps.
                 if seq_len <= p_count:
+                    gather_fail_reason = (
+                        f"not_decode_yet rid={rid} qh={qh_idx} sk={sk} "
+                        f"seq_len={seq_len} p_count={p_count} "
+                        f"out_tokens={len(rs.output_token_ids)}"
+                    )
                     return None
                 g_cur = seq_len - 1
                 bsz = spec.block_size
