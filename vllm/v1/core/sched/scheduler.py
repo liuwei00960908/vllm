@@ -1113,7 +1113,8 @@ class Scheduler(SchedulerInterface):
             has_sparse_mgr = self.kv_cache_manager.get_sparse_manager() is not None
             decode_phase = (req.num_output_tokens + req.num_output_placeholders) > 0
             is_sparse_decode_req = has_sparse_mgr and decode_phase
-            phase_gate_no_layer_state = False
+            phase_gate_sparse_meta = False
+            phase_gate_reason = ""
             if is_sparse_decode_req:
                 missing_sparse_meta = (
                     by_layer is None or tok_by_layer is None or chrono is None
@@ -1128,8 +1129,6 @@ class Scheduler(SchedulerInterface):
                         req_id
                         )
                     )
-                    if ensure_reason == "no_layer_state":
-                        phase_gate_no_layer_state = True
                     if refreshed:
                         selected = (
                             self.kv_cache_manager.get_sparse_selected_block_indices(
@@ -1159,7 +1158,13 @@ class Scheduler(SchedulerInterface):
                 # Sparse decode worker expects a FULL row (selected history +
                 # decode tail). Incremental allocation payload ([] / [1] on
                 # rollover) would be misinterpreted as full-row replacement.
-                if phase_gate_no_layer_state:
+                missing_sparse_meta = (
+                    by_layer is None or tok_by_layer is None or chrono is None
+                )
+                if missing_sparse_meta:
+                    phase_gate_sparse_meta = True
+                    phase_gate_reason = ensure_reason or "missing_sparse_meta"
+                if phase_gate_sparse_meta:
                     block_ids_payload = req_to_new_blocks[req_id].get_block_ids(
                         allow_none=True
                     )
@@ -1207,14 +1212,15 @@ class Scheduler(SchedulerInterface):
                 sparse_chrono_phys_block_ids[req_id] = chrono
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_for_worker = req.num_output_tokens + req.num_output_placeholders
-            if phase_gate_no_layer_state:
+            if phase_gate_sparse_meta:
                 # Keep worker in prefill-context mode for one transition step
                 # until sparse layer_state is ready.
                 num_output_for_worker = req.num_output_tokens
                 logger.warning(
-                    "[SparseRC:phase_gate] req_id=%s gate=no_layer_state "
+                    "[SparseRC:phase_gate] req_id=%s gate=%s "
                     "num_output_tokens=%d num_placeholders=%d worker_num_output_tokens=%d",
                     req_id,
+                    phase_gate_reason or "missing_sparse_meta",
                     req.num_output_tokens,
                     req.num_output_placeholders,
                     num_output_for_worker,
