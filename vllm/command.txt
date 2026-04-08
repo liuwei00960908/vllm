@@ -1,2 +1,1 @@
-
-grep -nE "SparseStep:sample|SparseFirstTok:sample|SparseRC:map_dbg|SparseHardStop" vllm_server.log
+grep -nE "SparseStep:sample|SparseRC:map_dbg|SparseProbe:select_tokens|SparseHardStop" vllm_server.log

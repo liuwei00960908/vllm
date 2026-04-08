@@ -1448,6 +1448,38 @@ class SparseKVManager(FullAttentionManager):
                 len(result),
                 len(self._selected_retrieve_block_indices.get(request_id, [])),
             )
+            if self._token_mode():
+                tok_by_layer = self._selected_token_indices_by_layer.get(
+                    request_id, {}
+                )
+                qh0_key: str | None = None
+                for k in sorted(tok_by_layer.keys()):
+                    if k.endswith("##qh0"):
+                        qh0_key = k
+                        break
+                if qh0_key is not None:
+                    toks0 = [int(t) for t in tok_by_layer.get(qh0_key, [])]
+                    p_count = int(self._prefill_token_count.get(request_id, n_units))
+                    bsz = int(self.block_size)
+                    lb0 = [
+                        int(self._global_token_to_logical_block(t, p_count, bsz))
+                        for t in toks0
+                    ]
+                    lb_hist: dict[int, int] = {}
+                    for lb in lb0:
+                        lb_hist[lb] = lb_hist.get(lb, 0) + 1
+                    lb_hist_head = sorted(lb_hist.items(), key=lambda kv: kv[0])[:6]
+                    logger.info(
+                        "[SparseProbe:select_tokens] req_id=%s qh0=%s "
+                        "n_units=%d p_count=%d tok_head=%s lb_head=%s lb_hist=%s",
+                        request_id,
+                        qh0_key,
+                        int(n_units),
+                        p_count,
+                        toks0[:16],
+                        lb0[:16],
+                        lb_hist_head,
+                    )
             if request_id not in self._first_select_probe_done:
                 self._first_select_probe_done.add(request_id)
                 if self._token_mode():
