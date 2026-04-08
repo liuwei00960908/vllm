@@ -223,6 +223,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Sparse first-decode hard debug (NO env vars).
+# When True: prints SparseFirstTok kv/sample lines (if sparse attention is on)
+# and calls os._exit(0) immediately after the first valid new output token
+# is appended in bookkeeping.  Set to False before merge or normal serving.
+# ---------------------------------------------------------------------------
+_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = True
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -548,25 +556,21 @@ class GPUModelRunner(
         self._sparse_debug_first_token_all_layers: bool = bool(
             int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN_ALL_LAYERS", "0"))
         )
-        self._sparse_debug_first_token_os_exit: bool = bool(
-            int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN_OS_EXIT", "0"))
-        )
-        # Hard-stop at first decode KV snapshot (earlier than sampling hook).
-        self._sparse_debug_first_token_kv_os_exit: bool = bool(
-            int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN_KV_OS_EXIT", "0"))
-        )
         # Cleared at the start of each _build_attention_metadata call.
         self._sparse_first_token_forward_rid_this_step: set[str] = set()
         self._sparse_ft_kv_layer_pair_this_step: set[tuple[str, str]] = set()
         self._sparse_ft_pending_sample: set[str] = set()
         self._sparse_first_token_sample_logged: set[str] = set()
-        self._sparse_first_token_kv_exit_done: set[str] = set()
         # <= 0 means "no cap" (print all selected blocks).
         self._sparse_debug_max_blocks: int = int(
             os.getenv("VLLM_SPARSE_DEBUG_MAX_BLOCKS", "0")
         )
         self._sparse_debug_tokenizer = None
-        if self._sparse_debug_decode_tokens or self._sparse_debug_first_token:
+        if (
+            self._sparse_debug_decode_tokens
+            or self._sparse_debug_first_token
+            or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+        ):
             try:
                 self._sparse_debug_tokenizer = cached_tokenizer_from_config(
                     self.model_config
@@ -588,10 +592,13 @@ class GPUModelRunner(
         if self._sparse_debug_first_token:
             logger.info(
                 "Sparse first-token debug enabled: VLLM_SPARSE_DEBUG_FIRST_TOKEN=1 "
-                "optional ALL_LAYERS=%d OS_EXIT=%d KV_OS_EXIT=%d",
+                "optional ALL_LAYERS=%d",
                 int(self._sparse_debug_first_token_all_layers),
-                int(self._sparse_debug_first_token_os_exit),
-                int(self._sparse_debug_first_token_kv_os_exit),
+            )
+        if _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
+            logger.critical(
+                "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=True: process will "
+                "os._exit(0) after the first valid sampled output token."
             )
 
         # mm_hash ->  encoder_output
@@ -2239,7 +2246,7 @@ class GPUModelRunner(
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
 
-        if self._sparse_debug_first_token:
+        if self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
             self._sparse_first_token_forward_rid_this_step.clear()
             self._sparse_ft_kv_layer_pair_this_step.clear()
             self._sparse_ft_pending_sample.clear()
@@ -3801,9 +3808,8 @@ class GPUModelRunner(
 
             req_state.output_token_ids.extend(sampled_ids)
             if (
-                self._sparse_debug_first_token
-                and prev_output_n == 0
-            ):
+                self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+            ) and prev_output_n == 0:
                 self._sparse_log_first_sampled_token(
                     req_idx=req_idx,
                     req_id=req_id,
@@ -3811,6 +3817,18 @@ class GPUModelRunner(
                     logits=logits,
                     spec_decode_metadata=spec_decode_metadata,
                 )
+            if _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN and prev_output_n == 0:
+                t0i = int(sampled_ids[0])
+                if t0i >= 0:
+                    logger.critical(
+                        "[SparseHardStop] os._exit(0) after first valid output "
+                        "token req_id=%s tok_id=%d — set "
+                        "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=False in "
+                        "gpu_model_runner.py to disable.",
+                        req_id,
+                        t0i,
+                    )
+                    os._exit(0)
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -7312,7 +7330,9 @@ class GPUModelRunner(
         common_attn_metadata: CommonAttentionMetadata,
         spec: SparseAttentionSpec,
     ) -> None:
-        if not self._sparse_debug_first_token or not self._has_sparse_attn:
+        if not self._has_sparse_attn:
+            return
+        if not self._sparse_debug_first_token and not _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
             return
         bsz = spec.block_size
         for ri in range(num_reqs):
@@ -7406,16 +7426,6 @@ class GPUModelRunner(
                 ok_sim,
                 sim_reason,
             )
-            if (
-                self._sparse_debug_first_token_kv_os_exit
-                and rid not in self._sparse_first_token_kv_exit_done
-            ):
-                self._sparse_first_token_kv_exit_done.add(rid)
-                logger.critical(
-                    "[SparseFirstTok] OS exit after first KV snapshot "
-                    "(VLLM_SPARSE_DEBUG_FIRST_TOKEN_KV_OS_EXIT=1)."
-                )
-                os._exit(0)
             self._sparse_ft_pending_sample.add(rid)
             if self._sparse_debug_first_token_all_layers:
                 self._sparse_ft_kv_layer_pair_this_step.add((rid, layer_name))
@@ -7431,13 +7441,20 @@ class GPUModelRunner(
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> None:
-        if not self._sparse_debug_first_token or not self._has_sparse_attn:
+        if not self._has_sparse_attn:
+            return
+        if (
+            not self._sparse_debug_first_token
+            and not _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+        ):
             return
         if req_id in self._sparse_first_token_sample_logged:
             return
         if not sampled_ids:
             return
         tok = int(sampled_ids[0])
+        if tok < 0:
+            return
         top_txt = ""
         top_pairs: list[tuple[int, float]] = []
         if logits is not None and logits.dim() >= 2 and req_idx < logits.size(0):
@@ -7483,13 +7500,6 @@ class GPUModelRunner(
             spec_hint,
         )
         self._sparse_first_token_sample_logged.add(req_id)
-        if self._sparse_debug_first_token_os_exit:
-            logger.critical(
-                "[SparseFirstTok] OS exit after first sampled token "
-                "(VLLM_SPARSE_DEBUG_FIRST_TOKEN_OS_EXIT=1). "
-                "Use single-worker / local runs only."
-            )
-            os._exit(0)
 
     def _maybe_patch_sparse_compact_kv_metadata(
         self,
@@ -7606,6 +7616,7 @@ class GPUModelRunner(
                                 self._sparse_probe_info_enabled
                                 or self._sparse_debug_decode_tokens
                                 or self._sparse_debug_first_token
+                                or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
                             )
                         ):
                             self._sparse_mismatch_logged.add(key)
@@ -7690,7 +7701,11 @@ class GPUModelRunner(
         _sparse_compact_layer_verbose = (
             self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens
         ) and not (
-            self._sparse_debug_first_token and not self._sparse_debug_decode_tokens
+            (
+                self._sparse_debug_first_token
+                or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+            )
+            and not self._sparse_debug_decode_tokens
         )
 
         triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
