@@ -1375,6 +1375,7 @@ class GPUModelRunner(
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
+            new_token_ids_len = -1
 
             if not is_last_rank:
                 if not req_data.new_token_ids:
@@ -1397,6 +1398,7 @@ class GPUModelRunner(
                         req_state.output_token_ids.extend(
                             new_token_ids[-num_new_tokens:]
                         )
+                new_token_ids_len = len(new_token_ids)
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
@@ -1672,9 +1674,6 @@ class GPUModelRunner(
                 (self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
                 and self.use_async_scheduling
             ):
-                new_token_ids_len = (
-                    len(new_token_ids) if new_token_ids is not None else -1
-                )
                 logger.info(
                     "[SparseState:bridge] req_id=%s stage=persistent "
                     "req_index=%d num_output_tokens=%d output_len=%d "
