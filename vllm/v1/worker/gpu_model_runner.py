@@ -1413,6 +1413,30 @@ class GPUModelRunner(
                 [] if new_block_ids is None else [len(ids) for ids in new_block_ids]
             )
             prev_row_lens = [len(ids) for ids in req_state.block_ids]
+            if self._has_sparse_attn and num_output_tokens > 0:
+                by_layer = sparse_by_layer_map.get(req_id)
+                tok_by_layer = sparse_tok_by_layer_map.get(req_id)
+                chrono_by_req = sparse_chrono_phys_map.get(req_id)
+                if by_layer is None or tok_by_layer is None or chrono_by_req is None:
+                    logger.warning(
+                        "[SparseRC:bridge_worker] req_id=%s "
+                        "missing by_layer=%s tok=%s chrono=%s "
+                        "selected_len=%d retrieve_len=%d num_output_tokens=%d "
+                        "incoming_row_lens=%s prev_row_lens=%s "
+                        "cached_prev by_layer_keys=%d tok_keys=%d chrono_len=%d",
+                        req_id,
+                        by_layer is None,
+                        tok_by_layer is None,
+                        chrono_by_req is None,
+                        selected_count,
+                        retrieve_count,
+                        num_output_tokens,
+                        incoming_row_lens,
+                        prev_row_lens,
+                        len(self._sparse_by_layer_logical.get(req_id, {})),
+                        len(self._sparse_token_indices_by_layer.get(req_id, {})),
+                        len(self._sparse_chrono_phys.get(req_id, [])),
+                    )
             sparse_row_collapse_guard = (
                 self._has_sparse_attn
                 and num_output_tokens > 0
@@ -1497,20 +1521,65 @@ class GPUModelRunner(
                                 zone_name="merged",
                             )
                         else:
-                            self._sparse_merged_logical.pop(req_id, None)
-                            self._sparse_by_layer_logical.pop(req_id, None)
+                            if is_sparse_decode:
+                                # Decode-step sparse metadata may transiently
+                                # miss one scheduler payload. Keep previous
+                                # mapping to avoid disabling compact gather
+                                # for all layers in this step.
+                                if (
+                                    self._sparse_probe_info_enabled
+                                    or self._sparse_debug_decode_tokens
+                                ):
+                                    logger.warning(
+                                        "[SparseRC] keep_prev_sparse_meta "
+                                        "req_id=%s kind=logical merged_prev=%d by_layer_prev=%d",
+                                        req_id,
+                                        len(self._sparse_merged_logical.get(req_id, [])),
+                                        len(self._sparse_by_layer_logical.get(req_id, {})),
+                                    )
+                            else:
+                                self._sparse_merged_logical.pop(req_id, None)
+                                self._sparse_by_layer_logical.pop(req_id, None)
                         stl = sparse_tok_by_layer_map.get(req_id)
                         if stl is not None:
                             self._sparse_token_indices_by_layer[req_id] = {
                                 k: list(v) for k, v in stl.items()
                             }
                         else:
-                            self._sparse_token_indices_by_layer.pop(req_id, None)
+                            if is_sparse_decode:
+                                if (
+                                    self._sparse_probe_info_enabled
+                                    or self._sparse_debug_decode_tokens
+                                ):
+                                    logger.warning(
+                                        "[SparseRC] keep_prev_sparse_meta "
+                                        "req_id=%s kind=tokens tok_prev_keys=%d",
+                                        req_id,
+                                        len(
+                                            self._sparse_token_indices_by_layer.get(
+                                                req_id, {}
+                                            )
+                                        ),
+                                    )
+                            else:
+                                self._sparse_token_indices_by_layer.pop(req_id, None)
                         chrono = sparse_chrono_phys_map.get(req_id)
                         if chrono is not None:
                             self._sparse_chrono_phys[req_id] = list(chrono)
                         else:
-                            self._sparse_chrono_phys.pop(req_id, None)
+                            if is_sparse_decode:
+                                if (
+                                    self._sparse_probe_info_enabled
+                                    or self._sparse_debug_decode_tokens
+                                ):
+                                    logger.warning(
+                                        "[SparseRC] keep_prev_sparse_meta "
+                                        "req_id=%s kind=chrono chrono_prev_len=%d",
+                                        req_id,
+                                        len(self._sparse_chrono_phys.get(req_id, [])),
+                                    )
+                            else:
+                                self._sparse_chrono_phys.pop(req_id, None)
                     elif is_sparse_decode:
                         # Guard against sparse-row collapse. Keep historical
                         # row shape and append truly new blocks only.

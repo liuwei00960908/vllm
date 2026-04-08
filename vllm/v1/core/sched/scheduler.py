@@ -1121,6 +1121,27 @@ class Scheduler(SchedulerInterface):
                 block_ids_payload = self.kv_cache_manager.get_blocks(
                     req_id
                 ).get_block_ids(allow_none=True)
+                if by_layer is None or tok_by_layer is None or chrono is None:
+                    logger.warning(
+                        "[SparseRC:bridge_sched] req_id=%s "
+                        "missing by_layer=%s tok=%s chrono=%s "
+                        "selected_len=%d retrieve_len=%d "
+                        "num_output_tokens=%d num_placeholders=%d "
+                        "payload_row_lens=%s",
+                        req_id,
+                        by_layer is None,
+                        tok_by_layer is None,
+                        chrono is None,
+                        0 if selected is None else len(selected),
+                        0 if retrieve is None else len(retrieve),
+                        req.num_output_tokens,
+                        req.num_output_placeholders,
+                        (
+                            []
+                            if block_ids_payload is None
+                            else [len(x) for x in block_ids_payload]
+                        ),
+                    )
             else:
                 block_ids_payload = req_to_new_blocks[req_id].get_block_ids(
                     allow_none=True
