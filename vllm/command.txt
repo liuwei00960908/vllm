@@ -1,2 +1,1 @@
-grep -nE "SparseFirstTok:sample|SparseHardStop" vllm_server.log
-grep -nE "missing_tok_or_chrono|fallback_lbs=|boundary_disable_sparse|compact_gather layer=.*enabled=0 reason=" vllm_server.log
+grep -nE "SparseRC:bridge_sched|SparseRC:bridge_worker|missing_tok_or_chrono|compact_gather layer=.*enabled=0 reason=" vllm_server.log
