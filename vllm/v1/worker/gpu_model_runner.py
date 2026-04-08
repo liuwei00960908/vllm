@@ -2561,7 +2561,12 @@ class GPUModelRunner(
                     p_i = int(self.input_batch.num_prompt_tokens[req_idx])
                     rs = self.requests.get(rid)
                     out_n = 0 if rs is None else len(rs.output_token_ids)
-                    if seq_i == p_i and out_n == 0:
+                    # Async placeholder boundary: first decode forward can have
+                    # seq_len == prompt_len + 1 while no output token is yet
+                    # committed on worker side. Treat this as boundary as well
+                    # so token-sparse patching is disabled for that transition
+                    # step and cannot affect the first sampled token.
+                    if out_n == 0 and seq_i <= (p_i + 1):
                         boundary_req_ids.append(rid)
                 boundary_disable_sparse = len(boundary_req_ids) > 0
                 if boundary_disable_sparse and (
