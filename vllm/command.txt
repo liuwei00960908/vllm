@@ -1,3 +1,35 @@
 
 grep -nE "AttnAB:sample|SparseProbe:select_tokens|SparseRC:map_dbg|SparseRC:step5_cmp|SparseHardStop" vllm_server.log
 grep -nE "AttnAB:sample" vllm_server.log
+
+import torch
+
+a = torch.load("fa_dump_full.pt", map_location="cpu")
+b = torch.load("fa_dump_sparse.pt", map_location="cpu")
+
+print("full:", {k: a[k] for k in ["mode", "req_id", "layer", "seq_len", "out_before"]})
+print("sparse:", {k: b[k] for k in ["mode", "req_id", "layer", "seq_len", "out_before"]})
+
+for key in ["phys", "slot"]:
+    same = a[key] == b[key]
+    print(f"{key}: same={same}, len_full={len(a[key])}, len_sparse={len(b[key])}")
+    if not same:
+        n = min(len(a[key]), len(b[key]))
+        diff_idx = [i for i in range(n) if a[key][i] != b[key][i]]
+        print(f"  first_diff_idx={diff_idx[:10]}")
+        print(f"  full_head={a[key][:20]}")
+        print(f"  sparse_head={b[key][:20]}")
+
+for key in ["k", "v"]:
+    x = a[key].float()
+    y = b[key].float()
+
+    same_shape = x.shape == y.shape
+    print(f"{key}: shape_full={tuple(x.shape)}, shape_sparse={tuple(y.shape)}, same_shape={same_shape}")
+    if not same_shape:
+        continue
+
+    diff = (x - y).abs()
+    print(f"  max_abs_diff={diff.max().item():.6e}")
+    print(f"  mean_abs_diff={diff.mean().item():.6e}")
+    print(f"  allclose(1e-5,1e-5)={torch.allclose(x, y, atol=1e-5, rtol=1e-5)}")
