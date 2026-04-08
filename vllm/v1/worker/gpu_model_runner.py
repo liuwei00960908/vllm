@@ -1405,6 +1405,28 @@ class GPUModelRunner(
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
+                if (
+                    self._sparse_debug_first_token
+                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                ) and num_output_tokens <= 8:
+                    req_idx_dbg = self.input_batch.req_id_to_index.get(req_id)
+                    tail_before: list[int] = []
+                    if req_idx_dbg is not None:
+                        nspec_before = int(self.input_batch.num_tokens_no_spec[req_idx_dbg])
+                        tail_before = self.input_batch.token_ids_cpu[
+                            req_idx_dbg, max(0, nspec_before - 2):nspec_before
+                        ].tolist()
+                    logger.info(
+                        "[SparseState:trim] req_id=%s reason=sync_kv_load_failure "
+                        "before_output_len=%d target_output_len=%d "
+                        "num_computed_tokens=%d req_index=%s tail_ids_before=%s",
+                        req_id,
+                        int(len(req_state.output_token_ids)),
+                        int(num_output_tokens),
+                        int(num_computed_tokens),
+                        "none" if req_idx_dbg is None else str(int(req_idx_dbg)),
+                        [int(x) for x in tail_before],
+                    )
                 del req_state.output_token_ids[num_output_tokens:]
                 if req_index is not None:
                     end_idx = (
@@ -1412,6 +1434,27 @@ class GPUModelRunner(
                         + num_output_tokens
                     )
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
+                if (
+                    self._sparse_debug_first_token
+                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                ) and num_output_tokens <= 8:
+                    req_idx_dbg = self.input_batch.req_id_to_index.get(req_id)
+                    tail_after: list[int] = []
+                    nspec_after = -1
+                    if req_idx_dbg is not None:
+                        nspec_after = int(self.input_batch.num_tokens_no_spec[req_idx_dbg])
+                        tail_after = self.input_batch.token_ids_cpu[
+                            req_idx_dbg, max(0, nspec_after - 2):nspec_after
+                        ].tolist()
+                    logger.info(
+                        "[SparseState:trim_after] req_id=%s output_len_after=%d "
+                        "num_tokens_no_spec_after=%d req_index=%s tail_ids_after=%s",
+                        req_id,
+                        int(len(req_state.output_token_ids)),
+                        int(nspec_after),
+                        "none" if req_idx_dbg is None else str(int(req_idx_dbg)),
+                        [int(x) for x in tail_after],
+                    )
 
             selected_logical_blocks = sparse_selected_map.get(req_id)
             retrieve_logical_blocks = sparse_retrieve_map.get(req_id)
