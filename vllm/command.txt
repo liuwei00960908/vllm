@@ -1,1 +1,2 @@
-grep -nE "SparseFirstTok:kv|SparseFirstTok:sample|compact_gather layer=.*enabled=1|compact_gather layer=.*enabled=0 reason=|boundary_disable_sparse|bridge_sched|phase_gate|SparseHardStop" vllm_server.log
+
+grep -nE "SparseStep:sample|SparseFirstTok:sample|SparseRC:map_dbg|SparseHardStop" vllm_server.log

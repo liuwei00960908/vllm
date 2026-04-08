@@ -3939,6 +3939,13 @@ class GPUModelRunner(
 
             req_state.output_token_ids.extend(sampled_ids)
             out_n_after = len(req_state.output_token_ids)
+            self._sparse_log_sample_step(
+                req_idx=req_idx,
+                req_id=req_id,
+                prev_output_n=prev_output_n,
+                sampled_ids=sampled_ids,
+                logits=logits,
+            )
             if (
                 self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
             ) and prev_output_n <= 1:
@@ -7670,6 +7677,66 @@ class GPUModelRunner(
         if prev_output_n == 0:
             self._sparse_first_token_sample_logged.add(req_id)
 
+    def _sparse_log_sample_step(
+        self,
+        *,
+        req_idx: int,
+        req_id: str,
+        prev_output_n: int,
+        sampled_ids: list[int],
+        logits: torch.Tensor | None,
+    ) -> None:
+        """Lightweight per-step sampled-token log for early decode debugging."""
+        if not self._has_sparse_attn:
+            return
+        if not (
+            self._sparse_debug_first_token
+            or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+        ):
+            return
+        if prev_output_n >= int(_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N):
+            return
+        if not sampled_ids:
+            return
+        tok = int(sampled_ids[0])
+        if tok < 0:
+            return
+        tok_txt = ""
+        if self._sparse_debug_tokenizer is not None:
+            try:
+                tok_txt = self._sparse_debug_tokenizer.decode([tok])
+            except Exception:
+                tok_txt = ""
+        top_txt = ""
+        if logits is not None and logits.dim() >= 2 and req_idx < logits.size(0):
+            row = logits[req_idx]
+            k = min(3, row.numel())
+            vals, idx = torch.topk(row, k=k)
+            if self._sparse_debug_tokenizer is not None:
+                try:
+                    parts = []
+                    for i in range(k):
+                        tid = int(idx[i].item())
+                        tv = float(vals[i].item())
+                        tt = self._sparse_debug_tokenizer.decode([tid])
+                        parts.append(f"{tid}:{tv:.3f}:{tt!r}")
+                    top_txt = " ".join(parts)
+                except Exception:
+                    top_txt = str(
+                        [
+                            (int(idx[i].item()), float(vals[i].item()))
+                            for i in range(k)
+                        ]
+                    )
+        logger.info(
+            "[SparseStep:sample] req_id=%s step=%d tok_id=%d tok=%r top3=%s",
+            req_id,
+            int(prev_output_n + 1),
+            tok,
+            tok_txt,
+            top_txt,
+        )
+
     def _maybe_patch_sparse_compact_kv_metadata(
         self,
         attn_metadata_i: FlashAttentionMetadata,
@@ -7718,6 +7785,8 @@ class GPUModelRunner(
             phys_h: list[int] = []
             slot_h: list[int] = []
             cu_h: list[int] = [0]
+            debug_sel_head: list[int] = []
+            debug_decode_lb: int = -1
             sk = sparse_qh_unit_key(layer_name, qh_idx)
             for rid, seq_len, p_count, chrono, tok_map in req_ctx:
                 rs = self.requests.get(rid)
@@ -7808,11 +7877,19 @@ class GPUModelRunner(
                         return None
                 sel = sorted(set(toks) | {g_cur})
                 sel = [g for g in sel if 0 <= g < seq_len]
+                if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
+                    debug_sel_head = [int(x) for x in sel[:12]]
                 logical_to_phys: dict[int, int] = {}
                 decode_phys: int | None = int(rs.block_ids[kv_cache_gid][-1])
                 decode_lb: int | None = SparseKVManager._global_token_to_logical_block(
                     g_cur, p_count, bsz
                 )
+                if (
+                    qh_idx == 0
+                    and layer_name.endswith("layers.0.self_attn.attn")
+                    and decode_lb is not None
+                ):
+                    debug_decode_lb = int(decode_lb)
                 logical_order: list[int] = []
                 if len(chrono) == 0:
                     row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
@@ -7946,6 +8023,29 @@ class GPUModelRunner(
             if not phys_h:
                 gather_fail_reason = "empty_phys_after_selection"
                 return None
+            if (
+                qh_idx == 0
+                and layer_name.endswith("layers.0.self_attn.attn")
+                and num_reqs > 0
+                and (
+                    self._sparse_probe_info_enabled
+                    or self._sparse_debug_decode_tokens
+                    or self._sparse_debug_first_token
+                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                )
+            ):
+                logger.info(
+                    "[SparseRC:map_dbg] layer=%s req_id=%s qh=%d "
+                    "sel_head=%s decode_lb=%d phys_head=%s slot_head=%s total=%d",
+                    layer_name,
+                    self.input_batch.req_ids[0],
+                    qh_idx,
+                    debug_sel_head,
+                    debug_decode_lb,
+                    [int(x) for x in phys_h[:12]],
+                    [int(x) for x in slot_h[:12]],
+                    len(phys_h),
+                )
             return phys_h, slot_h, cu_h
 
         _sparse_compact_layer_verbose = (
