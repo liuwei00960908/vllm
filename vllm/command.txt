@@ -1,1 +1,1 @@
-grep -nE "SparseRC:bridge_sched|SparseRC:phase_gate|missing_tok_or_chrono|logical_phys_mismatch|compact_gather layer=.*enabled=1|SparseFirstTok:sample|SparseHardStop" vllm_server.log
+grep -nE "ensure_reason=|SparseRC:phase_gate|SparseRC:bridge_sched|missing_tok_or_chrono|logical_phys_mismatch|compact_gather layer=.*enabled=1|SparseFirstTok:sample|SparseHardStop" vllm_server.log
