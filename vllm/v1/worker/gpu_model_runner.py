@@ -8150,6 +8150,15 @@ class GPUModelRunner(
                         )
                         return None
                 sel = sorted(set(toks) | {g_cur})
+                # In async token-sparse decode, selection payload can lag by a
+                # couple of newest history tokens. Enforce the local recency
+                # invariant at materialization time so FA input always contains
+                # the two latest context tokens before current decode token.
+                if seq_len >= 2:
+                    sel.append(seq_len - 2)
+                if seq_len >= 3:
+                    sel.append(seq_len - 3)
+                sel = sorted(set(sel))
                 sel = [g for g in sel if 0 <= g < seq_len]
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
                     debug_sel_all = [int(x) for x in sel]

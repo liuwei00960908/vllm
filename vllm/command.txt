@@ -1,1 +1,1 @@
-grep -nE "AttnAB:sel_diff|AttnAB:fa_dump|SparseRC:map_dbg|SparseStep:sample" vllm_server.log
+grep -nE "AttnAB:sel_diff" vllm_server.log
