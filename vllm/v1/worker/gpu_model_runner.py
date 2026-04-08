@@ -546,6 +546,9 @@ class GPUModelRunner(
         self._sparse_by_layer_logical: dict[str, dict[str, list[int]]] = {}
         self._sparse_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
         self._sparse_chrono_phys: dict[str, list[int]] = {}
+        # Defer hard-stop to next execute_model entry so current step can
+        # finish producing ModelRunnerOutput and scheduler sparse hooks.
+        self._sparse_hard_stop_pending: tuple[str, int, int] | None = None
         # One-shot diagnostics for logical/physical length mismatch.
         self._sparse_mismatch_logged: set[tuple[str, str, int]] = set()
         self._sparse_debug_decode_tokens_max: int = int(
@@ -3943,7 +3946,7 @@ class GPUModelRunner(
                 t0i = int(sampled_ids[0])
                 if t0i >= 0:
                     logger.critical(
-                        "[SparseHardStop] os._exit(0) after valid output "
+                        "[SparseHardStop] arm deferred-exit after valid output "
                         "count=%d req_id=%s tok_id=%d — set "
                         "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=False in "
                         "gpu_model_runner.py to disable.",
@@ -3951,7 +3954,7 @@ class GPUModelRunner(
                         req_id,
                         t0i,
                     )
-                    os._exit(0)
+                    self._sparse_hard_stop_pending = (req_id, t0i, out_n_after)
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -4268,6 +4271,16 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if self._sparse_hard_stop_pending is not None:
+            rid, tok, out_n = self._sparse_hard_stop_pending
+            logger.critical(
+                "[SparseHardStop] deferred os._exit(0) before next execute_model "
+                "req_id=%s tok_id=%d out_n=%d",
+                rid,
+                tok,
+                out_n,
+            )
+            os._exit(0)
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
