@@ -1471,13 +1471,13 @@ class SparseKVManager(FullAttentionManager):
                     lb_hist_head = sorted(lb_hist.items(), key=lambda kv: kv[0])[:6]
                     logger.info(
                         "[SparseProbe:select_tokens] req_id=%s qh0=%s "
-                        "n_units=%d p_count=%d tok_head=%s lb_head=%s lb_hist=%s",
+                        "n_units=%d p_count=%d tok_all=%s lb_all=%s lb_hist=%s",
                         request_id,
                         qh0_key,
                         int(n_units),
                         p_count,
-                        toks0[:16],
-                        lb0[:16],
+                        toks0,
+                        lb0,
                         lb_hist_head,
                     )
             if request_id not in self._first_select_probe_done:
