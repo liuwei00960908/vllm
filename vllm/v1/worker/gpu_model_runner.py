@@ -4109,13 +4109,17 @@ class GPUModelRunner(
                 and prev_output_n == 0
                 and nspec_before == prompt_n
             )
+            should_defer_commit = (
+                (sparse_context_phase or sparse_uncommitted_first_step)
+                and self.use_async_scheduling
+                and force_real_sampled_ids
+            )
             if self.use_async_scheduling:
                 if req_idx in invalid_req_indices_set:
                     sampled_ids = None
                 elif (
                     force_real_sampled_ids
-                    and not sparse_context_phase
-                    and not sparse_uncommitted_first_step
+                    and not should_defer_commit
                 ):
                     sampled_ids = [int(sampled_token_ids[req_idx, 0].item())]
                 else:
@@ -4129,9 +4133,8 @@ class GPUModelRunner(
                 continue
 
             self._sparse_output_tokens_before_step[req_id] = prev_output_n
-            if (
-                (sparse_context_phase or sparse_uncommitted_first_step)
-                and (self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
+            if should_defer_commit and (
+                self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
             ):
                 raw_tid = int(sampled_token_ids[req_idx, 0].item())
                 logger.info(
@@ -4141,6 +4144,11 @@ class GPUModelRunner(
                     req_idx,
                     raw_tid,
                 )
+            if should_defer_commit:
+                # Do not mutate worker-side token state in uncommitted boundary
+                # phase. The scheduler has not acknowledged output progression
+                # yet, so writing placeholder/real token here causes drift.
+                continue
 
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]
             end_idx = start_idx + num_sampled_ids
