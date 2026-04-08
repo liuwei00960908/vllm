@@ -229,7 +229,7 @@ logger = init_logger(__name__)
 # and calls os._exit(0) after Nth valid new output token is appended in
 # bookkeeping. Set to False before merge or normal serving.
 # ---------------------------------------------------------------------------
-_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = True
+_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = False
 # Stop after this many valid generated tokens for a request.
 # 1 = first token, 2 = second token (useful for capturing "V" -> "Vo").
 _SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 2
