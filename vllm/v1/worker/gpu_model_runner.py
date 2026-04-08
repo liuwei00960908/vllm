@@ -7404,6 +7404,13 @@ class GPUModelRunner(
                 logical_order = [
                     int(x) for x in self._sparse_merged_logical.get(rid, [])
                 ]
+            # When chrono metadata is unavailable, map only historical logical
+            # blocks with row[:-1]. The current decode logical block is handled
+            # by decode_phys fallback and must not participate in history zip.
+            if decode_lb is not None:
+                logical_order = [
+                    lg for lg in logical_order if int(lg) != int(decode_lb)
+                ]
             if (
                 decode_lb is not None
                 and len(hist_phys) > 0
@@ -7777,6 +7784,12 @@ class GPUModelRunner(
                         logical_order = [int(x) for x in by_l[sk]]
                     else:
                         logical_order = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
+                    # Chrono missing path: exclude active decode logical block
+                    # from history mapping (row[:-1] only has history blocks).
+                    if decode_lb is not None:
+                        logical_order = [
+                            lg for lg in logical_order if int(lg) != int(decode_lb)
+                        ]
                     if (
                         decode_lb is not None
                         and len(hist_phys) > 0
