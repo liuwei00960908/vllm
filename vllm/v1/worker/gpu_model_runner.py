@@ -7964,6 +7964,23 @@ class GPUModelRunner(
                         last_tok_text = self._sparse_debug_tokenizer.decode([t])
                     except Exception:
                         last_tok_text = ""
+        if last_tok_id < 0:
+            # Full-attention async path may keep placeholder ids in
+            # output_token_ids; recover last committed token from the batch
+            # token buffer instead.
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is not None and out_before > 0:
+                p = int(self.input_batch.num_prompt_tokens[req_idx])
+                pos = p + int(out_before) - 1
+                if 0 <= pos < self.input_batch.token_ids_cpu.shape[1]:
+                    tid = int(self.input_batch.token_ids_cpu[req_idx, pos])
+                    if tid >= 0:
+                        last_tok_id = tid
+                        if self._sparse_debug_tokenizer is not None:
+                            try:
+                                last_tok_text = self._sparse_debug_tokenizer.decode([tid])
+                            except Exception:
+                                last_tok_text = ""
         payload = {
             "mode": mode,
             "req_id": req_id,
@@ -8344,6 +8361,34 @@ class GPUModelRunner(
                     sel_detok,
                     len(phys_h),
                 )
+                # Direct sparse-vs-full equivalence probe at token-index level.
+                # Full-attention expected coverage is [0, seq_len-1] in decode.
+                expected_all = list(range(max(0, int(seq_len))))
+                sel_set = set(debug_sel_all)
+                exp_set = set(expected_all)
+                missing = sorted(exp_set - sel_set)
+                extra = sorted(sel_set - exp_set)
+                if (
+                    self._sparse_probe_info_enabled
+                    or self._sparse_debug_decode_tokens
+                    or self._sparse_debug_first_token
+                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                ):
+                    logger.info(
+                        "[AttnAB:sel_diff] req_id=%s layer=%s qh=%d seq_len=%d "
+                        "sel_n=%d exp_n=%d missing_n=%d extra_n=%d "
+                        "missing_head=%s extra_head=%s",
+                        rid0,
+                        layer_name,
+                        qh_idx,
+                        int(seq_len),
+                        len(debug_sel_all),
+                        len(expected_all),
+                        len(missing),
+                        len(extra),
+                        missing[:24],
+                        extra[:24],
+                    )
                 # Step-5 focused comparison: inspect why the 5th sampled token
                 # diverges by comparing sparse-selected token coverage against
                 # full-history coverage in the same forward.
