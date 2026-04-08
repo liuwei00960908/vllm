@@ -8025,15 +8025,6 @@ class GPUModelRunner(
         if not sparse_groups:
             return None, None, None, None
 
-        # Build req_id → num_output_tokens_before_this_step mapping.
-        # New requests (scheduled_new_reqs) always have 0 output tokens.
-        num_output_map: dict[str, int] = {}
-        for new_req in scheduler_output.scheduled_new_reqs:
-            num_output_map[new_req.req_id] = 0
-        cached = scheduler_output.scheduled_cached_reqs
-        for idx, rid in enumerate(cached.req_ids):
-            num_output_map[rid] = cached.num_output_tokens[idx]
-
         sparse_block_features: dict[str, dict[str, np.ndarray]] = {}
         sparse_query_vectors: dict[str, dict[str, np.ndarray]] = {}
         sparse_new_block_features: dict[str, dict[str, np.ndarray]] = {}
@@ -8047,9 +8038,13 @@ class GPUModelRunner(
             if num_scheduled == 0:
                 continue
 
-            num_output_before = num_output_map.get(req_id, -1)
-            if num_output_before < 0:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
                 continue
+            # IMPORTANT: use worker-side committed outputs instead of scheduler
+            # num_output_tokens (may include async placeholders), otherwise the
+            # prefill->decode transition can be misclassified and skip indexing.
+            num_output_before = len(req_state.output_token_ids)
 
             num_prompt_tokens = int(
                 self.input_batch.num_prompt_tokens[req_idx]
