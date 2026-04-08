@@ -1672,6 +1672,9 @@ class GPUModelRunner(
                 (self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
                 and self.use_async_scheduling
             ):
+                new_token_ids_len = (
+                    len(new_token_ids) if new_token_ids is not None else -1
+                )
                 logger.info(
                     "[SparseState:bridge] req_id=%s stage=persistent "
                     "req_index=%d num_output_tokens=%d output_len=%d "
@@ -1681,7 +1684,7 @@ class GPUModelRunner(
                     int(num_output_tokens),
                     len(req_state.output_token_ids),
                     int(num_computed_tokens),
-                    len(new_token_ids),
+                    int(new_token_ids_len),
                 )
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
