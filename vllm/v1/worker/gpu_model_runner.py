@@ -7907,10 +7907,12 @@ class GPUModelRunner(
             return
         if not layer_name.endswith("layers.0.self_attn.attn"):
             return
-        # Focus exactly on divergence neighborhood.
+        # Focus on divergence neighborhood; use threshold instead of exact
+        # equality because async bookkeeping can shift exact counters.
         out_before = len(rs.output_token_ids)
-        target = 4 if mode == "sparse" else 5
-        if out_before != target:
+        min_out = 4 if mode == "sparse" else 5
+        min_seq = 30 if mode == "sparse" else 31
+        if out_before < min_out and seq_len < min_seq:
             return
         attn_mod = self.compilation_config.static_forward_context.get(layer_name)
         if attn_mod is None or not attn_mod.kv_cache or attn_mod.kv_cache[0] is None:
