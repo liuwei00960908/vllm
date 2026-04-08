@@ -4030,6 +4030,40 @@ class GPUModelRunner(
                 sampled_ids=sampled_ids,
                 logits=logits,
             )
+            if _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
+                tok0 = int(sampled_ids[0]) if sampled_ids else -1
+                tok_txt = ""
+                if tok0 >= 0 and self._sparse_debug_tokenizer is not None:
+                    try:
+                        tok_txt = self._sparse_debug_tokenizer.decode([tok0])
+                    except Exception:
+                        tok_txt = ""
+                top3_txt = ""
+                if logits is not None and logits.dim() >= 2 and req_idx < logits.size(0):
+                    row = logits[req_idx]
+                    k = min(3, row.numel())
+                    vals, idx = torch.topk(row, k=k)
+                    parts: list[str] = []
+                    for i in range(k):
+                        tid = int(idx[i].item())
+                        tv = float(vals[i].item())
+                        ttxt = ""
+                        if self._sparse_debug_tokenizer is not None:
+                            try:
+                                ttxt = self._sparse_debug_tokenizer.decode([tid])
+                            except Exception:
+                                ttxt = ""
+                        parts.append(f"{tid}:{tv:.3f}:{ttxt!r}")
+                    top3_txt = " ".join(parts)
+                logger.info(
+                    "[AttnAB:sample] mode=%s req_id=%s step=%d tok_id=%d tok=%r top3=%s",
+                    "sparse" if self._has_sparse_attn else "full",
+                    req_id,
+                    int(prev_output_n + 1),
+                    tok0,
+                    tok_txt,
+                    top3_txt,
+                )
             if (
                 self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
             ) and prev_output_n <= 1:
