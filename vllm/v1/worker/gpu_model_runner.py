@@ -7288,27 +7288,12 @@ class GPUModelRunner(
                                 hist_phys[:8],
                                 sel[:8],
                             )
-                        # Prefer deterministic alignment with the actual
-                        # physical history row shape.
-                        if len(logical_order) > len(hist_phys):
-                            logical_order = logical_order[-len(hist_phys) :]
-                        else:
-                            # logical_order is shorter than physical history:
-                            # rebuild from selected-token-derived history blocks.
-                            hist_lbs = sorted(
-                                {
-                                    SparseKVManager._global_token_to_logical_block(
-                                        g, p_count, bsz
-                                    )
-                                    for g in sel
-                                    if SparseKVManager._global_token_to_logical_block(
-                                        g, p_count, bsz
-                                    )
-                                    != int(decode_lb)
-                                }
-                            )
-                            if len(hist_lbs) >= len(hist_phys):
-                                logical_order = hist_lbs[-len(hist_phys) :]
+                        gather_fail_reason = (
+                            f"logical_phys_mismatch rid={rid} qh={qh_idx} sk={sk} "
+                            f"logical_order_len={len(logical_order)} "
+                            f"hist_phys_len={len(hist_phys)}"
+                        )
+                        return None
                     for lg, ph in zip(logical_order, hist_phys):
                         logical_to_phys[int(lg)] = int(ph)
                 for g in sel:
