@@ -7786,6 +7786,7 @@ class GPUModelRunner(
             slot_h: list[int] = []
             cu_h: list[int] = [0]
             debug_sel_head: list[int] = []
+            debug_lb_head: list[int] = []
             debug_decode_lb: int = -1
             sk = sparse_qh_unit_key(layer_name, qh_idx)
             for rid, seq_len, p_count, chrono, tok_map in req_ctx:
@@ -7879,6 +7880,10 @@ class GPUModelRunner(
                 sel = [g for g in sel if 0 <= g < seq_len]
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
                     debug_sel_head = [int(x) for x in sel[:12]]
+                    debug_lb_head = [
+                        int(SparseKVManager._global_token_to_logical_block(g, p_count, bsz))
+                        for g in sel[:12]
+                    ]
                 logical_to_phys: dict[int, int] = {}
                 decode_phys: int | None = int(rs.block_ids[kv_cache_gid][-1])
                 decode_lb: int | None = SparseKVManager._global_token_to_logical_block(
@@ -8036,11 +8041,12 @@ class GPUModelRunner(
             ):
                 logger.info(
                     "[SparseRC:map_dbg] layer=%s req_id=%s qh=%d "
-                    "sel_head=%s decode_lb=%d phys_head=%s slot_head=%s total=%d",
+                    "sel_head=%s lb_head=%s decode_lb=%d phys_head=%s slot_head=%s total=%d",
                     layer_name,
                     self.input_batch.req_ids[0],
                     qh_idx,
                     debug_sel_head,
+                    debug_lb_head,
                     debug_decode_lb,
                     [int(x) for x in phys_h[:12]],
                     [int(x) for x in slot_h[:12]],
