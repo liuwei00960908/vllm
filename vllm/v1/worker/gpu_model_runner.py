@@ -551,11 +551,16 @@ class GPUModelRunner(
         self._sparse_debug_first_token_os_exit: bool = bool(
             int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN_OS_EXIT", "0"))
         )
+        # Hard-stop at first decode KV snapshot (earlier than sampling hook).
+        self._sparse_debug_first_token_kv_os_exit: bool = bool(
+            int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN_KV_OS_EXIT", "0"))
+        )
         # Cleared at the start of each _build_attention_metadata call.
         self._sparse_first_token_forward_rid_this_step: set[str] = set()
         self._sparse_ft_kv_layer_pair_this_step: set[tuple[str, str]] = set()
         self._sparse_ft_pending_sample: set[str] = set()
         self._sparse_first_token_sample_logged: set[str] = set()
+        self._sparse_first_token_kv_exit_done: set[str] = set()
         # <= 0 means "no cap" (print all selected blocks).
         self._sparse_debug_max_blocks: int = int(
             os.getenv("VLLM_SPARSE_DEBUG_MAX_BLOCKS", "0")
@@ -583,9 +588,10 @@ class GPUModelRunner(
         if self._sparse_debug_first_token:
             logger.info(
                 "Sparse first-token debug enabled: VLLM_SPARSE_DEBUG_FIRST_TOKEN=1 "
-                "optional ALL_LAYERS=%d OS_EXIT=%d",
+                "optional ALL_LAYERS=%d OS_EXIT=%d KV_OS_EXIT=%d",
                 int(self._sparse_debug_first_token_all_layers),
                 int(self._sparse_debug_first_token_os_exit),
+                int(self._sparse_debug_first_token_kv_os_exit),
             )
 
         # mm_hash ->  encoder_output
@@ -3797,18 +3803,14 @@ class GPUModelRunner(
             if (
                 self._sparse_debug_first_token
                 and prev_output_n == 0
-                and int(sampled_ids[0]) >= 0
             ):
-                n_prompt = int(self.input_batch.num_prompt_tokens[req_idx])
-                n_comp = int(self.input_batch.num_computed_tokens_cpu[req_idx])
-                if n_comp >= n_prompt:
-                    self._sparse_log_first_sampled_token(
-                        req_idx=req_idx,
-                        req_id=req_id,
-                        sampled_ids=sampled_ids,
-                        logits=logits,
-                        spec_decode_metadata=spec_decode_metadata,
-                    )
+                self._sparse_log_first_sampled_token(
+                    req_idx=req_idx,
+                    req_id=req_id,
+                    sampled_ids=sampled_ids,
+                    logits=logits,
+                    spec_decode_metadata=spec_decode_metadata,
+                )
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -7404,6 +7406,16 @@ class GPUModelRunner(
                 ok_sim,
                 sim_reason,
             )
+            if (
+                self._sparse_debug_first_token_kv_os_exit
+                and rid not in self._sparse_first_token_kv_exit_done
+            ):
+                self._sparse_first_token_kv_exit_done.add(rid)
+                logger.critical(
+                    "[SparseFirstTok] OS exit after first KV snapshot "
+                    "(VLLM_SPARSE_DEBUG_FIRST_TOKEN_KV_OS_EXIT=1)."
+                )
+                os._exit(0)
             self._sparse_ft_pending_sample.add(rid)
             if self._sparse_debug_first_token_all_layers:
                 self._sparse_ft_kv_layer_pair_this_step.add((rid, layer_name))
