@@ -1218,6 +1218,18 @@ class Scheduler(SchedulerInterface):
                 sparse_chrono_phys_block_ids[req_id] = chrono
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_for_worker = req.num_output_tokens + req.num_output_placeholders
+            sparse_mgr = self.kv_cache_manager.get_sparse_manager()
+            token_sparse_async = (
+                self.scheduler_config.async_scheduling
+                and sparse_mgr is not None
+                and sparse_mgr._token_mode()
+            )
+            if token_sparse_async:
+                # Keep worker-side output counters aligned with committed output
+                # token ids. In async token-sparse mode, placeholders are a
+                # scheduler bookkeeping detail and should not advance worker
+                # decode/output phase counters.
+                num_output_for_worker = req.num_output_tokens
             if phase_gate_sparse_meta:
                 # Keep worker in prefill-context mode for one transition step
                 # until sparse layer_state is ready.
@@ -1238,7 +1250,7 @@ class Scheduler(SchedulerInterface):
                     "[SparseState:sched] req_id=%s decode_phase=%s "
                     "num_output_tokens=%d num_placeholders=%d "
                     "worker_num_output_tokens=%d num_computed_tokens=%d "
-                    "phase_gate=%s gate_reason=%s",
+                    "phase_gate=%s gate_reason=%s token_sparse_async=%s",
                     req_id,
                     decode_phase,
                     req.num_output_tokens,
@@ -1247,6 +1259,7 @@ class Scheduler(SchedulerInterface):
                     req.num_computed_tokens,
                     phase_gate_sparse_meta,
                     phase_gate_reason or "none",
+                    token_sparse_async,
                 )
             num_output_tokens.append(num_output_for_worker)
 
