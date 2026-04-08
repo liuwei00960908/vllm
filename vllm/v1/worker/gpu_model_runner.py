@@ -1631,10 +1631,35 @@ class GPUModelRunner(
                 # scheduled in the previous step and needs to be added again.
 
                 if self.use_async_scheduling and num_output_tokens > 0:
+                    if (
+                        self._sparse_debug_first_token
+                        or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                    ):
+                        logger.info(
+                            "[SparseState:bridge] req_id=%s stage=resumed_before "
+                            "num_output_tokens=%d output_len_before=%d "
+                            "all_token_ids_len=%d",
+                            req_id,
+                            int(num_output_tokens),
+                            len(req_state.output_token_ids),
+                            len(req_data.all_token_ids.get(req_id, [])),
+                        )
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
                     resumed_token_ids = req_data.all_token_ids[req_id]
                     req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
+                    if (
+                        self._sparse_debug_first_token
+                        or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                    ):
+                        logger.info(
+                            "[SparseState:bridge] req_id=%s stage=resumed_after "
+                            "num_output_tokens=%d output_len_after=%d output_tail=%s",
+                            req_id,
+                            int(num_output_tokens),
+                            len(req_state.output_token_ids),
+                            [int(x) for x in req_state.output_token_ids[-8:]],
+                        )
 
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
@@ -1643,6 +1668,21 @@ class GPUModelRunner(
                 continue
 
             # Update the persistent batch.
+            if (
+                (self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
+                and self.use_async_scheduling
+            ):
+                logger.info(
+                    "[SparseState:bridge] req_id=%s stage=persistent "
+                    "req_index=%d num_output_tokens=%d output_len=%d "
+                    "num_computed_tokens=%d new_token_ids_len=%d",
+                    req_id,
+                    int(req_index),
+                    int(num_output_tokens),
+                    len(req_state.output_token_ids),
+                    int(num_computed_tokens),
+                    len(new_token_ids),
+                )
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
                 if is_sparse_decode and sparse_should_replace_row:
