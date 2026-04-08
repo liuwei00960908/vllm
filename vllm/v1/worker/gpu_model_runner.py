@@ -7421,8 +7421,6 @@ class GPUModelRunner(
     ) -> None:
         if not self._sparse_debug_first_token or not self._has_sparse_attn:
             return
-        if not get_pp_group().is_last_rank:
-            return
         if req_id in self._sparse_first_token_sample_logged:
             return
         if not sampled_ids:
@@ -7460,7 +7458,7 @@ class GPUModelRunner(
         kv_same_step = req_id in self._sparse_ft_pending_sample
         logger.info(
             "[SparseFirstTok:sample] req_id=%s req_idx=%d tok_id=%d tok=%r "
-            "top8=%s top5_detok=%s kv_same_step=%s %s",
+            "top8=%s top5_detok=%s kv_same_step=%s pp_rank=%s/%s %s",
             req_id,
             req_idx,
             tok,
@@ -7468,6 +7466,8 @@ class GPUModelRunner(
             top_pairs,
             top_txt,
             kv_same_step,
+            get_pp_group().rank_in_group,
+            get_pp_group().world_size,
             spec_hint,
         )
         self._sparse_first_token_sample_logged.add(req_id)
