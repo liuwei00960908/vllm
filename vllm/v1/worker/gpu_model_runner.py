@@ -7404,17 +7404,16 @@ class GPUModelRunner(
         sel = sorted(set(toks) | {g_cur})
         sel = [g for g in sel if 0 <= g < seq_len]
         logical_to_phys: dict[int, int] = {}
-        decode_phys: int | None = None
-        decode_lb: int | None = None
+        decode_phys: int | None = int(rs.block_ids[kv_cache_gid][-1])
+        decode_lb: int | None = SparseKVManager._global_token_to_logical_block(
+            g_cur, p_count, bsz
+        )
         logical_order: list[int] = []
         if len(chrono) == 0:
             row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
             if row is None or len(row) == 0:
                 return False, "missing_layer_row"
             decode_phys = int(row[-1])
-            decode_lb = SparseKVManager._global_token_to_logical_block(
-                g_cur, p_count, bsz
-            )
             hist_phys = [int(x) for x in row[:-1]]
             by_l = self._sparse_by_layer_logical.get(rid)
             if by_l and sk in by_l:
@@ -7445,9 +7444,23 @@ class GPUModelRunner(
         for g in sel:
             lb = SparseKVManager._global_token_to_logical_block(g, p_count, bsz)
             if len(chrono) > 0:
-                if lb < 0 or lb >= len(chrono):
+                if lb < 0:
                     return False, f"logical_block_oob lb={lb} chrono_len={len(chrono)}"
-                _phys_bid = int(chrono[lb])
+                if lb >= len(chrono):
+                    if (
+                        decode_phys is not None
+                        and decode_lb is not None
+                        and lb == decode_lb
+                    ):
+                        _phys_bid = int(decode_phys)
+                    else:
+                        return (
+                            False,
+                            f"logical_block_oob lb={lb} chrono_len={len(chrono)} "
+                            f"decode_lb={decode_lb}",
+                        )
+                else:
+                    _phys_bid = int(chrono[lb])
             else:
                 if lb in logical_to_phys:
                     _phys_bid = int(logical_to_phys[lb])
@@ -7781,8 +7794,10 @@ class GPUModelRunner(
                 sel = sorted(set(toks) | {g_cur})
                 sel = [g for g in sel if 0 <= g < seq_len]
                 logical_to_phys: dict[int, int] = {}
-                decode_phys: int | None = None
-                decode_lb: int | None = None
+                decode_phys: int | None = int(rs.block_ids[kv_cache_gid][-1])
+                decode_lb: int | None = SparseKVManager._global_token_to_logical_block(
+                    g_cur, p_count, bsz
+                )
                 logical_order: list[int] = []
                 if len(chrono) == 0:
                     row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
@@ -7794,9 +7809,6 @@ class GPUModelRunner(
                         )
                         return None
                     decode_phys = int(row[-1])
-                    decode_lb = SparseKVManager._global_token_to_logical_block(
-                        g_cur, p_count, bsz
-                    )
                     hist_phys = [int(x) for x in row[:-1]]
                     by_l = self._sparse_by_layer_logical.get(rid)
                     if by_l and sk in by_l:
@@ -7856,13 +7868,31 @@ class GPUModelRunner(
                         g, p_count, bsz
                     )
                     if len(chrono) > 0:
-                        if lb < 0 or lb >= len(chrono):
+                        if lb < 0:
                             gather_fail_reason = (
                                 f"logical_block_oob rid={rid} g={g} lb={lb} "
                                 f"chrono_len={len(chrono)} seq_len={seq_len}"
                             )
                             return None
-                        phys_bid = int(chrono[lb])
+                        if lb >= len(chrono):
+                            if (
+                                decode_phys is not None
+                                and decode_lb is not None
+                                and lb == decode_lb
+                            ):
+                                # Chrono may temporarily contain only history
+                                # blocks while the active decode logical block
+                                # is represented by the row tail.
+                                phys_bid = int(decode_phys)
+                            else:
+                                gather_fail_reason = (
+                                    f"logical_block_oob rid={rid} g={g} lb={lb} "
+                                    f"chrono_len={len(chrono)} seq_len={seq_len} "
+                                    f"decode_lb={-1 if decode_lb is None else int(decode_lb)}"
+                                )
+                                return None
+                        else:
+                            phys_bid = int(chrono[lb])
                     else:
                         if lb in logical_to_phys:
                             phys_bid = int(logical_to_phys[lb])

@@ -1,1 +1,1 @@
-grep -nE "SparseHardStop|SparseRC:bridge_sched|SparseRC:phase_gate|ensure_reason=|SparseProbe] indexing|SparseProbe:first_select|compact_gather layer=.*enabled=1|compact_gather layer=.*enabled=0 reason=|SparseFirstTok:sample" vllm_server.log
+grep -nE "SparseRC:bridge_sched|SparseRC:phase_gate|SparseProbe] indexing|SparseProbe:first_select|compact_gather layer=.*enabled=1|compact_gather layer=.*enabled=0 reason=|SparseFirstTok:sample|SparseHardStop" vllm_server.log
