@@ -1115,6 +1115,42 @@ class Scheduler(SchedulerInterface):
                 and (req.num_output_tokens + req.num_output_placeholders) > 0
             )
             if is_sparse_decode_req:
+                missing_sparse_meta = (
+                    by_layer is None or tok_by_layer is None or chrono is None
+                )
+                # Decode-phase invariant: sparse metadata must be ready before
+                # packaging CachedRequestData. Re-run selection from pending
+                # query to resolve first-decode transition races.
+                if missing_sparse_meta:
+                    refreshed = self.kv_cache_manager.sparse_ensure_decode_selection(
+                        req_id
+                    )
+                    if refreshed:
+                        selected = (
+                            self.kv_cache_manager.get_sparse_selected_block_indices(
+                                req_id
+                            )
+                        )
+                        retrieve = (
+                            self.kv_cache_manager.get_sparse_retrieve_block_indices(
+                                req_id
+                            )
+                        )
+                        by_layer = (
+                            self.kv_cache_manager.get_sparse_selected_block_indices_by_layer(
+                                req_id
+                            )
+                        )
+                        tok_by_layer = (
+                            self.kv_cache_manager.get_sparse_selected_token_indices_by_layer(
+                                req_id
+                            )
+                        )
+                        chrono = (
+                            self.kv_cache_manager.get_sparse_chrono_phys_block_ids(
+                                req_id
+                            )
+                        )
                 # Sparse decode worker expects a FULL row (selected history +
                 # decode tail). Incremental allocation payload ([] / [1] on
                 # rollover) would be misinterpreted as full-row replacement.

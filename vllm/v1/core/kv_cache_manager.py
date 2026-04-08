@@ -590,6 +590,30 @@ class KVCacheManager:
                 ignore_prefill_topk_cache=mgr._spec.refresh_topk_each_decode,
             )
 
+    def sparse_ensure_decode_selection(self, request_id: str) -> bool:
+        """Best-effort on-demand sparse selection refresh for decode bridging.
+
+        Returns True if a selection attempt was executed, False otherwise.
+        """
+        mgr = self.get_sparse_manager()
+        if mgr is None:
+            return False
+        # Already selected for this request in this step.
+        if mgr._selected_block_indices_by_layer.get(request_id):
+            return False
+        if not mgr.req_to_blocks.get(request_id):
+            return False
+        qv = mgr.get_pending_query(request_id)
+        if qv is None:
+            return False
+        mgr.select(
+            request_id,
+            qv,
+            mgr._spec.sparse_selection_budget(),
+            ignore_prefill_topk_cache=mgr._spec.refresh_topk_each_decode,
+        )
+        return True
+
     def sparse_post_decode_rebalance(
         self,
         new_block_features: dict[str, np.ndarray],
