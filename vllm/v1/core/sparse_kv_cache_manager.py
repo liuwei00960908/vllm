@@ -724,7 +724,20 @@ class SparseKVManager(FullAttentionManager):
         ls = self._layer_states.get(request_id, {})
         if not ls:
             return 0
-        return len(next(iter(ls.values())).all_block_features)
+        base_units = len(next(iter(ls.values())).all_block_features)
+        if not self._token_mode():
+            return base_units
+        # Token mode must expose decode history tokens too (not only prefill
+        # indexed rows), otherwise tail/static windows miss the newest decode
+        # tokens and selection lags behind by recent tokens.
+        p_count = int(self._prefill_token_count.get(request_id, base_units))
+        bsz = int(self.block_size)
+        prefill_blocks = self._prefill_blocks.get(request_id, [])
+        n_prefill_blocks = cdiv(p_count, bsz)
+        finalized_decode_blocks = max(0, len(prefill_blocks) - n_prefill_blocks)
+        decode_hist_tokens = finalized_decode_blocks * bsz
+        decode_active_tokens = int(self._decode_block_fill.get(request_id, 0))
+        return max(base_units, p_count + decode_hist_tokens + decode_active_tokens)
 
     @staticmethod
     def _global_token_to_logical_block(
