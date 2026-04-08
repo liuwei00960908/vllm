@@ -4089,10 +4089,16 @@ class GPUModelRunner(
         req_ids = self.input_batch.req_ids
         self._sparse_output_tokens_before_step.clear()
         for req_idx in range(num_sampled_tokens):
+            req_id = req_ids[req_idx]
+            sparse_context_phase = (
+                self.use_async_scheduling
+                and force_real_sampled_ids
+                and scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
+            )
             if self.use_async_scheduling:
                 if req_idx in invalid_req_indices_set:
                     sampled_ids = None
-                elif force_real_sampled_ids:
+                elif force_real_sampled_ids and not sparse_context_phase:
                     sampled_ids = [int(sampled_token_ids[req_idx, 0].item())]
                 else:
                     sampled_ids = [-1]
@@ -4104,10 +4110,21 @@ class GPUModelRunner(
             if not sampled_ids:
                 continue
 
-            req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             prev_output_n = len(req_state.output_token_ids)
             self._sparse_output_tokens_before_step[req_id] = prev_output_n
+            if (
+                sparse_context_phase
+                and (self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
+            ):
+                raw_tid = int(sampled_token_ids[req_idx, 0].item())
+                logger.info(
+                    "[SparseStep:defer_commit] req_id=%s req_idx=%d "
+                    "raw_sampled_id=%d reason=context_phase_worker_out0",
+                    req_id,
+                    req_idx,
+                    raw_tid,
+                )
 
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]
             end_idx = start_idx + num_sampled_ids
