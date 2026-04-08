@@ -2627,6 +2627,36 @@ class GPUModelRunner(
                 attn_metadata_dict = attn_metadata[ubid]
 
             layers_fill = layer_names_override or attn_group.layer_names
+            if (
+                not for_cudagraph_capture
+                and isinstance(attn_metadata_i, FlashAttentionMetadata)
+                and not self._has_sparse_attn
+                and num_reqs > 0
+                and "model.layers.0.self_attn.attn" in layers_fill
+            ):
+                req0 = self.input_batch.req_ids[0]
+                seq0 = int(common_attn_metadata._seq_lens_cpu[0].item())
+                blk = self.input_batch.block_table[kv_cache_gid]
+                nblk0 = int(blk.num_blocks_per_row[0])
+                bsz0 = int(blk.block_size)
+                row0 = blk.block_table.np[0, :nblk0]
+                phys0: list[int] = []
+                slot0: list[int] = []
+                for g in range(max(0, seq0)):
+                    lb = int(g // bsz0)
+                    if lb >= nblk0:
+                        break
+                    phys0.append(int(row0[lb]))
+                    slot0.append(int(g % bsz0))
+                self._dump_fa_inputs_once(
+                    mode="full",
+                    req_id=req0,
+                    layer_name="model.layers.0.self_attn.attn",
+                    kv_cache_gid=kv_cache_gid,
+                    seq_len=seq0,
+                    phys=phys0,
+                    slot=slot0,
+                )
             for layer_name in layers_fill:
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
