@@ -1951,6 +1951,29 @@ class GPUModelRunner(
                 prev_draft_token_indices.extend(range(start, start + draft_len))
                 indices_match &= prev_index == flattened_index
                 max_flattened_index = max(max_flattened_index, flattened_index)
+                if (
+                    (self._sparse_debug_first_token
+                     or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
+                    and self.input_batch.prev_sampled_token_ids is not None
+                ):
+                    try:
+                        prev_tok = int(
+                            self.input_batch.prev_sampled_token_ids[
+                                prev_index, 0
+                            ].item()
+                        )
+                    except Exception:
+                        prev_tok = -1
+                    logger.info(
+                        "[SparseStep:consume] req_id=%s cur_idx=%d prev_idx=%d "
+                        "flattened_idx=%d draft_len=%d prev_tok=%d",
+                        req_id,
+                        int(cur_index),
+                        int(prev_index),
+                        int(flattened_index),
+                        int(draft_len),
+                        prev_tok,
+                    )
         num_common_tokens = len(sample_flattened_indices)
         total_without_spec = total_num_scheduled_tokens - total_num_spec_tokens
         if num_common_tokens < total_without_spec:
@@ -3843,6 +3866,7 @@ class GPUModelRunner(
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
+        force_real_sampled_ids = False
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
@@ -3939,6 +3963,24 @@ class GPUModelRunner(
 
             req_state.output_token_ids.extend(sampled_ids)
             out_n_after = len(req_state.output_token_ids)
+            if (
+                self._sparse_debug_first_token
+                or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+            ):
+                logger.info(
+                    "[SparseStep:commit] req_id=%s req_idx=%d sampled_ids=%s "
+                    "prev_out=%d out_after=%d start_idx=%d end_idx=%d "
+                    "async=%s force_real=%s",
+                    req_id,
+                    req_idx,
+                    [int(x) for x in sampled_ids],
+                    int(prev_output_n),
+                    int(out_n_after),
+                    int(start_idx),
+                    int(end_idx),
+                    self.use_async_scheduling,
+                    force_real_sampled_ids,
+                )
             self._sparse_log_sample_step(
                 req_idx=req_idx,
                 req_id=req_id,
