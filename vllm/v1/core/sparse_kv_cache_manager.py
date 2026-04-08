@@ -1469,9 +1469,17 @@ class SparseKVManager(FullAttentionManager):
                     for lb in lb0:
                         lb_hist[lb] = lb_hist.get(lb, 0) + 1
                     lb_hist_head = sorted(lb_hist.items(), key=lambda kv: kv[0])[:6]
+                    tail_n = int(self._spec.static_pattern_end)
+                    tail_expected = list(
+                        range(max(0, int(n_units) - tail_n), int(n_units))
+                    )
+                    tok_set = set(toks0)
+                    tail_hit = [t for t in tail_expected if t in tok_set]
+                    tail_miss = [t for t in tail_expected if t not in tok_set]
                     logger.info(
                         "[SparseProbe:select_tokens] req_id=%s qh0=%s "
-                        "n_units=%d p_count=%d tok_all=%s lb_all=%s lb_hist=%s",
+                        "n_units=%d p_count=%d tok_all=%s lb_all=%s lb_hist=%s "
+                        "tail_expected=%s tail_hit=%s tail_miss=%s",
                         request_id,
                         qh0_key,
                         int(n_units),
@@ -1479,6 +1487,9 @@ class SparseKVManager(FullAttentionManager):
                         toks0,
                         lb0,
                         lb_hist_head,
+                        tail_expected,
+                        tail_hit,
+                        tail_miss,
                     )
             if request_id not in self._first_select_probe_done:
                 self._first_select_probe_done.add(request_id)
