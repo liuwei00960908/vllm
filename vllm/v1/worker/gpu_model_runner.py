@@ -132,6 +132,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sparse_kmeans_torch import (
     prefill_cluster_meta_from_features_torch,
+    prefill_cluster_meta_from_features_torch_batched,
     sparse_prefill_cluster_use_device_kmeans,
 )
 from vllm.v1.core.sparse_kv_cache_manager import (
@@ -8483,6 +8484,136 @@ class GPUModelRunner(
                     time.perf_counter() - _t_feat_copy,
                 )
 
+    def _sparse_store_prefill_kv_heads_block_features(
+        self,
+        req_id: str,
+        layer_name: str,
+        k_heads: torch.Tensor,
+        spec: SparseAttentionSpec,
+        sparse_block_features: dict[str, dict[str, np.ndarray]],
+        sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]],
+        pending_async_feat: list[tuple[str, str, torch.Tensor]],
+        pending_async_meta: list[tuple[str, str, dict[str, torch.Tensor]]],
+    ) -> None:
+        """Prefill sparse features for all KV heads of one layer in one batched K-Means.
+
+        ``k_heads`` is ``[num_kv, N, D]`` (token or block rows).  Per-head outputs match
+        ``_sparse_store_prefill_block_features`` for each ``layer##kv{h}`` key.
+        """
+        if k_heads.dim() != 3:
+            raise ValueError(
+                "batched sparse prefill expects k_heads [H, N, D], "
+                f"got shape {tuple(k_heads.shape)}"
+            )
+        perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
+        use_async_d2h = (
+            self._sparse_async_d2h_enabled
+            and self._sparse_d2h_stream is not None
+            and k_heads.is_cuda
+        )
+        num_kv = int(k_heads.shape[0])
+
+        if sparse_prefill_cluster_use_device_kmeans(k_heads):
+            _t_kmeans = time.perf_counter() if perf_enabled else None
+            raw_b = prefill_cluster_meta_from_features_torch_batched(
+                k_heads,
+                num_clusters=spec.num_clusters,
+                n_segment=spec.n_segment,
+            )
+            if _t_kmeans is not None:
+                self._sparse_perf_record(
+                    "collect:prefill_device_kmeans",
+                    time.perf_counter() - _t_kmeans,
+                )
+            for kv_h in range(num_kv):
+                unit_key = sparse_kv_unit_key(layer_name, kv_h)
+                raw = {
+                    "cluster_centres": raw_b["cluster_centres"][kv_h],
+                    "block_to_cluster": raw_b["block_to_cluster"][kv_h],
+                    "cluster_size": raw_b["cluster_size"][kv_h],
+                    "mean_key": raw_b["mean_key"][kv_h],
+                }
+                if use_async_d2h:
+                    _t_meta_copy = time.perf_counter() if perf_enabled else None
+                    pending_async_meta.append(
+                        (
+                            req_id,
+                            unit_key,
+                            {
+                                "cluster_centres": self._sparse_async_copy_to_cpu_pinned(
+                                    raw["cluster_centres"]
+                                ),
+                                "block_to_cluster": self._sparse_async_copy_to_cpu_pinned(
+                                    raw["block_to_cluster"]
+                                ),
+                                "cluster_size": self._sparse_async_copy_to_cpu_pinned(
+                                    raw["cluster_size"]
+                                ),
+                                "mean_key": self._sparse_async_copy_to_cpu_pinned(
+                                    raw["mean_key"]
+                                ),
+                            },
+                        )
+                    )
+                    if _t_meta_copy is not None:
+                        self._sparse_perf_record(
+                            "collect:prefill_meta_d2h_enqueue",
+                            time.perf_counter() - _t_meta_copy,
+                        )
+                else:
+                    _t_meta_copy = time.perf_counter() if perf_enabled else None
+                    sparse_prefill_cluster_meta.setdefault(req_id, {})[unit_key] = {
+                        "cluster_centres": raw["cluster_centres"]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32, copy=False),
+                        "block_to_cluster": raw["block_to_cluster"]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.int32, copy=False),
+                        "cluster_size": raw["cluster_size"]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.int32, copy=False),
+                        "mean_key": raw["mean_key"]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32, copy=False),
+                    }
+                    if _t_meta_copy is not None:
+                        self._sparse_perf_record(
+                            "collect:prefill_meta_cpu_numpy",
+                            time.perf_counter() - _t_meta_copy,
+                        )
+
+        for kv_h in range(num_kv):
+            unit_key = sparse_kv_unit_key(layer_name, kv_h)
+            k_feat = k_heads[kv_h]
+            if use_async_d2h:
+                _t_feat_copy = time.perf_counter() if perf_enabled else None
+                pending_async_feat.append(
+                    (req_id, unit_key, self._sparse_async_copy_to_cpu_pinned(k_feat))
+                )
+                if _t_feat_copy is not None:
+                    self._sparse_perf_record(
+                        "collect:prefill_feat_d2h_enqueue",
+                        time.perf_counter() - _t_feat_copy,
+                    )
+            else:
+                _t_feat_copy = time.perf_counter() if perf_enabled else None
+                sparse_block_features.setdefault(req_id, {})[unit_key] = (
+                    k_feat.detach().cpu().numpy().astype(np.float32, copy=False)
+                )
+                if _t_feat_copy is not None:
+                    self._sparse_perf_record(
+                        "collect:prefill_feat_cpu_numpy",
+                        time.perf_counter() - _t_feat_copy,
+                    )
+
     def _collect_sparse_features(
         self,
         scheduler_output: "SchedulerOutput",
@@ -8694,18 +8825,17 @@ class GPUModelRunner(
                                         pending_async_meta,
                                     )
                                 else:
-                                    for kv_h in range(num_kv):
-                                        self._sparse_store_prefill_block_features(
-                                            # includes optional device kmeans + cpu copy
-                                            req_id,
-                                            sparse_kv_unit_key(layer_name, kv_h),
-                                            k_flat[:, kv_h, :],
-                                            spec,
-                                            sparse_block_features,
-                                            sparse_prefill_cluster_meta,
-                                            pending_async_feat,
-                                            pending_async_meta,
-                                        )
+                                    k_heads = k_flat.transpose(0, 1).contiguous()
+                                    self._sparse_store_prefill_kv_heads_block_features(
+                                        req_id,
+                                        layer_name,
+                                        k_heads,
+                                        spec,
+                                        sparse_block_features,
+                                        sparse_prefill_cluster_meta,
+                                        pending_async_feat,
+                                        pending_async_meta,
+                                    )
                         if is_decode_committed:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
@@ -8739,17 +8869,17 @@ class GPUModelRunner(
                                     pending_async_meta,
                                 )
                             else:
-                                for kv_h in range(num_kv):
-                                    self._sparse_store_prefill_block_features(
-                                        req_id,
-                                        sparse_kv_unit_key(layer_name, kv_h),
-                                        k_blk[:, kv_h, :],
-                                        spec,
-                                        sparse_block_features,
-                                        sparse_prefill_cluster_meta,
-                                        pending_async_feat,
-                                        pending_async_meta,
-                                    )
+                                k_heads = k_blk.transpose(0, 1).contiguous()
+                                self._sparse_store_prefill_kv_heads_block_features(
+                                    req_id,
+                                    layer_name,
+                                    k_heads,
+                                    spec,
+                                    sparse_block_features,
+                                    sparse_prefill_cluster_meta,
+                                    pending_async_feat,
+                                    pending_async_meta,
+                                )
                         if is_decode_committed:
                             if k_blk.dim() == 2:
                                 assert num_kv == 1
