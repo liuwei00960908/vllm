@@ -532,6 +532,16 @@ class GPUModelRunner(
         self._sparse_probe_info_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_PROBE_INFO", "0")) == 1
         )
+        # Sparse performance stats switch (independent from debug/probe logs).
+        self._sparse_perf_stats_enabled: bool = (
+            int(os.getenv("VLLM_SPARSE_PERF_STATS", "0")) == 1
+        )
+        self._sparse_perf_log_interval: int = max(
+            1, int(os.getenv("VLLM_SPARSE_PERF_LOG_INTERVAL", "50"))
+        )
+        self._sparse_perf_steps: int = 0
+        self._sparse_perf_accum_ms: dict[str, float] = defaultdict(float)
+        self._sparse_perf_accum_calls: dict[str, int] = defaultdict(int)
         # Optional sparse decode token debug logs.
         self._sparse_debug_decode_tokens: bool = bool(
             int(os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS", "0"))
@@ -606,6 +616,12 @@ class GPUModelRunner(
                 "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=True: process will "
                 "os._exit(0) after valid output token count reaches %d.",
                 int(_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N),
+            )
+        if self._sparse_perf_stats_enabled:
+            logger.info(
+                "Sparse perf stats enabled: VLLM_SPARSE_PERF_STATS=1 "
+                "VLLM_SPARSE_PERF_LOG_INTERVAL=%d",
+                self._sparse_perf_log_interval,
             )
 
         # mm_hash ->  encoder_output
@@ -2520,6 +2536,9 @@ class GPUModelRunner(
                 and not disable_token_sparse_boundary
                 and isinstance(attn_metadata_i, FlashAttentionMetadata)
             ):
+                _t0_sparse_patch = (
+                    time.perf_counter() if self._sparse_perf_stats_enabled else None
+                )
                 attn_metadata_i = self._maybe_patch_sparse_compact_kv_metadata(
                     attn_metadata_i,
                     kv_cache_gid=kv_cache_gid,
@@ -2529,6 +2548,11 @@ class GPUModelRunner(
                     spec=kv_cache_spec,
                     for_cudagraph_capture=for_cudagraph_capture,
                 )
+                if _t0_sparse_patch is not None:
+                    self._sparse_perf_record(
+                        "_maybe_patch_sparse_compact_kv_metadata",
+                        time.perf_counter() - _t0_sparse_patch,
+                    )
             if (
                 sparse_per_head_block_table is not None
                 and sparse_per_head_seq_lens is not None
@@ -2604,6 +2628,9 @@ class GPUModelRunner(
             # Union-based seq_lens (used for spec-decode bookkeeping and as the
             # source block table for per-layer sparse slicing).
             if is_sparse_group and not boundary_disable_sparse:
+                _t0_sparse_seq = (
+                    time.perf_counter() if self._sparse_perf_stats_enabled else None
+                )
                 cm_union = self._override_sparse_seq_lens(
                     cm,
                     kv_cache_gid,
@@ -2611,6 +2638,11 @@ class GPUModelRunner(
                     num_reqs_padded,
                     kv_cache_group.kv_cache_spec.block_size,
                 )
+                if _t0_sparse_seq is not None:
+                    self._sparse_perf_record(
+                        "_override_sparse_seq_lens",
+                        time.perf_counter() - _t0_sparse_seq,
+                    )
             else:
                 cm_union = cm
 
@@ -2667,6 +2699,11 @@ class GPUModelRunner(
                             )
                             cm_layer = copy(cm)
                             cm_layer.block_table_tensor = layer_bt
+                            _t0_sparse_seq = (
+                                time.perf_counter()
+                                if self._sparse_perf_stats_enabled
+                                else None
+                            )
                             cm_layer = self._override_sparse_seq_lens(
                                 cm_layer,
                                 kv_cache_gid,
@@ -2675,6 +2712,11 @@ class GPUModelRunner(
                                 bsz,
                                 decode_num_blocks_override=decode_override,
                             )
+                            if _t0_sparse_seq is not None:
+                                self._sparse_perf_record(
+                                    "_override_sparse_seq_lens",
+                                    time.perf_counter() - _t0_sparse_seq,
+                                )
                         else:
                             per_bt, per_sl = (
                                 self._build_sparse_per_head_block_table_and_lens(
@@ -2705,6 +2747,11 @@ class GPUModelRunner(
                                 cm_layer.block_table_tensor = (
                                     cm_union.block_table_tensor.clone()
                                 )
+                                _t0_sparse_seq = (
+                                    time.perf_counter()
+                                    if self._sparse_perf_stats_enabled
+                                    else None
+                                )
                                 cm_layer = self._override_sparse_seq_lens(
                                     cm_layer,
                                     kv_cache_gid,
@@ -2713,6 +2760,11 @@ class GPUModelRunner(
                                     bsz,
                                     decode_num_blocks_override=None,
                                 )
+                                if _t0_sparse_seq is not None:
+                                    self._sparse_perf_record(
+                                        "_override_sparse_seq_lens",
+                                        time.perf_counter() - _t0_sparse_seq,
+                                    )
                         if (
                             (self._sparse_probe_info_enabled
                              or self._sparse_debug_decode_tokens)
@@ -4503,6 +4555,9 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
+            _t0_attn_meta = (
+                time.perf_counter() if self._sparse_perf_stats_enabled else None
+            )
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -4518,6 +4573,11 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            if _t0_attn_meta is not None:
+                self._sparse_perf_record(
+                    "_build_attention_metadata",
+                    time.perf_counter() - _t0_attn_meta,
+                )
 
             (
                 input_ids,
@@ -4846,6 +4906,9 @@ class GPUModelRunner(
                     logger.error("RoutedExpertsCapturer not initialized.")
 
             # ── Sparse KV attention features ──────────────────────────────
+            _t0_sparse_collect = (
+                time.perf_counter() if self._sparse_perf_stats_enabled else None
+            )
             (
                 sparse_block_features,
                 sparse_query_vectors,
@@ -4854,8 +4917,14 @@ class GPUModelRunner(
             ) = self._collect_sparse_features(
                 scheduler_output, self.input_batch.num_reqs
             )
+            if _t0_sparse_collect is not None:
+                self._sparse_perf_record(
+                    "_collect_sparse_features",
+                    time.perf_counter() - _t0_sparse_collect,
+                )
             # Clear per-step Q captures to free GPU memory references.
             self._sparse_q_captures.clear()
+            self._sparse_perf_flush_if_needed()
             # ──────────────────────────────────────────────────────────────
 
             output = ModelRunnerOutput(
@@ -5945,6 +6014,9 @@ class GPUModelRunner(
                 self.query_start_loc.copy_to_gpu()
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                _t0_attn_meta = (
+                    time.perf_counter() if self._sparse_perf_stats_enabled else None
+                )
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
@@ -5955,6 +6027,11 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
+                if _t0_attn_meta is not None:
+                    self._sparse_perf_record(
+                        "_build_attention_metadata",
+                        time.perf_counter() - _t0_attn_meta,
+                    )
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -7404,6 +7481,45 @@ class GPUModelRunner(
                 sparse_group_count,
                 hooked_layers,
             )
+
+    def _sparse_perf_record(self, key: str, elapsed_s: float) -> None:
+        if not self._sparse_perf_stats_enabled or not self._has_sparse_attn:
+            return
+        self._sparse_perf_accum_ms[key] += float(elapsed_s) * 1000.0
+        self._sparse_perf_accum_calls[key] += 1
+
+    def _sparse_perf_flush_if_needed(self) -> None:
+        if not self._sparse_perf_stats_enabled or not self._has_sparse_attn:
+            return
+        self._sparse_perf_steps += 1
+        if self._sparse_perf_steps % self._sparse_perf_log_interval != 0:
+            return
+        if not self._sparse_perf_accum_ms:
+            logger.info(
+                "[SparsePerf] steps=%d no sparse perf samples collected",
+                self._sparse_perf_steps,
+            )
+            return
+
+        items = sorted(
+            self._sparse_perf_accum_ms.items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        parts: list[str] = []
+        for key, total_ms in items:
+            calls = max(1, self._sparse_perf_accum_calls.get(key, 0))
+            avg_ms = total_ms / calls
+            parts.append(
+                f"{key}:total_ms={total_ms:.2f},calls={calls},avg_ms={avg_ms:.3f}"
+            )
+        logger.info(
+            "[SparsePerf] window_steps=%d %s",
+            self._sparse_perf_log_interval,
+            " | ".join(parts),
+        )
+        self._sparse_perf_accum_ms.clear()
+        self._sparse_perf_accum_calls.clear()
 
     def _sparse_simulate_compact_gather_one_req(
         self,
