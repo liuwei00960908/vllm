@@ -8368,12 +8368,20 @@ class GPUModelRunner(
         sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]],
     ) -> None:
         """Copy prefill K features to CPU and optionally run K-Means on device."""
+        perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
         if sparse_prefill_cluster_use_device_kmeans(k_feat):
+            _t_kmeans = time.perf_counter() if perf_enabled else None
             raw = prefill_cluster_meta_from_features_torch(
                 k_feat,
                 num_clusters=spec.num_clusters,
                 n_segment=spec.n_segment,
             )
+            if _t_kmeans is not None:
+                self._sparse_perf_record(
+                    "collect:prefill_device_kmeans",
+                    time.perf_counter() - _t_kmeans,
+                )
+            _t_meta_copy = time.perf_counter() if perf_enabled else None
             sparse_prefill_cluster_meta.setdefault(req_id, {})[unit_key] = {
                 "cluster_centres": raw["cluster_centres"]
                 .detach()
@@ -8396,9 +8404,20 @@ class GPUModelRunner(
                 .numpy()
                 .astype(np.float32, copy=False),
             }
+            if _t_meta_copy is not None:
+                self._sparse_perf_record(
+                    "collect:prefill_meta_cpu_numpy",
+                    time.perf_counter() - _t_meta_copy,
+                )
+        _t_feat_copy = time.perf_counter() if perf_enabled else None
         sparse_block_features.setdefault(req_id, {})[unit_key] = (
             k_feat.detach().cpu().numpy().astype(np.float32, copy=False)
         )
+        if _t_feat_copy is not None:
+            self._sparse_perf_record(
+                "collect:prefill_feat_cpu_numpy",
+                time.perf_counter() - _t_feat_copy,
+            )
 
     def _collect_sparse_features(
         self,
@@ -8439,6 +8458,14 @@ class GPUModelRunner(
         sparse_prefill_cluster_meta
             Optional GPU-computed K-Means metadata per ``layer##kv{i}`` (CPU numpy).
         """
+        perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
+        perf_local_ms: dict[str, float] = defaultdict(float)
+
+        def _perf_add(name: str, start_t: float | None) -> None:
+            if start_t is None:
+                return
+            perf_local_ms[name] += (time.perf_counter() - start_t) * 1000.0
+
         if not self._has_sparse_attn:
             return None, None, None, None
 
@@ -8512,6 +8539,7 @@ class GPUModelRunner(
             last_tok_idx = tok_end - 1  # last token of this request
 
             # ── Q vectors: one row per query head (layer##qh{j})
+            _t_q_extract = time.perf_counter() if perf_enabled else None
             q_per_unit: dict[str, np.ndarray] = {}
             for _, grp in sparse_groups:
                 for layer_name in grp.layer_names:
@@ -8532,26 +8560,32 @@ class GPUModelRunner(
                         q_heads = q_tok
                     else:
                         q_heads = q_tok.view(num_q, head_size)
+                    _t_q_cpu = time.perf_counter() if perf_enabled else None
                     q_heads_np = q_heads.cpu().numpy()
+                    _perf_add("collect:q_cpu_numpy", _t_q_cpu)
                     for qh in range(num_q):
                         q_per_unit[sparse_qh_unit_key(layer_name, qh)] = (
                             q_heads_np[qh]
                         )
+            _perf_add("collect:q_extract_total", _t_q_extract)
 
             if q_per_unit:
                 sparse_query_vectors[req_id] = q_per_unit
 
             # ── K block features from KV cache (per layer, no cross-layer mean)
+            _t_k_extract = time.perf_counter() if perf_enabled else None
             for gid, grp in sparse_groups:
                 block_table = self.input_batch.block_table[gid]
                 num_blocks = int(block_table.num_blocks_per_row[req_idx])
                 if num_blocks == 0:
                     continue
 
+                _t_block_ids = time.perf_counter() if perf_enabled else None
                 block_ids_np = block_table.block_table.np[
                     req_idx, :num_blocks
                 ].copy()
                 block_ids_t = torch.from_numpy(block_ids_np).to(self.device)
+                _perf_add("collect:block_ids_to_device", _t_block_ids)
 
                 spec = grp.kv_cache_spec
                 token_sparse = isinstance(
@@ -8594,6 +8628,7 @@ class GPUModelRunner(
                                 else:
                                     for kv_h in range(num_kv):
                                         self._sparse_store_prefill_block_features(
+                                            # includes optional device kmeans + cpu copy
                                             req_id,
                                             sparse_kv_unit_key(layer_name, kv_h),
                                             k_flat[:, kv_h, :],
@@ -8604,7 +8639,9 @@ class GPUModelRunner(
                         if is_decode_committed:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
+                            _t_decode_cpu = time.perf_counter() if perf_enabled else None
                             k_row_np = k_blocks[-1][slot].float().cpu().numpy()
+                            _perf_add("collect:k_decode_cpu_numpy", _t_decode_cpu)
                             for kv_h in range(num_kv):
                                 if num_kv == 1:
                                     k_vec = k_row_np
@@ -8642,15 +8679,24 @@ class GPUModelRunner(
                         if is_decode_committed:
                             if k_blk.dim() == 2:
                                 assert num_kv == 1
+                                _t_decode_cpu = (
+                                    time.perf_counter() if perf_enabled else None
+                                )
                                 sparse_new_block_features.setdefault(req_id, {})[
                                     sparse_kv_unit_key(layer_name, 0)
                                 ] = k_blk[-1].cpu().numpy()
+                                _perf_add("collect:k_decode_cpu_numpy", _t_decode_cpu)
                             else:
+                                _t_decode_cpu = (
+                                    time.perf_counter() if perf_enabled else None
+                                )
                                 k_last_np = k_blk[-1].cpu().numpy()
+                                _perf_add("collect:k_decode_cpu_numpy", _t_decode_cpu)
                                 for kv_h in range(num_kv):
                                     sparse_new_block_features.setdefault(req_id, {})[
                                         sparse_kv_unit_key(layer_name, kv_h)
                                     ] = k_last_np[kv_h]
+            _perf_add("collect:k_extract_total", _t_k_extract)
 
         if self._sparse_probe_info_enabled:
             logger.info(
@@ -8661,6 +8707,11 @@ class GPUModelRunner(
                 len(sparse_query_vectors),
                 len(sparse_new_block_features),
             )
+
+        if perf_enabled and perf_local_ms:
+            for k, ms in perf_local_ms.items():
+                self._sparse_perf_accum_ms[k] += ms
+                self._sparse_perf_accum_calls[k] += 1
 
         return (
             sparse_block_features or None,
