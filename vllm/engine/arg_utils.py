@@ -616,6 +616,7 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    sparse_attention: dict | None = CacheConfig.sparse_attention
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1013,6 +1014,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--sparse-attention", **cache_kwargs["sparse_attention"]
         )
 
         # Model weight offload related configs
@@ -1564,6 +1568,7 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            sparse_attention=self.sparse_attention,
         )
 
         ray_runtime_env = None

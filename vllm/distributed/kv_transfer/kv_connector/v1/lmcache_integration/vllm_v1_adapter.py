@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
+import inspect
 import os
 import uuid
 from collections.abc import Generator
@@ -54,6 +55,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.core.sparse_kv_cache_manager import parse_sparse_qh_key
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -65,6 +67,128 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _sort_unique_prompt_token_indices(indices: list[int]) -> list[int]:
+    """Deduplicate and sort ascending (0-based positions in the prompt/sequence).
+
+    Values must be **sequence indices**, not vocabulary token ids.
+    """
+    return sorted(set(indices))
+
+
+def _sparse_token_map_to_per_head_rows(
+    tok_by_qh: dict[str, list[int]],
+) -> tuple[list[list[int]] | None, dict[str, list[list[int]]] | None]:
+    """Convert sparse manager's ``layer##qh{i}`` map into LMCache per-head rows.
+
+    Each inner list is **0-based indices** into the request's token sequence
+    (prompt + generated prefix as scheduled), **not** vocabulary token ids.
+    Lists are sorted ascending with duplicates removed.
+    """
+    if not tok_by_qh:
+        return None, None
+    by_layer: dict[str, list[tuple[int, str]]] = {}
+    noparse_keys: list[str] = []
+    for k in tok_by_qh:
+        parsed = parse_sparse_qh_key(k)
+        if parsed is None:
+            noparse_keys.append(k)
+            continue
+        layer, qh = parsed
+        by_layer.setdefault(layer, []).append((qh, k))
+
+    flat_rows: list[list[int]] = []
+    per_layer: dict[str, list[list[int]]] = {}
+    for layer in sorted(by_layer.keys()):
+        pairs = sorted(by_layer[layer], key=lambda x: x[0])
+        layer_rows = [_sort_unique_prompt_token_indices(list(tok_by_qh[key])) for _, key in pairs]
+        per_layer[layer] = layer_rows
+        flat_rows.extend(layer_rows)
+    for k in sorted(noparse_keys):
+        flat_rows.append(_sort_unique_prompt_token_indices(list(tok_by_qh[k])))
+    return flat_rows or None, per_layer or None
+
+
+def _truncate_head_index_rows(
+    rows: list[list[int]] | None, max_pos: int
+) -> list[list[int]] | None:
+    """Keep indices in ``[0, max_pos)``, then sort ascending and dedupe per row."""
+    if rows is None:
+        return None
+    out: list[list[int]] = []
+    for row in rows:
+        clipped = [t for t in row if 0 <= t < max_pos]
+        out.append(_sort_unique_prompt_token_indices(clipped))
+    return out
+
+
+def _truncate_head_index_by_layer(
+    m: dict[str, list[list[int]]] | None, max_pos: int
+) -> dict[str, list[list[int]]] | None:
+    if not m:
+        return None
+    return {
+        layer: _truncate_head_index_rows(rows, max_pos) or [] for layer, rows in m.items()
+    }
+
+
+def _head_rows_have_tokens(rows: list[list[int]] | None) -> bool:
+    if not rows:
+        return False
+    return any(len(r) > 0 for r in rows)
+
+
+def _head_by_layer_have_tokens(m: dict[str, list[list[int]]] | None) -> bool:
+    if not m:
+        return False
+    return any(_head_rows_have_tokens(v) for v in m.values())
+
+
+def _filter_callable_kwargs(fn: Any, kw: dict[str, Any]) -> dict[str, Any]:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return kw
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kw
+    return {k: v for k, v in kw.items() if k in params}
+
+
+def _with_per_head_token_kw(fn: Any, kw: dict[str, Any], rows: list[list[int]] | None) -> dict[str, Any]:
+    if not _head_rows_have_tokens(rows):
+        return kw
+    out = dict(kw)
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if var_kw or "per_head_token_indices" in params:
+            out["per_head_token_indices"] = rows
+        elif "head_token_indices" in params:
+            out["head_token_indices"] = rows
+    except (TypeError, ValueError):
+        out["per_head_token_indices"] = rows
+    return _filter_callable_kwargs(fn, out)
+
+
+def _with_per_head_token_by_layer_kw(
+    fn: Any, kw: dict[str, Any], m: dict[str, list[list[int]]] | None
+) -> dict[str, Any]:
+    if not _head_by_layer_have_tokens(m):
+        return kw
+    out = dict(kw)
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        key = "per_head_token_indices_by_layer"
+        if var_kw or key in params:
+            out[key] = m
+    except (TypeError, ValueError):
+        out["per_head_token_indices_by_layer"] = m
+    return _filter_callable_kwargs(fn, out)
 
 
 @dataclass
@@ -176,16 +300,18 @@ class RequestTracker:
         # list[list[int]]
         # Need to check the type of request.block_ids
 
+        raw_block_ids = new_request.block_ids
         unfolded_block_ids = []
-
-        if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
+        if not raw_block_ids:
+            unfolded_block_ids = []
+        elif not isinstance(raw_block_ids[0], list):
+            unfolded_block_ids = raw_block_ids.copy()
         else:
             # According to the vLLM code
             # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
             # sched/scheduler.py#L943),
             # only one KVCacheGroup is supported in connector for now.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+            unfolded_block_ids = raw_block_ids[0].copy()
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -265,6 +391,12 @@ class ReqMeta:
     disagg_spec: DisaggSpec | None = None
     # the configs of the request
     request_configs: dict | None = None
+    # Optional: per logical head row -> **sequence indices** (0..len-1 in the
+    # request's token timeline), NOT vocabulary token ids. Each row sorted asc.
+    # Row order matches sorted ``layer##qh*``.
+    per_head_token_indices: list[list[int]] | None = None
+    # Layerwise LMCache: vLLM layer name -> per-head **sequence index** rows.
+    per_head_token_indices_by_layer: dict[str, list[list[int]]] | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -355,14 +487,31 @@ class ReqMeta:
 
         if len(token_ids) > num_blocks * block_size:
             logger.error(
-                "The number of tokens is more than the number of blocks."
-                "Something might be wrong in scheduling logic!"
+                "LMCache v1 adapter length mismatch (tokens > blocks*block_size)."
+                " Scheduling logic likely inconsistent."
             )
+            load_debug = ""
+            if load_spec is not None:
+                load_debug = (
+                    f" load_spec(can_load={load_spec.can_load}, "
+                    f"lmcache_cached_tokens={load_spec.lmcache_cached_tokens}, "
+                    f"vllm_cached_tokens={load_spec.vllm_cached_tokens})"
+                )
             logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
+                "req_id=%s num_tokens=%d num_blocks=%d block_size=%d "
+                "expected_max_slots=%d input_token_len=%d num_saved_tokens=%d "
+                "is_last_prefill=%s is_decode_phase=%s skip_save=%s%s",
+                tracker.req_id,
                 len(token_ids),
                 num_blocks,
                 block_size,
+                num_blocks * block_size,
+                input_token_len,
+                tracker.num_saved_tokens,
+                is_last_prefill,
+                tracker.is_decode_phase,
+                tracker.skip_save,
+                load_debug,
             )
 
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
@@ -396,6 +545,16 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
         )
+
+
+def _attach_sparse_head_token_indices(
+    req_meta: ReqMeta | None, tok_by_qh: dict[str, list[int]] | None
+) -> None:
+    if req_meta is None or not tok_by_qh:
+        return
+    flat, by_layer = _sparse_token_map_to_per_head_rows(tok_by_qh)
+    req_meta.per_head_token_indices = flat
+    req_meta.per_head_token_indices_by_layer = by_layer
 
 
 def need_gpu_interim_buffer(lmcache_config: LMCacheEngineConfig):
@@ -840,7 +999,60 @@ class LMCacheConnectorV1Impl:
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.cuda()
-            assert len(tokens) == len(slot_mapping)
+            print("### ADAPTER_FILE ###", __file__, flush=True)
+            print(
+                "### DEBUG_REACHED_START_LOAD_KV_MISMATCH_CHECK ###",
+                f"req_id={request.req_id}",
+                f"len(tokens)={len(tokens)}",
+                f"len(slot_mapping)={len(slot_mapping)}",
+                flush=True,
+            )
+            if len(tokens) != len(slot_mapping):
+                # Print minimal but actionable info before fatal error.
+                add_kw = getattr(forward_context, "additional_kwargs", None) or {}
+                override_req = (
+                    "lmcache_per_head_token_indices_by_req_id" in add_kw
+                    and request.req_id in (add_kw.get("lmcache_per_head_token_indices_by_req_id") or {})
+                )
+                override_layer = (
+                    "lmcache_per_head_token_indices_by_layer_by_req_id" in add_kw
+                    and request.req_id
+                    in (add_kw.get("lmcache_per_head_token_indices_by_layer_by_req_id") or {})
+                )
+                head_rows_nonempty = (
+                    request.per_head_token_indices is not None
+                    and any(len(r) > 0 for r in request.per_head_token_indices)
+                )
+                head_by_layer_nonempty = (
+                    request.per_head_token_indices_by_layer is not None
+                    and any(
+                        any(len(r) > 0 for r in rows)
+                        for rows in request.per_head_token_indices_by_layer.values()
+                    )
+                )
+                load_spec = request.load_spec
+                logger.error(
+                    "LMCache v1 start_load_kv length mismatch: req_id=%s "
+                    "len(tokens)=%d len(slot_mapping)=%d "
+                    "load_spec(can_load=%s lmcache_cached_tokens=%d vllm_cached_tokens=%d) "
+                    "sparse_override(req_level=%s layer_level=%s) "
+                    "per_head_indices_nonempty=%s per_head_by_layer_nonempty=%s",
+                    request.req_id,
+                    len(tokens),
+                    len(slot_mapping),
+                    load_spec.can_load,
+                    load_spec.lmcache_cached_tokens,
+                    load_spec.vllm_cached_tokens,
+                    override_req,
+                    override_layer,
+                    head_rows_nonempty,
+                    head_by_layer_nonempty,
+                )
+                raise AssertionError(
+                    "### MISMATCH_ASSERT_REACHED ### "
+                    f"len(tokens)({len(tokens)}) != len(slot_mapping)({len(slot_mapping)}) "
+                    f"for req_id={request.req_id} file={__file__}"
+                )
 
             self._stats_monitor.update_interval_vllm_hit_tokens(
                 request.load_spec.vllm_cached_tokens
@@ -854,38 +1066,90 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            # Overrides: use **sequence indices** (position in prompt+context), not
+            # vocabulary token ids. Each inner list is sorted ascending after clip.
+            add_kw = getattr(forward_context, "additional_kwargs", None) or {}
+            ovr = add_kw.get("lmcache_per_head_token_indices_by_req_id")
+            ovr_bl = add_kw.get("lmcache_per_head_token_indices_by_layer_by_req_id")
+            if isinstance(ovr, dict) and request.req_id in ovr:
+                raw_rows = ovr[request.req_id]
+                if isinstance(raw_rows, list):
+                    request.per_head_token_indices = [
+                        _sort_unique_prompt_token_indices(list(r))
+                        for r in raw_rows
+                        if isinstance(r, list)
+                    ]
+            if isinstance(ovr_bl, dict) and request.req_id in ovr_bl:
+                raw_bl = ovr_bl[request.req_id]
+                if isinstance(raw_bl, dict):
+                    request.per_head_token_indices_by_layer = {
+                        ln: [
+                            _sort_unique_prompt_token_indices(list(r))
+                            for r in rows
+                            if isinstance(r, list)
+                        ]
+                        for ln, rows in raw_bl.items()
+                        if isinstance(rows, list)
+                    }
+
+            head_rows = _truncate_head_index_rows(
+                request.per_head_token_indices, lmcache_cached_tokens
+            )
+            head_by_layer = _truncate_head_index_by_layer(
+                request.per_head_token_indices_by_layer, lmcache_cached_tokens
+            )
             if self.use_layerwise:
                 sync = idx == last_idx
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending
                     # compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
+                    blend_fn = self.blender.blend
+                    blend_kw: dict[str, Any] = dict(
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                     )
-                else:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                    blend_kw = _with_per_head_token_by_layer_kw(
+                        blend_fn, blend_kw, head_by_layer
+                    )
+                    blend_kw = _with_per_head_token_kw(blend_fn, blend_kw, head_rows)
+                    blend_fn(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
+                        **blend_kw,
+                    )
+                else:
+                    rl_fn = self.lmcache_engine.retrieve_layer
+                    rl_kw: dict[str, Any] = dict(
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         sync=sync,
+                    )
+                    rl_kw = _with_per_head_token_by_layer_kw(rl_fn, rl_kw, head_by_layer)
+                    rl_kw = _with_per_head_token_kw(rl_fn, rl_kw, head_rows)
+                    layerwise_retriever = rl_fn(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        **rl_kw,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
-                ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
+                r_fn = self.lmcache_engine.retrieve
+                r_kw: dict[str, Any] = dict(
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
                     request_configs=request.request_configs,
                     req_id=request.req_id,
+                )
+                r_kw = _with_per_head_token_kw(r_fn, r_kw, head_rows)
+                r_kw = _with_per_head_token_by_layer_kw(r_fn, r_kw, head_by_layer)
+                ret_token_mask = r_fn(
+                    tokens[:lmcache_cached_tokens],
+                    token_mask[:lmcache_cached_tokens],
+                    **r_kw,
                 )
 
                 # Check the result
@@ -1012,14 +1276,22 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
-                layerwise_storer = self.lmcache_engine.store_layer(
-                    token_ids,
+                sl_fn = self.lmcache_engine.store_layer
+                sl_kw: dict[str, Any] = dict(
                     mask=store_mask,
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
                     sync=is_first,
                 )
+                n_save = len(token_ids)
+                h_rows = _truncate_head_index_rows(request.per_head_token_indices, n_save)
+                h_bl = _truncate_head_index_by_layer(
+                    request.per_head_token_indices_by_layer, n_save
+                )
+                sl_kw = _with_per_head_token_by_layer_kw(sl_fn, sl_kw, h_bl)
+                sl_kw = _with_per_head_token_kw(sl_fn, sl_kw, h_rows)
+                layerwise_storer = sl_fn(token_ids, **sl_kw)
                 self.layerwise_storers.append(layerwise_storer)
                 if is_first:
                     is_first = False
@@ -1112,8 +1384,9 @@ class LMCacheConnectorV1Impl:
                 store_mask = store_mask[:aligned_token_len]
                 slot_mapping = slot_mapping[:aligned_token_len]
 
-            self.lmcache_engine.store(
-                token_ids,
+            st_fn = self.lmcache_engine.store
+            n_save = len(token_ids)
+            st_kw: dict[str, Any] = dict(
                 mask=store_mask,
                 kvcaches=kvcaches,
                 slot_mapping=slot_mapping,
@@ -1121,6 +1394,13 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
             )
+            h_rows = _truncate_head_index_rows(request.per_head_token_indices, n_save)
+            h_bl = _truncate_head_index_by_layer(
+                request.per_head_token_indices_by_layer, n_save
+            )
+            st_kw = _with_per_head_token_kw(st_fn, st_kw, h_rows)
+            st_kw = _with_per_head_token_by_layer_kw(st_fn, st_kw, h_bl)
+            st_fn(token_ids, **st_kw)
 
             # NOTE(Jiayi): We assume all tokens are saved
             save_spec.skip_leading_tokens = len(token_ids)
@@ -1318,6 +1598,11 @@ class LMCacheConnectorV1Impl:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
 
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        sparse_tok_by_req: dict[str, dict[str, list[int]]] | None = None
+        if not isinstance(cached_reqs, list):
+            sparse_tok_by_req = cached_reqs.sparse_selected_token_indices_by_layer
+
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
             load_spec = self.load_specs.pop(request.req_id, None)
@@ -1344,6 +1629,23 @@ class LMCacheConnectorV1Impl:
             )
             self._request_trackers[request.req_id] = request_tracker
 
+            if load_spec is not None and load_spec.can_load:
+                logger.error(
+                    "LMCache build_meta debug: req_id=%s num_computed_tokens=%d "
+                    "num_scheduled_tokens=%d num_tokens_to_compute=%d "
+                    "load_spec(vllm_cached_tokens=%d lmcache_cached_tokens=%d can_load=%s) "
+                    "tracker(token_ids_len=%d allocated_block_ids_len=%d)",
+                    request.req_id,
+                    request.num_computed_tokens,
+                    scheduler_output.num_scheduled_tokens[request.req_id],
+                    num_tokens_to_compute,
+                    load_spec.vllm_cached_tokens,
+                    load_spec.lmcache_cached_tokens,
+                    load_spec.can_load,
+                    len(request_tracker.token_ids),
+                    len(request_tracker.allocated_block_ids),
+                )
+
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -1353,9 +1655,11 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
+                if sparse_tok_by_req:
+                    _attach_sparse_head_token_indices(
+                        req_meta, sparse_tok_by_req.get(request.req_id)
+                    )
                 meta.add_request(req_meta)
-
-        cached_reqs = scheduler_output.scheduled_cached_reqs
 
         # NOTE: For backward compatibility with vllm version < 0.9.2,
         # In the latest vllm version, the type of scheduled_cached_reqs has
@@ -1402,12 +1706,16 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
+                if sparse_tok_by_req:
+                    _attach_sparse_head_token_indices(
+                        req_meta, sparse_tok_by_req.get(req_id)
+                    )
                 meta.add_request(req_meta)
 
         return meta
 
     @_lmcache_nvtx_annotate
-    def request_finished(
+def request_finished(
         self,
         request: "Request",
         block_ids: list[int],

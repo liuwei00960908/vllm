@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowSpec,
+    SparseAttentionSpec,
 )
 from vllm.v1.request import Request
 
@@ -1106,7 +1107,7 @@ class SinkFullAttentionManager(FullAttentionManager):
         self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
 
 
-spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
+spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager] | None] = {
     FullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
@@ -1114,12 +1115,33 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     MambaSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
     SinkFullAttentionSpec: SinkFullAttentionManager,
+    # Registered last so SparseAttentionSpec (subclass of FullAttentionSpec)
+    # gets its own dedicated manager rather than falling back to
+    # FullAttentionManager.
+    SparseAttentionSpec: None,  # filled below after import to avoid circular
 }
+
+def _ensure_sparse_manager_registered() -> None:
+    """Lazy registration to avoid circular imports during module import."""
+    if spec_manager_map.get(SparseAttentionSpec) is not None:
+        return
+    from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager  # noqa: PLC0415
+    spec_manager_map[SparseAttentionSpec] = SparseKVManager
 
 
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec, **kwargs
 ) -> SingleTypeKVCacheManager:
+    # `SparseKVManager` is intentionally registered lazily because importing it
+    # requires loading `single_type_kv_cache_manager.py` (base class), which in
+    # turn would otherwise trigger a reverse import before `sparse_kv_cache_manager`
+    # finishes initializing.
+    if (
+        isinstance(kv_cache_spec, SparseAttentionSpec)
+        and spec_manager_map.get(SparseAttentionSpec) is None
+    ):
+        _ensure_sparse_manager_registered()
+
     manager_class = spec_manager_map[type(kv_cache_spec)]
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager

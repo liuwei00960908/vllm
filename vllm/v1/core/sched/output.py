@@ -122,6 +122,22 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Optional sparse debug payload: req_id -> selected logical block indices
+    # used to build the sparse KV table for the upcoming decode forward.
+    sparse_selected_block_indices: dict[str, list[int]] | None = None
+    # Optional sparse debug payload: req_id -> retrieve-zone logical block
+    # indices (steady zone excluded) that truly participate in sparse retrieval.
+    sparse_retrieve_block_indices: dict[str, list[int]] | None = None
+    # Per-query-head sparse selection (logical block indices); keys ``layer##qh{j}``.
+    sparse_selected_block_indices_by_layer: dict[str, dict[str, list[int]]] | None = (
+        None
+    )
+    # Token-sparse: per-query-head global token indices for compact KV gather.
+    sparse_selected_token_indices_by_layer: dict[str, dict[str, list[int]]] | None = (
+        None
+    )
+    # Token-sparse: chronological physical block ids (see SparseKVManager).
+    sparse_chrono_phys_block_ids: dict[str, list[int]] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -172,6 +188,11 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            sparse_selected_block_indices=None,
+            sparse_retrieve_block_indices=None,
+            sparse_selected_block_indices_by_layer=None,
+            sparse_selected_token_indices_by_layer=None,
+            sparse_chrono_phys_block_ids=None,
         )
 
 

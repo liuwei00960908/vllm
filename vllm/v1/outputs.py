@@ -253,6 +253,51 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # ------------------------------------------------------------------ #
+    # Sparse KV attention fields                                           #
+    # Populated by the model runner when SparseAttentionSpec is active.   #
+    # All arrays are CPU numpy to minimise serialisation cost.            #
+    # ------------------------------------------------------------------ #
+
+    # req_id -> (layer##kv{i}) -> np.ndarray[num_blocks, feature_dim]
+    # Emitted after prefill completes; used by SparseKVManager.indexing().
+    # Plain layer names are normalized to ``layer##kv0``.
+    sparse_block_features: "dict[str, dict[str, np.ndarray]] | None" = None
+
+    # req_id -> (layer##qh{j}) -> np.ndarray[feature_dim]
+    # Query vector of the last computed token per query head.
+    # • For prefill completions: query of the last prompt token (seeds the
+    #   first decode-step select()).
+    # • For decode steps: query of the newly generated token (used for the
+    #   *next* decode step's select()).
+    sparse_query_vectors: "dict[str, dict[str, np.ndarray]] | None" = None
+
+    # req_id -> (layer##kv{i}) -> np.ndarray[feature_dim]
+    # K feature of the last written slot during this decode step (per KV head).
+    # Used by SparseKVManager.rebalance() to update cluster structure.
+    sparse_new_block_features: "dict[str, dict[str, np.ndarray]] | None" = None
+
+    # req_id -> layer_name -> np.ndarray[feature_dim]
+    # Mean V feature of the block written during this decode step.
+    # TODO(estimation-zone): Used for value_sum accumulation.
+    # When the Estimation Zone is enabled, the model runner should also
+    # populate this field alongside sparse_new_block_features.
+    sparse_new_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
+
+    # req_id -> (layer##kv{i}) -> K-Means metadata dict (CPU numpy), optional.
+    # When set, ``SparseKVManager.indexing()`` skips CPU numpy K-Means.
+    # Per-layer keys: ``cluster_centres``, ``block_to_cluster``, ``cluster_size``,
+    # ``mean_key``.
+    sparse_prefill_cluster_meta: (
+        "dict[str, dict[str, dict[str, np.ndarray]]] | None"
+    ) = None
+
+    # req_id -> layer_name -> np.ndarray[num_blocks, feature_dim]
+    # Mean V feature per block; emitted after prefill alongside
+    # sparse_block_features.
+    # TODO(estimation-zone): populate from model runner for Estimation Zone.
+    sparse_block_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
