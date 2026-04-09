@@ -528,10 +528,9 @@ class GPUModelRunner(
         self._sparse_q_captures: dict[str, torch.Tensor] = {}
         # Hook handles so they can be removed if needed.
         self._sparse_q_hooks: list[torch.utils.hooks.RemovableHandle] = []
-        # Emit sparse branch probe INFO logs only when user explicitly sets
-        # VLLM_LOGGING_LEVEL=DEBUG.
+        # Emit sparse branch probe logs only when explicitly enabled.
         self._sparse_probe_info_enabled: bool = (
-            os.getenv("VLLM_LOGGING_LEVEL", "").upper() == "DEBUG"
+            int(os.getenv("VLLM_SPARSE_PROBE_INFO", "0")) == 1
         )
         # Optional sparse decode token debug logs.
         self._sparse_debug_decode_tokens: bool = bool(
@@ -1424,7 +1423,7 @@ class GPUModelRunner(
                 tok_by_layer = sparse_tok_by_layer_map.get(req_id)
                 chrono_by_req = sparse_chrono_phys_map.get(req_id)
                 if by_layer is None or tok_by_layer is None or chrono_by_req is None:
-                    logger.warning(
+                    logger.debug(
                         "[SparseRC:bridge_worker] req_id=%s "
                         "missing by_layer=%s tok=%s chrono=%s "
                         "selected_len=%d retrieve_len=%d num_output_tokens=%d "
@@ -8886,14 +8885,14 @@ class GPUModelRunner(
         if not self._sparse_debug_decode_tokens:
             return
         if req_state.prompt_token_ids is None:
-            logger.info(
+            logger.debug(
                 "Sparse %s KV trace skipped (no prompt token IDs): req_id=%s",
                 zone_name,
                 req_id,
             )
             return
         if not selected_logical_blocks:
-            logger.info(
+            logger.debug(
                 "Sparse %s KV trace: req_id=%s selected_blocks=[]",
                 zone_name,
                 req_id,
@@ -8949,7 +8948,7 @@ class GPUModelRunner(
                 f"pieces={block_pieces!r} text={block_text!r}"
             )
 
-        logger.info(
+        logger.debug(
             "Sparse %s KV trace:\n"
             "req_id=%s\n"
             "selected_blocks(total=%d shown=%d, max=%d)=%s\n"

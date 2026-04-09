@@ -813,7 +813,7 @@ class Scheduler(SchedulerInterface):
                 if (selected_probe is not None and len(selected_probe) > 0) or any(
                     rebuilt_lens_probe
                 ):
-                    logger.info(
+                    logger.debug(
                         "[SparseProbe] sched_resume_source req_id=%s "
                         "selected_logical_blocks=%d retrieve_logical_blocks=%d "
                         "source_new_block_ids_lens=%s",
@@ -1179,7 +1179,7 @@ class Scheduler(SchedulerInterface):
                     if chrono is None and not phase_gate_sparse_meta and block_ids_payload:
                         if len(block_ids_payload) > 0 and len(block_ids_payload[0]) > 0:
                             chrono = list(block_ids_payload[0])
-                    logger.warning(
+                    logger.debug(
                         "[SparseRC:bridge_sched] req_id=%s "
                         "missing by_layer=%s tok=%s chrono=%s "
                         "selected_len=%d retrieve_len=%d "
@@ -1234,7 +1234,7 @@ class Scheduler(SchedulerInterface):
                 # Keep worker in prefill-context mode for one transition step
                 # until sparse layer_state is ready.
                 num_output_for_worker = req.num_output_tokens
-                logger.warning(
+                logger.debug(
                     "[SparseRC:phase_gate] req_id=%s gate=%s "
                     "num_output_tokens=%d num_placeholders=%d worker_num_output_tokens=%d",
                     req_id,

@@ -374,9 +374,9 @@ class SparseKVManager(FullAttentionManager):
         self._debug_state_transitions: bool = bool(
             int(os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS", "0"))
         )
-        # Probe logs visible only when VLLM_LOGGING_LEVEL=DEBUG.
+        # Probe logs are disabled by default; enable explicitly when needed.
         self._sparse_probe_info_enabled: bool = (
-            os.getenv("VLLM_LOGGING_LEVEL", "").upper() == "DEBUG"
+            int(os.getenv("VLLM_SPARSE_PROBE_INFO", "0")) == 1
         )
         # Per-step compact trace (req_id -> latest key state in this step).
         self._step_trace: dict[str, dict[str, object]] = {}
