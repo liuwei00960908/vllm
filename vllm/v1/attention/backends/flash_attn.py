@@ -769,6 +769,25 @@ class FlashAttentionImpl(AttentionImpl):
                     and not self.kv_cache_dtype.startswith("fp8")
                 )
                 use_per_head_bt = attn_metadata.sparse_per_head_block_table is not None
+                # TODO(sparse-debug): remove after locating compact-gather routing issues.
+                logger.info(
+                    "[SparseDebug] FA sparse branch layer=%s num_tok=%d "
+                    "use_q_head_gather=%s use_gather=%s use_per_head_bt=%s | "
+                    "sparse_q_head_gather=%s sparse_gather_phys=%s sparse_per_head_bt=%s | "
+                    "alibi=%s sinks=%s sliding=%s fp8_kv=%s",
+                    getattr(layer, "__class__", type(layer)).__name__,
+                    int(num_actual_tokens),
+                    use_q_head_gather,
+                    use_gather,
+                    use_per_head_bt,
+                    attn_metadata.sparse_q_head_gather is not None,
+                    attn_metadata.sparse_gather_phys is not None,
+                    attn_metadata.sparse_per_head_block_table is not None,
+                    self.alibi_slopes is not None,
+                    self.sinks is not None,
+                    sliding_window_size,
+                    bool(self.kv_cache_dtype.startswith("fp8")),
+                )
                 if use_q_head_gather:
                     self._forward_per_head_compact_kv_gather(
                         query[:num_actual_tokens],
@@ -935,6 +954,14 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> None:
         """One compact-KV varlen FA call per query head (token-sparse)."""
         assert attn_metadata.sparse_q_head_gather is not None
+        # TODO(sparse-debug): remove after locating compact-gather routing issues.
+        logger.info(
+            "[SparseDebug] _forward_per_head_compact_kv_gather ENTER "
+            "num_q_heads_gather=%d q_shape0=%d max_seqlen_q=%d",
+            len(attn_metadata.sparse_q_head_gather),
+            int(query.shape[0]),
+            int(max_seqlen_q),
+        )
         win = (
             list(self.sliding_window)
             if self.sliding_window is not None
