@@ -1,24 +1,23 @@
-grep -nE "async_sampled_ids|runtime_mode" vllm_server.log | head -5
+# 确认同步模式 + num_output_tokens 递增
+grep -nE "runtime_mode|_override_sparse_slot_mapping gid=0 req_idx=0" vllm_server.log | head -25 > tmp.txt
 
+# FA sparse branch 路由（关键：是否有 True）
+grep -nE "FA sparse branch" vllm_server.log | head -10 > tmp.txt
 
-grep -nE "_override_sparse_slot_mapping gid=0 req_idx=0" vllm_server.log | head -20
+# 是否还有 mismatch
+grep -c "SparseRC:mismatch" vllm_server.log > tmp.txt
 
+# compact gather 成功还是失败
+grep -nE "gather_fail_reason|compact_gather.*ENTER|q_head_gather" vllm_server.log | head -20 > tmp.txt
 
-grep -nE "FA sparse branch" vllm_server.log | head -20
+# collect_sparse_features 输出
+grep -nE "collect_sparse_features" vllm_server.log | head -10 > tmp.txt
 
+# select 结果
+grep -nE "select req_id=" vllm_server.log | head -10 > tmp.txt
 
-grep -nE "boundary_disable_sparse" vllm_server.log | head -20
-
-grep -nE "collect_sparse_features" vllm_server.log | head -20
-
-
-grep -nE "indexing req_id=|sparse_notify_prefill_done|select req_id=" vllm_server.log | head -30
-
-
-grep -nE "gather_fail_reason|layer_bridge|seq_lens_bridge" vllm_server.log | head -30
-
-
-grep -nE "SparseRC.*seq_lens|SparseRC.*layer_bridge" vllm_server.log | head -20
+# boundary_disable_sparse
+grep -c "boundary_disable_sparse" vllm_server.log > tmp.txt
 
 export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_SPARSE_PROBE_INFO=1

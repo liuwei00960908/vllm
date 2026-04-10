@@ -560,6 +560,9 @@ class GPUModelRunner(
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
         self._sparse_output_tokens_before_step: dict[str, int] = {}
+        # Track requests whose first-step commit was deferred under async
+        # scheduling so the deferral does not repeat indefinitely.
+        self._sparse_deferred_once: set[str] = set()
         # One-shot diagnostics for logical/physical length mismatch.
         self._sparse_mismatch_logged: set[tuple[str, str, int]] = set()
         self._sparse_debug_decode_tokens_max: int = int(
@@ -1182,6 +1185,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._sparse_deferred_once.discard(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -4000,11 +4004,14 @@ class GPUModelRunner(
             # Robust first-step guard: if no committed outputs yet and we're
             # still exactly at prompt boundary, treat this as uncommitted phase
             # regardless of scheduler carrier type (new/cached req packaging).
+            # Only defer once per request to prevent an infinite defer loop
+            # where output_token_ids never grows and the condition re-triggers.
             sparse_uncommitted_first_step = (
                 self.use_async_scheduling
                 and force_real_sampled_ids
                 and prev_output_n == 0
                 and nspec_before == prompt_n
+                and req_id not in self._sparse_deferred_once
             )
             should_defer_commit = (
                 (sparse_context_phase or sparse_uncommitted_first_step)
@@ -4034,6 +4041,7 @@ class GPUModelRunner(
                 # Do not mutate worker-side token state in uncommitted boundary
                 # phase. The scheduler has not acknowledged output progression
                 # yet, so writing placeholder/real token here causes drift.
+                self._sparse_deferred_once.add(req_id)
                 continue
 
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]
@@ -7579,39 +7587,27 @@ class GPUModelRunner(
         decode_lb: int | None = SparseKVManager._global_token_to_logical_block(
             g_cur, p_count, bsz
         )
-        logical_order: list[int] = []
         if len(chrono) == 0:
             row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
             if row is None or len(row) == 0:
                 return False, "missing_layer_row"
             decode_phys = int(row[-1])
-            hist_phys = [int(x) for x in row[:-1]]
-            by_l = self._sparse_by_layer_logical.get(rid)
-            if by_l and sk in by_l:
-                logical_order = [int(x) for x in by_l[sk]]
+            # Build logical→physical mapping via block_table.
+            ri_idx = self.input_batch.req_id_to_index.get(rid)
+            if ri_idx is not None:
+                blk_tbl = self.input_batch.block_table[kv_cache_gid]
+                bt_row = blk_tbl.block_table.np[ri_idx]
+                n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
+                by_l = self._sparse_by_layer_logical.get(rid)
+                if by_l and sk in by_l:
+                    lo = [int(x) for x in by_l[sk]]
+                else:
+                    lo = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
+                for lg in lo:
+                    if lg != decode_lb and 0 <= lg < n_blks:
+                        logical_to_phys[lg] = int(bt_row[lg])
             else:
-                logical_order = [
-                    int(x) for x in self._sparse_merged_logical.get(rid, [])
-                ]
-            # When chrono metadata is unavailable, map only historical logical
-            # blocks with row[:-1]. The current decode logical block is handled
-            # by decode_phys fallback and must not participate in history zip.
-            if decode_lb is not None:
-                logical_order = [
-                    lg for lg in logical_order if int(lg) != int(decode_lb)
-                ]
-            if (
-                decode_lb is not None
-                and len(hist_phys) > 0
-                and len(logical_order) != len(hist_phys)
-            ):
-                return (
-                    False,
-                    f"logical_phys_mismatch logical_order_len={len(logical_order)} "
-                    f"hist_phys_len={len(hist_phys)}",
-                )
-            for lg, ph in zip(logical_order, hist_phys):
-                logical_to_phys[int(lg)] = int(ph)
+                return False, f"missing_req_index rid={rid}"
         for g in sel:
             lb = SparseKVManager._global_token_to_logical_block(g, p_count, bsz)
             if len(chrono) > 0:
@@ -8055,7 +8051,6 @@ class GPUModelRunner(
                     and decode_lb is not None
                 ):
                     debug_decode_lb = int(decode_lb)
-                logical_order: list[int] = []
                 if len(chrono) == 0:
                     row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
                     if row is None or len(row) == 0:
@@ -8066,60 +8061,26 @@ class GPUModelRunner(
                         )
                         return None
                     decode_phys = int(row[-1])
-                    hist_phys = [int(x) for x in row[:-1]]
-                    by_l = self._sparse_by_layer_logical.get(rid)
-                    if by_l and sk in by_l:
-                        logical_order = [int(x) for x in by_l[sk]]
+                    # Build logical→physical mapping via block_table
+                    # (same source used by _sparse_layer_decode_phys_row).
+                    ri_idx = self.input_batch.req_id_to_index.get(rid)
+                    if ri_idx is not None:
+                        blk_tbl = self.input_batch.block_table[kv_cache_gid]
+                        bt_row = blk_tbl.block_table.np[ri_idx]
+                        n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
+                        by_l = self._sparse_by_layer_logical.get(rid)
+                        if by_l and sk in by_l:
+                            lo = [int(x) for x in by_l[sk]]
+                        else:
+                            lo = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
+                        for lg in lo:
+                            if lg != decode_lb and 0 <= lg < n_blks:
+                                logical_to_phys[lg] = int(bt_row[lg])
                     else:
-                        logical_order = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
-                    # Chrono missing path: exclude active decode logical block
-                    # from history mapping (row[:-1] only has history blocks).
-                    if decode_lb is not None:
-                        logical_order = [
-                            lg for lg in logical_order if int(lg) != int(decode_lb)
-                        ]
-                    if (
-                        decode_lb is not None
-                        and len(hist_phys) > 0
-                        and len(logical_order) != len(hist_phys)
-                    ):
-                        key = (rid, layer_name, qh_idx)
-                        if (
-                            key not in self._sparse_mismatch_logged
-                            and (
-                                self._sparse_probe_info_enabled
-                                or self._sparse_debug_decode_tokens
-                                or self._sparse_debug_first_token
-                                or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                            )
-                        ):
-                            self._sparse_mismatch_logged.add(key)
-                            logger.info(
-                                "[SparseRC:mismatch] req_id=%s layer=%s qh=%d "
-                                "seq_len=%d p_count=%d g_cur=%d decode_lb=%d "
-                                "logical_order_len=%d hist_phys_len=%d "
-                                "logical_order_head=%s hist_phys_head=%s sel_head=%s",
-                                rid,
-                                layer_name,
-                                qh_idx,
-                                seq_len,
-                                p_count,
-                                g_cur,
-                                int(decode_lb),
-                                len(logical_order),
-                                len(hist_phys),
-                                logical_order[:8],
-                                hist_phys[:8],
-                                sel[:8],
-                            )
                         gather_fail_reason = (
-                            f"logical_phys_mismatch rid={rid} qh={qh_idx} sk={sk} "
-                            f"logical_order_len={len(logical_order)} "
-                            f"hist_phys_len={len(hist_phys)}"
+                            f"missing_req_index rid={rid} qh={qh_idx} sk={sk}"
                         )
                         return None
-                    for lg, ph in zip(logical_order, hist_phys):
-                        logical_to_phys[int(lg)] = int(ph)
                 for g in sel:
                     lb = SparseKVManager._global_token_to_logical_block(
                         g, p_count, bsz
@@ -8962,6 +8923,10 @@ class GPUModelRunner(
 
         ``sparse_row_key`` is ``layer##qh{j}`` (per query head).  When absent
         from the per-head map, falls back to merged union order (legacy).
+
+        Uses the block_table (logical-index → physical-block-id mapping) to
+        resolve physical addresses rather than zipping with bid_row, which
+        can differ in length from the logical selection list.
         """
         rs = self.requests.get(req_id)
         if rs is None or len(rs.output_token_ids) == 0:
@@ -8972,11 +8937,21 @@ class GPUModelRunner(
         bid_row = rs.block_ids[kv_cache_gid]
         if len(bid_row) < 2:
             return None
-        phys_hist = [int(x) for x in bid_row[:-1]]
         decode_id = int(bid_row[-1])
+
+        req_idx = self.input_batch.req_id_to_index.get(req_id)
+        if req_idx is None:
+            return None
+        blk_table = self.input_batch.block_table[kv_cache_gid]
+        bt_np = blk_table.block_table.np[req_idx]
+        num_blocks = int(blk_table.num_blocks_per_row[req_idx])
+
         logical_to_phys: dict[int, int] = {}
-        for log, phys in zip(merged, phys_hist):
-            logical_to_phys[int(log)] = int(phys)
+        for log_idx in merged:
+            li = int(log_idx)
+            if 0 <= li < num_blocks:
+                logical_to_phys[li] = int(bt_np[li])
+
         by_l = self._sparse_by_layer_logical.get(req_id)
         if by_l and sparse_row_key in by_l:
             logical_order = [int(x) for x in by_l[sparse_row_key]]
