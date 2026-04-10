@@ -1,24 +1,40 @@
 rm -rf tmp.txt
 
-# === 验证 slot 编址修复 ===
+# === 异步模式诊断 ===
 
-# 1. 最重要：输出内容是否完全正常
-echo "=== output content ===" >> tmp.txt
-grep -n "data:.*content" vllm_server.log | tail -20 >> tmp.txt
-
-# 2. compact_gather 状态
+# 1. compact_gather 状态统计
 echo "=== compact_gather enabled=0 count ===" >> tmp.txt
 grep -c "compact_gather.*enabled=0" vllm_server.log >> tmp.txt
 echo "=== compact_gather enabled=1 count ===" >> tmp.txt
 grep -c "compact_gather.*enabled=1" vllm_server.log >> tmp.txt
 
-# 3. 检查是否有 block_idx_oob 错误
+# 2. enabled=0 的 reason 分类
+echo "=== enabled=0 reasons ===" >> tmp.txt
+grep "compact_gather.*enabled=0" vllm_server.log | head -5 >> tmp.txt
+
+# 3. block_idx_oob 错误
 echo "=== block_idx_oob ===" >> tmp.txt
 grep -c "block_idx_oob" vllm_server.log >> tmp.txt
 
-# 4. FA sparse branch（decode 阶段是否有 use_q_head_gather=True）
+# 4. seq_lens 前 10 条
+echo "=== SparseRC seq_lens ===" >> tmp.txt
+grep -n "SparseRC.*seq_lens.*num_output_tokens" vllm_server.log | head -10 >> tmp.txt
+
+# 5. boundary_disable_sparse
+echo "=== boundary_disable_sparse ===" >> tmp.txt
+grep -n "boundary_disable_sparse" vllm_server.log >> tmp.txt
+
+# 6. _sparse_output_tokens_before_step / deferred 相关
+echo "=== deferred_once ===" >> tmp.txt
+grep -c "deferred_once" vllm_server.log >> tmp.txt
+
+# 7. num_output_tokens 在前几步的变化
+echo "=== first decode steps (compact_gather lines) ===" >> tmp.txt
+grep -n "compact_gather.*layers.0.self_attn" vllm_server.log | head -10 >> tmp.txt
+
+# 8. FA sparse branch decode 阶段
 echo "=== FA decode use_q_head_gather ===" >> tmp.txt
-grep -n "FA sparse branch.*num_tok=1.*use_q_head_gather=True" vllm_server.log | head -5 >> tmp.txt
+grep -n "FA sparse branch.*num_tok=1" vllm_server.log | head -5 >> tmp.txt
 
 # === 环境变量 ===
 export VLLM_LOGGING_LEVEL=DEBUG
