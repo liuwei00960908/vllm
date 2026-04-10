@@ -1,23 +1,23 @@
-# 确认同步模式 + num_output_tokens 递增
-grep -nE "runtime_mode|_override_sparse_slot_mapping gid=0 req_idx=0" vllm_server.log | head -25 > tmp.txt
+# 1. 查看是否有 compact_gather 或 gather_fail 日志
+grep -ni "compact_gather\|gather_fail\|enabled=0" vllm_server.log | head -20 >> tmp.txt
 
-# FA sparse branch 路由（关键：是否有 True）
-grep -nE "FA sparse branch" vllm_server.log | head -10 > tmp.txt
+# 2. 查看 boundary_disable_sparse（之前修复前的日志里有，现在呢？）
+grep -ni "boundary_disable_sparse" vllm_server.log | head -5 >> tmp.txt
 
-# 是否还有 mismatch
-grep -c "SparseRC:mismatch" vllm_server.log > tmp.txt
+# 3. 查看 _maybe_patch 是否被调用
+grep -ni "maybe_patch\|_maybe_patch" vllm_server.log | head -10 >> tmp.txt
 
-# compact gather 成功还是失败
-grep -nE "gather_fail_reason|compact_gather.*ENTER|q_head_gather" vllm_server.log | head -20 > tmp.txt
+# 4. 查看 seq_lens_bridge 或 layer_bridge（decode 阶段的 per-layer 构建）
+grep -ni "seq_lens_bridge\|layer_bridge" vllm_server.log | head -10 >> tmp.txt
 
-# collect_sparse_features 输出
-grep -nE "collect_sparse_features" vllm_server.log | head -10 > tmp.txt
+# 5. 查看是否有 is_tok_compact 日志
+grep -ni "is_tok_compact" vllm_server.log | head -10 >> tmp.txt
 
-# select 结果
-grep -nE "select req_id=" vllm_server.log | head -10 > tmp.txt
+# 6. 最关键——查看 decode 阶段 FA 日志有没有（用行数范围看 decode 的第一步）
+grep -n "FA sparse branch\|SparseDebug.*FA" vllm_server.log | head -30 >> tmp.txt
 
-# boundary_disable_sparse
-grep -c "boundary_disable_sparse" vllm_server.log > tmp.txt
+# 7. 总共有多少行
+wc -l vllm_server.log >> tmp.txt
 
 export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_SPARSE_PROBE_INFO=1
