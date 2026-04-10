@@ -1,16 +1,16 @@
 rm -rf tmp.txt
 
-# 1. 查看 cascade 相关日志
-grep -ni "cascade\|common_prefix" vllm_server.log | head -10 >> tmp.txt
+# 1. 查看输出的响应内容
+grep -ni "finish_reason\|choices\|content" vllm_server.log | tail -5 >> tmp.txt
 
-# 2. compact_gather 失败原因（这个很关键）
-grep -ni "compact_gather\|enabled=0" vllm_server.log | head -20 >> tmp.txt
+# 2. 查看第二步之后的 compact_gather（看是否持续 enabled=1）
+grep -n "compact_gather.*enabled=" vllm_server.log | head -30 >> tmp.txt
 
-# 3. 在 decode 第一步（行 360 附近）前后看完整日志
-sed -n '355,400p' vllm_server.log >> tmp.txt
+# 3. 最关键——查看 FA sparse branch 在 decode 阶段是否终于有了 True
+grep -n "FA sparse branch" vllm_server.log | head -50 >> tmp.txt
 
-# 4. 在 decode 第二步（行 756 附近）前后看完整日志 >> tmp.txt
-sed -n '750,800p' vllm_server.log >> tmp.txt
+# 4. 确认输出还是乱码
+grep -n "data:.*content" vllm_server.log | tail -10 >> tmp.txt
 
 export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_SPARSE_PROBE_INFO=1
