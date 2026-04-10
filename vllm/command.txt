@@ -1,30 +1,28 @@
 rm -rf tmp.txt
 
-# === 异步模式深度诊断 ===
+# === 异步模式 + cm_union 修复验证 ===
 
-# 1. 前 10 步所有层 0 的 compact_gather 详细（看 seq_len/out_before/out_tokens 变化）
-echo "=== layer0 compact_gather first 15 ===" >> tmp.txt
-grep -n "compact_gather.*layers.0.self_attn" vllm_server.log | head -15 >> tmp.txt
+# 1. 输出内容（最重要！）
+echo "=== output content ===" >> tmp.txt
+grep -n "data:.*content" vllm_server.log | tail -20 >> tmp.txt
 
-# 2. boundary_disable_sparse 全部
+# 2. compact_gather 统计
+echo "=== compact_gather enabled=0 count ===" >> tmp.txt
+grep -c "compact_gather.*enabled=0" vllm_server.log >> tmp.txt
+echo "=== compact_gather enabled=1 count ===" >> tmp.txt
+grep -c "compact_gather.*enabled=1" vllm_server.log >> tmp.txt
+
+# 3. block_idx_oob
+echo "=== block_idx_oob ===" >> tmp.txt
+grep -c "block_idx_oob" vllm_server.log >> tmp.txt
+
+# 4. boundary_disable_sparse
 echo "=== boundary_disable_sparse ===" >> tmp.txt
 grep -n "boundary_disable_sparse" vllm_server.log >> tmp.txt
 
-# 3. 看 seq_lens 的变化（前 15 条）
-echo "=== seq_lens first 15 ===" >> tmp.txt
-grep -n "SparseRC.*seq_lens.*num_output_tokens" vllm_server.log | head -15 >> tmp.txt
-
-# 4. 看 FA decode 路径前 10 条
-echo "=== FA decode branch first 10 ===" >> tmp.txt
-grep -n "FA sparse branch.*num_tok=1" vllm_server.log | head -10 >> tmp.txt
-
-# 5. 看有没有 num_tok=2 的情况（异步模式可能一次处理多个 token）
-echo "=== FA branch num_tok>1 ===" >> tmp.txt
-grep -n "FA sparse branch.*num_tok=[2-9]" vllm_server.log | head -5 >> tmp.txt
-
-# 6. _sparse_log_sample_step 前 5 步
-echo "=== sample_step ===" >> tmp.txt
-grep -n "sample_step" vllm_server.log | head -10 >> tmp.txt
+# 5. seq_lens override（不应再有 SparseRC seq_lens 日志，因为 is_tok_compact 跳过了）
+echo "=== SparseRC seq_lens count ===" >> tmp.txt
+grep -c "SparseRC.*seq_lens.*num_output_tokens" vllm_server.log >> tmp.txt
 
 # === 环境变量 ===
 export VLLM_LOGGING_LEVEL=DEBUG

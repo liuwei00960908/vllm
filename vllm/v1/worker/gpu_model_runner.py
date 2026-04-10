@@ -2643,9 +2643,21 @@ class GPUModelRunner(
                         len(boundary_req_ids),
                         boundary_req_ids[:2],
                     )
-            # Union-based seq_lens (used for spec-decode bookkeeping and as the
-            # source block table for per-layer sparse slicing).
-            if is_sparse_group and not boundary_disable_sparse:
+            # Token-level compact gather uses sparse_q_head_gather metadata
+            # (phys, slot, cu_seqlens_k) to index KV directly with
+            # block_table=None.  The underlying block_table and seq_lens
+            # must therefore stay *unmodified* so that when compact gather
+            # is unavailable (e.g. first decode step) FA falls back to
+            # standard paged attention with the full, correct metadata.
+            # Skipping _override_sparse_seq_lens here also eliminates the
+            # async-scheduling state drift that caused repeated-token output.
+            _group_is_tok_compact = (
+                is_sparse_group
+                and isinstance(kv_cache_group.kv_cache_spec, SparseAttentionSpec)
+                and kv_cache_group.kv_cache_spec.cluster_granularity == "token"
+                and kv_cache_group.kv_cache_spec.use_compact_kv_gather
+            )
+            if is_sparse_group and not boundary_disable_sparse and not _group_is_tok_compact:
                 _t0_sparse_seq = (
                     time.perf_counter() if self._sparse_perf_stats_enabled else None
                 )
