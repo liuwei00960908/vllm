@@ -1,25 +1,14 @@
 rm -rf tmp.txt
 
-# === 诊断 compact gather token selection ===
+# === 诊断缺失的 token 和 phys mapping ===
 
 # 1. 输出内容
 echo "=== output content ===" >> tmp.txt
 grep -n "data:.*content" vllm_server.log | tail -20 >> tmp.txt
 
-# 2. sel_diag 日志（前 10 条 + 最后 5 条）
-echo "=== sel_diag (first 10) ===" >> tmp.txt
-grep "sel_diag" vllm_server.log | head -10 >> tmp.txt
-echo "=== sel_diag (last 5) ===" >> tmp.txt
-grep "sel_diag" vllm_server.log | tail -5 >> tmp.txt
-echo "=== sel_diag count ===" >> tmp.txt
-grep -c "sel_diag" vllm_server.log >> tmp.txt
+# 2. miss_diag（显示被排除的 token positions 和 phys block mapping）
+echo "=== miss_diag (all, should be few) ===" >> tmp.txt
+grep "miss_diag" vllm_server.log >> tmp.txt
 
-# 3. compact_gather 统计
-echo "=== compact_gather enabled=0 count ===" >> tmp.txt
-grep -c "compact_gather.*enabled=0" vllm_server.log >> tmp.txt
-echo "=== compact_gather enabled=1 count ===" >> tmp.txt
-grep -c "compact_gather.*enabled=1" vllm_server.log >> tmp.txt
-
-# 4. boundary
-echo "=== boundary_disable_sparse ===" >> tmp.txt
-grep "boundary_disable_sparse" vllm_server.log >> tmp.txt
+# 3. 同步模式对比基准：请再跑一次同步模式（加 --disable-async-output-proc）
+# 然后执行相同的 grep 获取 miss_diag
