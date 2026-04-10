@@ -2223,14 +2223,19 @@ class GPUModelRunner(
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
 
-        # Bug 3 fix: for sparse decode requests, override the slot_mapping
-        # so the new token is written into the correct slot of the decode
-        # block rather than the out-of-range "full-context" position.
-        # Pass cu_num_tokens (already computed above) so we can locate each
-        # request's token(s) in the flat token array without relying on
-        # query_start_loc.np, which is not yet filled at this point.
-        if self._has_sparse_attn:
-            self._override_sparse_slot_mapping(num_reqs, cu_num_tokens)
+        # NOTE: _override_sparse_slot_mapping is intentionally DISABLED.
+        # compute_slot_mapping above uses the *original* (non-sparse)
+        # block_table, which already maps each decode token to the correct
+        # physical slot.  The sparse block-table rewrite
+        # (_build_sparse_layer_block_table_tensor) only produces a separate
+        # tensor for the attention kernel and never mutates
+        # input_batch.block_table.  The old override mis-computed
+        # fill_offset = num_output_tokens % block_size instead of the
+        # correct (prompt_len + num_output_tokens - 1) % block_size,
+        # corrupting newly-written KV cache entries and causing garbled
+        # output.
+        # if self._has_sparse_attn:
+        #     self._override_sparse_slot_mapping(num_reqs, cu_num_tokens)
 
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 

@@ -1,17 +1,23 @@
 rm -rf tmp.txt
 
-# 1. 查看输出的响应内容
-grep -ni "finish_reason\|choices\|content" vllm_server.log | tail -5 >> tmp.txt
+# === 验证 slot_mapping 修复 ===
 
-# 2. 查看第二步之后的 compact_gather（看是否持续 enabled=1）
-grep -n "compact_gather.*enabled=" vllm_server.log | head -30 >> tmp.txt
+# 1. 确认 _override_sparse_slot_mapping 不再执行（不应有任何输出）
+grep -c "_override_sparse_slot_mapping" vllm_server.log >> tmp.txt
 
-# 3. 最关键——查看 FA sparse branch 在 decode 阶段是否终于有了 True
-grep -n "FA sparse branch" vllm_server.log | head -50 >> tmp.txt
+# 2. 查看输出内容是否正常
+grep -n "data:.*content" vllm_server.log | tail -20 >> tmp.txt
 
-# 4. 确认输出还是乱码
-grep -n "data:.*content" vllm_server.log | tail -10 >> tmp.txt
+# 3. 查看 compact_gather 状态
+grep -n "compact_gather.*enabled=" vllm_server.log | head -20 >> tmp.txt
 
+# 4. 查看 seq_lens 覆盖
+grep -n "SparseRC.*seq_lens" vllm_server.log | head -10 >> tmp.txt
+
+# 5. 查看 slot_map（如果 override 还在的话）
+grep -n "slot_map" vllm_server.log | head -10 >> tmp.txt
+
+# === 启动环境变量 ===
 export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_SPARSE_PROBE_INFO=1
 export VLLM_SPARSE_DEBUG_DECODE_TOKENS=1
