@@ -7833,6 +7833,11 @@ class GPUModelRunner(
         for_cudagraph_capture: bool,
     ) -> FlashAttentionMetadata:
         """Attach paged-cache gather indices for token-sparse compact KV attention."""
+        # TEMPORARY DIAGNOSTIC: bypass compact gather in async mode to isolate
+        # whether the garbled output is caused by compact-gather token selection
+        # or by some other async-scheduling interaction.
+        if self.use_async_scheduling:
+            return attn_metadata_i
         if for_cudagraph_capture or self.dcp_world_size > 1:
             return attn_metadata_i
 
