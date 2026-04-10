@@ -1,13 +1,24 @@
-grep -n "_override_sparse_slot_mapping" engine.log
-grep -nE "FA sparse branch|_forward_per_head_compact_kv_gather ENTER" engine.log
-grep -nE "collect_sparse_features|sparse_notify_prefill_done|indexing req_id=" engine.log
+grep -nE "async_sampled_ids|runtime_mode" vllm_server.log | head -5
 
 
-grep -nE "_override_sparse_slot_mapping|boundary_disable_sparse|collect_sparse_features|sparse_notify_prefill_done|FA sparse branch|_forward_per_head_compact_kv_gather ENTER" engine.log
-grep -n "_override_sparse_slot_mapping" engine.log
-grep -nE "FA sparse branch|_forward_per_head_compact_kv_gather ENTER" engine.log
-grep -nE "sparse_notify_prefill_done|indexing req_id=|indexing_done" engine.log
-grep -nE "collect_sparse_features|decode_new_block_reqs" engine.log
+grep -nE "_override_sparse_slot_mapping gid=0 req_idx=0" vllm_server.log | head -20
+
+
+grep -nE "FA sparse branch" vllm_server.log | head -20
+
+
+grep -nE "boundary_disable_sparse" vllm_server.log | head -20
+
+grep -nE "collect_sparse_features" vllm_server.log | head -20
+
+
+grep -nE "indexing req_id=|sparse_notify_prefill_done|select req_id=" vllm_server.log | head -30
+
+
+grep -nE "gather_fail_reason|layer_bridge|seq_lens_bridge" vllm_server.log | head -30
+
+
+grep -nE "SparseRC.*seq_lens|SparseRC.*layer_bridge" vllm_server.log | head -20
 
 export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_SPARSE_PROBE_INFO=1
