@@ -1,1 +1,12 @@
 grep -nE "SparseStep:defer_commit|SparseStep:commit|SparseState:trim|SparseState:trim_after|SparseState:invariant" vllm_server.log
+
+
+
+export VLLM_LOGGING_LEVEL=DEBUG
+export VLLM_SPARSE_PROBE_INFO=1
+export VLLM_SPARSE_DEBUG_DECODE_TOKENS=1
+export VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX=256
+export VLLM_SPARSE_DEBUG_MAX_BLOCKS=256
+export VLLM_SPARSE_PERF_STATS=1
+export VLLM_SPARSE_PERF_LOG_INTERVAL=10
+export VLLM_SPARSE_ASYNC_D2H=0
