@@ -3981,35 +3981,10 @@ class GPUModelRunner(
             prev_output_n = len(req_state.output_token_ids)
             prompt_n = int(self.input_batch.num_prompt_tokens[req_idx])
             nspec_before = int(self.input_batch.num_tokens_no_spec[req_idx])
-            sparse_context_phase = (
-                self.use_async_scheduling
-                and force_real_sampled_ids
-                and scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
-            )
-            # Robust first-step guard: if no committed outputs yet and we're
-            # still exactly at prompt boundary, treat this as uncommitted phase
-            # regardless of scheduler carrier type (new/cached req packaging).
-            # Only defer once per request to prevent an infinite defer loop
-            # where output_token_ids never grows and the condition re-triggers.
-            sparse_uncommitted_first_step = (
-                self.use_async_scheduling
-                and force_real_sampled_ids
-                and prev_output_n == 0
-                and nspec_before == prompt_n
-                and req_id not in self._sparse_deferred_once
-            )
-            should_defer_commit = (
-                (sparse_context_phase or sparse_uncommitted_first_step)
-                and self.use_async_scheduling
-                and force_real_sampled_ids
-            )
             if self.use_async_scheduling:
                 if req_idx in invalid_req_indices_set:
                     sampled_ids = None
-                elif (
-                    force_real_sampled_ids
-                    and not should_defer_commit
-                ):
+                elif force_real_sampled_ids:
                     sampled_ids = [int(sampled_token_ids[req_idx, 0].item())]
                 else:
                     sampled_ids = [-1]
@@ -4022,12 +3997,6 @@ class GPUModelRunner(
                 continue
 
             self._sparse_output_tokens_before_step[req_id] = prev_output_n
-            if should_defer_commit:
-                # Do not mutate worker-side token state in uncommitted boundary
-                # phase. The scheduler has not acknowledged output progression
-                # yet, so writing placeholder/real token here causes drift.
-                self._sparse_deferred_once.add(req_id)
-                continue
 
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]
             end_idx = start_idx + num_sampled_ids
