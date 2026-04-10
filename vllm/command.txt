@@ -2,6 +2,21 @@ rm -rf tmp.txt
 
 # === 异步模式 + cm_union 修复验证 ===
 
+# 输出内容
+grep "data:.*content" vllm_server.log | tail -20
+
+# compact_gather 统计
+grep -c "compact_gather.*enabled=0" vllm_server.log
+grep -c "compact_gather.*enabled=1" vllm_server.log
+
+# boundary_disable_sparse
+grep "boundary_disable_sparse" vllm_server.log
+
+# seq_lens override 调用（应为 0）
+grep -c "SparseRC.*seq_lens" vllm_server.log
+
+
+
 # 1. 输出内容（最重要！）
 echo "=== output content ===" >> tmp.txt
 grep -n "data:.*content" vllm_server.log | tail -20 >> tmp.txt
