@@ -1402,6 +1402,7 @@ class GPUModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
             new_token_ids_len = -1
 
+            _worker_had_output_before_trunc = len(req_state.output_token_ids) > 0
             if not is_last_rank:
                 if not req_data.new_token_ids:
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
@@ -1495,8 +1496,19 @@ class GPUModelRunner(
             # sparse selection unexpectedly goes empty while the request had
             # long history, replacing with a single decode block would collapse
             # seq_lens to one block and permanently poison subsequent steps.
+            # In async scheduling the scheduler's num_output_tokens may
+            # lag one step behind the worker's output_token_ids (the worker
+            # already appended the sampled token in _bookkeeping_sync but
+            # the scheduler hasn't confirmed it yet).  Clearing sparse
+            # metadata based solely on num_output_tokens==0 would destroy
+            # the prefill-stage sparse selection that was just computed,
+            # causing compact gather to fall back to an empty token set
+            # for the remainder of the request.
+            # _worker_had_output_before_trunc captures the pre-truncation
+            # state so the guard survives output_token_ids alignment.
             is_sparse_decode = (
-                self._has_sparse_attn and num_output_tokens > 0
+                self._has_sparse_attn
+                and (num_output_tokens > 0 or _worker_had_output_before_trunc)
             )
             if not resumed_from_preemption:
                 if new_block_ids is not None:

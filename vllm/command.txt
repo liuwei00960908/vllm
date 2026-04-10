@@ -1,21 +1,6 @@
 rm -rf tmp.txt
 
-# === 异步模式 + cm_union 修复验证 ===
-
-# 输出内容
-grep "data:.*content" vllm_server.log | tail -20
-
-# compact_gather 统计
-grep -c "compact_gather.*enabled=0" vllm_server.log
-grep -c "compact_gather.*enabled=1" vllm_server.log
-
-# boundary_disable_sparse
-grep "boundary_disable_sparse" vllm_server.log
-
-# seq_lens override 调用（应为 0）
-grep -c "SparseRC.*seq_lens" vllm_server.log
-
-
+# === 异步模式 + cm_union + metadata 保护 验证 ===
 
 # 1. 输出内容（最重要！）
 echo "=== output content ===" >> tmp.txt
@@ -27,24 +12,24 @@ grep -c "compact_gather.*enabled=0" vllm_server.log >> tmp.txt
 echo "=== compact_gather enabled=1 count ===" >> tmp.txt
 grep -c "compact_gather.*enabled=1" vllm_server.log >> tmp.txt
 
-# 3. block_idx_oob
+# 3. enabled=0 reason (关键诊断)
+echo "=== compact_gather enabled=0 reasons ===" >> tmp.txt
+grep "compact_gather.*enabled=0" vllm_server.log | head -5 >> tmp.txt
+
+# 4. block_idx_oob
 echo "=== block_idx_oob ===" >> tmp.txt
 grep -c "block_idx_oob" vllm_server.log >> tmp.txt
 
-# 4. boundary_disable_sparse
+# 5. boundary_disable_sparse
 echo "=== boundary_disable_sparse ===" >> tmp.txt
 grep -n "boundary_disable_sparse" vllm_server.log >> tmp.txt
 
-# 5. seq_lens override（不应再有 SparseRC seq_lens 日志，因为 is_tok_compact 跳过了）
+# 6. keep_prev_sparse_meta（应该出现，因为 is_sparse_decode 保护了 metadata）
+echo "=== keep_prev_sparse_meta count ===" >> tmp.txt
+grep -c "keep_prev_sparse_meta" vllm_server.log >> tmp.txt
+echo "=== keep_prev_sparse_meta (first 3) ===" >> tmp.txt
+grep "keep_prev_sparse_meta" vllm_server.log | head -3 >> tmp.txt
+
+# 7. SparseRC seq_lens count（应为 0）
 echo "=== SparseRC seq_lens count ===" >> tmp.txt
 grep -c "SparseRC.*seq_lens.*num_output_tokens" vllm_server.log >> tmp.txt
-
-# === 环境变量 ===
-export VLLM_LOGGING_LEVEL=DEBUG
-export VLLM_SPARSE_PROBE_INFO=1
-export VLLM_SPARSE_DEBUG_DECODE_TOKENS=1
-export VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX=256
-export VLLM_SPARSE_DEBUG_MAX_BLOCKS=256
-export VLLM_SPARSE_PERF_STATS=1
-export VLLM_SPARSE_PERF_LOG_INTERVAL=10
-export VLLM_SPARSE_ASYNC_D2H=0
