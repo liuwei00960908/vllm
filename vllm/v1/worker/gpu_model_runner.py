@@ -7833,11 +7833,6 @@ class GPUModelRunner(
         for_cudagraph_capture: bool,
     ) -> FlashAttentionMetadata:
         """Attach paged-cache gather indices for token-sparse compact KV attention."""
-        # TEMPORARY DIAGNOSTIC: bypass compact gather in async mode to isolate
-        # whether the garbled output is caused by compact-gather token selection
-        # or by some other async-scheduling interaction.
-        if self.use_async_scheduling:
-            return attn_metadata_i
         if for_cudagraph_capture or self.dcp_world_size > 1:
             return attn_metadata_i
 
@@ -7968,6 +7963,18 @@ class GPUModelRunner(
                 sel = sorted(set(toks) | {g_cur})
                 sel = [g for g in sel if 0 <= g < seq_len]
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
+                    toks_source = (
+                        "tok_map" if tok_map.get(sk) is not None or tok_map.get(layer_name) is not None
+                        else "fallback_lbs"
+                    )
+                    logger.info(
+                        "[SparseRC:sel_diag] layer=%s rid=%s qh=0 "
+                        "sel_n=%d seq_len=%d toks_n=%d g_cur=%d "
+                        "toks_src=%s out_before=%d",
+                        layer_name, rid, len(sel), seq_len,
+                        len(toks) if toks else 0, g_cur,
+                        toks_source, int(out_before_step),
+                    )
                     debug_sel_all = [int(x) for x in sel]
                     debug_lb_all = [
                         int(SparseKVManager._global_token_to_logical_block(g, p_count, bsz))
