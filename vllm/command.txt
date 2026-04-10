@@ -1,21 +1,21 @@
 rm -rf tmp.txt
 
-# === 验证 slot_mapping 修复 ===
+# === 验证 block_table 修复 ===
 
-# 1. 确认 _override_sparse_slot_mapping 不再执行（不应有任何输出）
+# 1. 看输出内容是否正常（最重要！）
+grep -n "data:.*content" vllm_server.log | tail -30 >> tmp.txt
+
+# 2. compact_gather 状态（第一步 enabled=0 是正常的，后续应 enabled=1）
+grep -n "compact_gather.*enabled=" vllm_server.log | head -30 >> tmp.txt
+
+# 3. seq_lens 覆盖日志（is_tok_compact 分支不再有 decode_override=4 的日志）
+grep -n "SparseProbe.*seq_lens_bridge" vllm_server.log | head -10 >> tmp.txt
+
+# 4. 确认 _override_sparse_slot_mapping 没有被调用
 grep -c "_override_sparse_slot_mapping" vllm_server.log >> tmp.txt
 
-# 2. 查看输出内容是否正常
-grep -n "data:.*content" vllm_server.log | tail -20 >> tmp.txt
-
-# 3. 查看 compact_gather 状态
-grep -n "compact_gather.*enabled=" vllm_server.log | head -20 >> tmp.txt
-
-# 4. 查看 seq_lens 覆盖
-grep -n "SparseRC.*seq_lens" vllm_server.log | head -10 >> tmp.txt
-
-# 5. 查看 slot_map（如果 override 还在的话）
-grep -n "slot_map" vllm_server.log | head -10 >> tmp.txt
+# 5. FA sparse branch 日志
+grep -n "FA sparse branch" vllm_server.log | head -10 >> tmp.txt
 
 # === 启动环境变量 ===
 export VLLM_LOGGING_LEVEL=DEBUG

@@ -2701,40 +2701,20 @@ class GPUModelRunner(
                                 cm_union.block_table_tensor.clone()
                             )
                         elif is_tok_compact:
-                            sk0 = sparse_qh_unit_key(layer_name, 0)
-                            layer_bt = self._build_sparse_layer_block_table_tensor(
-                                cm_union.block_table_tensor.clone(),
-                                kv_cache_gid,
-                                sk0,
-                                num_reqs,
-                                num_reqs_padded,
+                            # Token-level compact gather uses
+                            # sparse_q_head_gather metadata (phys, slot,
+                            # cu_seqlens_k) to index KV directly – it
+                            # passes block_table=None to FA.  Therefore
+                            # the block_table and seq_lens in
+                            # CommonAttentionMetadata must remain
+                            # *unmodified* so that when compact gather is
+                            # unavailable (e.g. first decode step) FA
+                            # falls back to standard paged attention with
+                            # the full, correct block_table.
+                            cm_layer = copy(cm_union)
+                            cm_layer.block_table_tensor = (
+                                cm_union.block_table_tensor.clone()
                             )
-                            decode_override = self._sparse_decode_num_blocks_np(
-                                kv_cache_gid,
-                                sk0,
-                                num_reqs,
-                                num_reqs_padded,
-                            )
-                            cm_layer = copy(cm)
-                            cm_layer.block_table_tensor = layer_bt
-                            _t0_sparse_seq = (
-                                time.perf_counter()
-                                if self._sparse_perf_stats_enabled
-                                else None
-                            )
-                            cm_layer = self._override_sparse_seq_lens(
-                                cm_layer,
-                                kv_cache_gid,
-                                num_reqs,
-                                num_reqs_padded,
-                                bsz,
-                                decode_num_blocks_override=decode_override,
-                            )
-                            if _t0_sparse_seq is not None:
-                                self._sparse_perf_record(
-                                    "_override_sparse_seq_lens",
-                                    time.perf_counter() - _t0_sparse_seq,
-                                )
                         else:
                             per_bt, per_sl = (
                                 self._build_sparse_per_head_block_table_and_lens(
