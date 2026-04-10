@@ -7567,72 +7567,22 @@ class GPUModelRunner(
             )
         sel = sorted(set(toks) | {g_cur})
         sel = [g for g in sel if 0 <= g < seq_len]
-        logical_to_phys: dict[int, int] = {}
-        decode_phys: int | None = int(rs.block_ids[kv_cache_gid][-1])
-        decode_lb: int | None = SparseKVManager._global_token_to_logical_block(
-            g_cur, p_count, bsz
-        )
-        if len(chrono) == 0:
-            row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
-            if row is None or len(row) == 0:
-                return False, "missing_layer_row"
-            decode_phys = int(row[-1])
-            # Build logical→physical mapping via block_table.
-            ri_idx = self.input_batch.req_id_to_index.get(rid)
-            if ri_idx is not None:
-                blk_tbl = self.input_batch.block_table[kv_cache_gid]
-                bt_row = blk_tbl.block_table.np[ri_idx]
-                n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
-                by_l = self._sparse_by_layer_logical.get(rid)
-                if by_l and sk in by_l:
-                    lo = [int(x) for x in by_l[sk]]
-                else:
-                    lo = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
-                for lg in lo:
-                    if lg != decode_lb and 0 <= lg < n_blks:
-                        logical_to_phys[lg] = int(bt_row[lg])
-            else:
-                return False, f"missing_req_index rid={rid}"
+        ri_idx = self.input_batch.req_id_to_index.get(rid)
+        if ri_idx is None:
+            return False, f"missing_req_index rid={rid}"
+        blk_tbl = self.input_batch.block_table[kv_cache_gid]
+        bt_row = blk_tbl.block_table.np[ri_idx]
+        n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
         for g in sel:
-            lb = SparseKVManager._global_token_to_logical_block(g, p_count, bsz)
-            if len(chrono) > 0:
-                if lb < 0:
-                    return False, f"logical_block_oob lb={lb} chrono_len={len(chrono)}"
-                if lb >= len(chrono):
-                    if (
-                        decode_phys is not None
-                        and decode_lb is not None
-                        and lb == decode_lb
-                    ):
-                        _phys_bid = int(decode_phys)
-                    else:
-                        return (
-                            False,
-                            f"logical_block_oob lb={lb} chrono_len={len(chrono)} "
-                            f"decode_lb={decode_lb}",
-                        )
-                else:
-                    _phys_bid = int(chrono[lb])
-            else:
-                if lb in logical_to_phys:
-                    _phys_bid = int(logical_to_phys[lb])
-                elif (
-                    decode_phys is not None
-                    and decode_lb is not None
-                    and lb == decode_lb
-                ):
-                    _phys_bid = int(decode_phys)
-                else:
-                    return (
-                        False,
-                        f"logical_not_selected g={g} lb={lb} g_cur={g_cur} "
-                        f"decode_lb={decode_lb} mapped={len(logical_to_phys)} "
-                        f"logical_order_len={len(logical_order)}",
-                    )
-            g0 = SparseKVManager._logical_block_first_global(lb, p_count, bsz)
-            sl = g - g0
-            if sl < 0 or sl >= bsz:
-                return False, f"slot_oob g={g} slot={sl}"
+            block_idx = g // bsz
+            sl = g % bsz
+            if block_idx < 0 or block_idx >= n_blks:
+                return (
+                    False,
+                    f"block_idx_oob g={g} block_idx={block_idx} "
+                    f"n_blks={n_blks} seq_len={seq_len}",
+                )
+            _phys_bid = int(bt_row[block_idx])
         return True, f"ok sel_len={len(sel)}"
 
     def _sparse_log_first_decode_kv_snapshot(
@@ -8025,109 +7975,34 @@ class GPUModelRunner(
                         int(SparseKVManager._global_token_to_logical_block(g, p_count, bsz))
                         for g in sel
                     ]
-                logical_to_phys: dict[int, int] = {}
-                decode_phys: int | None = int(rs.block_ids[kv_cache_gid][-1])
-                decode_lb: int | None = SparseKVManager._global_token_to_logical_block(
-                    g_cur, p_count, bsz
-                )
-                if (
-                    qh_idx == 0
-                    and layer_name.endswith("layers.0.self_attn.attn")
-                    and decode_lb is not None
-                ):
-                    debug_decode_lb = int(decode_lb)
-                if len(chrono) == 0:
-                    row = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk)
-                    if row is None or len(row) == 0:
-                        gather_fail_reason = (
-                            f"missing_layer_row rid={rid} qh={qh_idx} sk={sk} "
-                            f"seq_len={seq_len} p_count={p_count} "
-                            f"merged_len={len(self._sparse_merged_logical.get(rid, []))}"
-                        )
-                        return None
-                    decode_phys = int(row[-1])
-                    # Build logical→physical mapping via block_table
-                    # (same source used by _sparse_layer_decode_phys_row).
-                    ri_idx = self.input_batch.req_id_to_index.get(rid)
-                    if ri_idx is not None:
-                        blk_tbl = self.input_batch.block_table[kv_cache_gid]
-                        bt_row = blk_tbl.block_table.np[ri_idx]
-                        n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
-                        by_l = self._sparse_by_layer_logical.get(rid)
-                        if by_l and sk in by_l:
-                            lo = [int(x) for x in by_l[sk]]
-                        else:
-                            lo = [int(x) for x in self._sparse_merged_logical.get(rid, [])]
-                        for lg in lo:
-                            if lg != decode_lb and 0 <= lg < n_blks:
-                                logical_to_phys[lg] = int(bt_row[lg])
-                    else:
-                        gather_fail_reason = (
-                            f"missing_req_index rid={rid} qh={qh_idx} sk={sk}"
-                        )
-                        return None
+                # Resolve (phys_block, slot) via the *original* block
+                # table using the same addressing as compute_slot_mapping:
+                #   block_idx = g // block_size
+                #   slot      = g % block_size
+                # This avoids the sparse-manager's prefill/decode split
+                # addressing which diverges from vLLM's contiguous layout.
+                ri_idx = self.input_batch.req_id_to_index.get(rid)
+                if ri_idx is None:
+                    gather_fail_reason = (
+                        f"missing_req_index rid={rid} qh={qh_idx} sk={sk}"
+                    )
+                    return None
+                blk_tbl = self.input_batch.block_table[kv_cache_gid]
+                bt_row = blk_tbl.block_table.np[ri_idx]
+                n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
+                if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
+                    debug_decode_lb = g_cur // bsz
                 for g in sel:
-                    lb = SparseKVManager._global_token_to_logical_block(
-                        g, p_count, bsz
-                    )
-                    if len(chrono) > 0:
-                        if lb < 0:
-                            gather_fail_reason = (
-                                f"logical_block_oob rid={rid} g={g} lb={lb} "
-                                f"chrono_len={len(chrono)} seq_len={seq_len}"
-                            )
-                            return None
-                        if lb >= len(chrono):
-                            if (
-                                decode_phys is not None
-                                and decode_lb is not None
-                                and lb == decode_lb
-                            ):
-                                # Chrono may temporarily contain only history
-                                # blocks while the active decode logical block
-                                # is represented by the row tail.
-                                phys_bid = int(decode_phys)
-                            else:
-                                gather_fail_reason = (
-                                    f"logical_block_oob rid={rid} g={g} lb={lb} "
-                                    f"chrono_len={len(chrono)} seq_len={seq_len} "
-                                    f"decode_lb={-1 if decode_lb is None else int(decode_lb)}"
-                                )
-                                return None
-                        else:
-                            phys_bid = int(chrono[lb])
-                    else:
-                        if lb in logical_to_phys:
-                            phys_bid = int(logical_to_phys[lb])
-                        elif (
-                            decode_phys is not None
-                            and decode_lb is not None
-                            and lb == decode_lb
-                        ):
-                            # Fallback row layout is [selected history..., decode].
-                            # Map only tokens in the active decode logical block
-                            # to decode_phys; never alias arbitrary missing logical
-                            # blocks to decode KV pages.
-                            phys_bid = int(decode_phys)
-                        else:
-                            gather_fail_reason = (
-                                f"logical_not_selected rid={rid} qh={qh_idx} sk={sk} "
-                                f"g={g} lb={lb} g_cur={g_cur} "
-                                f"decode_lb={-1 if decode_lb is None else int(decode_lb)} "
-                                f"selected={len(logical_to_phys)} "
-                                f"logical_order_len={len(logical_order)} "
-                                f"chrono_len={len(chrono)}"
-                            )
-                            return None
-                    g0 = SparseKVManager._logical_block_first_global(
-                        lb, p_count, bsz
-                    )
-                    sl = g - g0
-                    if sl < 0 or sl >= bsz:
+                    block_idx = g // bsz
+                    sl = g % bsz
+                    if block_idx < 0 or block_idx >= n_blks:
                         gather_fail_reason = (
-                            f"slot_oob rid={rid} g={g} slot={sl} bsz={bsz}"
+                            f"block_idx_oob rid={rid} g={g} "
+                            f"block_idx={block_idx} n_blks={n_blks} "
+                            f"seq_len={seq_len}"
                         )
                         return None
+                    phys_bid = int(bt_row[block_idx])
                     phys_h.append(phys_bid)
                     slot_h.append(int(sl))
                 cu_h.append(cu_h[-1] + len(sel))

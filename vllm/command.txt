@@ -1,34 +1,24 @@
 rm -rf tmp.txt
 
-# === 诊断前几个 decode step ===
+# === 验证 slot 编址修复 ===
 
-# 1. 统计 compact_gather enabled=0 vs enabled=1 的数量
+# 1. 最重要：输出内容是否完全正常
+echo "=== output content ===" >> tmp.txt
+grep -n "data:.*content" vllm_server.log | tail -20 >> tmp.txt
+
+# 2. compact_gather 状态
 echo "=== compact_gather enabled=0 count ===" >> tmp.txt
 grep -c "compact_gather.*enabled=0" vllm_server.log >> tmp.txt
 echo "=== compact_gather enabled=1 count ===" >> tmp.txt
 grep -c "compact_gather.*enabled=1" vllm_server.log >> tmp.txt
 
-# 2. 看前 5 个 decode step 的 compact_gather（每步 28 层 * 28 头）
-# enabled=0 应该只有第一步的 28 条，之后全是 enabled=1
-echo "=== first decode step (enabled=0 全部) ===" >> tmp.txt
-grep -n "compact_gather.*enabled=0" vllm_server.log >> tmp.txt
-echo "=== enabled=1 前 5 条 ===" >> tmp.txt
-grep -n "compact_gather.*enabled=1" vllm_server.log | head -5 >> tmp.txt
+# 3. 检查是否有 block_idx_oob 错误
+echo "=== block_idx_oob ===" >> tmp.txt
+grep -c "block_idx_oob" vllm_server.log >> tmp.txt
 
-# 3. 第一个 decode step FA sparse branch 日志（num_tok=1 的那些）
-echo "=== FA decode sparse branch ===" >> tmp.txt
-grep -n "FA sparse branch.*num_tok=1" vllm_server.log | head -5 >> tmp.txt
-
-# 4. 看 _override_sparse_seq_lens 在 decode 阶段是否修改了 seq_lens
-echo "=== SparseRC seq_lens in decode ===" >> tmp.txt
-grep -n "SparseRC.*seq_lens.*num_output_tokens" vllm_server.log | head -10 >> tmp.txt
-
-# 5. 看 boundary_disable_sparse
-echo "=== boundary_disable_sparse ===" >> tmp.txt
-grep -n "boundary_disable_sparse" vllm_server.log >> tmp.txt
-
-# 6. 不带 sparse 时的基线输出（可选：不开 sparse 跑一次对比）
-# 这条可以忽略
+# 4. FA sparse branch（decode 阶段是否有 use_q_head_gather=True）
+echo "=== FA decode use_q_head_gather ===" >> tmp.txt
+grep -n "FA sparse branch.*num_tok=1.*use_q_head_gather=True" vllm_server.log | head -5 >> tmp.txt
 
 # === 环境变量 ===
 export VLLM_LOGGING_LEVEL=DEBUG
