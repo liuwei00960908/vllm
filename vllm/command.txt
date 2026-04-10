@@ -1,14 +1,9 @@
 rm -rf tmp.txt
 
-# === 诊断缺失的 token 和 phys mapping ===
+# === 验证修复：异步模式 compact gather decode token gap ===
 
 # 1. 输出内容
 echo "=== output content ===" >> tmp.txt
-grep -n "data:.*content" vllm_server.log | tail -20 >> tmp.txt
+grep -oP '"content":"[^"]*"' vllm_server.log | tail -5 >> tmp.txt
 
-# 2. miss_diag（显示被排除的 token positions 和 phys block mapping）
-echo "=== miss_diag (all, should be few) ===" >> tmp.txt
-grep "miss_diag" vllm_server.log >> tmp.txt
-
-# 3. 同步模式对比基准：请再跑一次同步模式（加 --disable-async-output-proc）
-# 然后执行相同的 grep 获取 miss_diag
+cat tmp.txt

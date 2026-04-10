@@ -7558,7 +7558,8 @@ class GPUModelRunner(
                 f"missing_tok_or_chrono seq_len={seq_len} p_count={p_count} "
                 f"chrono_len={len(chrono)}",
             )
-        sel = sorted(set(toks) | {g_cur})
+        decode_positions = set(range(p_count, seq_len))
+        sel = sorted(set(toks) | decode_positions | {g_cur})
         sel = [g for g in sel if 0 <= g < seq_len]
         ri_idx = self.input_batch.req_id_to_index.get(rid)
         if ri_idx is None:
@@ -7960,7 +7961,18 @@ class GPUModelRunner(
                             f"fallback_lbs={len(fallback_lbs)}"
                         )
                         return None
-                sel = sorted(set(toks) | {g_cur})
+                # Sparse token selection from the scheduler may lag behind
+                # the actual sequence length under async scheduling (the
+                # scheduler's selection is computed one or more steps
+                # earlier).  Decode tokens generated after the selection
+                # snapshot will be absent from `toks`, creating gaps in
+                # the KV context that cause repeated/garbled output.
+                # Fix: always include every decode-phase token position
+                # [p_count, seq_len) so that no recently-generated KV is
+                # ever dropped.  The sparse budget only trims *prefill*
+                # history tokens; decode tokens are unconditional.
+                decode_positions = set(range(p_count, seq_len))
+                sel = sorted(set(toks) | decode_positions | {g_cur})
                 sel = [g for g in sel if 0 <= g < seq_len]
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
                     debug_sel_all = [int(x) for x in sel]
@@ -7998,22 +8010,6 @@ class GPUModelRunner(
                     phys_bid = int(bt_row[block_idx])
                     phys_h.append(phys_bid)
                     slot_h.append(int(sl))
-                if (
-                    qh_idx == 0
-                    and layer_name.endswith("layers.0.self_attn.attn")
-                    and seq_len <= 50
-                ):
-                    all_g = set(range(seq_len))
-                    sel_set = set(sel)
-                    missing = sorted(all_g - sel_set)
-                    logger.info(
-                        "[SparseRC:miss_diag] rid=%s seq_len=%d "
-                        "sel_n=%d missing=%s g_cur=%d "
-                        "phys_head=%s slot_head=%s",
-                        rid, seq_len, len(sel),
-                        missing[:10], g_cur,
-                        phys_h[:5], slot_h[:5],
-                    )
                 cu_h.append(cu_h[-1] + len(sel))
             if not phys_h:
                 gather_fail_reason = "empty_phys_after_selection"
