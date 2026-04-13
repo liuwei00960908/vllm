@@ -9334,9 +9334,15 @@ class GPUModelRunner(
                 request 0 is 0, start of request i > 0 is
                 ``cu_num_tokens[i-1]``).
         """
+        sparse_debug_enabled = self._sparse_debug_decode_tokens
+
         if not hasattr(self, "kv_cache_config"):
             # TODO(sparse-debug): remove after locating sparse slot_mapping issues.
-            logger.info("[SparseDebug] _override_sparse_slot_mapping SKIP no kv_cache_config")
+            if sparse_debug_enabled:
+                logger.info(
+                    "[SparseDebug] _override_sparse_slot_mapping "
+                    "SKIP no kv_cache_config"
+                )
             return
 
         sparse_gids = [
@@ -9346,21 +9352,26 @@ class GPUModelRunner(
         ]
         if not sparse_gids:
             # TODO(sparse-debug): remove after locating sparse slot_mapping issues.
-            logger.info("[SparseDebug] _override_sparse_slot_mapping SKIP empty sparse_gids")
+            if sparse_debug_enabled:
+                logger.info(
+                    "[SparseDebug] _override_sparse_slot_mapping "
+                    "SKIP empty sparse_gids"
+                )
             return
 
         # TODO(sparse-debug): remove after locating sparse slot_mapping issues.
-        logger.info(
-            "[SparseDebug] _override_sparse_slot_mapping ENTER num_reqs=%d "
-            "sparse_gids=%s cu_num_tokens_tail=%s",
-            int(num_reqs),
-            sparse_gids,
-            (
-                int(cu_num_tokens[num_reqs - 1])
-                if num_reqs > 0 and cu_num_tokens.size > 0
-                else -1
-            ),
-        )
+        if sparse_debug_enabled:
+            logger.info(
+                "[SparseDebug] _override_sparse_slot_mapping ENTER num_reqs=%d "
+                "sparse_gids=%s cu_num_tokens_tail=%s",
+                int(num_reqs),
+                sparse_gids,
+                (
+                    int(cu_num_tokens[num_reqs - 1])
+                    if num_reqs > 0 and cu_num_tokens.size > 0
+                    else -1
+                ),
+            )
 
         # For each sparse group, override the slot_mapping of decode reqs.
         for gid in sparse_gids:
@@ -9380,24 +9391,26 @@ class GPUModelRunner(
                 _out_n = (
                     len(req_state.output_token_ids) if req_state is not None else -1
                 )
-                logger.info(
-                    "[SparseDebug] _override_sparse_slot_mapping gid=%d req_idx=%d "
-                    "req_id=%s has_req_state=%s num_sched=%d tok_start=%d tok_end=%d "
-                    "num_output_tokens=%d num_prompt_tokens=%s",
-                    gid,
-                    req_idx,
-                    req_id,
-                    req_state is not None,
-                    num_sched,
-                    tok_start,
-                    tok_end,
-                    _out_n,
-                    (
-                        int(self.input_batch.num_prompt_tokens[req_idx])
-                        if req_idx < len(self.input_batch.num_prompt_tokens)
-                        else None
-                    ),
-                )
+                if sparse_debug_enabled:
+                    logger.info(
+                        "[SparseDebug] _override_sparse_slot_mapping "
+                        "gid=%d req_idx=%d req_id=%s has_req_state=%s "
+                        "num_sched=%d tok_start=%d tok_end=%d "
+                        "num_output_tokens=%d num_prompt_tokens=%s",
+                        gid,
+                        req_idx,
+                        req_id,
+                        req_state is not None,
+                        num_sched,
+                        tok_start,
+                        tok_end,
+                        _out_n,
+                        (
+                            int(self.input_batch.num_prompt_tokens[req_idx])
+                            if req_idx < len(self.input_batch.num_prompt_tokens)
+                            else None
+                        ),
+                    )
 
                 if req_state is None or num_sched == 0:
                     continue
