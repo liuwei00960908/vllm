@@ -7579,6 +7579,10 @@ class GPUModelRunner(
             )
             if steady_tokens.numel() > 0:
                 steady_mask[steady_tokens] = True
+            indexed_tokens = min(
+                int(total_tokens),
+                int(state.block_to_cluster.shape[0]),
+            )
 
             if (state.cluster_centres.numel() == 0
                     or state.block_to_cluster.numel() == 0):
@@ -7598,8 +7602,10 @@ class GPUModelRunner(
             top_clusters = torch.topk(scores_c, k=nprobe, dim=-1).indices.to(
                 dtype=torch.int64
             )
-            labels = state.block_to_cluster.to(dtype=torch.int64, device=q.device)
-            if labels.numel() == 0:
+            labels = state.block_to_cluster.to(
+                dtype=torch.int64, device=q.device
+            )[:indexed_tokens]
+            if labels.numel() == 0 or indexed_tokens <= 0:
                 return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
             cluster_mask = torch.zeros(
                 (int(q.shape[0]), int(state.cluster_centres.shape[0])),
@@ -7607,7 +7613,13 @@ class GPUModelRunner(
                 device=q.device,
             )
             cluster_mask.scatter_(1, top_clusters, True)
-            retr_mask = cluster_mask[:, labels]
+            retr_mask_indexed = cluster_mask[:, labels]
+            retr_mask = torch.zeros(
+                (int(q.shape[0]), int(total_tokens)),
+                dtype=torch.bool,
+                device=q.device,
+            )
+            retr_mask[:, :indexed_tokens] = retr_mask_indexed
             combined_mask = retr_mask | steady_mask.unsqueeze(0)
             if int(combined_mask.shape[1]) == 0:
                 return combined_mask
@@ -7625,9 +7637,16 @@ class GPUModelRunner(
             if not bool(nonsteady_retr_mask.any()):
                 return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
 
-            token_scores = scores_c.gather(
-                1, labels.unsqueeze(0).expand(int(q.shape[0]), -1)
+            token_scores_indexed = scores_c.gather(
+                1, labels.unsqueeze(0).expand(int(q.shape[0]), indexed_tokens)
             )
+            token_scores = torch.full(
+                (int(q.shape[0]), int(total_tokens)),
+                float("-inf"),
+                dtype=token_scores_indexed.dtype,
+                device=q.device,
+            )
+            token_scores[:, :indexed_tokens] = token_scores_indexed
             masked_scores = token_scores.masked_fill(
                 ~nonsteady_retr_mask,
                 float("-inf"),

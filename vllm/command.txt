@@ -14,7 +14,10 @@ grep -c "_build_attention_metadata" your_log_file.log
 grep -c "_maybe_patch_sparse_compact_kv_metadata" your_log_file.log                                                                                                             
 grep -c "_collect_sparse_features" your_log_file.log                                                                                                                            
 grep -c "FA sparse branch" your_log_file.log                                                                                                                                    
-grep -c "_forward_per_head_compact_kv_gather ENTER" your_log_file.log                                                                                                           
+grep -c "_forward_per_head_compact_kv_gather ENTER" your_log_file.log
+
+grep -nE "_build_sparse_runtime_q_head_gather|_sparse_online_select_tokens|_build_attention_metadata|SparseDebug" your_log_file.log
+
                                                                                                                                                                                   
   再补这三条看最近窗口的性能汇总：                                                                                                                                                
                                                                                                                                                                                   
