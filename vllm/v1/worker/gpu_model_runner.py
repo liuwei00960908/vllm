@@ -7551,68 +7551,95 @@ class GPUModelRunner(
     ) -> torch.Tensor:
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
         try:
+            if q.dim() == 1:
+                q = q.unsqueeze(0)
             budget = int(spec.sparse_selection_budget())
             if budget <= 0:
-                return torch.empty(0, dtype=torch.int64, device=q.device)
+                return torch.zeros(
+                    (int(q.shape[0]), int(total_tokens)),
+                    dtype=torch.bool,
+                    device=q.device,
+                )
             head = min(int(spec.static_pattern_start), int(total_tokens))
             steady_head = torch.arange(head, dtype=torch.int64, device=q.device)
             tail_start = max(0, int(total_tokens) - int(spec.static_pattern_end))
             steady_tail = torch.arange(
                 tail_start, int(total_tokens), dtype=torch.int64, device=q.device
             )
-            steady_tokens = (
-                torch.unique(torch.cat([steady_head, steady_tail], dim=0))
-                if steady_head.numel() > 0 or steady_tail.numel() > 0
-                else torch.empty(0, dtype=torch.int64, device=q.device)
+            token_ids = torch.arange(
+                int(total_tokens), dtype=torch.int64, device=q.device
             )
+            steady_tokens = torch.unique(
+                torch.cat([steady_head, steady_tail], dim=0)
+            ) if steady_head.numel() > 0 or steady_tail.numel() > 0 else torch.empty(
+                0, dtype=torch.int64, device=q.device
+            )
+            steady_mask = torch.zeros(
+                int(total_tokens), dtype=torch.bool, device=q.device
+            )
+            if steady_tokens.numel() > 0:
+                steady_mask[steady_tokens] = True
 
             if (state.cluster_centres.numel() == 0
                     or state.block_to_cluster.numel() == 0):
                 fallback_start = max(0, int(total_tokens) - budget)
-                fallback = torch.arange(
-                    fallback_start, int(total_tokens), dtype=torch.int64,
-                    device=q.device
+                fallback_mask = torch.zeros(
+                    int(total_tokens), dtype=torch.bool, device=q.device
                 )
-                return torch.sort(
-                    torch.unique(torch.cat([fallback, steady_tokens]))
-                )[0]
+                fallback_mask[fallback_start:int(total_tokens)] = True
+                return fallback_mask.unsqueeze(0) | steady_mask.unsqueeze(0)
 
             scores_c = torch.matmul(
                 q.to(dtype=torch.float32), state.cluster_centres.transpose(0, 1)
             ) / float(max(int(q.shape[-1]), 1))**0.5
             nprobe = min(int(spec.nprobe), int(state.cluster_centres.shape[0]))
             if nprobe <= 0:
-                return torch.sort(steady_tokens)[0]
+                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
             top_clusters = torch.topk(scores_c, k=nprobe, dim=-1).indices.to(
                 dtype=torch.int64
             )
             labels = state.block_to_cluster.to(dtype=torch.int64, device=q.device)
             if labels.numel() == 0:
-                return torch.sort(steady_tokens)[0]
-            match = labels.unsqueeze(1) == top_clusters.unsqueeze(0)
-            retr_tokens = torch.nonzero(match.any(dim=1), as_tuple=False).flatten()
-            if retr_tokens.numel() == 0:
-                return torch.sort(steady_tokens)[0]
+                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+            cluster_mask = torch.zeros(
+                (int(q.shape[0]), int(state.cluster_centres.shape[0])),
+                dtype=torch.bool,
+                device=q.device,
+            )
+            cluster_mask.scatter_(1, top_clusters, True)
+            retr_mask = cluster_mask[:, labels]
+            combined_mask = retr_mask | steady_mask.unsqueeze(0)
+            if int(combined_mask.shape[1]) == 0:
+                return combined_mask
 
-            combined = torch.unique(torch.cat([steady_tokens, retr_tokens], dim=0))
-            if int(combined.numel()) > budget:
-                retr_nonsteady_mask = ~torch.isin(retr_tokens, steady_tokens)
-                nonsteady = retr_tokens[retr_nonsteady_mask]
-                cap = max(0, budget - int(steady_tokens.numel()))
-                if cap <= 0 or nonsteady.numel() == 0:
-                    combined = steady_tokens
-                else:
-                    token_scores = scores_c.index_select(
-                        0, labels.index_select(0, nonsteady)
-                    )
-                    k = min(cap, int(nonsteady.numel()))
-                    keep = torch.topk(token_scores, k=k, dim=-1).indices
-                    combined = torch.unique(
-                        torch.cat(
-                            [steady_tokens, nonsteady.index_select(0, keep)], dim=0
-                        )
-                    )
-            return torch.sort(combined)[0]
+            combined_counts = combined_mask.sum(dim=1)
+            if bool((combined_counts <= budget).all()):
+                return combined_mask
+
+            steady_count = int(steady_mask.sum().item())
+            cap = max(0, budget - steady_count)
+            if cap <= 0:
+                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+
+            nonsteady_retr_mask = retr_mask & ~steady_mask.unsqueeze(0)
+            if not bool(nonsteady_retr_mask.any()):
+                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+
+            token_scores = scores_c.gather(
+                1, labels.unsqueeze(0).expand(int(q.shape[0]), -1)
+            )
+            masked_scores = token_scores.masked_fill(
+                ~nonsteady_retr_mask,
+                float("-inf"),
+            )
+            k = min(cap, int(token_ids.numel()))
+            if k <= 0:
+                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+            top_vals, top_idx = torch.topk(masked_scores, k=k, dim=1)
+            valid = torch.isfinite(top_vals)
+            selected_nonsteady = torch.zeros_like(nonsteady_retr_mask)
+            selected_nonsteady.scatter_(1, top_idx, valid)
+            return steady_mask.unsqueeze(0) | selected_nonsteady
         finally:
             if _t0 is not None:
                 self._sparse_perf_record(
@@ -7646,74 +7673,104 @@ class GPUModelRunner(
                 query.view(-1, num_heads, head_size)
                 if query.dim() != 3 else query
             )
-            triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            qh_to_kv = [
+                self._sparse_online_qh_to_kv_index(qh_idx, num_heads, num_kv_heads)
+                for qh_idx in range(num_heads)
+            ]
+            kv_to_qh: dict[int, list[int]] = defaultdict(list)
+            for qh_idx, kv_idx in enumerate(qh_to_kv):
+                kv_to_qh[kv_idx].append(qh_idx)
+            kv_to_qh_tensor = {
+                kv_idx: torch.tensor(
+                    qh_indices, dtype=torch.int64, device=query.device
+                )
+                for kv_idx, qh_indices in kv_to_qh.items()
+            }
+
+            phys_chunks: list[list[torch.Tensor]] = [[] for _ in range(num_heads)]
+            slot_chunks: list[list[torch.Tensor]] = [[] for _ in range(num_heads)]
+            cu_lists: list[list[int]] = [[0] for _ in range(num_heads)]
             blk_tbl = self.input_batch.block_table[kv_cache_gid]
-            for qh_idx in range(num_heads):
-                phys_h: list[int] = []
-                slot_h: list[int] = []
-                cu_h: list[int] = [0]
-                for req_idx in range(num_reqs):
-                    rid = self.input_batch.req_ids[req_idx]
-                    req_states = self._sparse_online_index.get(rid)
-                    if not req_states:
-                        return None
-                    req_state = self.requests.get(rid)
-                    if req_state is None:
-                        return None
-                    seq_len = int(self.seq_lens.np[req_idx])
-                    p_count = int(self.input_batch.num_prompt_tokens[req_idx])
-                    if seq_len <= p_count:
-                        return None
-                    out_before_step = self._sparse_output_tokens_before_step.get(
-                        rid, len(req_state.output_token_ids)
-                    )
-                    if out_before_step <= 0:
-                        return None
-                    tok_end = int(self.query_start_loc.np[req_idx + 1])
-                    if tok_end <= 0:
-                        return None
-                    q_tok = q_flat[tok_end - 1, qh_idx].to(dtype=torch.float32)
-                    kv_idx = self._sparse_online_qh_to_kv_index(
-                        qh_idx, num_heads, num_kv_heads
-                    )
+            bsz = int(spec.block_size)
+            for req_idx in range(num_reqs):
+                rid = self.input_batch.req_ids[req_idx]
+                req_states = self._sparse_online_index.get(rid)
+                if not req_states:
+                    return None
+                req_state = self.requests.get(rid)
+                if req_state is None:
+                    return None
+                seq_len = int(self.seq_lens.np[req_idx])
+                p_count = int(self.input_batch.num_prompt_tokens[req_idx])
+                if seq_len <= p_count:
+                    return None
+                out_before_step = self._sparse_output_tokens_before_step.get(
+                    rid, len(req_state.output_token_ids)
+                )
+                if out_before_step <= 0:
+                    return None
+                tok_end = int(self.query_start_loc.np[req_idx + 1])
+                if tok_end <= 0:
+                    return None
+
+                q_tok = q_flat[tok_end - 1].to(dtype=torch.float32)
+                selected_mask = torch.zeros(
+                    (num_heads, seq_len), dtype=torch.bool, device=query.device
+                )
+                for kv_idx, qh_indices_t in kv_to_qh_tensor.items():
                     unit_key = sparse_kv_unit_key(layer_name, kv_idx)
                     state = req_states.get(unit_key)
                     if state is None:
                         return None
-                    selected = self._sparse_online_select_tokens(
+                    q_group = q_tok.index_select(0, qh_indices_t)
+                    group_mask = self._sparse_online_select_tokens(
                         state=state,
-                        q=q_tok,
+                        q=q_group,
                         total_tokens=seq_len,
                         spec=spec,
                     )
-                    decode_positions = torch.arange(
-                        p_count, seq_len, dtype=torch.int64, device=query.device
+                    selected_mask[qh_indices_t] = group_mask
+
+                selected_mask[:, p_count:seq_len] = True
+                token_ids = torch.arange(
+                    seq_len, dtype=torch.int64, device=query.device
+                )
+                n_blks = int(blk_tbl.num_blocks_per_row[req_idx])
+                bt_row_t = torch.as_tensor(
+                    blk_tbl.block_table.np[req_idx, :n_blks],
+                    dtype=torch.int64,
+                    device=query.device,
+                )
+                for qh_idx in range(num_heads):
+                    selected = token_ids[selected_mask[qh_idx]]
+                    block_idx = torch.div(
+                        selected, bsz, rounding_mode="floor"
+                    ).to(dtype=torch.int64)
+                    if block_idx.numel() > 0 and bool((block_idx >= n_blks).any()):
+                        return None
+                    phys_chunks[qh_idx].append(
+                        bt_row_t.index_select(0, block_idx).to(dtype=torch.int32)
                     )
-                    g_cur = torch.tensor(
-                        [seq_len - 1], dtype=torch.int64, device=query.device
+                    slot_chunks[qh_idx].append(
+                        selected.remainder(bsz).to(dtype=torch.int32)
                     )
-                    selected = torch.sort(
-                        torch.unique(
-                            torch.cat([selected, decode_positions, g_cur], dim=0)
-                        )
-                    )[0]
-                    bt_row = blk_tbl.block_table.np[req_idx]
-                    n_blks = int(blk_tbl.num_blocks_per_row[req_idx])
-                    bsz = int(spec.block_size)
-                    for g in selected.tolist():
-                        block_idx = int(g) // bsz
-                        if block_idx < 0 or block_idx >= n_blks:
-                            return None
-                        phys_h.append(int(bt_row[block_idx]))
-                        slot_h.append(int(g) % bsz)
-                    cu_h.append(cu_h[-1] + int(selected.numel()))
-                if not phys_h:
+                    cu_lists[qh_idx].append(
+                        cu_lists[qh_idx][-1] + int(selected.numel())
+                    )
+
+            triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            for qh_idx in range(num_heads):
+                if not phys_chunks[qh_idx]:
                     return None
                 triples.append(
                     (
-                        torch.tensor(phys_h, dtype=torch.int32, device=query.device),
-                        torch.tensor(slot_h, dtype=torch.int32, device=query.device),
-                        torch.tensor(cu_h, dtype=torch.int32, device=query.device),
+                        torch.cat(phys_chunks[qh_idx], dim=0),
+                        torch.cat(slot_chunks[qh_idx], dim=0),
+                        torch.tensor(
+                            cu_lists[qh_idx],
+                            dtype=torch.int32,
+                            device=query.device,
+                        ),
                     )
                 )
             return tuple(triples)

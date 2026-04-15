@@ -5,7 +5,7 @@ export VLLM_SPARSE_PERF_LOG_INTERVAL=1
 export VLLM_LOGGING_LEVEL=INFO
 
 
-grep -n "SparsePerf" your_log_file.log                                                                                                                                       
+grep -c "SparsePerf" your_log_file.log                                                                                                                                          
 grep -c "_build_sparse_runtime_q_head_gather" your_log_file.log                                                                                                                 
 grep -c "_sparse_online_select_tokens" your_log_file.log                                                                                                                        
 grep -c "_update_sparse_online_index" your_log_file.log                                                                                                                         
@@ -14,9 +14,10 @@ grep -c "_build_attention_metadata" your_log_file.log
 grep -c "_maybe_patch_sparse_compact_kv_metadata" your_log_file.log                                                                                                             
 grep -c "_collect_sparse_features" your_log_file.log                                                                                                                            
 grep -c "FA sparse branch" your_log_file.log                                                                                                                                    
-grep -c "_forward_per_head_compact_kv_gather ENTER" your_log_file.log      
-
-# 1. 输出内容
+grep -c "_forward_per_head_compact_kv_gather ENTER" your_log_file.log                                                                                                           
+                                                                                                                                                                                  
+  再补这三条看最近窗口的性能汇总：                                                                                                                                                
+                                                                                                                                                                                  
 grep "SparsePerf" your_log_file.log | tail -n 5                                                                                                                                 
 grep "FA sparse branch" your_log_file.log | tail -n 5                                                                                                                           
 grep "_forward_per_head_compact_kv_gather ENTER" your_log_file.log | tail -n 5   
