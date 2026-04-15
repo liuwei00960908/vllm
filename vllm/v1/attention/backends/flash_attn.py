@@ -3,7 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import numpy as np
@@ -759,6 +759,18 @@ class FlashAttentionImpl(AttentionImpl):
                     and sliding_window_size == [-1, -1]
                     and not self.kv_cache_dtype.startswith("fp8")
                 )
+                runtime_q_head_gather = getattr(
+                    layer, "_vllm_sparse_runtime_q_head_gather", None
+                )
+                if runtime_q_head_gather is not None:
+                    attn_metadata = replace(
+                        attn_metadata,
+                        sparse_q_head_gather=runtime_q_head_gather,
+                        sparse_gather_phys=None,
+                        sparse_gather_slots=None,
+                        sparse_gather_cu_seqlens_k=None,
+                    )
+                    use_q_head_gather = True
                 use_gather = (
                     attn_metadata.sparse_gather_phys is not None
                     and attn_metadata.sparse_gather_cu_seqlens_k is not None
@@ -801,6 +813,8 @@ class FlashAttentionImpl(AttentionImpl):
                         k_descale,
                         v_descale,
                     )
+                    if runtime_q_head_gather is not None:
+                        layer._vllm_sparse_runtime_q_head_gather = None
                 elif use_per_head_bt:
                     self._forward_per_head_block_table_sparse(
                         query[:num_actual_tokens],

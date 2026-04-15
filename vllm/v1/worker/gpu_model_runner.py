@@ -11,7 +11,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
@@ -133,10 +133,12 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sparse_kmeans_torch import (
     prefill_cluster_meta_from_features_torch,
     prefill_cluster_meta_from_features_torch_batched,
+    segment_kmeans_centered_torch,
     sparse_prefill_cluster_use_device_kmeans,
 )
 from vllm.v1.core.sparse_kv_cache_manager import (
     SparseKVManager,
+    parse_sparse_kv_key,
     sparse_kv_unit_key,
     sparse_qh_unit_key,
 )
@@ -408,6 +410,16 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+@dataclass
+class _SparseOnlineLayerState:
+    cluster_centres: torch.Tensor
+    cluster_size: torch.Tensor
+    block_to_cluster: torch.Tensor
+    all_block_features: torch.Tensor
+    mean_key: torch.Tensor
+    decode_block_buffer: list[torch.Tensor] = field(default_factory=list)
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -556,6 +568,9 @@ class GPUModelRunner(
         self._sparse_by_layer_logical: dict[str, dict[str, list[int]]] = {}
         self._sparse_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
         self._sparse_chrono_phys: dict[str, list[int]] = {}
+        self._sparse_layer_spec_by_name: dict[str, SparseAttentionSpec] = {}
+        self._sparse_layer_gid_by_name: dict[str, int] = {}
+        self._sparse_online_index: dict[str, dict[str, _SparseOnlineLayerState]] = {}
         # Snapshot of per-request output length BEFORE this step appends sampled
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
@@ -1186,6 +1201,7 @@ class GPUModelRunner(
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
             self._sparse_deferred_once.discard(req_id)
+            self._sparse_online_index.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -4912,6 +4928,11 @@ class GPUModelRunner(
             ) = self._collect_sparse_features(
                 scheduler_output, self.input_batch.num_reqs
             )
+            self._update_sparse_online_index(
+                sparse_block_features,
+                sparse_prefill_cluster_meta,
+                sparse_new_block_features,
+            )
             if _t0_sparse_collect is not None:
                 self._sparse_perf_record(
                     "_collect_sparse_features",
@@ -7439,12 +7460,14 @@ class GPUModelRunner(
             return
         sparse_group_count = 0
         hooked_layers = 0
-        for group in self.kv_cache_config.kv_cache_groups:
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if not isinstance(group.kv_cache_spec, SparseAttentionSpec):
                 continue
             sparse_group_count += 1
             self._has_sparse_attn = True
             for layer_name in group.layer_names:
+                self._sparse_layer_spec_by_name[layer_name] = group.kv_cache_spec
+                self._sparse_layer_gid_by_name[layer_name] = gid
                 attn_mod = self.compilation_config.static_forward_context.get(
                     layer_name
                 )
@@ -7459,7 +7482,40 @@ class GPUModelRunner(
                         # [num_tokens, num_q_heads * head_size] (2-D) or
                         # [num_tokens, num_q_heads, head_size] (3-D).
                         if args:
-                            self._sparse_q_captures[name] = args[0]
+                            q = args[0]
+                            self._sparse_q_captures[name] = q
+                            spec = self._sparse_layer_spec_by_name.get(name)
+                            if (
+                                spec is None
+                                or spec.cluster_granularity != "token"
+                                or not spec.use_compact_kv_gather
+                                or self.dcp_world_size > 1
+                            ):
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_q_head_gather",
+                                    None,
+                                )
+                                return
+                            try:
+                                if q.is_cuda and torch.cuda.is_current_stream_capturing():
+                                    setattr(
+                                        module,
+                                        "_vllm_sparse_runtime_q_head_gather",
+                                        None,
+                                    )
+                                    return
+                            except Exception:
+                                pass
+                            setattr(
+                                module,
+                                "_vllm_sparse_runtime_q_head_gather",
+                                self._build_sparse_runtime_q_head_gather(
+                                    layer_name=name,
+                                    query=q,
+                                    spec=spec,
+                                ),
+                            )
 
                     return _hook
 
@@ -7476,6 +7532,312 @@ class GPUModelRunner(
                 sparse_group_count,
                 hooked_layers,
             )
+
+    @staticmethod
+    def _sparse_online_qh_to_kv_index(
+        qh_idx: int, num_q: int, num_kv: int
+    ) -> int:
+        if num_kv <= 1:
+            return 0
+        q_per_kv = max(1, num_q // num_kv)
+        return min(qh_idx // q_per_kv, num_kv - 1)
+
+    def _sparse_online_select_tokens(
+        self,
+        state: _SparseOnlineLayerState,
+        q: torch.Tensor,
+        total_tokens: int,
+        spec: SparseAttentionSpec,
+    ) -> torch.Tensor:
+        budget = int(spec.sparse_selection_budget())
+        if budget <= 0:
+            return torch.empty(0, dtype=torch.int64, device=q.device)
+        head = min(int(spec.static_pattern_start), int(total_tokens))
+        steady_head = torch.arange(head, dtype=torch.int64, device=q.device)
+        tail_start = max(0, int(total_tokens) - int(spec.static_pattern_end))
+        steady_tail = torch.arange(
+            tail_start, int(total_tokens), dtype=torch.int64, device=q.device
+        )
+        steady_tokens = (
+            torch.unique(torch.cat([steady_head, steady_tail], dim=0))
+            if steady_head.numel() > 0 or steady_tail.numel() > 0
+            else torch.empty(0, dtype=torch.int64, device=q.device)
+        )
+
+        if state.cluster_centres.numel() == 0 or state.block_to_cluster.numel() == 0:
+            fallback_start = max(0, int(total_tokens) - budget)
+            fallback = torch.arange(
+                fallback_start, int(total_tokens), dtype=torch.int64, device=q.device
+            )
+            return torch.sort(torch.unique(torch.cat([fallback, steady_tokens])))[0]
+
+        scores_c = torch.matmul(
+            q.to(dtype=torch.float32), state.cluster_centres.transpose(0, 1)
+        ) / float(max(int(q.shape[-1]), 1))**0.5
+        nprobe = min(int(spec.nprobe), int(state.cluster_centres.shape[0]))
+        if nprobe <= 0:
+            return torch.sort(steady_tokens)[0]
+        top_clusters = torch.topk(scores_c, k=nprobe, dim=-1).indices.to(
+            dtype=torch.int64
+        )
+        labels = state.block_to_cluster.to(dtype=torch.int64, device=q.device)
+        if labels.numel() == 0:
+            return torch.sort(steady_tokens)[0]
+        match = labels.unsqueeze(1) == top_clusters.unsqueeze(0)
+        retr_tokens = torch.nonzero(match.any(dim=1), as_tuple=False).flatten()
+        if retr_tokens.numel() == 0:
+            return torch.sort(steady_tokens)[0]
+
+        combined = torch.unique(torch.cat([steady_tokens, retr_tokens], dim=0))
+        if int(combined.numel()) > budget:
+            retr_nonsteady_mask = ~torch.isin(retr_tokens, steady_tokens)
+            nonsteady = retr_tokens[retr_nonsteady_mask]
+            cap = max(0, budget - int(steady_tokens.numel()))
+            if cap <= 0 or nonsteady.numel() == 0:
+                combined = steady_tokens
+            else:
+                token_scores = scores_c.index_select(0, labels.index_select(0, nonsteady))
+                k = min(cap, int(nonsteady.numel()))
+                keep = torch.topk(token_scores, k=k, dim=-1).indices
+                combined = torch.unique(
+                    torch.cat([steady_tokens, nonsteady.index_select(0, keep)], dim=0)
+                )
+        return torch.sort(combined)[0]
+
+    def _build_sparse_runtime_q_head_gather(
+        self,
+        *,
+        layer_name: str,
+        query: torch.Tensor,
+        spec: SparseAttentionSpec,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...] | None:
+        kv_cache_gid = self._sparse_layer_gid_by_name.get(layer_name)
+        if kv_cache_gid is None:
+            return None
+        attn_mod = self.compilation_config.static_forward_context.get(layer_name)
+        if attn_mod is None:
+            return None
+        num_heads = int(attn_mod.num_heads)
+        num_kv_heads = int(getattr(attn_mod, "num_kv_heads", 1))
+        head_size = int(attn_mod.head_size)
+        num_reqs = int(self.input_batch.num_reqs)
+        if num_reqs <= 0:
+            return None
+
+        q_flat = query.view(-1, num_heads, head_size) if query.dim() != 3 else query
+        triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        blk_tbl = self.input_batch.block_table[kv_cache_gid]
+        for qh_idx in range(num_heads):
+            phys_h: list[int] = []
+            slot_h: list[int] = []
+            cu_h: list[int] = [0]
+            for req_idx in range(num_reqs):
+                rid = self.input_batch.req_ids[req_idx]
+                req_states = self._sparse_online_index.get(rid)
+                if not req_states:
+                    return None
+                req_state = self.requests.get(rid)
+                if req_state is None:
+                    return None
+                seq_len = int(self.seq_lens.np[req_idx])
+                p_count = int(self.input_batch.num_prompt_tokens[req_idx])
+                if seq_len <= p_count:
+                    return None
+                out_before_step = self._sparse_output_tokens_before_step.get(
+                    rid, len(req_state.output_token_ids)
+                )
+                if out_before_step <= 0:
+                    return None
+                tok_end = int(self.query_start_loc.np[req_idx + 1])
+                if tok_end <= 0:
+                    return None
+                q_tok = q_flat[tok_end - 1, qh_idx].to(dtype=torch.float32)
+                kv_idx = self._sparse_online_qh_to_kv_index(
+                    qh_idx, num_heads, num_kv_heads
+                )
+                unit_key = sparse_kv_unit_key(layer_name, kv_idx)
+                state = req_states.get(unit_key)
+                if state is None:
+                    return None
+                selected = self._sparse_online_select_tokens(
+                    state=state,
+                    q=q_tok,
+                    total_tokens=seq_len,
+                    spec=spec,
+                )
+                decode_positions = torch.arange(
+                    p_count, seq_len, dtype=torch.int64, device=query.device
+                )
+                g_cur = torch.tensor([seq_len - 1], dtype=torch.int64, device=query.device)
+                selected = torch.sort(
+                    torch.unique(torch.cat([selected, decode_positions, g_cur], dim=0))
+                )[0]
+                bt_row = blk_tbl.block_table.np[req_idx]
+                n_blks = int(blk_tbl.num_blocks_per_row[req_idx])
+                bsz = int(spec.block_size)
+                for g in selected.tolist():
+                    block_idx = int(g) // bsz
+                    if block_idx < 0 or block_idx >= n_blks:
+                        return None
+                    phys_h.append(int(bt_row[block_idx]))
+                    slot_h.append(int(g) % bsz)
+                cu_h.append(cu_h[-1] + int(selected.numel()))
+            if not phys_h:
+                return None
+            triples.append(
+                (
+                    torch.tensor(phys_h, dtype=torch.int32, device=query.device),
+                    torch.tensor(slot_h, dtype=torch.int32, device=query.device),
+                    torch.tensor(cu_h, dtype=torch.int32, device=query.device),
+                )
+            )
+        return tuple(triples)
+
+    def _sparse_online_dynamic_update(
+        self,
+        state: _SparseOnlineLayerState,
+    ) -> None:
+        if not state.decode_block_buffer:
+            return
+        feat = torch.stack(state.decode_block_buffer, dim=0).to(dtype=torch.float32)
+        mean_key_new = feat.mean(dim=0)
+        centered = feat - mean_key_new
+        m = int(feat.shape[0])
+        k_new = max(1, m // 16)
+        k_new = (k_new // max(1, 32)) * 32
+        k_new = max(k_new, 1)
+        k_new = min(k_new, m)
+        centres_c, labels_new, sizes_new = segment_kmeans_centered_torch(
+            centered, n_clusters=k_new, n_segments=1
+        )
+        centres_new = centres_c + mean_key_new
+        n_existing = int(state.cluster_centres.shape[0])
+        state.cluster_centres = torch.cat(
+            [state.cluster_centres, centres_new.to(dtype=torch.float32)], dim=0
+        )
+        state.cluster_size = torch.cat(
+            [
+                state.cluster_size,
+                sizes_new.to(dtype=torch.int32, device=state.cluster_size.device),
+            ],
+            dim=0,
+        )
+        labels_new = labels_new.to(dtype=torch.int64, device=state.block_to_cluster.device)
+        state.block_to_cluster[-m:] = labels_new + n_existing
+        state.decode_block_buffer.clear()
+
+    def _update_sparse_online_index(
+        self,
+        sparse_block_features: dict[str, dict[str, np.ndarray]] | None,
+        sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]] | None,
+        sparse_new_block_features: dict[str, dict[str, np.ndarray]] | None,
+    ) -> None:
+        if sparse_block_features:
+            for req_id, unit_map in sparse_block_features.items():
+                req_states = self._sparse_online_index.setdefault(req_id, {})
+                meta_map = (
+                    {} if sparse_prefill_cluster_meta is None else sparse_prefill_cluster_meta.get(req_id, {})
+                )
+                for unit_key, feat_np in unit_map.items():
+                    parsed = parse_sparse_kv_key(unit_key)
+                    if parsed is None:
+                        continue
+                    layer_name, _ = parsed
+                    spec = self._sparse_layer_spec_by_name.get(layer_name)
+                    if spec is None or spec.cluster_granularity != "token":
+                        continue
+                    feat_t = torch.as_tensor(
+                        feat_np, dtype=torch.float32, device=self.device
+                    )
+                    meta = meta_map.get(unit_key)
+                    if meta is None:
+                        raw = prefill_cluster_meta_from_features_torch(
+                            feat_t,
+                            num_clusters=spec.num_clusters,
+                            n_segment=spec.n_segment,
+                        )
+                        centres_t = raw["cluster_centres"].to(
+                            dtype=torch.float32, device=self.device
+                        )
+                        labels_t = raw["block_to_cluster"].to(
+                            dtype=torch.int64, device=self.device
+                        )
+                        sizes_t = raw["cluster_size"].to(
+                            dtype=torch.int32, device=self.device
+                        )
+                        mean_t = raw["mean_key"].to(
+                            dtype=torch.float32, device=self.device
+                        )
+                    else:
+                        centres_t = torch.as_tensor(
+                            meta["cluster_centres"],
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        labels_t = torch.as_tensor(
+                            meta["block_to_cluster"],
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                        sizes_t = torch.as_tensor(
+                            meta["cluster_size"],
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        mean_t = torch.as_tensor(
+                            meta["mean_key"], dtype=torch.float32, device=self.device
+                        )
+                    req_states[unit_key] = _SparseOnlineLayerState(
+                        cluster_centres=centres_t,
+                        cluster_size=sizes_t,
+                        block_to_cluster=labels_t,
+                        all_block_features=feat_t,
+                        mean_key=mean_t,
+                    )
+        if sparse_new_block_features:
+            for req_id, unit_map in sparse_new_block_features.items():
+                req_states = self._sparse_online_index.get(req_id)
+                if not req_states:
+                    continue
+                for unit_key, feat_np in unit_map.items():
+                    parsed = parse_sparse_kv_key(unit_key)
+                    if parsed is None:
+                        continue
+                    layer_name, _ = parsed
+                    spec = self._sparse_layer_spec_by_name.get(layer_name)
+                    if spec is None or spec.cluster_granularity != "token":
+                        continue
+                    state = req_states.get(unit_key)
+                    if state is None:
+                        continue
+                    feat_t = torch.as_tensor(
+                        feat_np, dtype=torch.float32, device=self.device
+                    )
+                    state.all_block_features = torch.cat(
+                        [state.all_block_features, feat_t.unsqueeze(0)], dim=0
+                    )
+                    state.decode_block_buffer.append(feat_t)
+                    if int(state.cluster_centres.shape[0]) > 0:
+                        centered_feat = feat_t - state.mean_key
+                        centred_c = state.cluster_centres - state.mean_key
+                        nearest = torch.argmax(
+                            torch.matmul(centred_c, centered_feat)
+                        ).to(dtype=torch.int64)
+                        state.block_to_cluster = torch.cat(
+                            [state.block_to_cluster, nearest.view(1)], dim=0
+                        )
+                    else:
+                        state.block_to_cluster = torch.cat(
+                            [
+                                state.block_to_cluster,
+                                torch.zeros(
+                                    1, dtype=torch.int64, device=self.device
+                                ),
+                            ],
+                            dim=0,
+                        )
+                    if len(state.decode_block_buffer) >= int(spec.update_threshold_tokens):
+                        self._sparse_online_dynamic_update(state)
 
     def _sparse_perf_record(self, key: str, elapsed_s: float) -> None:
         if not self._sparse_perf_stats_enabled or not self._has_sparse_attn:
