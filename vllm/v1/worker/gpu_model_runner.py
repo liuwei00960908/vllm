@@ -7809,27 +7809,42 @@ class GPUModelRunner(
                     "_build_sparse_runtime_q_head_gather:block_ids_setup",
                     _t_block_ids,
                 )
-                _t_pack = time.perf_counter() if perf_enabled else None
                 for qh_idx in range(num_heads):
+                    _t_selected = time.perf_counter() if perf_enabled else None
                     selected = token_ids[selected_mask[qh_idx]]
+                    _perf_add(
+                        "_build_sparse_runtime_q_head_gather:pack_selected_tokens",
+                        _t_selected,
+                    )
+                    _t_block_idx = time.perf_counter() if perf_enabled else None
                     block_idx = torch.div(
                         selected, bsz, rounding_mode="floor"
                     ).to(dtype=torch.int64)
+                    _perf_add(
+                        "_build_sparse_runtime_q_head_gather:pack_block_idx",
+                        _t_block_idx,
+                    )
                     if block_idx.numel() > 0 and bool((block_idx >= n_blks).any()):
                         return None
+                    _t_phys = time.perf_counter() if perf_enabled else None
                     phys_chunks[qh_idx].append(
                         bt_row_t.index_select(0, block_idx).to(dtype=torch.int32)
                     )
+                    _perf_add(
+                        "_build_sparse_runtime_q_head_gather:pack_phys_index_select",
+                        _t_phys,
+                    )
+                    _t_slots = time.perf_counter() if perf_enabled else None
                     slot_chunks[qh_idx].append(
                         selected.remainder(bsz).to(dtype=torch.int32)
                     )
                     cu_lists[qh_idx].append(
                         cu_lists[qh_idx][-1] + int(selected.numel())
                     )
-                _perf_add(
-                    "_build_sparse_runtime_q_head_gather:pack_per_head",
-                    _t_pack,
-                )
+                    _perf_add(
+                        "_build_sparse_runtime_q_head_gather:pack_slots_and_cu",
+                        _t_slots,
+                    )
                 _perf_add(
                     "_build_sparse_runtime_q_head_gather:per_req_total",
                     _t_req,
@@ -8398,6 +8413,13 @@ class GPUModelRunner(
         """Attach paged-cache gather indices for token-sparse compact KV attention."""
         if for_cudagraph_capture or self.dcp_world_size > 1:
             return attn_metadata_i
+        perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
+        perf_local_ms: dict[str, float] = defaultdict(float)
+
+        def _perf_add(name: str, start_t: float | None) -> None:
+            if start_t is None:
+                return
+            perf_local_ms[name] += (time.perf_counter() - start_t) * 1000.0
 
         self._sparse_log_first_decode_kv_snapshot(
             layer_name=layer_name,
@@ -8413,6 +8435,7 @@ class GPUModelRunner(
         req_ctx: list[
             tuple[str, int, int, list[int], dict[str, list[int]]]
         ] = []
+        _t_req_ctx = time.perf_counter() if perf_enabled else None
         for ri in range(num_reqs):
             rid = self.input_batch.req_ids[ri]
             req_ctx.append(
@@ -8424,6 +8447,7 @@ class GPUModelRunner(
                     self._sparse_token_indices_by_layer.get(rid, {}),
                 )
             )
+        _perf_add("_maybe_patch_sparse_compact_kv_metadata:req_ctx", _t_req_ctx)
 
         gather_fail_reason: str | None = None
 
@@ -8728,7 +8752,12 @@ class GPUModelRunner(
 
         triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for qh in range(num_heads):
+            _t_gather = time.perf_counter() if perf_enabled else None
             g = gather_one_head(qh)
+            _perf_add(
+                "_maybe_patch_sparse_compact_kv_metadata:gather_one_head",
+                _t_gather,
+            )
             if g is None:
                 if _sparse_compact_layer_verbose:
                     req0 = self.input_batch.req_ids[0] if num_reqs > 0 else "<none>"
@@ -8741,12 +8770,17 @@ class GPUModelRunner(
                     )
                 return attn_metadata_i
             phys_h, slot_h, cu_h = g
+            _t_tensorize = time.perf_counter() if perf_enabled else None
             triples.append(
                 (
                     torch.tensor(phys_h, dtype=torch.int32, device=dev),
                     torch.tensor(slot_h, dtype=torch.int32, device=dev),
                     torch.tensor(cu_h, dtype=torch.int32, device=dev),
                 )
+            )
+            _perf_add(
+                "_maybe_patch_sparse_compact_kv_metadata:tensorize_triples",
+                _t_tensorize,
             )
         if _sparse_compact_layer_verbose and num_reqs > 0:
             logger.info(
@@ -8757,13 +8791,20 @@ class GPUModelRunner(
                 num_heads,
                 int(triples[0][0].numel()) if triples else 0,
             )
-        return replace(
+        _t_replace = time.perf_counter() if perf_enabled else None
+        out = replace(
             attn_metadata_i,
             sparse_gather_phys=None,
             sparse_gather_slots=None,
             sparse_gather_cu_seqlens_k=None,
             sparse_q_head_gather=tuple(triples),
         )
+        _perf_add("_maybe_patch_sparse_compact_kv_metadata:replace", _t_replace)
+        if perf_enabled and perf_local_ms:
+            for k, ms in perf_local_ms.items():
+                self._sparse_perf_accum_ms[k] += ms
+                self._sparse_perf_accum_calls[k] += 1
+        return out
 
     def _sparse_store_prefill_block_features(
         self,
