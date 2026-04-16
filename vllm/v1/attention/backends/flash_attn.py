@@ -976,13 +976,27 @@ class FlashAttentionImpl(AttentionImpl):
             int(query.shape[0]),
             int(max_seqlen_q),
         )
+        total_ms = 0.0
+        gather_ms = 0.0
+        fa_ms = 0.0
+        use_cuda_timing = bool(query.is_cuda)
         win = (
             list(self.sliding_window)
             if self.sliding_window is not None
             else [-1, -1]
         )
+        if use_cuda_timing:
+            total_start = torch.cuda.Event(enable_timing=True)
+            total_end = torch.cuda.Event(enable_timing=True)
+            total_start.record()
         for qh, trip in enumerate(attn_metadata.sparse_q_head_gather):
             phys, slots, cu_k = trip
+            if use_cuda_timing:
+                gather_start = torch.cuda.Event(enable_timing=True)
+                gather_end = torch.cuda.Event(enable_timing=True)
+                fa_start = torch.cuda.Event(enable_timing=True)
+                fa_end = torch.cuda.Event(enable_timing=True)
+                gather_start.record()
             phys64 = phys.to(dtype=torch.int64, device=key_cache.device)
             slots64 = slots.to(dtype=torch.int64, device=key_cache.device)
             kv_h = qh // max(self.num_queries_per_kv, 1)
@@ -992,6 +1006,9 @@ class FlashAttentionImpl(AttentionImpl):
             v_compact = v_slice.unsqueeze(1)
             k_lens = cu_k[1:] - cu_k[:-1]
             max_seqlen_k = int(k_lens.max().item())
+            if use_cuda_timing:
+                gather_end.record()
+                fa_start.record()
             flash_attn_varlen_func(
                 q=query[:, qh : qh + 1, :],
                 k=k_compact,
@@ -1016,6 +1033,25 @@ class FlashAttentionImpl(AttentionImpl):
                 num_splits=0,
                 s_aux=None,
             )
+            if use_cuda_timing:
+                fa_end.record()
+                fa_end.synchronize()
+                gather_ms += float(gather_start.elapsed_time(gather_end))
+                fa_ms += float(fa_start.elapsed_time(fa_end))
+        if use_cuda_timing:
+            total_end.record()
+            total_end.synchronize()
+            total_ms = float(total_start.elapsed_time(total_end))
+        logger.info(
+            "[SparsePerfFA] compact_kv_gather total_ms=%.3f gather_ms=%.3f "
+            "fa_ms=%.3f num_q_heads=%d num_tok=%d max_seqlen_q=%d",
+            total_ms,
+            gather_ms,
+            fa_ms,
+            len(attn_metadata.sparse_q_head_gather),
+            int(query.shape[0]),
+            int(max_seqlen_q),
+        )
 
     def _forward_per_head_block_table_sparse(
         self,

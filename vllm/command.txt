@@ -4,9 +4,9 @@ export VLLM_SPARSE_PERF_STATS=1
 export VLLM_SPARSE_PERF_LOG_INTERVAL=1
 export VLLM_LOGGING_LEVEL=INFO
 
+grep -n "SparsePerfFA" your_log_file.log
+grep -nE "SparsePerfFA|_build_sparse_runtime_q_head_gather|_build_attention_metadata|_maybe_patch_sparse_compact_kv_metadata" your_log_file.log
 
-grep -nE "use_q_head_gather=False use_gather=False use_per_head_bt=False|use_q_head_gather=True" your_log_file.log
-grep -nE "bridge_sched|phase_gate|no_layer_state|num_output_tokens=0|num_placeholders=1" your_log_file.log
 
 
 
