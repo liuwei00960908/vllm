@@ -7747,6 +7747,7 @@ class GPUModelRunner(
             phys_chunks: list[list[np.ndarray]] = [[] for _ in range(num_heads)]
             slot_chunks: list[list[np.ndarray]] = [[] for _ in range(num_heads)]
             cu_lists: list[list[int]] = [[0] for _ in range(num_heads)]
+            total_selected_per_head = [0 for _ in range(num_heads)]
             blk_tbl = self.input_batch.block_table[kv_cache_gid]
             bsz = int(spec.block_size)
             for req_idx in range(num_reqs):
@@ -7799,14 +7800,14 @@ class GPUModelRunner(
                 n_blks = int(blk_tbl.num_blocks_per_row[req_idx])
                 token_ids_np = np.arange(seq_len, dtype=np.int64)
                 bt_row_np = blk_tbl.block_table.np[req_idx, :n_blks]
+                selected_mask_np = selected_mask.detach().cpu().numpy()
                 _perf_add(
                     "_build_sparse_runtime_q_head_gather:block_ids_setup",
                     _t_block_ids,
                 )
                 for qh_idx in range(num_heads):
                     _t_selected = time.perf_counter() if perf_enabled else None
-                    selected_mask_np = selected_mask[qh_idx].detach().cpu().numpy()
-                    selected = token_ids_np[selected_mask_np]
+                    selected = token_ids_np[selected_mask_np[qh_idx]]
                     _perf_add(
                         "_build_sparse_runtime_q_head_gather:pack_selected_tokens",
                         _t_selected,
@@ -7833,6 +7834,7 @@ class GPUModelRunner(
                             np.int32, copy=False
                         )
                     )
+                    total_selected_per_head[qh_idx] += int(selected.size)
                     cu_lists[qh_idx].append(
                         cu_lists[qh_idx][-1] + int(selected.size)
                     )
@@ -7850,15 +7852,26 @@ class GPUModelRunner(
             for qh_idx in range(num_heads):
                 if not phys_chunks[qh_idx]:
                     return None
+                total_len = total_selected_per_head[qh_idx]
+                phys_np = np.empty(total_len, dtype=np.int32)
+                slot_np = np.empty(total_len, dtype=np.int32)
+                offset = 0
+                for phys_chunk, slot_chunk in zip(
+                    phys_chunks[qh_idx], slot_chunks[qh_idx], strict=True
+                ):
+                    chunk_len = int(len(phys_chunk))
+                    phys_np[offset:offset + chunk_len] = phys_chunk
+                    slot_np[offset:offset + chunk_len] = slot_chunk
+                    offset += chunk_len
                 triples.append(
                     (
                         torch.as_tensor(
-                            np.concatenate(phys_chunks[qh_idx], axis=0),
+                            phys_np,
                             dtype=torch.int32,
                             device=query.device,
                         ),
                         torch.as_tensor(
-                            np.concatenate(slot_chunks[qh_idx], axis=0),
+                            slot_np,
                             dtype=torch.int32,
                             device=query.device,
                         ),
