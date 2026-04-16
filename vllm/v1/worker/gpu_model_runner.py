@@ -7744,8 +7744,8 @@ class GPUModelRunner(
             }
             _perf_add("_build_sparse_runtime_q_head_gather:qhead_map", _t_qh_map)
 
-            phys_chunks: list[list[torch.Tensor]] = [[] for _ in range(num_heads)]
-            slot_chunks: list[list[torch.Tensor]] = [[] for _ in range(num_heads)]
+            phys_chunks: list[list[np.ndarray]] = [[] for _ in range(num_heads)]
+            slot_chunks: list[list[np.ndarray]] = [[] for _ in range(num_heads)]
             cu_lists: list[list[int]] = [[0] for _ in range(num_heads)]
             blk_tbl = self.input_batch.block_table[kv_cache_gid]
             bsz = int(spec.block_size)
@@ -7796,39 +7796,32 @@ class GPUModelRunner(
 
                 selected_mask[:, p_count:seq_len] = True
                 _t_block_ids = time.perf_counter() if perf_enabled else None
-                token_ids = torch.arange(
-                    seq_len, dtype=torch.int64, device=query.device
-                )
                 n_blks = int(blk_tbl.num_blocks_per_row[req_idx])
-                bt_row_t = torch.as_tensor(
-                    blk_tbl.block_table.np[req_idx, :n_blks],
-                    dtype=torch.int64,
-                    device=query.device,
-                )
+                token_ids_np = np.arange(seq_len, dtype=np.int64)
+                bt_row_np = blk_tbl.block_table.np[req_idx, :n_blks]
                 _perf_add(
                     "_build_sparse_runtime_q_head_gather:block_ids_setup",
                     _t_block_ids,
                 )
                 for qh_idx in range(num_heads):
                     _t_selected = time.perf_counter() if perf_enabled else None
-                    selected = token_ids[selected_mask[qh_idx]]
+                    selected_mask_np = selected_mask[qh_idx].detach().cpu().numpy()
+                    selected = token_ids_np[selected_mask_np]
                     _perf_add(
                         "_build_sparse_runtime_q_head_gather:pack_selected_tokens",
                         _t_selected,
                     )
                     _t_block_idx = time.perf_counter() if perf_enabled else None
-                    block_idx = torch.div(
-                        selected, bsz, rounding_mode="floor"
-                    ).to(dtype=torch.int64)
+                    block_idx = selected // int(bsz)
                     _perf_add(
                         "_build_sparse_runtime_q_head_gather:pack_block_idx",
                         _t_block_idx,
                     )
-                    if block_idx.numel() > 0 and bool((block_idx >= n_blks).any()):
+                    if block_idx.size > 0 and bool(np.any(block_idx >= n_blks)):
                         return None
                     _t_phys = time.perf_counter() if perf_enabled else None
                     phys_chunks[qh_idx].append(
-                        bt_row_t.index_select(0, block_idx).to(dtype=torch.int32)
+                        np.asarray(bt_row_np[block_idx], dtype=np.int32)
                     )
                     _perf_add(
                         "_build_sparse_runtime_q_head_gather:pack_phys_index_select",
@@ -7836,10 +7829,12 @@ class GPUModelRunner(
                     )
                     _t_slots = time.perf_counter() if perf_enabled else None
                     slot_chunks[qh_idx].append(
-                        selected.remainder(bsz).to(dtype=torch.int32)
+                        np.remainder(selected, int(bsz)).astype(
+                            np.int32, copy=False
+                        )
                     )
                     cu_lists[qh_idx].append(
-                        cu_lists[qh_idx][-1] + int(selected.numel())
+                        cu_lists[qh_idx][-1] + int(selected.size)
                     )
                     _perf_add(
                         "_build_sparse_runtime_q_head_gather:pack_slots_and_cu",
@@ -7857,10 +7852,18 @@ class GPUModelRunner(
                     return None
                 triples.append(
                     (
-                        torch.cat(phys_chunks[qh_idx], dim=0),
-                        torch.cat(slot_chunks[qh_idx], dim=0),
-                        torch.tensor(
-                            cu_lists[qh_idx],
+                        torch.as_tensor(
+                            np.concatenate(phys_chunks[qh_idx], axis=0),
+                            dtype=torch.int32,
+                            device=query.device,
+                        ),
+                        torch.as_tensor(
+                            np.concatenate(slot_chunks[qh_idx], axis=0),
+                            dtype=torch.int32,
+                            device=query.device,
+                        ),
+                        torch.as_tensor(
+                            np.asarray(cu_lists[qh_idx], dtype=np.int32),
                             dtype=torch.int32,
                             device=query.device,
                         ),
