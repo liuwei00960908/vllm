@@ -8455,8 +8455,8 @@ class GPUModelRunner(
             qh_idx: int,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
             nonlocal gather_fail_reason
-            phys_chunks_h: list[torch.Tensor] = []
-            slot_chunks_h: list[torch.Tensor] = []
+            phys_chunks_h: list[np.ndarray] = []
+            slot_chunks_h: list[np.ndarray] = []
             req_lengths_h: list[int] = []
             debug_sel_all: list[int] = []
             debug_lb_all: list[int] = []
@@ -8594,16 +8594,11 @@ class GPUModelRunner(
                 blk_tbl = self.input_batch.block_table[kv_cache_gid]
                 bt_row = blk_tbl.block_table.np[ri_idx]
                 n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
-                bt_row_t = torch.as_tensor(
-                    bt_row[:n_blks],
-                    dtype=torch.int64,
-                    device=dev,
-                )
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
                     debug_decode_lb = g_cur // bsz
                 _t_phys_loop = time.perf_counter() if perf_enabled else None
-                sel_t = torch.tensor(sel, dtype=torch.int64, device=dev)
-                if sel_t.numel() == 0:
+                sel_np = np.asarray(sel, dtype=np.int64)
+                if sel_np.size == 0:
                     req_lengths_h.append(0)
                     _perf_add(
                         "_maybe_patch_sparse_compact_kv_metadata:gather_phys_slot_loop",
@@ -8614,29 +8609,27 @@ class GPUModelRunner(
                         _t_req_loop,
                     )
                     continue
-                block_idx_t = torch.div(
-                    sel_t, bsz, rounding_mode="floor"
-                ).to(dtype=torch.int64)
-                bad_mask = (block_idx_t < 0) | (block_idx_t >= n_blks)
-                if bool(bad_mask.any()):
-                    bad_pos = int(bad_mask.nonzero(as_tuple=True)[0][0].item())
-                    bad_idx = int(
-                        block_idx_t[bad_pos].item()
-                    )
-                    bad_g = int(
-                        sel_t[bad_pos].item()
-                    )
+                block_idx_np = sel_np // int(bsz)
+                bad_mask = (block_idx_np < 0) | (block_idx_np >= n_blks)
+                if bool(np.any(bad_mask)):
+                    bad_pos = int(np.flatnonzero(bad_mask)[0])
+                    bad_idx = int(block_idx_np[bad_pos])
+                    bad_g = int(sel_np[bad_pos])
                     gather_fail_reason = (
                         f"block_idx_oob rid={rid} g={bad_g} "
                         f"block_idx={bad_idx} n_blks={n_blks} "
                         f"seq_len={seq_len}"
                     )
                     return None
-                slot_t = sel_t.remainder(bsz).to(dtype=torch.int32)
-                phys_t = bt_row_t.index_select(0, block_idx_t).to(dtype=torch.int32)
-                phys_chunks_h.append(phys_t)
-                slot_chunks_h.append(slot_t)
-                req_lengths_h.append(int(sel_t.numel()))
+                slot_np = np.remainder(sel_np, int(bsz)).astype(
+                    np.int32, copy=False
+                )
+                phys_np = np.asarray(
+                    bt_row[block_idx_np], dtype=np.int32
+                )
+                phys_chunks_h.append(phys_np)
+                slot_chunks_h.append(slot_np)
+                req_lengths_h.append(int(sel_np.size))
                 _perf_add(
                     "_maybe_patch_sparse_compact_kv_metadata:gather_phys_slot_loop",
                     _t_phys_loop,
@@ -8650,24 +8643,31 @@ class GPUModelRunner(
                 gather_fail_reason = "empty_phys_after_selection"
                 return None
             _t_phys_tensor = time.perf_counter() if perf_enabled else None
-            phys_h = torch.cat(phys_chunks_h, dim=0)
+            phys_h = torch.as_tensor(
+                np.concatenate(phys_chunks_h, axis=0),
+                dtype=torch.int32,
+                device=dev,
+            )
             _perf_add(
                 "_maybe_patch_sparse_compact_kv_metadata:tensorize_phys",
                 _t_phys_tensor,
             )
             _t_slot_tensor = time.perf_counter() if perf_enabled else None
-            slot_h = torch.cat(slot_chunks_h, dim=0)
+            slot_h = torch.as_tensor(
+                np.concatenate(slot_chunks_h, axis=0),
+                dtype=torch.int32,
+                device=dev,
+            )
             _perf_add(
                 "_maybe_patch_sparse_compact_kv_metadata:tensorize_slots",
                 _t_slot_tensor,
             )
             _t_cu_tensor = time.perf_counter() if perf_enabled else None
-            lengths_t = torch.tensor(req_lengths_h, dtype=torch.int32, device=dev)
-            cu_h = torch.empty(
-                lengths_t.numel() + 1, dtype=torch.int32, device=dev
-            )
-            cu_h[0] = 0
-            cu_h[1:] = torch.cumsum(lengths_t, dim=0)
+            lengths_np = np.asarray(req_lengths_h, dtype=np.int32)
+            cu_np = np.empty(lengths_np.size + 1, dtype=np.int32)
+            cu_np[0] = 0
+            cu_np[1:] = np.cumsum(lengths_np, dtype=np.int32)
+            cu_h = torch.as_tensor(cu_np, dtype=torch.int32, device=dev)
             _perf_add(
                 "_maybe_patch_sparse_compact_kv_metadata:tensorize_cu",
                 _t_cu_tensor,
