@@ -8461,6 +8461,7 @@ class GPUModelRunner(
             debug_decode_lb: int = -1
             sk = sparse_qh_unit_key(layer_name, qh_idx)
             for rid, seq_len, p_count, chrono, tok_map in req_ctx:
+                _t_req_loop = time.perf_counter() if perf_enabled else None
                 rs = self.requests.get(rid)
                 if rs is None:
                     gather_fail_reason = (
@@ -8515,6 +8516,7 @@ class GPUModelRunner(
                     # Legacy / transient map may only carry layer-level keys.
                     toks = tok_map.get(layer_name)
                 if toks is None:
+                    _t_fallback = time.perf_counter() if perf_enabled else None
                     # Fallback: if token-level indices are missing, derive
                     # candidate token ids from selected logical blocks so
                     # compact gather can still run on decode steps.
@@ -8539,6 +8541,10 @@ class GPUModelRunner(
                             if g1_fb > g0_fb:
                                 fb_toks.extend(range(int(g0_fb), int(g1_fb)))
                         toks = sorted(set(fb_toks))
+                    _perf_add(
+                        "_maybe_patch_sparse_compact_kv_metadata:gather_fallback_tokens",
+                        _t_fallback,
+                    )
                     if toks is None or len(toks) == 0:
                         gather_fail_reason = (
                             f"missing_tok_or_chrono rid={rid} qh={qh_idx} sk={sk} "
@@ -8557,9 +8563,14 @@ class GPUModelRunner(
                 # [p_count, seq_len) so that no recently-generated KV is
                 # ever dropped.  The sparse budget only trims *prefill*
                 # history tokens; decode tokens are unconditional.
+                _t_sel = time.perf_counter() if perf_enabled else None
                 decode_positions = set(range(p_count, seq_len))
                 sel = sorted(set(toks) | decode_positions | {g_cur})
                 sel = [g for g in sel if 0 <= g < seq_len]
+                _perf_add(
+                    "_maybe_patch_sparse_compact_kv_metadata:gather_build_sel",
+                    _t_sel,
+                )
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
                     debug_sel_all = [int(x) for x in sel]
                     debug_lb_all = [
@@ -8583,6 +8594,7 @@ class GPUModelRunner(
                 n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
                 if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
                     debug_decode_lb = g_cur // bsz
+                _t_phys_loop = time.perf_counter() if perf_enabled else None
                 for g in sel:
                     block_idx = g // bsz
                     sl = g % bsz
@@ -8596,7 +8608,15 @@ class GPUModelRunner(
                     phys_bid = int(bt_row[block_idx])
                     phys_h.append(phys_bid)
                     slot_h.append(int(sl))
+                _perf_add(
+                    "_maybe_patch_sparse_compact_kv_metadata:gather_phys_slot_loop",
+                    _t_phys_loop,
+                )
                 cu_h.append(cu_h[-1] + len(sel))
+                _perf_add(
+                    "_maybe_patch_sparse_compact_kv_metadata:gather_req_total",
+                    _t_req_loop,
+                )
             if not phys_h:
                 gather_fail_reason = "empty_phys_after_selection"
                 return None
@@ -8771,12 +8791,26 @@ class GPUModelRunner(
                 return attn_metadata_i
             phys_h, slot_h, cu_h = g
             _t_tensorize = time.perf_counter() if perf_enabled else None
+            _t_phys_tensor = time.perf_counter() if perf_enabled else None
+            phys_t = torch.tensor(phys_h, dtype=torch.int32, device=dev)
+            _perf_add(
+                "_maybe_patch_sparse_compact_kv_metadata:tensorize_phys",
+                _t_phys_tensor,
+            )
+            _t_slot_tensor = time.perf_counter() if perf_enabled else None
+            slot_t = torch.tensor(slot_h, dtype=torch.int32, device=dev)
+            _perf_add(
+                "_maybe_patch_sparse_compact_kv_metadata:tensorize_slots",
+                _t_slot_tensor,
+            )
+            _t_cu_tensor = time.perf_counter() if perf_enabled else None
+            cu_t = torch.tensor(cu_h, dtype=torch.int32, device=dev)
+            _perf_add(
+                "_maybe_patch_sparse_compact_kv_metadata:tensorize_cu",
+                _t_cu_tensor,
+            )
             triples.append(
-                (
-                    torch.tensor(phys_h, dtype=torch.int32, device=dev),
-                    torch.tensor(slot_h, dtype=torch.int32, device=dev),
-                    torch.tensor(cu_h, dtype=torch.int32, device=dev),
-                )
+                (phys_t, slot_t, cu_t)
             )
             _perf_add(
                 "_maybe_patch_sparse_compact_kv_metadata:tensorize_triples",
