@@ -23,7 +23,7 @@ from pathlib import Path
 
 SPARSE_PERF_RE = re.compile(r"\[SparsePerf\]\s+window_steps=(\d+)\s+(.*)")
 ENTRY_RE = re.compile(
-    r"(?P<key>[^:|]+):total_ms=(?P<total_ms>\d+(?:\.\d+)?),"
+    r"(?P<key>.+?):total_ms=(?P<total_ms>\d+(?:\.\d+)?),"
     r"calls=(?P<calls>\d+),avg_ms=(?P<avg_ms>\d+(?:\.\d+)?)"
 )
 NO_SAMPLE_RE = re.compile(
