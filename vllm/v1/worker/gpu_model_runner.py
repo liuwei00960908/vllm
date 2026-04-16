@@ -2509,6 +2509,9 @@ class GPUModelRunner(
         cached_attn_metadata: dict[
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
+        perf_sparse_enabled = (
+            self._sparse_perf_stats_enabled and self._has_sparse_attn
+        )
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -2549,6 +2552,7 @@ class GPUModelRunner(
                     ],
                 )
 
+            _t_builder = time.perf_counter() if perf_sparse_enabled else None
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
@@ -2571,6 +2575,11 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table and not skip_block_table_cache:
                     cached_attn_metadata[cache_key] = attn_metadata_i
+            if _t_builder is not None:
+                self._sparse_perf_record(
+                    "_build_attention_metadata:builder_build_or_update",
+                    time.perf_counter() - _t_builder,
+                )
 
             if (
                 not for_cudagraph_capture
@@ -2629,6 +2638,7 @@ class GPUModelRunner(
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
+            _t_enc = time.perf_counter() if perf_sparse_enabled else None
             cm.encoder_seq_lens, cm.encoder_seq_lens_cpu = self._get_encoder_seq_lens(
                 num_scheduled_tokens or {},
                 kv_cache_group.kv_cache_spec,
@@ -2638,6 +2648,11 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+            if _t_enc is not None:
+                self._sparse_perf_record(
+                    "_build_attention_metadata:get_encoder_seq_lens",
+                    time.perf_counter() - _t_enc,
+                )
 
             is_sparse_group = isinstance(
                 kv_cache_group.kv_cache_spec, SparseAttentionSpec
@@ -2645,6 +2660,7 @@ class GPUModelRunner(
             boundary_disable_sparse = False
             boundary_req_ids: list[str] = []
             if is_sparse_group:
+                _t_boundary = time.perf_counter() if perf_sparse_enabled else None
                 for req_idx in range(num_reqs):
                     rid = self.input_batch.req_ids[req_idx]
                     seq_i = int(cm._seq_lens_cpu[req_idx].item())
@@ -2670,6 +2686,11 @@ class GPUModelRunner(
                         kv_cache_gid,
                         len(boundary_req_ids),
                         boundary_req_ids[:2],
+                    )
+                if _t_boundary is not None:
+                    self._sparse_perf_record(
+                        "_build_attention_metadata:sparse_boundary_scan",
+                        time.perf_counter() - _t_boundary,
                     )
             # Token-level compact gather uses sparse_q_head_gather metadata
             # (phys, slot, cu_seqlens_k) to index KV directly with
@@ -2756,6 +2777,9 @@ class GPUModelRunner(
                                 cm_union.block_table_tensor.clone()
                             )
                         else:
+                            _t_per_head = (
+                                time.perf_counter() if perf_sparse_enabled else None
+                            )
                             per_bt, per_sl = (
                                 self._build_sparse_per_head_block_table_and_lens(
                                     cm_union.block_table_tensor,
@@ -2768,6 +2792,11 @@ class GPUModelRunner(
                                     bsz,
                                 )
                             )
+                            if _t_per_head is not None:
+                                self._sparse_perf_record(
+                                    "_build_attention_metadata:per_head_block_table",
+                                    time.perf_counter() - _t_per_head,
+                                )
                             if per_bt is not None and per_sl is not None:
                                 cm_layer = copy(cm)
                                 cm_layer.block_table_tensor = per_bt[0]
@@ -7674,6 +7703,13 @@ class GPUModelRunner(
         spec: SparseAttentionSpec,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...] | None:
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
+        perf_local_ms: dict[str, float] = defaultdict(float)
+
+        def _perf_add(name: str, start_t: float | None) -> None:
+            if start_t is None:
+                return
+            perf_local_ms[name] += (time.perf_counter() - start_t) * 1000.0
         try:
             kv_cache_gid = self._sparse_layer_gid_by_name.get(layer_name)
             if kv_cache_gid is None:
@@ -7692,6 +7728,7 @@ class GPUModelRunner(
                 query.view(-1, num_heads, head_size)
                 if query.dim() != 3 else query
             )
+            _t_qh_map = time.perf_counter() if perf_enabled else None
             qh_to_kv = [
                 self._sparse_online_qh_to_kv_index(qh_idx, num_heads, num_kv_heads)
                 for qh_idx in range(num_heads)
@@ -7705,6 +7742,7 @@ class GPUModelRunner(
                 )
                 for kv_idx, qh_indices in kv_to_qh.items()
             }
+            _perf_add("_build_sparse_runtime_q_head_gather:qhead_map", _t_qh_map)
 
             phys_chunks: list[list[torch.Tensor]] = [[] for _ in range(num_heads)]
             slot_chunks: list[list[torch.Tensor]] = [[] for _ in range(num_heads)]
@@ -7712,6 +7750,7 @@ class GPUModelRunner(
             blk_tbl = self.input_batch.block_table[kv_cache_gid]
             bsz = int(spec.block_size)
             for req_idx in range(num_reqs):
+                _t_req = time.perf_counter() if perf_enabled else None
                 rid = self.input_batch.req_ids[req_idx]
                 req_states = self._sparse_online_index.get(rid)
                 if not req_states:
@@ -7736,6 +7775,7 @@ class GPUModelRunner(
                 selected_mask = torch.zeros(
                     (num_heads, seq_len), dtype=torch.bool, device=query.device
                 )
+                _t_select = time.perf_counter() if perf_enabled else None
                 for kv_idx, qh_indices_t in kv_to_qh_tensor.items():
                     unit_key = sparse_kv_unit_key(layer_name, kv_idx)
                     state = req_states.get(unit_key)
@@ -7749,8 +7789,13 @@ class GPUModelRunner(
                         spec=spec,
                     )
                     selected_mask[qh_indices_t] = group_mask
+                _perf_add(
+                    "_build_sparse_runtime_q_head_gather:select_tokens",
+                    _t_select,
+                )
 
                 selected_mask[:, p_count:seq_len] = True
+                _t_block_ids = time.perf_counter() if perf_enabled else None
                 token_ids = torch.arange(
                     seq_len, dtype=torch.int64, device=query.device
                 )
@@ -7760,6 +7805,11 @@ class GPUModelRunner(
                     dtype=torch.int64,
                     device=query.device,
                 )
+                _perf_add(
+                    "_build_sparse_runtime_q_head_gather:block_ids_setup",
+                    _t_block_ids,
+                )
+                _t_pack = time.perf_counter() if perf_enabled else None
                 for qh_idx in range(num_heads):
                     selected = token_ids[selected_mask[qh_idx]]
                     block_idx = torch.div(
@@ -7776,7 +7826,16 @@ class GPUModelRunner(
                     cu_lists[qh_idx].append(
                         cu_lists[qh_idx][-1] + int(selected.numel())
                     )
+                _perf_add(
+                    "_build_sparse_runtime_q_head_gather:pack_per_head",
+                    _t_pack,
+                )
+                _perf_add(
+                    "_build_sparse_runtime_q_head_gather:per_req_total",
+                    _t_req,
+                )
 
+            _t_finalize = time.perf_counter() if perf_enabled else None
             triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
             for qh_idx in range(num_heads):
                 if not phys_chunks[qh_idx]:
@@ -7792,6 +7851,14 @@ class GPUModelRunner(
                         ),
                     )
                 )
+            _perf_add(
+                "_build_sparse_runtime_q_head_gather:finalize_cat",
+                _t_finalize,
+            )
+            if perf_enabled and perf_local_ms:
+                for k, ms in perf_local_ms.items():
+                    self._sparse_perf_accum_ms[k] += ms
+                    self._sparse_perf_accum_calls[k] += 1
             return tuple(triples)
         finally:
             if _t0 is not None:
@@ -9124,13 +9191,18 @@ class GPUModelRunner(
                     ):
                         continue
                     kv = attn_mod.kv_cache[0]
+                    _t_k_cache_read = time.perf_counter() if perf_enabled else None
                     k_blocks = kv[0][block_ids_t]
+                    _perf_add("collect:k_cache_read", _t_k_cache_read)
                     num_kv = int(attn_mod.num_kv_heads)
                     if token_sparse:
                         if is_prefill_done:
                             # Keep prefill index aligned to prompt tokens only.
                             valid_len = num_prompt_tokens
                             if valid_len > 0:
+                                _t_prefill_store = (
+                                    time.perf_counter() if perf_enabled else None
+                                )
                                 k_flat = k_blocks.reshape(-1, *k_blocks.shape[2:])[
                                     :valid_len
                                 ].float()
@@ -9157,6 +9229,10 @@ class GPUModelRunner(
                                         pending_async_feat,
                                         pending_async_meta,
                                     )
+                                _perf_add(
+                                    "collect:prefill_store_features",
+                                    _t_prefill_store,
+                                )
                         if is_decode_committed:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
@@ -9172,8 +9248,13 @@ class GPUModelRunner(
                                     sparse_kv_unit_key(layer_name, kv_h)
                                 ] = k_vec
                     else:
+                        _t_block_mean = time.perf_counter() if perf_enabled else None
                         k_blk = k_blocks.mean(dim=1).float()
+                        _perf_add("collect:k_block_mean", _t_block_mean)
                         if is_prefill_done:
+                            _t_prefill_store = (
+                                time.perf_counter() if perf_enabled else None
+                            )
                             if k_blk.dim() == 2:
                                 assert num_kv == 1, (
                                     "KV cache layout: expected num_kv_heads==1 "
@@ -9201,6 +9282,10 @@ class GPUModelRunner(
                                     pending_async_feat,
                                     pending_async_meta,
                                 )
+                            _perf_add(
+                                "collect:prefill_store_features",
+                                _t_prefill_store,
+                            )
                         if is_decode_committed:
                             if k_blk.dim() == 2:
                                 assert num_kv == 1
