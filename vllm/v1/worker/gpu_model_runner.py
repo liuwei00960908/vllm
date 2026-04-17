@@ -2591,23 +2591,31 @@ class GPUModelRunner(
                 and not disable_token_sparse_boundary
                 and isinstance(attn_metadata_i, FlashAttentionMetadata)
             ):
-                _t0_sparse_patch = (
-                    time.perf_counter() if self._sparse_perf_stats_enabled else None
-                )
-                attn_metadata_i = self._maybe_patch_sparse_compact_kv_metadata(
-                    attn_metadata_i,
-                    kv_cache_gid=kv_cache_gid,
-                    layer_name=layer_names_override[0],
-                    num_reqs=num_reqs,
-                    common_attn_metadata=common_attn_metadata,
-                    spec=kv_cache_spec,
-                    for_cudagraph_capture=for_cudagraph_capture,
-                )
-                if _t0_sparse_patch is not None:
-                    self._sparse_perf_record(
-                        "_maybe_patch_sparse_compact_kv_metadata",
-                        time.perf_counter() - _t0_sparse_patch,
+                # Decode-only token-sparse compact gather now uses the runtime
+                # q-head gather path populated from the module forward hook.
+                # Skipping the metadata patch here avoids building an unused
+                # per-head gather structure that the backend immediately
+                # replaces with runtime_q_head_gather.
+                use_runtime_q_head_gather = int(max_query_len) == 1
+                if not use_runtime_q_head_gather:
+                    _t0_sparse_patch = (
+                        time.perf_counter()
+                        if self._sparse_perf_stats_enabled else None
                     )
+                    attn_metadata_i = self._maybe_patch_sparse_compact_kv_metadata(
+                        attn_metadata_i,
+                        kv_cache_gid=kv_cache_gid,
+                        layer_name=layer_names_override[0],
+                        num_reqs=num_reqs,
+                        common_attn_metadata=common_attn_metadata,
+                        spec=kv_cache_spec,
+                        for_cudagraph_capture=for_cudagraph_capture,
+                    )
+                    if _t0_sparse_patch is not None:
+                        self._sparse_perf_record(
+                            "_maybe_patch_sparse_compact_kv_metadata",
+                            time.perf_counter() - _t0_sparse_patch,
+                        )
             if (
                 sparse_per_head_block_table is not None
                 and sparse_per_head_seq_lens is not None
