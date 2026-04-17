@@ -920,16 +920,19 @@ class FlashAttentionImpl(AttentionImpl):
                         total_end.synchronize()
                         fa_ms = float(fa_start.elapsed_time(fa_end))
                         total_ms = float(total_start.elapsed_time(total_end))
-                    logger.info(
-                        "[FullPerfFA] paged_decode total_ms=%.3f fa_ms=%.3f "
-                        "num_q_heads=%d num_tok=%d max_seqlen_q=%d max_seqlen_k=%d",
-                        total_ms,
-                        fa_ms,
-                        int(query.shape[1]),
-                        int(num_actual_tokens),
-                        int(max_seqlen_q),
-                        int(max_seqlen_k),
-                    )
+                    # Keep the full-attention comparison on the same decode-only
+                    # footing as SparsePerfFA: one query token per sequence.
+                    if int(max_seqlen_q) == 1:
+                        logger.info(
+                            "[FullPerfFA] paged_decode total_ms=%.3f fa_ms=%.3f "
+                            "num_q_heads=%d num_tok=%d max_seqlen_q=%d max_seqlen_k=%d",
+                            total_ms,
+                            fa_ms,
+                            int(query.shape[1]),
+                            int(num_actual_tokens),
+                            int(max_seqlen_q),
+                            int(max_seqlen_k),
+                        )
                 return output
 
         # Cascade attention (rare case).
