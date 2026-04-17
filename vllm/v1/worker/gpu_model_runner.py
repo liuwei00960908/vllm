@@ -7701,7 +7701,7 @@ class GPUModelRunner(
         layer_name: str,
         query: torch.Tensor,
         spec: SparseAttentionSpec,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...] | None:
+    ) -> dict[str, torch.Tensor] | None:
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
         perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
         perf_local_ms: dict[str, float] = defaultdict(float)
@@ -7848,7 +7848,9 @@ class GPUModelRunner(
                 )
 
             _t_finalize = time.perf_counter() if perf_enabled else None
-            triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            phys_per_head: list[np.ndarray] = []
+            slot_per_head: list[np.ndarray] = []
+            cu_per_head: list[np.ndarray] = []
             for qh_idx in range(num_heads):
                 if not phys_chunks[qh_idx]:
                     return None
@@ -7863,34 +7865,47 @@ class GPUModelRunner(
                     phys_np[offset:offset + chunk_len] = phys_chunk
                     slot_np[offset:offset + chunk_len] = slot_chunk
                     offset += chunk_len
-                triples.append(
-                    (
-                        torch.as_tensor(
-                            phys_np,
-                            dtype=torch.int32,
-                            device=query.device,
-                        ),
-                        torch.as_tensor(
-                            slot_np,
-                            dtype=torch.int32,
-                            device=query.device,
-                        ),
-                        torch.as_tensor(
-                            np.asarray(cu_lists[qh_idx], dtype=np.int32),
-                            dtype=torch.int32,
-                            device=query.device,
-                        ),
-                    )
-                )
+                phys_per_head.append(phys_np)
+                slot_per_head.append(slot_np)
+                cu_per_head.append(np.asarray(cu_lists[qh_idx], dtype=np.int32))
             _perf_add(
                 "_build_sparse_runtime_q_head_gather:finalize_cat",
                 _t_finalize,
             )
+            total_phys_len = sum(int(arr.size) for arr in phys_per_head)
+            flat_phys_np = np.empty(total_phys_len, dtype=np.int32)
+            flat_slot_np = np.empty(total_phys_len, dtype=np.int32)
+            head_offsets_np = np.empty(num_heads + 1, dtype=np.int32)
+            cu_mat_np = np.empty((num_heads, num_reqs + 1), dtype=np.int32)
+            head_offsets_np[0] = 0
+            offset = 0
+            for qh_idx in range(num_heads):
+                phys_np = phys_per_head[qh_idx]
+                slot_np = slot_per_head[qh_idx]
+                chunk_len = int(phys_np.size)
+                flat_phys_np[offset:offset + chunk_len] = phys_np
+                flat_slot_np[offset:offset + chunk_len] = slot_np
+                offset += chunk_len
+                head_offsets_np[qh_idx + 1] = offset
+                cu_mat_np[qh_idx] = cu_per_head[qh_idx]
             if perf_enabled and perf_local_ms:
                 for k, ms in perf_local_ms.items():
                     self._sparse_perf_accum_ms[k] += ms
                     self._sparse_perf_accum_calls[k] += 1
-            return tuple(triples)
+            return {
+                "phys": torch.as_tensor(
+                    flat_phys_np, dtype=torch.int32, device=query.device
+                ),
+                "slots": torch.as_tensor(
+                    flat_slot_np, dtype=torch.int32, device=query.device
+                ),
+                "cu": torch.as_tensor(
+                    cu_mat_np, dtype=torch.int32, device=query.device
+                ),
+                "head_offsets": torch.as_tensor(
+                    head_offsets_np, dtype=torch.int32, device=query.device
+                ),
+            }
         finally:
             if _t0 is not None:
                 self._sparse_perf_record(

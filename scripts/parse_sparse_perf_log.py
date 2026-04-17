@@ -40,6 +40,14 @@ SPARSE_PERF_FA_RE = re.compile(
     r"(?:\s+num_tok=(?P<num_tok>\d+))?"
     r"(?:\s+max_seqlen_q=(?P<max_seqlen_q>\d+))?"
 )
+FULL_PERF_FA_RE = re.compile(
+    r"\[FullPerfFA\]\s+(?P<key>\S+)\s+total_ms=(?P<total_ms>\d+(?:\.\d+)?)\s+"
+    r"fa_ms=(?P<fa_ms>\d+(?:\.\d+)?)"
+    r"(?:\s+num_q_heads=(?P<num_q_heads>\d+))?"
+    r"(?:\s+num_tok=(?P<num_tok>\d+))?"
+    r"(?:\s+max_seqlen_q=(?P<max_seqlen_q>\d+))?"
+    r"(?:\s+max_seqlen_k=(?P<max_seqlen_k>\d+))?"
+)
 
 
 @dataclass
@@ -87,6 +95,7 @@ class FaAgg:
 def parse_log(path: Path) -> dict:
     perf_by_key: dict[str, PerfAgg] = defaultdict(PerfAgg)
     fa_by_key: dict[str, FaAgg] = defaultdict(FaAgg)
+    full_fa_by_key: dict[str, FaAgg] = defaultdict(FaAgg)
     dynamic_update_by_layer: dict[str, dict[str, int]] = defaultdict(
         lambda: {"events": 0, "added_clusters": 0, "last_total_clusters": 0}
     )
@@ -94,6 +103,7 @@ def parse_log(path: Path) -> dict:
     empty_windows = 0
     perf_lines = 0
     perf_fa_lines = 0
+    full_perf_fa_lines = 0
 
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for raw_line in f:
@@ -128,6 +138,24 @@ def parse_log(path: Path) -> dict:
                 agg = fa_by_key[key]
                 agg.total_ms += float(m.group("total_ms"))
                 agg.gather_ms += float(m.group("gather_ms"))
+                agg.fa_ms += float(m.group("fa_ms"))
+                agg.calls += 1
+                if m.group("num_q_heads") is not None:
+                    agg.num_q_heads_sum += int(m.group("num_q_heads"))
+                if m.group("num_tok") is not None:
+                    agg.num_tok_sum += int(m.group("num_tok"))
+                if m.group("max_seqlen_q") is not None:
+                    agg.max_seqlen_q_max = max(
+                        agg.max_seqlen_q_max, int(m.group("max_seqlen_q"))
+                    )
+                continue
+
+            m = FULL_PERF_FA_RE.search(line)
+            if m:
+                full_perf_fa_lines += 1
+                key = m.group("key")
+                agg = full_fa_by_key[key]
+                agg.total_ms += float(m.group("total_ms"))
                 agg.fa_ms += float(m.group("fa_ms"))
                 agg.calls += 1
                 if m.group("num_q_heads") is not None:
@@ -189,6 +217,29 @@ def parse_log(path: Path) -> dict:
             }
         )
 
+    full_fa_summary = []
+    for key, agg in sorted(
+        full_fa_by_key.items(), key=lambda kv: kv[1].total_ms, reverse=True
+    ):
+        full_fa_summary.append(
+            {
+                "key": key,
+                "total_ms": round(agg.total_ms, 3),
+                "fa_ms": round(agg.fa_ms, 3),
+                "calls": agg.calls,
+                "avg_total_ms": round(agg.avg_total_ms, 4),
+                "avg_fa_ms": round(agg.avg_fa_ms, 4),
+                "fa_share": round(agg.fa_share, 4),
+                "avg_num_q_heads": round(
+                    agg.num_q_heads_sum / agg.calls, 3
+                ) if agg.calls else 0.0,
+                "avg_num_tok": round(
+                    agg.num_tok_sum / agg.calls, 3
+                ) if agg.calls else 0.0,
+                "max_seqlen_q_max": agg.max_seqlen_q_max,
+            }
+        )
+
     dynamic_summary = []
     for layer, stats in sorted(
         dynamic_update_by_layer.items(),
@@ -201,10 +252,12 @@ def parse_log(path: Path) -> dict:
         "log_path": str(path),
         "perf_window_lines": perf_lines,
         "perf_fa_lines": perf_fa_lines,
+        "full_perf_fa_lines": full_perf_fa_lines,
         "empty_windows": empty_windows,
         "window_steps_values": sorted(set(window_steps)),
         "perf_summary": perf_summary,
         "fa_summary": fa_summary,
+        "full_fa_summary": full_fa_summary,
         "dynamic_update_summary": dynamic_summary,
     }
 
@@ -214,6 +267,7 @@ def render_text(summary: dict, top_n: int) -> str:
     lines.append(f"log: {summary['log_path']}")
     lines.append(f"sparse perf windows: {summary['perf_window_lines']}")
     lines.append(f"sparse perf fa lines: {summary['perf_fa_lines']}")
+    lines.append(f"full perf fa lines: {summary['full_perf_fa_lines']}")
     lines.append(f"empty windows: {summary['empty_windows']}")
     if summary["window_steps_values"]:
         vals = ", ".join(str(v) for v in summary["window_steps_values"])
@@ -257,6 +311,21 @@ def render_text(summary: dict, top_n: int) -> str:
             lines.append(
                 "  {layer}: events={events} added_clusters={added_clusters} "
                 "last_total_clusters={last_total_clusters}".format(**row)
+            )
+
+    lines.append("")
+    lines.append("Top FullPerfFA entries:")
+    full_fa_rows = summary["full_fa_summary"][:top_n]
+    if not full_fa_rows:
+        lines.append("  (none)")
+    else:
+        for row in full_fa_rows:
+            lines.append(
+                "  {key}: total_ms={total_ms:.3f} fa_ms={fa_ms:.3f} calls={calls} "
+                "avg_total_ms={avg_total_ms:.4f} avg_fa_ms={avg_fa_ms:.4f} "
+                "fa_share={fa_share:.2%} avg_num_q_heads={avg_num_q_heads} "
+                "avg_num_tok={avg_num_tok} max_seqlen_q_max={max_seqlen_q_max}"
+                .format(**row)
             )
 
     return "\n".join(lines)

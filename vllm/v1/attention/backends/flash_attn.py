@@ -242,6 +242,13 @@ class FlashAttentionMetadata:
     sparse_q_head_gather: (
         tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...] | None
     ) = None
+    # Flattened per query-head compact gather: phys/slots are flattened across
+    # heads, with head_offsets marking each head segment and cu_k stored as
+    # [num_heads, num_reqs + 1].
+    sparse_q_head_gather_flat_phys: torch.Tensor | None = None
+    sparse_q_head_gather_flat_slots: torch.Tensor | None = None
+    sparse_q_head_gather_flat_cu_seqlens_k: torch.Tensor | None = None
+    sparse_q_head_gather_head_offsets: torch.Tensor | None = None
     # Per query-head block-table sparse decode: [H, num_seqs, max_blocks], [H, num_seqs].
     sparse_per_head_block_table: torch.Tensor | None = None
     sparse_per_head_seq_lens: torch.Tensor | None = None
@@ -753,7 +760,10 @@ class FlashAttentionImpl(AttentionImpl):
                     else None
                 )
                 use_q_head_gather = (
-                    attn_metadata.sparse_q_head_gather is not None
+                    (
+                        attn_metadata.sparse_q_head_gather is not None
+                        or attn_metadata.sparse_q_head_gather_flat_phys is not None
+                    )
                     and self.alibi_slopes is None
                     and self.sinks is None
                     and sliding_window_size == [-1, -1]
@@ -763,18 +773,44 @@ class FlashAttentionImpl(AttentionImpl):
                     layer, "_vllm_sparse_runtime_q_head_gather", None
                 )
                 if runtime_q_head_gather is not None:
-                    attn_metadata = replace(
-                        attn_metadata,
-                        sparse_q_head_gather=runtime_q_head_gather,
-                        sparse_gather_phys=None,
-                        sparse_gather_slots=None,
-                        sparse_gather_cu_seqlens_k=None,
-                    )
+                    if isinstance(runtime_q_head_gather, dict):
+                        attn_metadata = replace(
+                            attn_metadata,
+                            sparse_q_head_gather=None,
+                            sparse_q_head_gather_flat_phys=runtime_q_head_gather[
+                                "phys"
+                            ],
+                            sparse_q_head_gather_flat_slots=runtime_q_head_gather[
+                                "slots"
+                            ],
+                            sparse_q_head_gather_flat_cu_seqlens_k=(
+                                runtime_q_head_gather["cu"]
+                            ),
+                            sparse_q_head_gather_head_offsets=(
+                                runtime_q_head_gather["head_offsets"]
+                            ),
+                            sparse_gather_phys=None,
+                            sparse_gather_slots=None,
+                            sparse_gather_cu_seqlens_k=None,
+                        )
+                    else:
+                        attn_metadata = replace(
+                            attn_metadata,
+                            sparse_q_head_gather=runtime_q_head_gather,
+                            sparse_q_head_gather_flat_phys=None,
+                            sparse_q_head_gather_flat_slots=None,
+                            sparse_q_head_gather_flat_cu_seqlens_k=None,
+                            sparse_q_head_gather_head_offsets=None,
+                            sparse_gather_phys=None,
+                            sparse_gather_slots=None,
+                            sparse_gather_cu_seqlens_k=None,
+                        )
                     use_q_head_gather = True
                 use_gather = (
                     attn_metadata.sparse_gather_phys is not None
                     and attn_metadata.sparse_gather_cu_seqlens_k is not None
                     and attn_metadata.sparse_q_head_gather is None
+                    and attn_metadata.sparse_q_head_gather_flat_phys is None
                     and self.alibi_slopes is None
                     and self.sinks is None
                     and sliding_window_size == [-1, -1]
@@ -785,7 +821,7 @@ class FlashAttentionImpl(AttentionImpl):
                 logger.info(
                     "[SparseDebug] FA sparse branch layer=%s num_tok=%d "
                     "use_q_head_gather=%s use_gather=%s use_per_head_bt=%s | "
-                    "sparse_q_head_gather=%s sparse_gather_phys=%s sparse_per_head_bt=%s | "
+                    "sparse_q_head_gather=%s sparse_q_head_gather_flat=%s sparse_gather_phys=%s sparse_per_head_bt=%s | "
                     "alibi=%s sinks=%s sliding=%s fp8_kv=%s",
                     getattr(layer, "__class__", type(layer)).__name__,
                     int(num_actual_tokens),
@@ -793,6 +829,7 @@ class FlashAttentionImpl(AttentionImpl):
                     use_gather,
                     use_per_head_bt,
                     attn_metadata.sparse_q_head_gather is not None,
+                    attn_metadata.sparse_q_head_gather_flat_phys is not None,
                     attn_metadata.sparse_gather_phys is not None,
                     attn_metadata.sparse_per_head_block_table is not None,
                     self.alibi_slopes is not None,
@@ -844,6 +881,16 @@ class FlashAttentionImpl(AttentionImpl):
                         v_descale,
                     )
                 else:
+                    total_ms = 0.0
+                    fa_ms = 0.0
+                    use_cuda_timing = bool(query.is_cuda)
+                    if use_cuda_timing:
+                        total_start = torch.cuda.Event(enable_timing=True)
+                        total_end = torch.cuda.Event(enable_timing=True)
+                        fa_start = torch.cuda.Event(enable_timing=True)
+                        fa_end = torch.cuda.Event(enable_timing=True)
+                        total_start.record()
+                        fa_start.record()
                     flash_attn_varlen_func(
                         q=query[:num_actual_tokens],
                         k=key_cache,
@@ -866,6 +913,22 @@ class FlashAttentionImpl(AttentionImpl):
                         v_descale=v_descale,
                         num_splits=attn_metadata.max_num_splits,
                         s_aux=self.sinks,
+                    )
+                    if use_cuda_timing:
+                        fa_end.record()
+                        total_end.record()
+                        total_end.synchronize()
+                        fa_ms = float(fa_start.elapsed_time(fa_end))
+                        total_ms = float(total_start.elapsed_time(total_end))
+                    logger.info(
+                        "[FullPerfFA] paged_decode total_ms=%.3f fa_ms=%.3f "
+                        "num_q_heads=%d num_tok=%d max_seqlen_q=%d max_seqlen_k=%d",
+                        total_ms,
+                        fa_ms,
+                        int(query.shape[1]),
+                        int(num_actual_tokens),
+                        int(max_seqlen_q),
+                        int(max_seqlen_k),
                     )
                 return output
 
@@ -967,12 +1030,24 @@ class FlashAttentionImpl(AttentionImpl):
         v_descale: torch.Tensor,
     ) -> None:
         """One compact-KV varlen FA call per query head (token-sparse)."""
-        assert attn_metadata.sparse_q_head_gather is not None
+        assert (
+            attn_metadata.sparse_q_head_gather is not None
+            or attn_metadata.sparse_q_head_gather_flat_phys is not None
+        )
+        flat_phys = attn_metadata.sparse_q_head_gather_flat_phys
+        flat_slots = attn_metadata.sparse_q_head_gather_flat_slots
+        flat_cu = attn_metadata.sparse_q_head_gather_flat_cu_seqlens_k
+        head_offsets = attn_metadata.sparse_q_head_gather_head_offsets
+        num_q_heads_gather = (
+            int(head_offsets.numel() - 1)
+            if head_offsets is not None
+            else len(attn_metadata.sparse_q_head_gather)
+        )
         # TODO(sparse-debug): remove after locating compact-gather routing issues.
         logger.info(
             "[SparseDebug] _forward_per_head_compact_kv_gather ENTER "
             "num_q_heads_gather=%d q_shape0=%d max_seqlen_q=%d",
-            len(attn_metadata.sparse_q_head_gather),
+            num_q_heads_gather,
             int(query.shape[0]),
             int(max_seqlen_q),
         )
@@ -989,8 +1064,19 @@ class FlashAttentionImpl(AttentionImpl):
             total_start = torch.cuda.Event(enable_timing=True)
             total_end = torch.cuda.Event(enable_timing=True)
             total_start.record()
-        for qh, trip in enumerate(attn_metadata.sparse_q_head_gather):
-            phys, slots, cu_k = trip
+        for qh in range(num_q_heads_gather):
+            if flat_phys is not None:
+                assert flat_slots is not None
+                assert flat_cu is not None
+                assert head_offsets is not None
+                off0 = int(head_offsets[qh].item())
+                off1 = int(head_offsets[qh + 1].item())
+                phys = flat_phys[off0:off1]
+                slots = flat_slots[off0:off1]
+                cu_k = flat_cu[qh]
+            else:
+                assert attn_metadata.sparse_q_head_gather is not None
+                phys, slots, cu_k = attn_metadata.sparse_q_head_gather[qh]
             if use_cuda_timing:
                 gather_start = torch.cuda.Event(enable_timing=True)
                 gather_end = torch.cuda.Event(enable_timing=True)
@@ -1048,7 +1134,7 @@ class FlashAttentionImpl(AttentionImpl):
             total_ms,
             gather_ms,
             fa_ms,
-            len(attn_metadata.sparse_q_head_gather),
+            num_q_heads_gather,
             int(query.shape[0]),
             int(max_seqlen_q),
         )
