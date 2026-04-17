@@ -1031,7 +1031,7 @@ class FlashAttentionImpl(AttentionImpl):
         q_descale: torch.Tensor,
         k_descale: torch.Tensor,
         v_descale: torch.Tensor,
-    ) -> None:
+        ) -> None:
         """One compact-KV varlen FA call per query head (token-sparse)."""
         assert (
             attn_metadata.sparse_q_head_gather is not None
@@ -1067,45 +1067,84 @@ class FlashAttentionImpl(AttentionImpl):
             total_start = torch.cuda.Event(enable_timing=True)
             total_end = torch.cuda.Event(enable_timing=True)
             total_start.record()
-        for qh in range(num_q_heads_gather):
-            if flat_phys is not None:
-                assert flat_slots is not None
-                assert flat_cu is not None
-                assert head_offsets is not None
-                off0 = int(head_offsets[qh].item())
-                off1 = int(head_offsets[qh + 1].item())
-                phys = flat_phys[off0:off1]
-                slots = flat_slots[off0:off1]
-                cu_k = flat_cu[qh]
-            else:
-                assert attn_metadata.sparse_q_head_gather is not None
-                phys, slots, cu_k = attn_metadata.sparse_q_head_gather[qh]
+        if (
+            flat_phys is not None
+            and flat_slots is not None
+            and flat_cu is not None
+            and head_offsets is not None
+            and int(max_seqlen_q) == 1
+            and int(query.shape[0]) == int(cu_seqlens_q.numel() - 1)
+        ):
             if use_cuda_timing:
                 gather_start = torch.cuda.Event(enable_timing=True)
                 gather_end = torch.cuda.Event(enable_timing=True)
                 fa_start = torch.cuda.Event(enable_timing=True)
                 fa_end = torch.cuda.Event(enable_timing=True)
                 gather_start.record()
-            phys64 = phys.to(dtype=torch.int64, device=key_cache.device)
-            slots64 = slots.to(dtype=torch.int64, device=key_cache.device)
-            kv_h = qh // max(self.num_queries_per_kv, 1)
-            k_slice = key_cache[phys64, slots64, kv_h]
-            v_slice = value_cache[phys64, slots64, kv_h]
+            num_reqs = int(query.shape[0])
+            head_ids = torch.arange(
+                num_q_heads_gather, dtype=torch.int64, device=query.device
+            )
+            kv_head_ids = head_ids // max(self.num_queries_per_kv, 1)
+            head_token_counts = (
+                head_offsets[1:].to(dtype=torch.int64)
+                - head_offsets[:-1].to(dtype=torch.int64)
+            )
+            kv_token_ids = kv_head_ids.repeat_interleave(head_token_counts)
+            phys64 = flat_phys.to(dtype=torch.int64, device=key_cache.device)
+            slots64 = flat_slots.to(dtype=torch.int64, device=key_cache.device)
+            kv_token_ids = kv_token_ids.to(device=key_cache.device)
+            k_slice = key_cache[phys64, slots64, kv_token_ids]
+            v_slice = value_cache[phys64, slots64, kv_token_ids]
             k_compact = k_slice.unsqueeze(1)
             v_compact = v_slice.unsqueeze(1)
-            k_lens = cu_k[1:] - cu_k[:-1]
+
+            q_flat = (
+                query.transpose(0, 1)
+                .contiguous()
+                .view(num_q_heads_gather * num_reqs, 1, query.shape[-1])
+            )
+            out_flat = torch.empty_like(q_flat)
+            q_lens = torch.ones(
+                num_q_heads_gather * num_reqs,
+                dtype=cu_seqlens_q.dtype,
+                device=query.device,
+            )
+            cu_q_flat = torch.empty(
+                int(q_lens.numel()) + 1,
+                dtype=cu_seqlens_q.dtype,
+                device=query.device,
+            )
+            cu_q_flat[0] = 0
+            cu_q_flat[1:] = torch.cumsum(q_lens, dim=0)
+
+            k_lens = (flat_cu[:, 1:] - flat_cu[:, :-1]).reshape(-1)
+            cu_k_flat = torch.empty(
+                int(k_lens.numel()) + 1,
+                dtype=flat_cu.dtype,
+                device=flat_cu.device,
+            )
+            cu_k_flat[0] = 0
+            cu_k_flat[1:] = torch.cumsum(k_lens, dim=0)
             max_seqlen_k = int(k_lens.max().item())
+
+            req_ids = torch.arange(num_reqs, dtype=torch.int64, device=query.device)
+            req_ids = req_ids.repeat(num_q_heads_gather)
+            kv_pair_ids = kv_head_ids.repeat_interleave(num_reqs)
+            q_descale_flat = q_descale[req_ids, kv_pair_ids].view(-1, 1)
+            k_descale_flat = k_descale[req_ids, kv_pair_ids].view(-1, 1)
+            v_descale_flat = v_descale[req_ids, kv_pair_ids].view(-1, 1)
             if use_cuda_timing:
                 gather_end.record()
                 fa_start.record()
             flash_attn_varlen_func(
-                q=query[:, qh : qh + 1, :],
+                q=q_flat,
                 k=k_compact,
                 v=v_compact,
-                out=output[:, qh : qh + 1, :],
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                cu_seqlens_k=cu_k,
+                out=out_flat,
+                cu_seqlens_q=cu_q_flat,
+                max_seqlen_q=1,
+                cu_seqlens_k=cu_k_flat,
                 seqused_k=None,
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.scale,
@@ -1116,17 +1155,83 @@ class FlashAttentionImpl(AttentionImpl):
                 softcap=self.logits_soft_cap,
                 scheduler_metadata=None,
                 fa_version=self.vllm_flash_attn_version,
-                q_descale=q_descale[:, kv_h : kv_h + 1],
-                k_descale=k_descale[:, kv_h : kv_h + 1],
-                v_descale=v_descale[:, kv_h : kv_h + 1],
+                q_descale=q_descale_flat,
+                k_descale=k_descale_flat,
+                v_descale=v_descale_flat,
                 num_splits=0,
                 s_aux=None,
+            )
+            output.copy_(
+                out_flat.view(num_q_heads_gather, num_reqs, query.shape[-1])
+                .transpose(0, 1)
+                .contiguous()
             )
             if use_cuda_timing:
                 fa_end.record()
                 fa_end.synchronize()
                 gather_ms += float(gather_start.elapsed_time(gather_end))
                 fa_ms += float(fa_start.elapsed_time(fa_end))
+        else:
+            for qh in range(num_q_heads_gather):
+                if flat_phys is not None:
+                    assert flat_slots is not None
+                    assert flat_cu is not None
+                    assert head_offsets is not None
+                    off0 = int(head_offsets[qh].item())
+                    off1 = int(head_offsets[qh + 1].item())
+                    phys = flat_phys[off0:off1]
+                    slots = flat_slots[off0:off1]
+                    cu_k = flat_cu[qh]
+                else:
+                    assert attn_metadata.sparse_q_head_gather is not None
+                    phys, slots, cu_k = attn_metadata.sparse_q_head_gather[qh]
+                if use_cuda_timing:
+                    gather_start = torch.cuda.Event(enable_timing=True)
+                    gather_end = torch.cuda.Event(enable_timing=True)
+                    fa_start = torch.cuda.Event(enable_timing=True)
+                    fa_end = torch.cuda.Event(enable_timing=True)
+                    gather_start.record()
+                phys64 = phys.to(dtype=torch.int64, device=key_cache.device)
+                slots64 = slots.to(dtype=torch.int64, device=key_cache.device)
+                kv_h = qh // max(self.num_queries_per_kv, 1)
+                k_slice = key_cache[phys64, slots64, kv_h]
+                v_slice = value_cache[phys64, slots64, kv_h]
+                k_compact = k_slice.unsqueeze(1)
+                v_compact = v_slice.unsqueeze(1)
+                k_lens = cu_k[1:] - cu_k[:-1]
+                max_seqlen_k = int(k_lens.max().item())
+                if use_cuda_timing:
+                    gather_end.record()
+                    fa_start.record()
+                flash_attn_varlen_func(
+                    q=query[:, qh : qh + 1, :],
+                    k=k_compact,
+                    v=v_compact,
+                    out=output[:, qh : qh + 1, :],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    cu_seqlens_k=cu_k,
+                    seqused_k=None,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=None,
+                    window_size=win,
+                    block_table=None,
+                    softcap=self.logits_soft_cap,
+                    scheduler_metadata=None,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale[:, kv_h : kv_h + 1],
+                    k_descale=k_descale[:, kv_h : kv_h + 1],
+                    v_descale=v_descale[:, kv_h : kv_h + 1],
+                    num_splits=0,
+                    s_aux=None,
+                )
+                if use_cuda_timing:
+                    fa_end.record()
+                    fa_end.synchronize()
+                    gather_ms += float(gather_start.elapsed_time(gather_end))
+                    fa_ms += float(fa_start.elapsed_time(fa_end))
         if use_cuda_timing:
             total_end.record()
             total_end.synchronize()
