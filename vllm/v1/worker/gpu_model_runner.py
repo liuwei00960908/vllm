@@ -564,6 +564,52 @@ class _SparseOnlineLayerState:
         self._b2c_storage[self._len].copy_(cluster_id)
         self._len += 1
 
+    @staticmethod
+    def bulk_append(
+        states: "list[_SparseOnlineLayerState]",
+        feats_stack: torch.Tensor,
+        clusters_stack: torch.Tensor,
+    ) -> None:
+        """Append one decode-step feature to each of ``states`` in batch.
+
+        ``feats_stack`` is a ``[U, D]`` tensor, ``clusters_stack`` is ``[U]``
+        int64; entry ``i`` is appended to ``states[i]``.  Compared to calling
+        :meth:`append_decode_feature` in a Python loop this collapses
+        ``2 * U`` small ``copy_`` kernel launches into two fused
+        ``torch._foreach_copy_`` launches, eliminating the per-(layer, kv_head)
+        launch overhead that dominates ``_update_sparse_online_index``.
+        """
+        u = len(states)
+        if u == 0:
+            return
+        assert feats_stack.shape[0] == u, (feats_stack.shape, u)
+        assert clusters_stack.shape[0] == u, (clusters_stack.shape, u)
+
+        # First ensure every storage has room for one more entry.  This is a
+        # pure-Python loop but is a no-op on the fast path (storage was grown
+        # geometrically on a previous append).  Any rare realloc happens here
+        # and not on the hot tensor-level path below.
+        for s in states:
+            s._grow_if_needed(1)
+
+        abf_dsts: list[torch.Tensor] = [
+            s._abf_storage[s._len] for s in states
+        ]
+        b2c_dsts: list[torch.Tensor] = [
+            s._b2c_storage[s._len] for s in states
+        ]
+        abf_srcs: list[torch.Tensor] = list(feats_stack.unbind(0))
+        b2c_srcs: list[torch.Tensor] = list(clusters_stack.unbind(0))
+
+        # ``torch._foreach_copy_`` is a multi-tensor fused copy available since
+        # PyTorch 2.0.  It is the only stable way to execute ``U`` element-wise
+        # copies with a single kernel launch for non-overlapping destinations.
+        torch._foreach_copy_(abf_dsts, abf_srcs)
+        torch._foreach_copy_(b2c_dsts, b2c_srcs)
+
+        for s in states:
+            s._len += 1
+
 
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
@@ -8388,6 +8434,17 @@ class GPUModelRunner(
                 ]
             else:
                 iter_src = []
+
+            # ------------------------------------------------------------
+            # Pass 1: gather every (state, feat_t, spec) unit for this step.
+            # Collecting once lets Pass 2 / Pass 3 batch across all
+            # (layer, kv_head) pairs instead of launching small kernels in a
+            # Python loop (which used to dominate the decode critical path –
+            # 28 layers x 4 kv_heads x ~3 kernels / unit ~= 300 launches).
+            # ------------------------------------------------------------
+            pass1_states: list[_SparseOnlineLayerState] = []
+            pass1_feats: list[torch.Tensor] = []
+            pass1_specs: list[SparseAttentionSpec] = []
             for req_id, unit_map, is_gpu in iter_src:
                 req_states = self._sparse_online_index.get(req_id)
                 if not req_states:
@@ -8411,21 +8468,83 @@ class GPUModelRunner(
                         feat_t = torch.as_tensor(
                             feat, dtype=torch.float32, device=self.device
                         )
-                    if int(state.cluster_centres.shape[0]) > 0:
-                        centered_feat = feat_t - state.mean_key
-                        centred_c = state.cluster_centres - state.mean_key
-                        nearest = torch.argmax(
-                            torch.matmul(centred_c, centered_feat)
-                        ).to(dtype=torch.int64)
-                    else:
-                        nearest = torch.zeros(
-                            (), dtype=torch.int64, device=self.device
-                        )
-                    state.append_decode_feature(feat_t, nearest)
-                    state.decode_block_buffer.append(feat_t)
-                    if (len(state.decode_block_buffer)
-                            >= int(spec.update_threshold_tokens)):
-                        self._sparse_online_dynamic_update(state)
+                    pass1_states.append(state)
+                    pass1_feats.append(feat_t)
+                    pass1_specs.append(spec)
+
+            if not pass1_states:
+                return
+
+            device = pass1_feats[0].device
+
+            # ------------------------------------------------------------
+            # Pass 2 + Pass 3: bucket units by (K, D) and, for each bucket,
+            # fuse the nearest-cluster argmax (single ``bmm``) with the
+            # multi-tensor append (single ``torch._foreach_copy_``).
+            #
+            # Why bucket by D: ``torch.stack`` requires identical shapes, and
+            # different layers can legally have different ``head_size`` (e.g.
+            # MLA / MQA layers coexisting with GQA).  Within a bucket all
+            # tensors share shape so we get a single ``bmm`` instead of one
+            # small matmul per unit.  In the common homogeneous case there is
+            # exactly one bucket, collapsing up to ~L*KH launches into O(1).
+            # ------------------------------------------------------------
+            buckets: dict[
+                tuple[int, int], list[int]
+            ] = {}
+            for i, s in enumerate(pass1_states):
+                k = int(s.cluster_centres.shape[0])
+                d = (
+                    int(s.mean_key.shape[0])
+                    if s.mean_key.dim() >= 1 else 0
+                )
+                buckets.setdefault((k, d), []).append(i)
+
+            for (k, d), idxs in buckets.items():
+                bucket_states = [pass1_states[i] for i in idxs]
+                bucket_feats = [pass1_feats[i] for i in idxs]
+                feats_g = torch.stack(bucket_feats, dim=0)  # [G, D]
+                g = feats_g.shape[0]
+
+                if k == 0 or d == 0:
+                    # Degenerate state – ``nearest`` is forced to 0 (matching
+                    # the legacy scalar ``torch.zeros(())`` path) and we skip
+                    # the bmm entirely.
+                    nearest_g = torch.zeros(
+                        g, dtype=torch.int64, device=device
+                    )
+                else:
+                    means_g = torch.stack(
+                        [s.mean_key for s in bucket_states], dim=0
+                    )  # [G, D]
+                    centres_g = torch.stack(
+                        [s.cluster_centres for s in bucket_states], dim=0
+                    )  # [G, K, D]
+                    centered = (feats_g - means_g).unsqueeze(-1)  # [G, D, 1]
+                    centred_c = centres_g - means_g.unsqueeze(1)  # [G, K, D]
+                    dots = torch.bmm(centred_c, centered).squeeze(-1)  # [G, K]
+                    nearest_g = dots.argmax(dim=-1).to(dtype=torch.int64)
+
+                _SparseOnlineLayerState.bulk_append(
+                    bucket_states, feats_g, nearest_g
+                )
+
+            # ------------------------------------------------------------
+            # Pass 4: per-state bookkeeping that stays in Python (it's
+            # trivially cheap – only list ``append`` and an ``int`` compare,
+            # no GPU work).  Dynamic K-Means updates are rare (fire every
+            # ``update_threshold_tokens`` decode steps) so we keep the
+            # existing path intact instead of trying to batch them.
+            # ------------------------------------------------------------
+            for state, feat_t, spec in zip(
+                pass1_states, pass1_feats, pass1_specs, strict=True
+            ):
+                state.decode_block_buffer.append(feat_t)
+                if (
+                    len(state.decode_block_buffer)
+                    >= int(spec.update_threshold_tokens)
+                ):
+                    self._sparse_online_dynamic_update(state)
         finally:
             if _t0 is not None:
                 self._sparse_perf_record(
