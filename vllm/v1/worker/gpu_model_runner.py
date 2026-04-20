@@ -5112,6 +5112,11 @@ class GPUModelRunner(
                 + _decode_perf_postprocess_ms
             )
             other_ms = max(0.0, total_ms - known_ms)
+            _t_decode_perf_log = (
+                time.perf_counter()
+                if self._sparse_perf_stats_enabled and self._has_sparse_attn
+                else None
+            )
             logger.info(
                 "[DecodePerf] mode=%s total_ms=%.3f preprocess_ms=%.3f "
                 "update_states_ms=%.3f prepare_inputs_ms=%.3f "
@@ -5140,6 +5145,18 @@ class GPUModelRunner(
                 int(has_kv_transfer_group()),
                 cudagraph_mode.name,
             )
+            if _t_decode_perf_log is not None:
+                # Direct measurement of the per-step ``[DecodePerf]``
+                # logger.info cost.  This lands in the ``sample_tokens_ms``
+                # share of ``[DecodePerfE2E]`` because ``step_exec_ms`` is
+                # captured BEFORE the logger.info fires (so sample_ms absorbs
+                # it).  If this key reports >> 1 ms on sparse and ~0 ms on
+                # full, we have our smoking gun for the 70 ms gap between
+                # ``sample_tokens:total`` and ``avg_sample_tokens_ms``.
+                self._sparse_perf_record(
+                    "execute_model:decode_perf_log",
+                    time.perf_counter() - _t_decode_perf_log,
+                )
         # Stamp exit time AFTER the log so ``sample_tokens`` can isolate the
         # engine-side gap (apply_grammar_bitmask, PP, IPC, ...) – this
         # quantity is normally 0 for single-process TP=1, and any non-trivial
@@ -5164,6 +5181,29 @@ class GPUModelRunner(
             # One-shot: clear so a non-decode execute_model cannot leak into
             # the next sample_tokens window.
             self._decode_perf_step_exec_exit_t = None
+        if (
+            _st_t0 is not None
+            and self._decode_perf_step_t0 is not None
+            and self._decode_perf_step_exec_ms > 0.0
+        ):
+            # Full gap from ``[DecodePerf]`` exec_ms measurement point to
+            # here.  This INCLUDES the ``logger.info`` call and any Python
+            # tail work between line 5104 (exec_ms stamp) and line 5148
+            # (exec_exit_t).  If this is ~ ``entry_gap_after_execute_model``
+            # then logger is cheap; if it's orders of magnitude bigger, the
+            # 70 ms gap between ``sample_tokens:total`` and
+            # ``avg_sample_tokens_ms`` is logger-info time absorbed into
+            # sample_ms.
+            exec_ms_stamp = (
+                self._decode_perf_step_t0
+                + self._decode_perf_step_exec_ms / 1000.0
+            )
+            gap = _st_t0 - exec_ms_stamp
+            if gap > 0.0:
+                self._sparse_perf_record(
+                    "sample_tokens:entry_gap_from_exec_ms_stamp",
+                    gap,
+                )
         if self.execute_model_state is None:
             # These short-circuit branches do not correspond to a completed
             # decode step (PP pass-through / empty KV-transfer).  Drop the
