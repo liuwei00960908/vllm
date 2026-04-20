@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -59,6 +60,14 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+
+# Gates all sparse-attention debug logs and the CUDA-event-based per-call timing
+# used inside the FA forward (``[SparseDebug]`` / ``[SparsePerfFA]`` /
+# ``[FullPerfFA]``).  Both the event.synchronize() calls and the log formatting
+# are skipped when this is 0, which removes a substantial stall budget from the
+# sparse decode hot path.  Default off.
+_SPARSE_PERF_DEBUG: bool = int(os.getenv("VLLM_SPARSE_PERF_DEBUG", "0")) == 1
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -252,6 +261,11 @@ class FlashAttentionMetadata:
     # Per query-head block-table sparse decode: [H, num_seqs, max_blocks], [H, num_seqs].
     sparse_per_head_block_table: torch.Tensor | None = None
     sparse_per_head_seq_lens: torch.Tensor | None = None
+    # Upper bound on per-(head, req) selected token count for the compact
+    # gather path.  Supplied by ``_build_sparse_runtime_q_head_gather`` via the
+    # ``max_k`` key on the runtime gather dict, which lets FA skip a
+    # ``.max().item()`` GPU sync when calling ``flash_attn_varlen_func``.
+    sparse_q_head_gather_max_k: int | None = None
 
 
 def _get_sliding_window_configs(
@@ -789,6 +803,9 @@ class FlashAttentionImpl(AttentionImpl):
                             sparse_q_head_gather_head_offsets=(
                                 runtime_q_head_gather["head_offsets"]
                             ),
+                            sparse_q_head_gather_max_k=(
+                                runtime_q_head_gather.get("max_k")
+                            ),
                             sparse_gather_phys=None,
                             sparse_gather_slots=None,
                             sparse_gather_cu_seqlens_k=None,
@@ -801,6 +818,7 @@ class FlashAttentionImpl(AttentionImpl):
                             sparse_q_head_gather_flat_slots=None,
                             sparse_q_head_gather_flat_cu_seqlens_k=None,
                             sparse_q_head_gather_head_offsets=None,
+                            sparse_q_head_gather_max_k=None,
                             sparse_gather_phys=None,
                             sparse_gather_slots=None,
                             sparse_gather_cu_seqlens_k=None,
@@ -817,26 +835,26 @@ class FlashAttentionImpl(AttentionImpl):
                     and not self.kv_cache_dtype.startswith("fp8")
                 )
                 use_per_head_bt = attn_metadata.sparse_per_head_block_table is not None
-                # TODO(sparse-debug): remove after locating compact-gather routing issues.
-                logger.info(
-                    "[SparseDebug] FA sparse branch layer=%s num_tok=%d "
-                    "use_q_head_gather=%s use_gather=%s use_per_head_bt=%s | "
-                    "sparse_q_head_gather=%s sparse_q_head_gather_flat=%s sparse_gather_phys=%s sparse_per_head_bt=%s | "
-                    "alibi=%s sinks=%s sliding=%s fp8_kv=%s",
-                    getattr(layer, "__class__", type(layer)).__name__,
-                    int(num_actual_tokens),
-                    use_q_head_gather,
-                    use_gather,
-                    use_per_head_bt,
-                    attn_metadata.sparse_q_head_gather is not None,
-                    attn_metadata.sparse_q_head_gather_flat_phys is not None,
-                    attn_metadata.sparse_gather_phys is not None,
-                    attn_metadata.sparse_per_head_block_table is not None,
-                    self.alibi_slopes is not None,
-                    self.sinks is not None,
-                    sliding_window_size,
-                    bool(self.kv_cache_dtype.startswith("fp8")),
-                )
+                if _SPARSE_PERF_DEBUG:
+                    logger.info(
+                        "[SparseDebug] FA sparse branch layer=%s num_tok=%d "
+                        "use_q_head_gather=%s use_gather=%s use_per_head_bt=%s | "
+                        "sparse_q_head_gather=%s sparse_q_head_gather_flat=%s sparse_gather_phys=%s sparse_per_head_bt=%s | "
+                        "alibi=%s sinks=%s sliding=%s fp8_kv=%s",
+                        getattr(layer, "__class__", type(layer)).__name__,
+                        int(num_actual_tokens),
+                        use_q_head_gather,
+                        use_gather,
+                        use_per_head_bt,
+                        attn_metadata.sparse_q_head_gather is not None,
+                        attn_metadata.sparse_q_head_gather_flat_phys is not None,
+                        attn_metadata.sparse_gather_phys is not None,
+                        attn_metadata.sparse_per_head_block_table is not None,
+                        self.alibi_slopes is not None,
+                        self.sinks is not None,
+                        sliding_window_size,
+                        bool(self.kv_cache_dtype.startswith("fp8")),
+                    )
                 if use_q_head_gather:
                     self._forward_per_head_compact_kv_gather(
                         query[:num_actual_tokens],
@@ -881,9 +899,7 @@ class FlashAttentionImpl(AttentionImpl):
                         v_descale,
                     )
                 else:
-                    total_ms = 0.0
-                    fa_ms = 0.0
-                    use_cuda_timing = bool(query.is_cuda)
+                    use_cuda_timing = _SPARSE_PERF_DEBUG and bool(query.is_cuda)
                     if use_cuda_timing:
                         total_start = torch.cuda.Event(enable_timing=True)
                         total_end = torch.cuda.Event(enable_timing=True)
@@ -920,19 +936,20 @@ class FlashAttentionImpl(AttentionImpl):
                         total_end.synchronize()
                         fa_ms = float(fa_start.elapsed_time(fa_end))
                         total_ms = float(total_start.elapsed_time(total_end))
-                    # Keep the full-attention comparison on the same decode-only
-                    # footing as SparsePerfFA: one query token per sequence.
-                    if int(max_seqlen_q) == 1:
-                        logger.info(
-                            "[FullPerfFA] paged_decode total_ms=%.3f fa_ms=%.3f "
-                            "num_q_heads=%d num_tok=%d max_seqlen_q=%d max_seqlen_k=%d",
-                            total_ms,
-                            fa_ms,
-                            int(query.shape[1]),
-                            int(num_actual_tokens),
-                            int(max_seqlen_q),
-                            int(max_seqlen_k),
-                        )
+                        # Keep the full-attention comparison on the same
+                        # decode-only footing as SparsePerfFA: one query token
+                        # per sequence.
+                        if int(max_seqlen_q) == 1:
+                            logger.info(
+                                "[FullPerfFA] paged_decode total_ms=%.3f fa_ms=%.3f "
+                                "num_q_heads=%d num_tok=%d max_seqlen_q=%d max_seqlen_k=%d",
+                                total_ms,
+                                fa_ms,
+                                int(query.shape[1]),
+                                int(num_actual_tokens),
+                                int(max_seqlen_q),
+                                int(max_seqlen_k),
+                            )
                 return output
 
         # Cascade attention (rare case).
@@ -1046,18 +1063,18 @@ class FlashAttentionImpl(AttentionImpl):
             if head_offsets is not None
             else len(attn_metadata.sparse_q_head_gather)
         )
-        # TODO(sparse-debug): remove after locating compact-gather routing issues.
-        logger.info(
-            "[SparseDebug] _forward_per_head_compact_kv_gather ENTER "
-            "num_q_heads_gather=%d q_shape0=%d max_seqlen_q=%d",
-            num_q_heads_gather,
-            int(query.shape[0]),
-            int(max_seqlen_q),
-        )
+        if _SPARSE_PERF_DEBUG:
+            logger.info(
+                "[SparseDebug] _forward_per_head_compact_kv_gather ENTER "
+                "num_q_heads_gather=%d q_shape0=%d max_seqlen_q=%d",
+                num_q_heads_gather,
+                int(query.shape[0]),
+                int(max_seqlen_q),
+            )
         total_ms = 0.0
         gather_ms = 0.0
         fa_ms = 0.0
-        use_cuda_timing = bool(query.is_cuda)
+        use_cuda_timing = _SPARSE_PERF_DEBUG and bool(query.is_cuda)
         win = (
             list(self.sliding_window)
             if self.sliding_window is not None
@@ -1067,6 +1084,10 @@ class FlashAttentionImpl(AttentionImpl):
             total_start = torch.cuda.Event(enable_timing=True)
             total_end = torch.cuda.Event(enable_timing=True)
             total_start.record()
+        # Pessimistic upper bound for FA's max_seqlen_k.  The runtime gather
+        # builder attaches an ``int`` budget via ``sparse_q_head_gather_max_k``;
+        # using that avoids the per-call ``.max().item()`` GPU→CPU sync.
+        max_k_hint = attn_metadata.sparse_q_head_gather_max_k
         if (
             flat_phys is not None
             and flat_slots is not None
@@ -1126,7 +1147,10 @@ class FlashAttentionImpl(AttentionImpl):
             )
             cu_k_flat[0] = 0
             cu_k_flat[1:] = torch.cumsum(k_lens, dim=0)
-            max_seqlen_k = int(k_lens.max().item())
+            if max_k_hint is not None:
+                max_seqlen_k = int(max_k_hint)
+            else:
+                max_seqlen_k = int(k_lens.max().item())
 
             req_ids = torch.arange(num_reqs, dtype=torch.int64, device=query.device)
             req_ids = req_ids.repeat(num_q_heads_gather)
@@ -1198,8 +1222,11 @@ class FlashAttentionImpl(AttentionImpl):
                 v_slice = value_cache[phys64, slots64, kv_h]
                 k_compact = k_slice.unsqueeze(1)
                 v_compact = v_slice.unsqueeze(1)
-                k_lens = cu_k[1:] - cu_k[:-1]
-                max_seqlen_k = int(k_lens.max().item())
+                if max_k_hint is not None:
+                    max_seqlen_k = int(max_k_hint)
+                else:
+                    k_lens = cu_k[1:] - cu_k[:-1]
+                    max_seqlen_k = int(k_lens.max().item())
                 if use_cuda_timing:
                     gather_end.record()
                     fa_start.record()
@@ -1236,16 +1263,16 @@ class FlashAttentionImpl(AttentionImpl):
             total_end.record()
             total_end.synchronize()
             total_ms = float(total_start.elapsed_time(total_end))
-        logger.info(
-            "[SparsePerfFA] compact_kv_gather total_ms=%.3f gather_ms=%.3f "
-            "fa_ms=%.3f num_q_heads=%d num_tok=%d max_seqlen_q=%d",
-            total_ms,
-            gather_ms,
-            fa_ms,
-            num_q_heads_gather,
-            int(query.shape[0]),
-            int(max_seqlen_q),
-        )
+            logger.info(
+                "[SparsePerfFA] compact_kv_gather total_ms=%.3f gather_ms=%.3f "
+                "fa_ms=%.3f num_q_heads=%d num_tok=%d max_seqlen_q=%d",
+                total_ms,
+                gather_ms,
+                fa_ms,
+                num_q_heads_gather,
+                int(query.shape[0]),
+                int(max_seqlen_q),
+            )
 
     def _forward_per_head_block_table_sparse(
         self,

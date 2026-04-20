@@ -649,7 +649,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": 32},
         )
         runner._has_sparse_attn = False
-        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm, _ = runner._collect_sparse_features(sched, 1)
         assert bf is None and qv is None and nbf is None
 
     # ── 4b: prefill completing ────────────────────────────────────────────────
@@ -666,7 +666,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": n_blocks * BLOCK_SIZE},
             blocks_per_req=[list(range(n_blocks))],
         )
-        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm, _ = runner._collect_sparse_features(sched, 1)
 
         assert bf is not None, "block_features must be emitted at prefill done"
         assert "r0" in bf
@@ -707,7 +707,7 @@ class TestCollectSparseFeatures:
             kv_data=kv,
             n_layers=1,
         )
-        bf, _, _, _ = runner._collect_sparse_features(sched, 1)
+        bf, _, _, _, _ = runner._collect_sparse_features(sched, 1)
         assert bf is not None
         ln0 = runner.kv_cache_config.kv_cache_groups[0].layer_names[0]
         # block 0: all K = 1.0; block 1: all K = 2.0 (same for every KV head)
@@ -733,7 +733,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": chunk_len},
             blocks_per_req=[list(range(2))],
         )
-        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm, _ = runner._collect_sparse_features(sched, 1)
         assert bf is None and qv is None and nbf is None
 
     # ── 4d: decode step ───────────────────────────────────────────────────────
@@ -750,7 +750,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": 1},
             blocks_per_req=[list(range(n_blocks))],
         )
-        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm, _ = runner._collect_sparse_features(sched, 1)
 
         assert bf is None, "block_features should NOT be emitted during decode"
         assert qv is not None, "query_vectors must be emitted during decode"
@@ -781,7 +781,7 @@ class TestCollectSparseFeatures:
             kv_data=kv,
             n_layers=1,
         )
-        _, _, nbf, _ = runner._collect_sparse_features(sched, 1)
+        _, _, nbf, _, _ = runner._collect_sparse_features(sched, 1)
         assert nbf is not None
         ln0 = runner.kv_cache_config.kv_cache_groups[0].layer_names[0]
         for kv_h in range(nh):
@@ -816,7 +816,7 @@ class TestCollectSparseFeatures:
                 (total_tokens, q_dim), float(i + 1)
             )
 
-        _, qv, _, _ = runner._collect_sparse_features(sched, 1)
+        _, qv, _, _, _ = runner._collect_sparse_features(sched, 1)
         assert qv is not None
         for i, ln in enumerate(
             runner.kv_cache_config.kv_cache_groups[0].layer_names
@@ -851,7 +851,7 @@ class TestCollectSparseFeatures:
             kv = torch.full((2, n_blocks, bs, nh, hs), float(i * 2 + 1))
             runner.compilation_config.static_forward_context[ln].kv_cache = [kv]
 
-        bf, _, _, _ = runner._collect_sparse_features(sched, 1)
+        bf, _, _, _, _ = runner._collect_sparse_features(sched, 1)
         assert bf is not None
         for i, ln in enumerate(
             runner.kv_cache_config.kv_cache_groups[0].layer_names
@@ -880,7 +880,7 @@ class TestCollectSparseFeatures:
             num_scheduled={"r0": n_blocks * BLOCK_SIZE, "r1": 1},
             blocks_per_req=[list(range(n_blocks)), list(range(n_blocks))],
         )
-        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 2)
+        bf, qv, nbf, _pcm, _ = runner._collect_sparse_features(sched, 2)
 
         assert bf is not None and "r0" in bf
         assert "r1" not in (bf or {})
@@ -903,7 +903,7 @@ class TestCollectSparseFeatures:
         )
         runner._sparse_q_captures.clear()  # simulate hook not firing
 
-        bf, qv, nbf, _pcm = runner._collect_sparse_features(sched, 1)
+        bf, qv, nbf, _pcm, _ = runner._collect_sparse_features(sched, 1)
         # block_features can still be extracted from KV cache
         assert bf is not None and "r0" in bf
         # query_vectors should be absent (no Q captured)
@@ -1281,7 +1281,7 @@ class TestFullPrefillDecodeCycle:
             blocks_per_req=[list(range(n_blocks))],
             n_layers=1,
         )
-        bf, qv, nbf, pcm = runner_mid._collect_sparse_features(sched_mid, 1)
+        bf, qv, nbf, pcm, _ = runner_mid._collect_sparse_features(sched_mid, 1)
         assert bf is None and qv is None and nbf is None
         self._simulate_step(kvcm, mgr, bf, qv, nbf, pcm)
         assert req_id not in mgr._layer_states
@@ -1300,7 +1300,7 @@ class TestFullPrefillDecodeCycle:
         layer0 = runner_prefill.kv_cache_config.kv_cache_groups[0].layer_names[0]
         # Real collect path keys features as layer##kv{h}, not legacy __flat__##kv0.
         sparse_rep_key = sparse_kv_unit_key(layer0, 0)
-        bf, qv, nbf, pcm = runner_prefill._collect_sparse_features(
+        bf, qv, nbf, pcm, _ = runner_prefill._collect_sparse_features(
             sched_prefill, 1
         )
         assert bf is not None and qv is not None and nbf is None
@@ -1323,7 +1323,7 @@ class TestFullPrefillDecodeCycle:
                 blocks_per_req=[list(range(n_blocks))],
                 n_layers=1,
             )
-            bf, qv, nbf, pcm = runner_dec._collect_sparse_features(sched_dec, 1)
+            bf, qv, nbf, pcm, _ = runner_dec._collect_sparse_features(sched_dec, 1)
             assert bf is None and qv is not None and nbf is not None
             self._simulate_step(kvcm, mgr, bf, qv, nbf, pcm)
 

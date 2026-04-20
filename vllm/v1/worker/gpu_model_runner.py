@@ -412,14 +412,149 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
-@dataclass
 class _SparseOnlineLayerState:
-    cluster_centres: torch.Tensor
-    cluster_size: torch.Tensor
-    block_to_cluster: torch.Tensor
-    all_block_features: torch.Tensor
-    mean_key: torch.Tensor
-    decode_block_buffer: list[torch.Tensor] = field(default_factory=list)
+    """Per-(layer, kv_head) online index state for token-granularity sparse.
+
+    ``all_block_features`` and ``block_to_cluster`` are stored in
+    pre-allocated growth buffers.  Decode appends one row per step; the legacy
+    ``torch.cat`` path allocates + copies the entire tensor every step, which
+    costs O(decode_len) per step and dominates the decode critical path for
+    long contexts.  Exposing ``block_to_cluster`` / ``all_block_features`` via
+    properties that slice the underlying storage preserves the previous
+    read-side contract (including in-place slice writes like
+    ``state.block_to_cluster[-m:] = ...`` in dynamic kmeans updates).
+    """
+
+    __slots__ = (
+        "cluster_centres",
+        "cluster_size",
+        "mean_key",
+        "decode_block_buffer",
+        "_abf_storage",
+        "_b2c_storage",
+        "_len",
+    )
+
+    def __init__(
+        self,
+        cluster_centres: torch.Tensor,
+        cluster_size: torch.Tensor,
+        block_to_cluster: torch.Tensor,
+        all_block_features: torch.Tensor,
+        mean_key: torch.Tensor,
+    ) -> None:
+        self.cluster_centres = cluster_centres
+        self.cluster_size = cluster_size
+        self.mean_key = mean_key
+        self.decode_block_buffer: list[torch.Tensor] = []
+
+        n = int(all_block_features.shape[0])
+        head_size = int(all_block_features.shape[1]) if all_block_features.dim() >= 2 else 0
+        cap = max(n * 2, 128)
+        self._abf_storage = torch.empty(
+            (cap, head_size) if head_size > 0 else (cap,),
+            dtype=all_block_features.dtype,
+            device=all_block_features.device,
+        )
+        if n > 0:
+            self._abf_storage[:n].copy_(all_block_features)
+        self._b2c_storage = torch.empty(
+            cap,
+            dtype=block_to_cluster.dtype,
+            device=block_to_cluster.device,
+        )
+        if n > 0:
+            self._b2c_storage[:n].copy_(block_to_cluster)
+        self._len = n
+
+    @property
+    def block_to_cluster(self) -> torch.Tensor:
+        return self._b2c_storage[: self._len]
+
+    @block_to_cluster.setter
+    def block_to_cluster(self, value: torch.Tensor) -> None:
+        """Replace ``block_to_cluster`` contents.
+
+        Only used by ``_sparse_online_dynamic_update`` fallbacks that rebuild
+        the entire label vector.  Preserves the pre-allocated capacity when
+        ``value.numel() <= capacity``.
+        """
+        n = int(value.numel())
+        if n > int(self._b2c_storage.shape[0]):
+            self._b2c_storage = torch.empty(
+                max(n, int(self._b2c_storage.shape[0]) * 2),
+                dtype=value.dtype,
+                device=value.device,
+            )
+        self._b2c_storage[:n].copy_(value)
+        self._len = n
+
+    @property
+    def all_block_features(self) -> torch.Tensor:
+        return self._abf_storage[: self._len]
+
+    @all_block_features.setter
+    def all_block_features(self, value: torch.Tensor) -> None:
+        """Replace ``all_block_features`` contents (full rewrite path)."""
+        n = int(value.shape[0])
+        head_size = int(value.shape[1]) if value.dim() >= 2 else 0
+        storage_head_size = (
+            int(self._abf_storage.shape[1]) if self._abf_storage.dim() >= 2 else 0
+        )
+        needs_realloc = (
+            n > int(self._abf_storage.shape[0])
+            or head_size != storage_head_size
+            or value.dtype != self._abf_storage.dtype
+            or value.device != self._abf_storage.device
+        )
+        if needs_realloc:
+            cap = max(n, int(self._abf_storage.shape[0]) * 2)
+            self._abf_storage = torch.empty(
+                (cap, head_size) if head_size > 0 else (cap,),
+                dtype=value.dtype,
+                device=value.device,
+            )
+        self._abf_storage[:n].copy_(value)
+        self._len = n
+
+    def _grow_if_needed(self, extra: int) -> None:
+        needed = self._len + extra
+        cap = int(self._abf_storage.shape[0])
+        if needed <= cap:
+            return
+        new_cap = cap if cap > 0 else 128
+        while new_cap < needed:
+            new_cap *= 2
+        head_size = (
+            int(self._abf_storage.shape[1]) if self._abf_storage.dim() >= 2 else 0
+        )
+        new_abf = torch.empty(
+            (new_cap, head_size) if head_size > 0 else (new_cap,),
+            dtype=self._abf_storage.dtype,
+            device=self._abf_storage.device,
+        )
+        new_abf[: self._len].copy_(self._abf_storage[: self._len])
+        self._abf_storage = new_abf
+        new_b2c = torch.empty(
+            new_cap,
+            dtype=self._b2c_storage.dtype,
+            device=self._b2c_storage.device,
+        )
+        new_b2c[: self._len].copy_(self._b2c_storage[: self._len])
+        self._b2c_storage = new_b2c
+
+    def append_decode_feature(
+        self, feat: torch.Tensor, cluster_id: torch.Tensor
+    ) -> None:
+        """Append one decode-step feature with its cluster id.
+
+        ``feat`` is a ``[head_size]`` tensor already on the correct device.
+        ``cluster_id`` is a 0-dim int64 tensor on the correct device.
+        """
+        self._grow_if_needed(1)
+        self._abf_storage[self._len].copy_(feat)
+        self._b2c_storage[self._len].copy_(cluster_id)
+        self._len += 1
 
 
 class GPUModelRunner(
@@ -574,6 +709,11 @@ class GPUModelRunner(
         self._sparse_chrono_phys: dict[str, list[int]] = {}
         self._sparse_layer_spec_by_name: dict[str, SparseAttentionSpec] = {}
         self._sparse_layer_gid_by_name: dict[str, int] = {}
+        # Per-layer static context lazily populated on first sparse forward.
+        # Holds ``num_heads``, ``num_kv_heads``, ``head_size`` and the cached
+        # ``kv_to_qh_tensor`` mapping so ``_build_sparse_runtime_q_head_gather``
+        # does not rebuild them every step.
+        self._sparse_layer_ctx: dict[str, dict[str, object]] = {}
         self._sparse_online_index: dict[str, dict[str, _SparseOnlineLayerState]] = {}
         # Snapshot of per-request output length BEFORE this step appends sampled
         # tokens. Used by sparse feature collection to classify prefill/decode
@@ -5077,6 +5217,7 @@ class GPUModelRunner(
                 sparse_query_vectors,
                 sparse_new_block_features,
                 sparse_prefill_cluster_meta,
+                sparse_new_block_features_gpu,
             ) = self._collect_sparse_features(
                 scheduler_output, self.input_batch.num_reqs
             )
@@ -5084,6 +5225,7 @@ class GPUModelRunner(
                 sparse_block_features,
                 sparse_prefill_cluster_meta,
                 sparse_new_block_features,
+                sparse_new_block_features_gpu,
             )
             if _t0_sparse_collect is not None:
                 self._sparse_perf_record(
@@ -7701,116 +7843,116 @@ class GPUModelRunner(
         total_tokens: int,
         spec: SparseAttentionSpec,
     ) -> torch.Tensor:
+        """Return ``[num_q_heads, total_tokens]`` bool selection mask.
+
+        Rewrite notes (behaviour must remain bitwise-equivalent to the legacy
+        implementation):
+
+        * Removed three GPU→CPU sync points:
+
+          - the ``(combined_counts <= budget).all().item()`` early-return,
+          - the ``steady_mask.sum().item()`` steady count,
+          - the ``nonsteady_retr_mask.any().item()`` guard.
+
+          The early-return is equivalent to the top-k path with ``k = cap``:
+          when ``combined_count_h <= budget`` we have ``nonsteady_retr_h <=
+          cap``, and ``torch.topk(masked_scores, k=cap)`` returns all valid
+          non-steady retrieve tokens (the remaining ``-inf`` padding is
+          filtered by ``isfinite``), so ``steady | selected_nonsteady`` equals
+          ``combined_mask`` in that case.  The empty-retrieve guard is
+          similarly subsumed by the ``isfinite`` filter.
+
+        * ``steady_count`` is now computed from ``spec`` + ``total_tokens``
+          with plain Python int math (no tensor ``.sum()`` involved).
+
+        * ``labels`` is taken as a direct view of ``state.block_to_cluster``
+          (already int64 on the correct device) instead of an extra ``.to()``.
+        """
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
         try:
             if q.dim() == 1:
                 q = q.unsqueeze(0)
+            device = q.device
+            H = int(q.shape[0])
+            N = int(total_tokens)
             budget = int(spec.sparse_selection_budget())
             if budget <= 0:
-                return torch.zeros(
-                    (int(q.shape[0]), int(total_tokens)),
-                    dtype=torch.bool,
-                    device=q.device,
-                )
-            head = min(int(spec.static_pattern_start), int(total_tokens))
-            steady_head = torch.arange(head, dtype=torch.int64, device=q.device)
-            tail_start = max(0, int(total_tokens) - int(spec.static_pattern_end))
-            steady_tail = torch.arange(
-                tail_start, int(total_tokens), dtype=torch.int64, device=q.device
-            )
-            token_ids = torch.arange(
-                int(total_tokens), dtype=torch.int64, device=q.device
-            )
-            steady_tokens = torch.unique(
-                torch.cat([steady_head, steady_tail], dim=0)
-            ) if steady_head.numel() > 0 or steady_tail.numel() > 0 else torch.empty(
-                0, dtype=torch.int64, device=q.device
-            )
-            steady_mask = torch.zeros(
-                int(total_tokens), dtype=torch.bool, device=q.device
-            )
-            if steady_tokens.numel() > 0:
-                steady_mask[steady_tokens] = True
-            indexed_tokens = min(
-                int(total_tokens),
-                int(state.block_to_cluster.shape[0]),
-            )
+                return torch.zeros((H, N), dtype=torch.bool, device=device)
+
+            head_n = min(int(spec.static_pattern_start), N)
+            tail_start = max(0, N - int(spec.static_pattern_end))
+            if head_n >= tail_start:
+                # Head and tail overlap: every token in [0, N) is steady.
+                steady_count = N
+            else:
+                steady_count = head_n + (N - tail_start)
+            steady_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            if head_n > 0:
+                steady_mask[:head_n] = True
+            if tail_start < N:
+                steady_mask[tail_start:] = True
+            steady_row = steady_mask.unsqueeze(0)
+
+            indexed_tokens = min(N, int(state.block_to_cluster.shape[0]))
 
             if (state.cluster_centres.numel() == 0
                     or state.block_to_cluster.numel() == 0):
-                fallback_start = max(0, int(total_tokens) - budget)
-                fallback_mask = torch.zeros(
-                    int(total_tokens), dtype=torch.bool, device=q.device
-                )
-                fallback_mask[fallback_start:int(total_tokens)] = True
-                return fallback_mask.unsqueeze(0) | steady_mask.unsqueeze(0)
+                fallback_start = max(0, N - budget)
+                fallback_mask = torch.zeros(N, dtype=torch.bool, device=device)
+                fallback_mask[fallback_start:N] = True
+                return fallback_mask.unsqueeze(0) | steady_row
 
             scores_c = torch.matmul(
                 q.to(dtype=torch.float32), state.cluster_centres.transpose(0, 1)
-            ) / float(max(int(q.shape[-1]), 1))**0.5
+            ) / float(max(int(q.shape[-1]), 1)) ** 0.5
             nprobe = min(int(spec.nprobe), int(state.cluster_centres.shape[0]))
             if nprobe <= 0:
-                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+                return steady_row.expand(H, -1).contiguous()
             top_clusters = torch.topk(scores_c, k=nprobe, dim=-1).indices.to(
                 dtype=torch.int64
             )
-            labels = state.block_to_cluster.to(
-                dtype=torch.int64, device=q.device
-            )[:indexed_tokens]
+            labels = state.block_to_cluster[:indexed_tokens]
+            if labels.dtype != torch.int64:
+                labels = labels.to(dtype=torch.int64)
             if labels.numel() == 0 or indexed_tokens <= 0:
-                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+                return steady_row.expand(H, -1).contiguous()
             cluster_mask = torch.zeros(
-                (int(q.shape[0]), int(state.cluster_centres.shape[0])),
+                (H, int(state.cluster_centres.shape[0])),
                 dtype=torch.bool,
-                device=q.device,
+                device=device,
             )
             cluster_mask.scatter_(1, top_clusters, True)
-            retr_mask_indexed = cluster_mask[:, labels]
-            retr_mask = torch.zeros(
-                (int(q.shape[0]), int(total_tokens)),
-                dtype=torch.bool,
-                device=q.device,
-            )
+            retr_mask_indexed = cluster_mask[:, labels]  # [H, indexed_tokens]
+            retr_mask = torch.zeros((H, N), dtype=torch.bool, device=device)
             retr_mask[:, :indexed_tokens] = retr_mask_indexed
-            combined_mask = retr_mask | steady_mask.unsqueeze(0)
-            if int(combined_mask.shape[1]) == 0:
-                return combined_mask
 
-            combined_counts = combined_mask.sum(dim=1)
-            if bool((combined_counts <= budget).all()):
-                return combined_mask
-
-            steady_count = int(steady_mask.sum().item())
             cap = max(0, budget - steady_count)
             if cap <= 0:
-                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+                return steady_row.expand(H, -1).contiguous()
 
-            nonsteady_retr_mask = retr_mask & ~steady_mask.unsqueeze(0)
-            if not bool(nonsteady_retr_mask.any()):
-                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+            nonsteady_retr_mask = retr_mask & ~steady_row
 
             token_scores_indexed = scores_c.gather(
-                1, labels.unsqueeze(0).expand(int(q.shape[0]), indexed_tokens)
+                1, labels.unsqueeze(0).expand(H, indexed_tokens)
             )
             token_scores = torch.full(
-                (int(q.shape[0]), int(total_tokens)),
+                (H, N),
                 float("-inf"),
                 dtype=token_scores_indexed.dtype,
-                device=q.device,
+                device=device,
             )
             token_scores[:, :indexed_tokens] = token_scores_indexed
             masked_scores = token_scores.masked_fill(
-                ~nonsteady_retr_mask,
-                float("-inf"),
+                ~nonsteady_retr_mask, float("-inf")
             )
-            k = min(cap, int(token_ids.numel()))
+            k = min(cap, N)
             if k <= 0:
-                return steady_mask.unsqueeze(0).expand(int(q.shape[0]), -1)
+                return steady_row.expand(H, -1).contiguous()
             top_vals, top_idx = torch.topk(masked_scores, k=k, dim=1)
             valid = torch.isfinite(top_vals)
             selected_nonsteady = torch.zeros_like(nonsteady_retr_mask)
             selected_nonsteady.scatter_(1, top_idx, valid)
-            return steady_mask.unsqueeze(0) | selected_nonsteady
+            return steady_row | selected_nonsteady
         finally:
             if _t0 is not None:
                 self._sparse_perf_record(
@@ -7825,6 +7967,26 @@ class GPUModelRunner(
         query: torch.Tensor,
         spec: SparseAttentionSpec,
     ) -> dict[str, torch.Tensor] | None:
+        """Build the per-query-head compact gather metadata for FA.
+
+        Rewrite notes (bitwise-equivalent to the legacy per-head numpy path):
+
+        * Removed the ``selected_mask.detach().cpu().numpy()`` D2H and the
+          matching ``torch.as_tensor(..., device=query.device)`` H2D at the end.
+          All packing (block index, slot, physical block id, per-head cu) is
+          performed on GPU via ``torch.nonzero`` + ``index_select`` +
+          ``cumsum``.  ``torch.nonzero`` introduces a single implicit sync per
+          request which was already present in the legacy path (via
+          ``.cpu().numpy()``), so total sync count is unchanged.
+
+        * Per-head static mapping (``kv_to_qh_tensor`` etc.) is cached on
+          ``self._sparse_layer_ctx`` – it is fully determined by
+          ``num_heads`` / ``num_kv_heads`` and does not change across steps.
+
+        * Adds ``max_k`` to the returned dict (= ``spec.sparse_selection_budget()``),
+          used by ``FlashAttentionImpl._forward_per_head_compact_kv_gather``
+          to skip a ``.max().item()`` sync when calling FA varlen.
+        """
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
         perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
         perf_local_ms: dict[str, float] = defaultdict(float)
@@ -7833,16 +7995,52 @@ class GPUModelRunner(
             if start_t is None:
                 return
             perf_local_ms[name] += (time.perf_counter() - start_t) * 1000.0
+
         try:
             kv_cache_gid = self._sparse_layer_gid_by_name.get(layer_name)
             if kv_cache_gid is None:
                 return None
-            attn_mod = self.compilation_config.static_forward_context.get(layer_name)
-            if attn_mod is None:
-                return None
-            num_heads = int(attn_mod.num_heads)
-            num_kv_heads = int(getattr(attn_mod, "num_kv_heads", 1))
-            head_size = int(attn_mod.head_size)
+
+            ctx = self._sparse_layer_ctx.get(layer_name)
+            if ctx is None:
+                attn_mod = self.compilation_config.static_forward_context.get(
+                    layer_name
+                )
+                if attn_mod is None:
+                    return None
+                _t_qh_map = time.perf_counter() if perf_enabled else None
+                num_heads_i = int(attn_mod.num_heads)
+                num_kv_heads_i = int(getattr(attn_mod, "num_kv_heads", 1))
+                head_size_i = int(attn_mod.head_size)
+                qh_to_kv = [
+                    self._sparse_online_qh_to_kv_index(
+                        qh_idx, num_heads_i, num_kv_heads_i
+                    )
+                    for qh_idx in range(num_heads_i)
+                ]
+                kv_to_qh: dict[int, list[int]] = defaultdict(list)
+                for qh_idx, kv_idx in enumerate(qh_to_kv):
+                    kv_to_qh[kv_idx].append(qh_idx)
+                kv_to_qh_tensor = {
+                    kv_idx: torch.tensor(
+                        qh_indices, dtype=torch.int64, device=query.device
+                    )
+                    for kv_idx, qh_indices in kv_to_qh.items()
+                }
+                ctx = {
+                    "num_heads": num_heads_i,
+                    "num_kv_heads": num_kv_heads_i,
+                    "head_size": head_size_i,
+                    "kv_to_qh_tensor": kv_to_qh_tensor,
+                }
+                self._sparse_layer_ctx[layer_name] = ctx
+                _perf_add(
+                    "_build_sparse_runtime_q_head_gather:qhead_map", _t_qh_map
+                )
+            num_heads = int(ctx["num_heads"])
+            head_size = int(ctx["head_size"])
+            kv_to_qh_tensor = ctx["kv_to_qh_tensor"]
+
             num_reqs = int(self.input_batch.num_reqs)
             if num_reqs <= 0:
                 return None
@@ -7851,26 +8049,7 @@ class GPUModelRunner(
                 query.view(-1, num_heads, head_size)
                 if query.dim() != 3 else query
             )
-            _t_qh_map = time.perf_counter() if perf_enabled else None
-            qh_to_kv = [
-                self._sparse_online_qh_to_kv_index(qh_idx, num_heads, num_kv_heads)
-                for qh_idx in range(num_heads)
-            ]
-            kv_to_qh: dict[int, list[int]] = defaultdict(list)
-            for qh_idx, kv_idx in enumerate(qh_to_kv):
-                kv_to_qh[kv_idx].append(qh_idx)
-            kv_to_qh_tensor = {
-                kv_idx: torch.tensor(
-                    qh_indices, dtype=torch.int64, device=query.device
-                )
-                for kv_idx, qh_indices in kv_to_qh.items()
-            }
-            _perf_add("_build_sparse_runtime_q_head_gather:qhead_map", _t_qh_map)
 
-            phys_chunks: list[list[np.ndarray]] = [[] for _ in range(num_heads)]
-            slot_chunks: list[list[np.ndarray]] = [[] for _ in range(num_heads)]
-            cu_lists: list[list[int]] = [[0] for _ in range(num_heads)]
-            total_selected_per_head = [0 for _ in range(num_heads)]
             forward_additional_kwargs = (
                 get_forward_context().additional_kwargs
                 if is_forward_context_available()
@@ -7884,6 +8063,18 @@ class GPUModelRunner(
             lmcache_rows_by_req: dict[str, list[list[int]]] = {}
             blk_tbl = self.input_batch.block_table[kv_cache_gid]
             bsz = int(spec.block_size)
+            budget = int(spec.sparse_selection_budget())
+
+            # Per-req GPU accumulators.  ``nonzero`` returns row-major order
+            # (head first, then token), so for each req the appended
+            # ``head_ids`` is already head-major and within each head sorted by
+            # token.  A stable argsort by (head, req) at the end yields the
+            # final head-major flat layout.
+            per_req_head_ids: list[torch.Tensor] = []
+            per_req_phys: list[torch.Tensor] = []
+            per_req_slots: list[torch.Tensor] = []
+            per_req_counts: list[torch.Tensor] = []
+
             for req_idx in range(num_reqs):
                 _t_req = time.perf_counter() if perf_enabled else None
                 rid = self.input_batch.req_ids[req_idx]
@@ -7908,7 +8099,9 @@ class GPUModelRunner(
 
                 q_tok = q_flat[tok_end - 1].to(dtype=torch.float32)
                 selected_mask = torch.zeros(
-                    (num_heads, seq_len), dtype=torch.bool, device=query.device
+                    (num_heads, seq_len),
+                    dtype=torch.bool,
+                    device=query.device,
                 )
                 _t_select = time.perf_counter() if perf_enabled else None
                 for kv_idx, qh_indices_t in kv_to_qh_tensor.items():
@@ -7929,103 +8122,93 @@ class GPUModelRunner(
                     _t_select,
                 )
 
+                # Post-prompt tokens are always included.
                 selected_mask[:, p_count:seq_len] = True
-                _t_block_ids = time.perf_counter() if perf_enabled else None
+
+                _t_pack = time.perf_counter() if perf_enabled else None
                 n_blks = int(blk_tbl.num_blocks_per_row[req_idx])
-                token_ids_np = np.arange(seq_len, dtype=np.int64)
                 bt_row_np = blk_tbl.block_table.np[req_idx, :n_blks]
-                selected_mask_np = selected_mask.detach().cpu().numpy()
+                bt_row_gpu = torch.from_numpy(
+                    np.ascontiguousarray(bt_row_np)
+                ).to(device=query.device, dtype=torch.int64)
+                # ``nonzero`` produces ``[N, 2]`` with row-major ordering:
+                # primary key = head id, secondary key = token id.  Output
+                # size is data-dependent → one implicit GPU sync per req,
+                # matching the legacy ``.cpu().numpy()`` sync footprint.
+                nz = torch.nonzero(selected_mask, as_tuple=False)
+                head_ids_r = nz[:, 0]
+                tok_ids_r = nz[:, 1]
+                block_idx = tok_ids_r // int(bsz)
+                slots_r = (tok_ids_r - block_idx * int(bsz)).to(torch.int32)
+                phys_r = bt_row_gpu.index_select(0, block_idx).to(torch.int32)
+                counts_r = selected_mask.sum(dim=1).to(torch.int64)
+
+                per_req_head_ids.append(head_ids_r)
+                per_req_phys.append(phys_r)
+                per_req_slots.append(slots_r)
+                per_req_counts.append(counts_r)
                 _perf_add(
-                    "_build_sparse_runtime_q_head_gather:block_ids_setup",
-                    _t_block_ids,
+                    "_build_sparse_runtime_q_head_gather:pack_per_req_gpu",
+                    _t_pack,
                 )
+
                 if publish_lmcache_rows:
-                    lmcache_rows_by_req[rid] = []
-                for qh_idx in range(num_heads):
-                    _t_selected = time.perf_counter() if perf_enabled else None
-                    selected = token_ids_np[selected_mask_np[qh_idx]]
-                    if publish_lmcache_rows:
-                        lmcache_rows_by_req[rid].append(selected.tolist())
-                    _perf_add(
-                        "_build_sparse_runtime_q_head_gather:pack_selected_tokens",
-                        _t_selected,
-                    )
-                    _t_block_idx = time.perf_counter() if perf_enabled else None
-                    block_idx = selected // int(bsz)
-                    _perf_add(
-                        "_build_sparse_runtime_q_head_gather:pack_block_idx",
-                        _t_block_idx,
-                    )
-                    if block_idx.size > 0 and bool(np.any(block_idx >= n_blks)):
-                        return None
-                    _t_phys = time.perf_counter() if perf_enabled else None
-                    phys_chunks[qh_idx].append(
-                        np.asarray(bt_row_np[block_idx], dtype=np.int32)
-                    )
-                    _perf_add(
-                        "_build_sparse_runtime_q_head_gather:pack_phys_index_select",
-                        _t_phys,
-                    )
-                    _t_slots = time.perf_counter() if perf_enabled else None
-                    slot_chunks[qh_idx].append(
-                        np.remainder(selected, int(bsz)).astype(
-                            np.int32, copy=False
-                        )
-                    )
-                    total_selected_per_head[qh_idx] += int(selected.size)
-                    cu_lists[qh_idx].append(
-                        cu_lists[qh_idx][-1] + int(selected.size)
-                    )
-                    _perf_add(
-                        "_build_sparse_runtime_q_head_gather:pack_slots_and_cu",
-                        _t_slots,
-                    )
+                    selected_mask_np = selected_mask.detach().cpu().numpy()
+                    token_ids_np = np.arange(seq_len, dtype=np.int64)
+                    lmcache_rows_by_req[rid] = [
+                        token_ids_np[selected_mask_np[qh]].tolist()
+                        for qh in range(num_heads)
+                    ]
+
                 _perf_add(
                     "_build_sparse_runtime_q_head_gather:per_req_total",
                     _t_req,
                 )
 
+            if not per_req_head_ids:
+                return None
+
             _t_finalize = time.perf_counter() if perf_enabled else None
-            phys_per_head: list[np.ndarray] = []
-            slot_per_head: list[np.ndarray] = []
-            cu_per_head: list[np.ndarray] = []
-            for qh_idx in range(num_heads):
-                if not phys_chunks[qh_idx]:
-                    return None
-                total_len = total_selected_per_head[qh_idx]
-                phys_np = np.empty(total_len, dtype=np.int32)
-                slot_np = np.empty(total_len, dtype=np.int32)
-                offset = 0
-                for phys_chunk, slot_chunk in zip(
-                    phys_chunks[qh_idx], slot_chunks[qh_idx], strict=True
-                ):
-                    chunk_len = int(len(phys_chunk))
-                    phys_np[offset:offset + chunk_len] = phys_chunk
-                    slot_np[offset:offset + chunk_len] = slot_chunk
-                    offset += chunk_len
-                phys_per_head.append(phys_np)
-                slot_per_head.append(slot_np)
-                cu_per_head.append(np.asarray(cu_lists[qh_idx], dtype=np.int32))
+            all_head_ids = torch.cat(per_req_head_ids)
+            all_phys = torch.cat(per_req_phys)
+            all_slots = torch.cat(per_req_slots)
+            # Build a ``req_id`` companion tensor on GPU without a loop by
+            # repeating req_idx for the length of each per_req entry.
+            lens = torch.tensor(
+                [int(h.shape[0]) for h in per_req_head_ids],
+                dtype=torch.int64,
+                device=query.device,
+            )
+            req_range = torch.arange(
+                num_reqs, dtype=torch.int64, device=query.device
+            )
+            all_req_ids = torch.repeat_interleave(req_range, lens)
+
+            # Stable argsort by (head, req) groups entries head-major with
+            # reqs in ascending order.  Within each (head, req) group the
+            # original nonzero order (ascending token id) is preserved.
+            sort_key = all_head_ids * int(num_reqs) + all_req_ids
+            order = torch.argsort(sort_key, stable=True)
+            flat_phys = all_phys.index_select(0, order).contiguous()
+            flat_slots = all_slots.index_select(0, order).contiguous()
+
+            counts_2d = torch.stack(per_req_counts, dim=1)  # [H, num_reqs]
+            cu_mat = torch.zeros(
+                (num_heads, num_reqs + 1),
+                dtype=torch.int32,
+                device=query.device,
+            )
+            cu_mat[:, 1:] = counts_2d.cumsum(dim=1).to(torch.int32)
+            total_per_head = counts_2d.sum(dim=1)
+            head_offsets = torch.zeros(
+                num_heads + 1, dtype=torch.int32, device=query.device
+            )
+            head_offsets[1:] = total_per_head.cumsum(0).to(torch.int32)
             _perf_add(
                 "_build_sparse_runtime_q_head_gather:finalize_cat",
                 _t_finalize,
             )
-            total_phys_len = sum(int(arr.size) for arr in phys_per_head)
-            flat_phys_np = np.empty(total_phys_len, dtype=np.int32)
-            flat_slot_np = np.empty(total_phys_len, dtype=np.int32)
-            head_offsets_np = np.empty(num_heads + 1, dtype=np.int32)
-            cu_mat_np = np.empty((num_heads, num_reqs + 1), dtype=np.int32)
-            head_offsets_np[0] = 0
-            offset = 0
-            for qh_idx in range(num_heads):
-                phys_np = phys_per_head[qh_idx]
-                slot_np = slot_per_head[qh_idx]
-                chunk_len = int(phys_np.size)
-                flat_phys_np[offset:offset + chunk_len] = phys_np
-                flat_slot_np[offset:offset + chunk_len] = slot_np
-                offset += chunk_len
-                head_offsets_np[qh_idx + 1] = offset
-                cu_mat_np[qh_idx] = cu_per_head[qh_idx]
+
             if perf_enabled and perf_local_ms:
                 for k, ms in perf_local_ms.items():
                     self._sparse_perf_accum_ms[k] += ms
@@ -8038,18 +8221,11 @@ class GPUModelRunner(
                     by_layer = by_req.setdefault(rid, {})
                     by_layer[layer_name] = rows
             return {
-                "phys": torch.as_tensor(
-                    flat_phys_np, dtype=torch.int32, device=query.device
-                ),
-                "slots": torch.as_tensor(
-                    flat_slot_np, dtype=torch.int32, device=query.device
-                ),
-                "cu": torch.as_tensor(
-                    cu_mat_np, dtype=torch.int32, device=query.device
-                ),
-                "head_offsets": torch.as_tensor(
-                    head_offsets_np, dtype=torch.int32, device=query.device
-                ),
+                "phys": flat_phys,
+                "slots": flat_slots,
+                "cu": cu_mat,
+                "head_offsets": head_offsets,
+                "max_k": budget,
             }
         finally:
             if _t0 is not None:
@@ -8110,6 +8286,7 @@ class GPUModelRunner(
         sparse_block_features: dict[str, dict[str, np.ndarray]] | None,
         sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]] | None,
         sparse_new_block_features: dict[str, dict[str, np.ndarray]] | None,
+        sparse_new_block_features_gpu: dict[str, dict[str, torch.Tensor]] | None = None,
     ) -> None:
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
         try:
@@ -8178,51 +8355,69 @@ class GPUModelRunner(
                             all_block_features=feat_t,
                             mean_key=mean_t,
                         )
-            if sparse_new_block_features:
-                for req_id, unit_map in sparse_new_block_features.items():
-                    req_states = self._sparse_online_index.get(req_id)
-                    if not req_states:
+            # Prefer the GPU-resident dict produced by
+            # ``_collect_sparse_features``: it avoids the ``torch.as_tensor``
+            # H2D sync per (req, unit_key) pair and keeps the new feature on
+            # the same CUDA stream as the rest of the decode work.  The numpy
+            # dict is kept around for backwards compatibility (and used as a
+            # fallback when ``*_gpu`` is ``None``).
+            iter_src: list[
+                tuple[
+                    str,
+                    dict[str, torch.Tensor] | dict[str, np.ndarray],
+                    bool,
+                ]
+            ]
+            if sparse_new_block_features_gpu:
+                iter_src = [
+                    (rid, umap, True)
+                    for rid, umap in sparse_new_block_features_gpu.items()
+                ]
+            elif sparse_new_block_features:
+                iter_src = [
+                    (rid, umap, False)
+                    for rid, umap in sparse_new_block_features.items()
+                ]
+            else:
+                iter_src = []
+            for req_id, unit_map, is_gpu in iter_src:
+                req_states = self._sparse_online_index.get(req_id)
+                if not req_states:
+                    continue
+                for unit_key, feat in unit_map.items():
+                    parsed = parse_sparse_kv_key(unit_key)
+                    if parsed is None:
                         continue
-                    for unit_key, feat_np in unit_map.items():
-                        parsed = parse_sparse_kv_key(unit_key)
-                        if parsed is None:
-                            continue
-                        layer_name, _ = parsed
-                        spec = self._sparse_layer_spec_by_name.get(layer_name)
-                        if spec is None or spec.cluster_granularity != "token":
-                            continue
-                        state = req_states.get(unit_key)
-                        if state is None:
-                            continue
+                    layer_name, _ = parsed
+                    spec = self._sparse_layer_spec_by_name.get(layer_name)
+                    if spec is None or spec.cluster_granularity != "token":
+                        continue
+                    state = req_states.get(unit_key)
+                    if state is None:
+                        continue
+                    if is_gpu:
+                        feat_t = feat
+                        if feat_t.dtype != torch.float32:
+                            feat_t = feat_t.to(dtype=torch.float32)
+                    else:
                         feat_t = torch.as_tensor(
-                            feat_np, dtype=torch.float32, device=self.device
+                            feat, dtype=torch.float32, device=self.device
                         )
-                        state.all_block_features = torch.cat(
-                            [state.all_block_features, feat_t.unsqueeze(0)], dim=0
+                    if int(state.cluster_centres.shape[0]) > 0:
+                        centered_feat = feat_t - state.mean_key
+                        centred_c = state.cluster_centres - state.mean_key
+                        nearest = torch.argmax(
+                            torch.matmul(centred_c, centered_feat)
+                        ).to(dtype=torch.int64)
+                    else:
+                        nearest = torch.zeros(
+                            (), dtype=torch.int64, device=self.device
                         )
-                        state.decode_block_buffer.append(feat_t)
-                        if int(state.cluster_centres.shape[0]) > 0:
-                            centered_feat = feat_t - state.mean_key
-                            centred_c = state.cluster_centres - state.mean_key
-                            nearest = torch.argmax(
-                                torch.matmul(centred_c, centered_feat)
-                            ).to(dtype=torch.int64)
-                            state.block_to_cluster = torch.cat(
-                                [state.block_to_cluster, nearest.view(1)], dim=0
-                            )
-                        else:
-                            state.block_to_cluster = torch.cat(
-                                [
-                                    state.block_to_cluster,
-                                    torch.zeros(
-                                        1, dtype=torch.int64, device=self.device
-                                    ),
-                                ],
-                                dim=0,
-                            )
-                        if (len(state.decode_block_buffer)
-                                >= int(spec.update_threshold_tokens)):
-                            self._sparse_online_dynamic_update(state)
+                    state.append_decode_feature(feat_t, nearest)
+                    state.decode_block_buffer.append(feat_t)
+                    if (len(state.decode_block_buffer)
+                            >= int(spec.update_threshold_tokens)):
+                        self._sparse_online_dynamic_update(state)
         finally:
             if _t0 is not None:
                 self._sparse_perf_record(
@@ -8655,6 +8850,7 @@ class GPUModelRunner(
         "dict[str, dict[str, np.ndarray]] | None",
         "dict[str, dict[str, np.ndarray]] | None",
         "dict[str, dict[str, dict[str, np.ndarray]]] | None",
+        "dict[str, dict[str, torch.Tensor]] | None",
     ]:
         """Extract block-level K features and per-request Q vectors.
 
@@ -8694,7 +8890,7 @@ class GPUModelRunner(
             perf_local_ms[name] += (time.perf_counter() - start_t) * 1000.0
 
         if not self._has_sparse_attn:
-            return None, None, None, None
+            return None, None, None, None, None
 
         sparse_groups = [
             (gid, grp)
@@ -8702,12 +8898,19 @@ class GPUModelRunner(
             if isinstance(grp.kv_cache_spec, SparseAttentionSpec)
         ]
         if not sparse_groups:
-            return None, None, None, None
+            return None, None, None, None, None
 
         sparse_block_features: dict[str, dict[str, np.ndarray]] = {}
         sparse_query_vectors: dict[str, dict[str, np.ndarray]] = {}
         sparse_new_block_features: dict[str, dict[str, np.ndarray]] = {}
         sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+        # GPU-resident mirror of ``sparse_new_block_features`` for the in-worker
+        # ``_update_sparse_online_index`` consumer.  Avoids the GPU→CPU→GPU
+        # round-trip that otherwise happens per (req, layer, kv_head) pair on
+        # every decode step.  The numpy dict above is still produced because
+        # it is serialized into ``ModelRunnerOutput`` and consumed by the
+        # scheduler across process boundaries.
+        sparse_new_block_features_gpu: dict[str, dict[str, torch.Tensor]] = {}
         pending_async_feat: list[tuple[str, str, torch.Tensor]] = []
         pending_async_meta: list[tuple[str, str, dict[str, torch.Tensor]]] = []
 
@@ -8835,9 +9038,24 @@ class GPUModelRunner(
                     ):
                         continue
                     kv = attn_mod.kv_cache[0]
-                    _t_k_cache_read = time.perf_counter() if perf_enabled else None
-                    k_blocks = kv[0][block_ids_t]
-                    _perf_add("collect:k_cache_read", _t_k_cache_read)
+                    # Fast-path: for a pure decode step in token-sparse mode we
+                    # only need the newly-written K slot (single row), not the
+                    # full block gather.  Skipping the full gather saves a
+                    # per-layer copy proportional to ``num_blocks * block_size``
+                    # and removes the dominant D2H in decode critical path.
+                    decode_only_token_sparse = (
+                        token_sparse
+                        and is_decode_committed
+                        and not is_prefill_done
+                    )
+                    if decode_only_token_sparse:
+                        k_blocks = None
+                    else:
+                        _t_k_cache_read = (
+                            time.perf_counter() if perf_enabled else None
+                        )
+                        k_blocks = kv[0][block_ids_t]
+                        _perf_add("collect:k_cache_read", _t_k_cache_read)
                     num_kv = int(attn_mod.num_kv_heads)
                     if token_sparse:
                         if is_prefill_done:
@@ -8880,17 +9098,42 @@ class GPUModelRunner(
                         if is_decode_committed:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
-                            _t_decode_cpu = time.perf_counter() if perf_enabled else None
-                            k_row_np = k_blocks[-1][slot].float().cpu().numpy()
-                            _perf_add("collect:k_decode_cpu_numpy", _t_decode_cpu)
+                            if decode_only_token_sparse:
+                                # Direct scalar read: no block_ids_t.to(device)
+                                # needed, no full-gather allocation.
+                                last_block_id = int(block_ids_np[-1])
+                                _t_k_cache_read = (
+                                    time.perf_counter() if perf_enabled else None
+                                )
+                                k_row_gpu = kv[0][last_block_id, slot].float()
+                                _perf_add(
+                                    "collect:k_cache_read", _t_k_cache_read
+                                )
+                            else:
+                                k_row_gpu = k_blocks[-1][slot].float()
+                            _t_decode_cpu = (
+                                time.perf_counter() if perf_enabled else None
+                            )
+                            k_row_np = k_row_gpu.cpu().numpy()
+                            _perf_add(
+                                "collect:k_decode_cpu_numpy", _t_decode_cpu
+                            )
                             for kv_h in range(num_kv):
+                                unit_key = sparse_kv_unit_key(layer_name, kv_h)
                                 if num_kv == 1:
-                                    k_vec = k_row_np
+                                    sparse_new_block_features.setdefault(
+                                        req_id, {}
+                                    )[unit_key] = k_row_np
+                                    sparse_new_block_features_gpu.setdefault(
+                                        req_id, {}
+                                    )[unit_key] = k_row_gpu
                                 else:
-                                    k_vec = k_row_np[kv_h]
-                                sparse_new_block_features.setdefault(req_id, {})[
-                                    sparse_kv_unit_key(layer_name, kv_h)
-                                ] = k_vec
+                                    sparse_new_block_features.setdefault(
+                                        req_id, {}
+                                    )[unit_key] = k_row_np[kv_h]
+                                    sparse_new_block_features_gpu.setdefault(
+                                        req_id, {}
+                                    )[unit_key] = k_row_gpu[kv_h]
                     else:
                         _t_block_mean = time.perf_counter() if perf_enabled else None
                         k_blk = k_blocks.mean(dim=1).float()
@@ -9000,6 +9243,7 @@ class GPUModelRunner(
             sparse_query_vectors or None,
             sparse_new_block_features or None,
             sparse_prefill_cluster_meta or None,
+            sparse_new_block_features_gpu or None,
         )
 
     def _sparse_layer_decode_phys_row(

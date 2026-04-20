@@ -7,6 +7,19 @@ Parses lines like:
   [DecodePerf] mode=sparse total_ms=10.0 preprocess_ms=...
   sparse dynamic update: req xxx layer=yyy - added 32 clusters (total 96 ...)
 
+Required env vars for the server/worker process that produces the log:
+  VLLM_DECODE_PERF_STATS=1      # emits [DecodePerf] lines (end-to-end stages)
+  VLLM_SPARSE_PERF_STATS=1      # emits [SparsePerf] aggregate windows
+  VLLM_SPARSE_PERF_LOG_INTERVAL=50   # optional, flush interval in decode steps
+
+Optional:
+  VLLM_SPARSE_PERF_DEBUG=1      # emits [SparsePerfFA]/[FullPerfFA]/[SparseDebug]
+                                # per-call FA timing.  These use CUDA events
+                                # and call logger.info from the hot path, so
+                                # leave it OFF for release benchmarking.
+                                # Turn it on only when you need a per-call
+                                # gather_ms/fa_ms breakdown for compact gather.
+
 Usage:
   python scripts/parse_sparse_perf_log.py path/to/log.txt
   python scripts/parse_sparse_perf_log.py path/to/log.txt --json
