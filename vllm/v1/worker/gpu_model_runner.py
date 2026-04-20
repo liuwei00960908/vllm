@@ -5518,7 +5518,7 @@ class GPUModelRunner(
                     "sample_tokens:total",
                     time.perf_counter() - _st_t0,
                 )
-            self._decode_perf_flush_e2e()
+            self._decode_perf_flush_e2e(st_t0=_st_t0)
             return output
 
         with record_function_or_nullcontext(
@@ -5547,7 +5547,7 @@ class GPUModelRunner(
                 "sample_tokens:total",
                 time.perf_counter() - _st_t0,
             )
-        self._decode_perf_flush_e2e()
+        self._decode_perf_flush_e2e(st_t0=_st_t0)
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
@@ -9030,7 +9030,7 @@ class GPUModelRunner(
                     time.perf_counter() - _t0,
                 )
 
-    def _decode_perf_flush_e2e(self) -> None:
+    def _decode_perf_flush_e2e(self, st_t0: float | None = None) -> None:
         """Emit the step-level end-to-end ``[DecodePerfE2E]`` log.
 
         Covers both ``execute_model`` and ``sample_tokens`` halves of the
@@ -9044,16 +9044,34 @@ class GPUModelRunner(
             or self._decode_perf_step_t0 is None
         ):
             return
-        total_ms = (time.perf_counter() - self._decode_perf_step_t0) * 1000.0
+        now_s = time.perf_counter()
+        total_ms = (now_s - self._decode_perf_step_t0) * 1000.0
         exec_ms = self._decode_perf_step_exec_ms
         sample_ms = max(0.0, total_ms - exec_ms)
+        # Debug variant: measure sample_tokens body directly from the entry
+        # timestamp (st_t0) passed in by the caller, bypassing the indirection
+        # via step_exec_ms.  If ``sample_body_ms`` is materially smaller than
+        # ``sample_tokens_ms`` (the historical field), something between the
+        # execute_model exec_ms stamp and sample_tokens entry is being
+        # silently absorbed into the e2e sample_ms – that is our 70–80 ms
+        # mystery gap.
+        sample_body_ms = (
+            (now_s - st_t0) * 1000.0 if st_t0 is not None else -1.0
+        )
+        pre_entry_ms = (
+            (total_ms - sample_body_ms - exec_ms)
+            if st_t0 is not None
+            else -1.0
+        )
         logger.info(
             "[DecodePerfE2E] mode=%s total_ms=%.3f execute_model_ms=%.3f "
-            "sample_tokens_ms=%.3f",
+            "sample_tokens_ms=%.3f sample_body_ms=%.3f pre_entry_ms=%.3f",
             "sparse" if self._has_sparse_attn else "full",
             total_ms,
             exec_ms,
             sample_ms,
+            sample_body_ms,
+            pre_entry_ms,
         )
         self._decode_perf_step_t0 = None
         self._decode_perf_step_exec_ms = 0.0
