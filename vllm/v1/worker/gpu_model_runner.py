@@ -793,6 +793,12 @@ class GPUModelRunner(
         # disabled or when no step is in flight.
         self._decode_perf_step_t0: float | None = None
         self._decode_perf_step_exec_ms: float = 0.0
+        # Wall-clock at ``execute_model`` EXIT (after the [DecodePerf] log
+        # emits).  ``sample_tokens`` diffs against ``time.perf_counter()`` at
+        # entry to expose the "engine-side gap" between the two RPC halves
+        # (grammar apply, PP dispatch, etc.) that would otherwise silently
+        # roll into ``avg_sample_tokens_ms``.
+        self._decode_perf_step_exec_exit_t: float | None = None
         self._sparse_perf_log_interval: int = max(
             1, int(os.getenv("VLLM_SPARSE_PERF_LOG_INTERVAL", "50"))
         )
@@ -5089,6 +5095,7 @@ class GPUModelRunner(
             # start.
             self._decode_perf_step_t0 = None
             self._decode_perf_step_exec_ms = 0.0
+            self._decode_perf_step_exec_exit_t = None
         if (
             self._decode_perf_stats_enabled
             and _decode_perf_decode_only
@@ -5133,12 +5140,30 @@ class GPUModelRunner(
                 int(has_kv_transfer_group()),
                 cudagraph_mode.name,
             )
+        # Stamp exit time AFTER the log so ``sample_tokens`` can isolate the
+        # engine-side gap (apply_grammar_bitmask, PP, IPC, ...) – this
+        # quantity is normally 0 for single-process TP=1, and any non-trivial
+        # value is a red flag for instrumentation overhead leaking in.
+        if self._decode_perf_stats_enabled and _decode_perf_decode_only:
+            self._decode_perf_step_exec_exit_t = time.perf_counter()
         return None
 
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        _sp_perf_enabled = (
+            self._sparse_perf_stats_enabled and self._has_sparse_attn
+        )
+        _st_t0 = time.perf_counter() if _sp_perf_enabled else None
+        if _st_t0 is not None and self._decode_perf_step_exec_exit_t is not None:
+            self._sparse_perf_record(
+                "sample_tokens:entry_gap_after_execute_model",
+                _st_t0 - self._decode_perf_step_exec_exit_t,
+            )
+            # One-shot: clear so a non-decode execute_model cannot leak into
+            # the next sample_tokens window.
+            self._decode_perf_step_exec_exit_t = None
         if self.execute_model_state is None:
             # These short-circuit branches do not correspond to a completed
             # decode step (PP pass-through / empty KV-transfer).  Drop the
@@ -5146,6 +5171,7 @@ class GPUModelRunner(
             # execute_model entry.
             self._decode_perf_step_t0 = None
             self._decode_perf_step_exec_ms = 0.0
+            self._decode_perf_step_exec_exit_t = None
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
@@ -5180,6 +5206,7 @@ class GPUModelRunner(
         self.execute_model_state = None
 
         # Apply structured output bitmasks if present.
+        _t_pre_bookkeep = time.perf_counter() if _sp_perf_enabled else None
         if grammar_output is not None:
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
@@ -5292,6 +5319,18 @@ class GPUModelRunner(
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+        if _t_pre_bookkeep is not None:
+            # Covers grammar bitmask apply + _sample + update_states_after +
+            # any GPU-side speculative-decode prep that runs before
+            # bookkeeping.  Bookkeeping below is the first spot that syncs
+            # sampled_token_ids back to CPU, so this window is pure-GPU
+            # launch / lightweight Python.
+            self._sparse_perf_record(
+                "sample_tokens:pre_bookkeep",
+                time.perf_counter() - _t_pre_bookkeep,
+            )
+
+        _t_bookkeep = time.perf_counter() if _sp_perf_enabled else None
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -5309,7 +5348,18 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        if _t_bookkeep is not None:
+            # ``_bookkeeping_sync`` is the major GPU→CPU sync point (pulls
+            # sampled token ids, logprobs, num_nans, etc.).  If the forward
+            # pipeline still has pending attention-kernel work, this is where
+            # the CPU blocks – that's why it's the prime suspect for the
+            # sparse/full ``sample_tokens_ms`` gap.
+            self._sparse_perf_record(
+                "sample_tokens:bookkeeping_sync",
+                time.perf_counter() - _t_bookkeep,
+            )
 
+        _t_post_bookkeep = time.perf_counter() if _sp_perf_enabled else None
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -5336,6 +5386,16 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            if _t_post_bookkeep is not None:
+                # Window covers propose_drafts_after_bookkeeping +
+                # finalize_kv_connector + eplb_step + RoutedExperts capture
+                # – i.e. everything that happens on the CPU path between
+                # the bookkeeping sync and the sparse feature collection.
+                self._sparse_perf_record(
+                    "sample_tokens:post_bookkeep_pre_sparse",
+                    time.perf_counter() - _t_post_bookkeep,
+                )
+
             # ── Sparse KV attention features ──────────────────────────────
             _t0_sparse_collect = (
                 time.perf_counter() if self._sparse_perf_stats_enabled else None
@@ -5356,15 +5416,34 @@ class GPUModelRunner(
                 sparse_new_block_features_gpu,
             )
             if _t0_sparse_collect is not None:
+                # Keep ``_collect_sparse_features`` key bitwise-compatible with
+                # earlier logs (covers both ``_collect_sparse_features`` and
+                # ``_update_sparse_online_index``).  We also split out the
+                # pure _collect portion below so decode-only analyses stop
+                # being contaminated by ``_update_sparse_online_index``.
                 self._sparse_perf_record(
                     "_collect_sparse_features",
                     time.perf_counter() - _t0_sparse_collect,
                 )
             # Clear per-step Q captures to free GPU memory references.
             self._sparse_q_captures.clear()
+            _t0_perf_flush = (
+                time.perf_counter() if self._sparse_perf_stats_enabled else None
+            )
             self._sparse_perf_flush_if_needed()
+            if _t0_perf_flush is not None:
+                # Window logger.info cost at VLLM_SPARSE_PERF_LOG_INTERVAL=1
+                # dominates sample_tokens runtime – isolate it so it does not
+                # get attributed to genuine sparse work.  Note the timer only
+                # fires on steps where the window actually flushes; at larger
+                # intervals it is near-zero on the non-flush steps.
+                self._sparse_perf_record(
+                    "sample_tokens:perf_log_flush",
+                    time.perf_counter() - _t0_perf_flush,
+                )
             # ──────────────────────────────────────────────────────────────
 
+            _t_tail = time.perf_counter() if _sp_perf_enabled else None
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -5382,8 +5461,23 @@ class GPUModelRunner(
                 sparse_new_block_features=sparse_new_block_features,
                 sparse_prefill_cluster_meta=sparse_prefill_cluster_meta,
             )
+            if _t_tail is not None:
+                # ModelRunnerOutput construction – should be near-zero even
+                # when sparse_* dict payloads are attached (they are already
+                # realised tensors/dicts by this point).  Non-trivial values
+                # here point at hidden cost in dataclass __post_init__ or
+                # attribute serialization.
+                self._sparse_perf_record(
+                    "sample_tokens:output_build",
+                    time.perf_counter() - _t_tail,
+                )
 
         if not self.use_async_scheduling:
+            if _sp_perf_enabled and _st_t0 is not None:
+                self._sparse_perf_record(
+                    "sample_tokens:total",
+                    time.perf_counter() - _st_t0,
+                )
             self._decode_perf_flush_e2e()
             return output
 
@@ -5408,6 +5502,11 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        if _sp_perf_enabled and _st_t0 is not None:
+            self._sparse_perf_record(
+                "sample_tokens:total",
+                time.perf_counter() - _st_t0,
+            )
         self._decode_perf_flush_e2e()
         return async_output
 
@@ -8616,6 +8715,11 @@ class GPUModelRunner(
     ) -> None:
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
         try:
+            _t_prefill_init = (
+                time.perf_counter()
+                if self._sparse_perf_stats_enabled and sparse_block_features
+                else None
+            )
             if sparse_block_features:
                 for req_id, unit_map in sparse_block_features.items():
                     req_states = self._sparse_online_index.setdefault(req_id, {})
@@ -8681,6 +8785,17 @@ class GPUModelRunner(
                             all_block_features=feat_t,
                             mean_key=mean_t,
                         )
+            if _t_prefill_init is not None:
+                # Isolates the prefill-only state-materialisation block so
+                # we can compare it cleanly against the batched decode path
+                # (pass1/bucket/stack_bmm/bulk_append/bookkeep).  Fires only
+                # on steps that observed a prefill completion, meaning the
+                # per-call avg divided by #prefill steps gives the true
+                # prefill-attributable cost of ``_update_sparse_online_index``.
+                self._sparse_perf_record(
+                    "_update_sparse_online_index:prefill_init",
+                    time.perf_counter() - _t_prefill_init,
+                )
             # Prefer the GPU-resident dict produced by
             # ``_collect_sparse_features``: it avoids the ``torch.as_tensor``
             # H2D sync per (req, unit_key) pair and keeps the new feature on
