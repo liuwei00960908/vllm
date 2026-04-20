@@ -1,0 +1,19 @@
+# PowerShell env vars for decode end-to-end perf comparison
+$env:VLLM_DECODE_PERF_STATS="1"
+$env:VLLM_SPARSE_PERF_STATS="1"
+$env:VLLM_SPARSE_PERF_LOG_INTERVAL="1"
+
+# Run your sparse-attention server / benchmark command here.
+# Then parse the sparse log:
+python scripts/parse_sparse_perf_log.py ../vllm_server.log --json
+
+# For full-attention comparison, keep this enabled:
+$env:VLLM_DECODE_PERF_STATS="1"
+
+# Optional: disable sparse-only perf vars when running full attention:
+Remove-Item Env:\VLLM_SPARSE_PERF_STATS -ErrorAction SilentlyContinue
+Remove-Item Env:\VLLM_SPARSE_PERF_LOG_INTERVAL -ErrorAction SilentlyContinue
+
+# Run your full-attention server / benchmark command here.
+# Then parse the full-attention log:
+python scripts/parse_sparse_perf_log.py ../vllm_server.log --json

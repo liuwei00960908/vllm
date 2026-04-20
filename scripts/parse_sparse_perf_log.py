@@ -4,6 +4,7 @@
 Parses lines like:
   [SparsePerf] window_steps=20 foo:total_ms=12.34,calls=4,avg_ms=3.085 | ...
   [SparsePerfFA] compact_kv_gather total_ms=7.240 gather_ms=3.926 fa_ms=2.168 ...
+  [DecodePerf] mode=sparse total_ms=10.0 preprocess_ms=...
   sparse dynamic update: req xxx layer=yyy - added 32 clusters (total 96 ...)
 
 Usage:
@@ -47,6 +48,20 @@ FULL_PERF_FA_RE = re.compile(
     r"(?:\s+num_tok=(?P<num_tok>\d+))?"
     r"(?:\s+max_seqlen_q=(?P<max_seqlen_q>\d+))?"
     r"(?:\s+max_seqlen_k=(?P<max_seqlen_k>\d+))?"
+)
+DECODE_PERF_RE = re.compile(
+    r"\[DecodePerf\]\s+mode=(?P<mode>\S+)\s+"
+    r"total_ms=(?P<total_ms>\d+(?:\.\d+)?)\s+"
+    r"preprocess_ms=(?P<preprocess_ms>\d+(?:\.\d+)?)\s+"
+    r"attn_metadata_ms=(?P<attn_metadata_ms>\d+(?:\.\d+)?)\s+"
+    r"forward_ms=(?P<forward_ms>\d+(?:\.\d+)?)\s+"
+    r"postprocess_ms=(?P<postprocess_ms>\d+(?:\.\d+)?)\s+"
+    r"other_ms=(?P<other_ms>\d+(?:\.\d+)?)\s+"
+    r"num_reqs=(?P<num_reqs>\d+)\s+"
+    r"num_tokens=(?P<num_tokens>\d+)\s+"
+    r"max_scheduled=(?P<max_scheduled>\d+)\s+"
+    r"has_kv_connector=(?P<has_kv_connector>\d+)\s+"
+    r"cudagraph=(?P<cudagraph>\S+)"
 )
 
 
@@ -92,10 +107,49 @@ class FaAgg:
         return self.fa_ms / self.total_ms if self.total_ms else 0.0
 
 
+@dataclass
+class DecodePerfAgg:
+    total_ms: float = 0.0
+    preprocess_ms: float = 0.0
+    attn_metadata_ms: float = 0.0
+    forward_ms: float = 0.0
+    postprocess_ms: float = 0.0
+    other_ms: float = 0.0
+    calls: int = 0
+    num_reqs_sum: int = 0
+    num_tokens_sum: int = 0
+    max_scheduled_max: int = 0
+    has_kv_connector_sum: int = 0
+    cudagraph_counts: dict[str, int] | None = None
+
+    def add(self, m: re.Match[str]) -> None:
+        self.total_ms += float(m.group("total_ms"))
+        self.preprocess_ms += float(m.group("preprocess_ms"))
+        self.attn_metadata_ms += float(m.group("attn_metadata_ms"))
+        self.forward_ms += float(m.group("forward_ms"))
+        self.postprocess_ms += float(m.group("postprocess_ms"))
+        self.other_ms += float(m.group("other_ms"))
+        self.calls += 1
+        self.num_reqs_sum += int(m.group("num_reqs"))
+        self.num_tokens_sum += int(m.group("num_tokens"))
+        self.max_scheduled_max = max(
+            self.max_scheduled_max, int(m.group("max_scheduled"))
+        )
+        self.has_kv_connector_sum += int(m.group("has_kv_connector"))
+        if self.cudagraph_counts is None:
+            self.cudagraph_counts = {}
+        cudagraph = m.group("cudagraph")
+        self.cudagraph_counts[cudagraph] = self.cudagraph_counts.get(cudagraph, 0) + 1
+
+    def avg(self, value: float) -> float:
+        return value / self.calls if self.calls else 0.0
+
+
 def parse_log(path: Path) -> dict:
     perf_by_key: dict[str, PerfAgg] = defaultdict(PerfAgg)
     fa_by_key: dict[str, FaAgg] = defaultdict(FaAgg)
     full_fa_by_key: dict[str, FaAgg] = defaultdict(FaAgg)
+    decode_perf_by_mode: dict[str, DecodePerfAgg] = defaultdict(DecodePerfAgg)
     dynamic_update_by_layer: dict[str, dict[str, int]] = defaultdict(
         lambda: {"events": 0, "added_clusters": 0, "last_total_clusters": 0}
     )
@@ -104,6 +158,7 @@ def parse_log(path: Path) -> dict:
     perf_lines = 0
     perf_fa_lines = 0
     full_perf_fa_lines = 0
+    decode_perf_lines = 0
 
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for raw_line in f:
@@ -166,6 +221,12 @@ def parse_log(path: Path) -> dict:
                     agg.max_seqlen_q_max = max(
                         agg.max_seqlen_q_max, int(m.group("max_seqlen_q"))
                     )
+                continue
+
+            m = DECODE_PERF_RE.search(line)
+            if m:
+                decode_perf_lines += 1
+                decode_perf_by_mode[m.group("mode")].add(m)
                 continue
 
             m = UPDATE_RE.search(line)
@@ -248,16 +309,82 @@ def parse_log(path: Path) -> dict:
     ):
         dynamic_summary.append({"layer": layer, **stats})
 
+    decode_perf_summary = []
+    for mode, agg in sorted(
+        decode_perf_by_mode.items(), key=lambda kv: kv[0]
+    ):
+        decode_perf_summary.append(
+            {
+                "mode": mode,
+                "total_ms": round(agg.total_ms, 3),
+                "calls": agg.calls,
+                "avg_total_ms": round(agg.avg(agg.total_ms), 4),
+                "avg_preprocess_ms": round(agg.avg(agg.preprocess_ms), 4),
+                "avg_attn_metadata_ms": round(agg.avg(agg.attn_metadata_ms), 4),
+                "avg_forward_ms": round(agg.avg(agg.forward_ms), 4),
+                "avg_postprocess_ms": round(agg.avg(agg.postprocess_ms), 4),
+                "avg_other_ms": round(agg.avg(agg.other_ms), 4),
+                "preprocess_share": round(
+                    agg.preprocess_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "attn_metadata_share": round(
+                    agg.attn_metadata_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "forward_share": round(
+                    agg.forward_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "postprocess_share": round(
+                    agg.postprocess_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "other_share": round(
+                    agg.other_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "avg_num_reqs": round(
+                    agg.num_reqs_sum / agg.calls, 3
+                ) if agg.calls else 0.0,
+                "avg_num_tokens": round(
+                    agg.num_tokens_sum / agg.calls, 3
+                ) if agg.calls else 0.0,
+                "max_scheduled_max": agg.max_scheduled_max,
+                "kv_connector_calls": agg.has_kv_connector_sum,
+                "cudagraph_counts": agg.cudagraph_counts or {},
+            }
+        )
+    decode_perf_comparison = None
+    decode_by_mode = {row["mode"]: row for row in decode_perf_summary}
+    if "sparse" in decode_by_mode and "full" in decode_by_mode:
+        sparse = decode_by_mode["sparse"]
+        full = decode_by_mode["full"]
+
+        def ratio(key: str) -> float:
+            denom = float(full.get(key, 0.0))
+            return round(float(sparse.get(key, 0.0)) / denom, 4) if denom else 0.0
+
+        decode_perf_comparison = {
+            "sparse_vs_full_avg_total_ratio": ratio("avg_total_ms"),
+            "sparse_vs_full_avg_preprocess_ratio": ratio("avg_preprocess_ms"),
+            "sparse_vs_full_avg_attn_metadata_ratio": ratio(
+                "avg_attn_metadata_ms"
+            ),
+            "sparse_vs_full_avg_forward_ratio": ratio("avg_forward_ms"),
+            "sparse_vs_full_avg_postprocess_ratio": ratio(
+                "avg_postprocess_ms"
+            ),
+        }
+
     return {
         "log_path": str(path),
         "perf_window_lines": perf_lines,
         "perf_fa_lines": perf_fa_lines,
         "full_perf_fa_lines": full_perf_fa_lines,
+        "decode_perf_lines": decode_perf_lines,
         "empty_windows": empty_windows,
         "window_steps_values": sorted(set(window_steps)),
         "perf_summary": perf_summary,
         "fa_summary": fa_summary,
         "full_fa_summary": full_fa_summary,
+        "decode_perf_summary": decode_perf_summary,
+        "decode_perf_comparison": decode_perf_comparison,
         "dynamic_update_summary": dynamic_summary,
     }
 
@@ -268,6 +395,7 @@ def render_text(summary: dict, top_n: int) -> str:
     lines.append(f"sparse perf windows: {summary['perf_window_lines']}")
     lines.append(f"sparse perf fa lines: {summary['perf_fa_lines']}")
     lines.append(f"full perf fa lines: {summary['full_perf_fa_lines']}")
+    lines.append(f"decode perf lines: {summary['decode_perf_lines']}")
     lines.append(f"empty windows: {summary['empty_windows']}")
     if summary["window_steps_values"]:
         vals = ", ".join(str(v) for v in summary["window_steps_values"])
@@ -312,6 +440,38 @@ def render_text(summary: dict, top_n: int) -> str:
                 "  {layer}: events={events} added_clusters={added_clusters} "
                 "last_total_clusters={last_total_clusters}".format(**row)
             )
+
+    lines.append("")
+    lines.append("DecodePerf summary:")
+    decode_rows = summary["decode_perf_summary"]
+    if not decode_rows:
+        lines.append("  (none)")
+    else:
+        for row in decode_rows:
+            lines.append(
+                "  {mode}: total_ms={total_ms:.3f} calls={calls} "
+                "avg_total_ms={avg_total_ms:.4f} "
+                "avg_preprocess_ms={avg_preprocess_ms:.4f} "
+                "avg_attn_metadata_ms={avg_attn_metadata_ms:.4f} "
+                "avg_forward_ms={avg_forward_ms:.4f} "
+                "avg_postprocess_ms={avg_postprocess_ms:.4f} "
+                "avg_other_ms={avg_other_ms:.4f} "
+                "forward_share={forward_share:.2%} "
+                "avg_num_reqs={avg_num_reqs} avg_num_tokens={avg_num_tokens} "
+                "kv_connector_calls={kv_connector_calls} "
+                "cudagraph_counts={cudagraph_counts}".format(**row)
+            )
+    if summary.get("decode_perf_comparison"):
+        cmp_row = summary["decode_perf_comparison"]
+        lines.append(
+            "  sparse/full ratios: avg_total={sparse_vs_full_avg_total_ratio:.4f} "
+            "preprocess={sparse_vs_full_avg_preprocess_ratio:.4f} "
+            "attn_metadata={sparse_vs_full_avg_attn_metadata_ratio:.4f} "
+            "forward={sparse_vs_full_avg_forward_ratio:.4f} "
+            "postprocess={sparse_vs_full_avg_postprocess_ratio:.4f}".format(
+                **cmp_row
+            )
+        )
 
     lines.append("")
     lines.append("Top FullPerfFA entries:")

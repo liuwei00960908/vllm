@@ -551,6 +551,9 @@ class GPUModelRunner(
         self._sparse_perf_stats_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_PERF_STATS", "0")) == 1
         )
+        self._decode_perf_stats_enabled: bool = bool(
+            int(os.getenv("VLLM_DECODE_PERF_STATS", "0"))
+        )
         self._sparse_perf_log_interval: int = max(
             1, int(os.getenv("VLLM_SPARSE_PERF_LOG_INTERVAL", "50"))
         )
@@ -634,6 +637,8 @@ class GPUModelRunner(
                 "VLLM_SPARSE_PERF_LOG_INTERVAL=%d",
                 self._sparse_perf_log_interval,
             )
+        if self._decode_perf_stats_enabled:
+            logger.info("Decode perf stats enabled: VLLM_DECODE_PERF_STATS=1")
         # Async sparse prefill D2H copy (independent switch).
         self._sparse_async_d2h_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_ASYNC_D2H", "0")) == 1
@@ -4344,6 +4349,17 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        _decode_perf_t0 = (
+            time.perf_counter() if self._decode_perf_stats_enabled else None
+        )
+        _decode_perf_preprocess_ms = 0.0
+        _decode_perf_attn_metadata_ms = 0.0
+        _decode_perf_forward_ms = 0.0
+        _decode_perf_postprocess_ms = 0.0
+        _decode_perf_num_reqs = 0
+        _decode_perf_num_tokens = 0
+        _decode_perf_max_scheduled = 0
+        _decode_perf_decode_only = False
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4380,6 +4396,10 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        _decode_perf_num_tokens = int(num_scheduled_tokens)
+        _t_decode_preprocess = (
+            time.perf_counter() if self._decode_perf_stats_enabled else None
+        )
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4421,11 +4441,18 @@ class GPUModelRunner(
                 )
 
             num_reqs = self.input_batch.num_reqs
+            _decode_perf_num_reqs = int(num_reqs)
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+            _decode_perf_max_scheduled = max_num_scheduled_tokens
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            _decode_perf_decode_only = (
+                max_num_scheduled_tokens == 1
+                and num_tokens_unpadded == num_reqs
+                and len(scheduler_output.scheduled_encoder_inputs) == 0
+            )
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -4525,7 +4552,15 @@ class GPUModelRunner(
             )
 
             _t0_attn_meta = (
-                time.perf_counter() if self._sparse_perf_stats_enabled else None
+                time.perf_counter()
+                if (
+                    self._sparse_perf_stats_enabled
+                    or (
+                        self._decode_perf_stats_enabled
+                        and _decode_perf_decode_only
+                    )
+                )
+                else None
             )
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -4543,9 +4578,18 @@ class GPUModelRunner(
                 )
             )
             if _t0_attn_meta is not None:
+                _attn_metadata_elapsed = time.perf_counter() - _t0_attn_meta
+                if (
+                    self._decode_perf_stats_enabled
+                    and _decode_perf_decode_only
+                ):
+                    _decode_perf_attn_metadata_ms = (
+                        _attn_metadata_elapsed * 1000.0
+                    )
+            if _t0_attn_meta is not None and self._sparse_perf_stats_enabled:
                 self._sparse_perf_record(
                     "_build_attention_metadata",
-                    time.perf_counter() - _t0_attn_meta,
+                    _attn_metadata_elapsed,
                 )
 
             (
@@ -4558,6 +4602,11 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+
+        if self._decode_perf_stats_enabled and _t_decode_preprocess is not None:
+            _decode_perf_preprocess_ms = (
+                time.perf_counter() - _t_decode_preprocess
+            ) * 1000.0
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4579,6 +4628,11 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        _t_decode_forward = (
+            time.perf_counter()
+            if self._decode_perf_stats_enabled and _decode_perf_decode_only
+            else None
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4605,6 +4659,16 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        if _t_decode_forward is not None:
+            _decode_perf_forward_ms = (
+                time.perf_counter() - _t_decode_forward
+            ) * 1000.0
+
+        _t_decode_postprocess = (
+            time.perf_counter()
+            if self._decode_perf_stats_enabled and _decode_perf_decode_only
+            else None
+        )
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4664,6 +4728,11 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        if _t_decode_postprocess is not None:
+            _decode_perf_postprocess_ms = (
+                time.perf_counter() - _t_decode_postprocess
+            ) * 1000.0
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4677,6 +4746,36 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+        if (
+            self._decode_perf_stats_enabled
+            and _decode_perf_decode_only
+            and _decode_perf_t0 is not None
+        ):
+            total_ms = (time.perf_counter() - _decode_perf_t0) * 1000.0
+            known_ms = (
+                _decode_perf_preprocess_ms
+                + _decode_perf_forward_ms
+                + _decode_perf_postprocess_ms
+            )
+            other_ms = max(0.0, total_ms - known_ms)
+            logger.info(
+                "[DecodePerf] mode=%s total_ms=%.3f preprocess_ms=%.3f "
+                "attn_metadata_ms=%.3f forward_ms=%.3f postprocess_ms=%.3f "
+                "other_ms=%.3f num_reqs=%d num_tokens=%d max_scheduled=%d "
+                "has_kv_connector=%d cudagraph=%s",
+                "sparse" if self._has_sparse_attn else "full",
+                total_ms,
+                _decode_perf_preprocess_ms,
+                _decode_perf_attn_metadata_ms,
+                _decode_perf_forward_ms,
+                _decode_perf_postprocess_ms,
+                other_ms,
+                _decode_perf_num_reqs,
+                _decode_perf_num_tokens,
+                _decode_perf_max_scheduled,
+                int(has_kv_transfer_group()),
+                cudagraph_mode.name,
+            )
         return None
 
     @torch.inference_mode
