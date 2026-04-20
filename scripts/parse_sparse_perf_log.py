@@ -53,9 +53,15 @@ DECODE_PERF_RE = re.compile(
     r"\[DecodePerf\]\s+mode=(?P<mode>\S+)\s+"
     r"total_ms=(?P<total_ms>\d+(?:\.\d+)?)\s+"
     r"preprocess_ms=(?P<preprocess_ms>\d+(?:\.\d+)?)\s+"
+    r"(?:update_states_ms=(?P<update_states_ms>\d+(?:\.\d+)?)\s+)?"
+    r"(?:prepare_inputs_ms=(?P<prepare_inputs_ms>\d+(?:\.\d+)?)\s+)?"
+    r"(?:batch_plan_ms=(?P<batch_plan_ms>\d+(?:\.\d+)?)\s+)?"
+    r"(?:slot_mapping_ms=(?P<slot_mapping_ms>\d+(?:\.\d+)?)\s+)?"
     r"attn_metadata_ms=(?P<attn_metadata_ms>\d+(?:\.\d+)?)\s+"
+    r"(?:model_preprocess_ms=(?P<model_preprocess_ms>\d+(?:\.\d+)?)\s+)?"
     r"forward_ms=(?P<forward_ms>\d+(?:\.\d+)?)\s+"
     r"postprocess_ms=(?P<postprocess_ms>\d+(?:\.\d+)?)\s+"
+    r"(?:compute_logits_ms=(?P<compute_logits_ms>\d+(?:\.\d+)?)\s+)?"
     r"other_ms=(?P<other_ms>\d+(?:\.\d+)?)\s+"
     r"num_reqs=(?P<num_reqs>\d+)\s+"
     r"num_tokens=(?P<num_tokens>\d+)\s+"
@@ -111,9 +117,15 @@ class FaAgg:
 class DecodePerfAgg:
     total_ms: float = 0.0
     preprocess_ms: float = 0.0
+    update_states_ms: float = 0.0
+    prepare_inputs_ms: float = 0.0
+    batch_plan_ms: float = 0.0
+    slot_mapping_ms: float = 0.0
     attn_metadata_ms: float = 0.0
+    model_preprocess_ms: float = 0.0
     forward_ms: float = 0.0
     postprocess_ms: float = 0.0
+    compute_logits_ms: float = 0.0
     other_ms: float = 0.0
     calls: int = 0
     num_reqs_sum: int = 0
@@ -123,12 +135,22 @@ class DecodePerfAgg:
     cudagraph_counts: dict[str, int] | None = None
 
     def add(self, m: re.Match[str]) -> None:
-        self.total_ms += float(m.group("total_ms"))
-        self.preprocess_ms += float(m.group("preprocess_ms"))
-        self.attn_metadata_ms += float(m.group("attn_metadata_ms"))
-        self.forward_ms += float(m.group("forward_ms"))
-        self.postprocess_ms += float(m.group("postprocess_ms"))
-        self.other_ms += float(m.group("other_ms"))
+        def f(name: str) -> float:
+            value = m.group(name)
+            return float(value) if value is not None else 0.0
+
+        self.total_ms += f("total_ms")
+        self.preprocess_ms += f("preprocess_ms")
+        self.update_states_ms += f("update_states_ms")
+        self.prepare_inputs_ms += f("prepare_inputs_ms")
+        self.batch_plan_ms += f("batch_plan_ms")
+        self.slot_mapping_ms += f("slot_mapping_ms")
+        self.attn_metadata_ms += f("attn_metadata_ms")
+        self.model_preprocess_ms += f("model_preprocess_ms")
+        self.forward_ms += f("forward_ms")
+        self.postprocess_ms += f("postprocess_ms")
+        self.compute_logits_ms += f("compute_logits_ms")
+        self.other_ms += f("other_ms")
         self.calls += 1
         self.num_reqs_sum += int(m.group("num_reqs"))
         self.num_tokens_sum += int(m.group("num_tokens"))
@@ -313,6 +335,20 @@ def parse_log(path: Path) -> dict:
     for mode, agg in sorted(
         decode_perf_by_mode.items(), key=lambda kv: kv[0]
     ):
+        preprocess_child_ms = (
+            agg.update_states_ms
+            + agg.prepare_inputs_ms
+            + agg.batch_plan_ms
+            + agg.slot_mapping_ms
+            + agg.attn_metadata_ms
+            + agg.model_preprocess_ms
+        )
+        preprocess_unaccounted_ms = max(
+            0.0, agg.preprocess_ms - preprocess_child_ms
+        )
+        postprocess_unaccounted_ms = max(
+            0.0, agg.postprocess_ms - agg.compute_logits_ms
+        )
         decode_perf_summary.append(
             {
                 "mode": mode,
@@ -320,21 +356,67 @@ def parse_log(path: Path) -> dict:
                 "calls": agg.calls,
                 "avg_total_ms": round(agg.avg(agg.total_ms), 4),
                 "avg_preprocess_ms": round(agg.avg(agg.preprocess_ms), 4),
+                "avg_update_states_ms": round(
+                    agg.avg(agg.update_states_ms), 4
+                ),
+                "avg_prepare_inputs_ms": round(
+                    agg.avg(agg.prepare_inputs_ms), 4
+                ),
+                "avg_batch_plan_ms": round(agg.avg(agg.batch_plan_ms), 4),
+                "avg_slot_mapping_ms": round(
+                    agg.avg(agg.slot_mapping_ms), 4
+                ),
                 "avg_attn_metadata_ms": round(agg.avg(agg.attn_metadata_ms), 4),
+                "avg_model_preprocess_ms": round(
+                    agg.avg(agg.model_preprocess_ms), 4
+                ),
+                "avg_preprocess_unaccounted_ms": round(
+                    agg.avg(preprocess_unaccounted_ms), 4
+                ),
                 "avg_forward_ms": round(agg.avg(agg.forward_ms), 4),
                 "avg_postprocess_ms": round(agg.avg(agg.postprocess_ms), 4),
+                "avg_compute_logits_ms": round(
+                    agg.avg(agg.compute_logits_ms), 4
+                ),
+                "avg_postprocess_unaccounted_ms": round(
+                    agg.avg(postprocess_unaccounted_ms), 4
+                ),
                 "avg_other_ms": round(agg.avg(agg.other_ms), 4),
                 "preprocess_share": round(
                     agg.preprocess_ms / agg.total_ms, 4
                 ) if agg.total_ms else 0.0,
+                "update_states_share": round(
+                    agg.update_states_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "prepare_inputs_share": round(
+                    agg.prepare_inputs_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "batch_plan_share": round(
+                    agg.batch_plan_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "slot_mapping_share": round(
+                    agg.slot_mapping_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
                 "attn_metadata_share": round(
                     agg.attn_metadata_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "model_preprocess_share": round(
+                    agg.model_preprocess_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "preprocess_unaccounted_share": round(
+                    preprocess_unaccounted_ms / agg.total_ms, 4
                 ) if agg.total_ms else 0.0,
                 "forward_share": round(
                     agg.forward_ms / agg.total_ms, 4
                 ) if agg.total_ms else 0.0,
                 "postprocess_share": round(
                     agg.postprocess_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "compute_logits_share": round(
+                    agg.compute_logits_ms / agg.total_ms, 4
+                ) if agg.total_ms else 0.0,
+                "postprocess_unaccounted_share": round(
+                    postprocess_unaccounted_ms / agg.total_ms, 4
                 ) if agg.total_ms else 0.0,
                 "other_share": round(
                     agg.other_ms / agg.total_ms, 4
@@ -363,12 +445,34 @@ def parse_log(path: Path) -> dict:
         decode_perf_comparison = {
             "sparse_vs_full_avg_total_ratio": ratio("avg_total_ms"),
             "sparse_vs_full_avg_preprocess_ratio": ratio("avg_preprocess_ms"),
+            "sparse_vs_full_avg_update_states_ratio": ratio(
+                "avg_update_states_ms"
+            ),
+            "sparse_vs_full_avg_prepare_inputs_ratio": ratio(
+                "avg_prepare_inputs_ms"
+            ),
+            "sparse_vs_full_avg_batch_plan_ratio": ratio("avg_batch_plan_ms"),
+            "sparse_vs_full_avg_slot_mapping_ratio": ratio(
+                "avg_slot_mapping_ms"
+            ),
             "sparse_vs_full_avg_attn_metadata_ratio": ratio(
                 "avg_attn_metadata_ms"
+            ),
+            "sparse_vs_full_avg_model_preprocess_ratio": ratio(
+                "avg_model_preprocess_ms"
+            ),
+            "sparse_vs_full_avg_preprocess_unaccounted_ratio": ratio(
+                "avg_preprocess_unaccounted_ms"
             ),
             "sparse_vs_full_avg_forward_ratio": ratio("avg_forward_ms"),
             "sparse_vs_full_avg_postprocess_ratio": ratio(
                 "avg_postprocess_ms"
+            ),
+            "sparse_vs_full_avg_compute_logits_ratio": ratio(
+                "avg_compute_logits_ms"
+            ),
+            "sparse_vs_full_avg_postprocess_unaccounted_ratio": ratio(
+                "avg_postprocess_unaccounted_ms"
             ),
         }
 
@@ -452,9 +556,19 @@ def render_text(summary: dict, top_n: int) -> str:
                 "  {mode}: total_ms={total_ms:.3f} calls={calls} "
                 "avg_total_ms={avg_total_ms:.4f} "
                 "avg_preprocess_ms={avg_preprocess_ms:.4f} "
+                "avg_update_states_ms={avg_update_states_ms:.4f} "
+                "avg_prepare_inputs_ms={avg_prepare_inputs_ms:.4f} "
+                "avg_batch_plan_ms={avg_batch_plan_ms:.4f} "
+                "avg_slot_mapping_ms={avg_slot_mapping_ms:.4f} "
                 "avg_attn_metadata_ms={avg_attn_metadata_ms:.4f} "
+                "avg_model_preprocess_ms={avg_model_preprocess_ms:.4f} "
+                "avg_preprocess_unaccounted_ms="
+                "{avg_preprocess_unaccounted_ms:.4f} "
                 "avg_forward_ms={avg_forward_ms:.4f} "
                 "avg_postprocess_ms={avg_postprocess_ms:.4f} "
+                "avg_compute_logits_ms={avg_compute_logits_ms:.4f} "
+                "avg_postprocess_unaccounted_ms="
+                "{avg_postprocess_unaccounted_ms:.4f} "
                 "avg_other_ms={avg_other_ms:.4f} "
                 "forward_share={forward_share:.2%} "
                 "avg_num_reqs={avg_num_reqs} avg_num_tokens={avg_num_tokens} "
@@ -466,9 +580,19 @@ def render_text(summary: dict, top_n: int) -> str:
         lines.append(
             "  sparse/full ratios: avg_total={sparse_vs_full_avg_total_ratio:.4f} "
             "preprocess={sparse_vs_full_avg_preprocess_ratio:.4f} "
+            "update_states={sparse_vs_full_avg_update_states_ratio:.4f} "
+            "prepare_inputs={sparse_vs_full_avg_prepare_inputs_ratio:.4f} "
+            "batch_plan={sparse_vs_full_avg_batch_plan_ratio:.4f} "
+            "slot_mapping={sparse_vs_full_avg_slot_mapping_ratio:.4f} "
             "attn_metadata={sparse_vs_full_avg_attn_metadata_ratio:.4f} "
+            "model_preprocess={sparse_vs_full_avg_model_preprocess_ratio:.4f} "
+            "preprocess_unaccounted="
+            "{sparse_vs_full_avg_preprocess_unaccounted_ratio:.4f} "
             "forward={sparse_vs_full_avg_forward_ratio:.4f} "
-            "postprocess={sparse_vs_full_avg_postprocess_ratio:.4f}".format(
+            "postprocess={sparse_vs_full_avg_postprocess_ratio:.4f} "
+            "compute_logits={sparse_vs_full_avg_compute_logits_ratio:.4f} "
+            "postprocess_unaccounted="
+            "{sparse_vs_full_avg_postprocess_unaccounted_ratio:.4f}".format(
                 **cmp_row
             )
         )

@@ -4353,9 +4353,15 @@ class GPUModelRunner(
             time.perf_counter() if self._decode_perf_stats_enabled else None
         )
         _decode_perf_preprocess_ms = 0.0
+        _decode_perf_update_states_ms = 0.0
+        _decode_perf_prepare_inputs_ms = 0.0
+        _decode_perf_batch_plan_ms = 0.0
+        _decode_perf_slot_mapping_ms = 0.0
         _decode_perf_attn_metadata_ms = 0.0
+        _decode_perf_model_preprocess_ms = 0.0
         _decode_perf_forward_ms = 0.0
         _decode_perf_postprocess_ms = 0.0
+        _decode_perf_compute_logits_ms = 0.0
         _decode_perf_num_reqs = 0
         _decode_perf_num_tokens = 0
         _decode_perf_max_scheduled = 0
@@ -4405,7 +4411,14 @@ class GPUModelRunner(
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
+            _t_decode_update_states = (
+                time.perf_counter() if self._decode_perf_stats_enabled else None
+            )
             self._update_states(scheduler_output)
+            if _t_decode_update_states is not None:
+                _decode_perf_update_states_ms = (
+                    time.perf_counter() - _t_decode_update_states
+                ) * 1000.0
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4454,11 +4467,31 @@ class GPUModelRunner(
                 and len(scheduler_output.scheduled_encoder_inputs) == 0
             )
 
+            _t_decode_prepare_inputs = (
+                time.perf_counter()
+                if (
+                    self._decode_perf_stats_enabled
+                    and _decode_perf_decode_only
+                )
+                else None
+            )
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if _t_decode_prepare_inputs is not None:
+                _decode_perf_prepare_inputs_ms = (
+                    time.perf_counter() - _t_decode_prepare_inputs
+                ) * 1000.0
 
+            _t_decode_batch_plan = (
+                time.perf_counter()
+                if (
+                    self._decode_perf_stats_enabled
+                    and _decode_perf_decode_only
+                )
+                else None
+            )
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
@@ -4510,6 +4543,10 @@ class GPUModelRunner(
                 ubatch_slices,
                 ubatch_slices_padded,
             )
+            if _t_decode_batch_plan is not None:
+                _decode_perf_batch_plan_ms = (
+                    time.perf_counter() - _t_decode_batch_plan
+                ) * 1000.0
 
             # True if any attention backend handles KV cache update separately
             # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
@@ -4540,6 +4577,14 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            _t_decode_slot_mapping = (
+                time.perf_counter()
+                if (
+                    self._decode_perf_stats_enabled
+                    and _decode_perf_decode_only
+                )
+                else None
+            )
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -4550,6 +4595,10 @@ class GPUModelRunner(
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
+            if _t_decode_slot_mapping is not None:
+                _decode_perf_slot_mapping_ms = (
+                    time.perf_counter() - _t_decode_slot_mapping
+                ) * 1000.0
 
             _t0_attn_meta = (
                 time.perf_counter()
@@ -4592,6 +4641,14 @@ class GPUModelRunner(
                     _attn_metadata_elapsed,
                 )
 
+            _t_decode_model_preprocess = (
+                time.perf_counter()
+                if (
+                    self._decode_perf_stats_enabled
+                    and _decode_perf_decode_only
+                )
+                else None
+            )
             (
                 input_ids,
                 inputs_embeds,
@@ -4602,6 +4659,10 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            if _t_decode_model_preprocess is not None:
+                _decode_perf_model_preprocess_ms = (
+                    time.perf_counter() - _t_decode_model_preprocess
+                ) * 1000.0
 
         if self._decode_perf_stats_enabled and _t_decode_preprocess is not None:
             _decode_perf_preprocess_ms = (
@@ -4696,8 +4757,20 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                _t_decode_compute_logits = (
+                    time.perf_counter()
+                    if (
+                        self._decode_perf_stats_enabled
+                        and _decode_perf_decode_only
+                    )
+                    else None
+                )
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                if _t_decode_compute_logits is not None:
+                    _decode_perf_compute_logits_ms += (
+                        time.perf_counter() - _t_decode_compute_logits
+                    ) * 1000.0
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4716,7 +4789,19 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    _t_decode_compute_logits = (
+                        time.perf_counter()
+                        if (
+                            self._decode_perf_stats_enabled
+                            and _decode_perf_decode_only
+                        )
+                        else None
+                    )
                     logits = self.model.compute_logits(sample_hidden_states)
+                    if _t_decode_compute_logits is not None:
+                        _decode_perf_compute_logits_ms += (
+                            time.perf_counter() - _t_decode_compute_logits
+                        ) * 1000.0
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -4760,15 +4845,25 @@ class GPUModelRunner(
             other_ms = max(0.0, total_ms - known_ms)
             logger.info(
                 "[DecodePerf] mode=%s total_ms=%.3f preprocess_ms=%.3f "
-                "attn_metadata_ms=%.3f forward_ms=%.3f postprocess_ms=%.3f "
+                "update_states_ms=%.3f prepare_inputs_ms=%.3f "
+                "batch_plan_ms=%.3f slot_mapping_ms=%.3f "
+                "attn_metadata_ms=%.3f model_preprocess_ms=%.3f "
+                "forward_ms=%.3f postprocess_ms=%.3f "
+                "compute_logits_ms=%.3f "
                 "other_ms=%.3f num_reqs=%d num_tokens=%d max_scheduled=%d "
                 "has_kv_connector=%d cudagraph=%s",
                 "sparse" if self._has_sparse_attn else "full",
                 total_ms,
                 _decode_perf_preprocess_ms,
+                _decode_perf_update_states_ms,
+                _decode_perf_prepare_inputs_ms,
+                _decode_perf_batch_plan_ms,
+                _decode_perf_slot_mapping_ms,
                 _decode_perf_attn_metadata_ms,
+                _decode_perf_model_preprocess_ms,
                 _decode_perf_forward_ms,
                 _decode_perf_postprocess_ms,
+                _decode_perf_compute_logits_ms,
                 other_ms,
                 _decode_perf_num_reqs,
                 _decode_perf_num_tokens,
