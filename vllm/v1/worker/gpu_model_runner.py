@@ -569,6 +569,7 @@ class _SparseOnlineLayerState:
         states: "list[_SparseOnlineLayerState]",
         feats_stack: torch.Tensor,
         clusters_stack: torch.Tensor,
+        perf_recorder: "object | None" = None,
     ) -> None:
         """Append one decode-step feature to each of ``states`` in batch.
 
@@ -576,8 +577,13 @@ class _SparseOnlineLayerState:
         int64; entry ``i`` is appended to ``states[i]``.  Compared to calling
         :meth:`append_decode_feature` in a Python loop this collapses
         ``2 * U`` small ``copy_`` kernel launches into two fused
-        ``torch._foreach_copy_`` launches, eliminating the per-(layer, kv_head)
-        launch overhead that dominates ``_update_sparse_online_index``.
+        ``torch._foreach_copy_`` launches (when available), eliminating the
+        per-(layer, kv_head) launch overhead that dominates
+        ``_update_sparse_online_index``.
+
+        If ``perf_recorder`` is a :class:`GPUModelRunner`-like object with a
+        ``_sparse_perf_record`` method and ``_sparse_perf_stats_enabled`` set,
+        sub-stage timings are recorded for diagnostics (no-op otherwise).
         """
         u = len(states)
         if u == 0:
@@ -585,13 +591,29 @@ class _SparseOnlineLayerState:
         assert feats_stack.shape[0] == u, (feats_stack.shape, u)
         assert clusters_stack.shape[0] == u, (clusters_stack.shape, u)
 
+        _stats_on = bool(
+            perf_recorder is not None
+            and getattr(perf_recorder, "_sparse_perf_stats_enabled", False)
+        )
+        _record = (
+            getattr(perf_recorder, "_sparse_perf_record", None)
+            if _stats_on else None
+        )
+
+        _t = time.perf_counter() if _stats_on else None
         # First ensure every storage has room for one more entry.  This is a
         # pure-Python loop but is a no-op on the fast path (storage was grown
         # geometrically on a previous append).  Any rare realloc happens here
         # and not on the hot tensor-level path below.
         for s in states:
             s._grow_if_needed(1)
+        if _record is not None and _t is not None:
+            _record(
+                "_update_sparse_online_index:ba_grow",
+                time.perf_counter() - _t,
+            )
 
+        _t = time.perf_counter() if _stats_on else None
         abf_dsts: list[torch.Tensor] = [
             s._abf_storage[s._len] for s in states
         ]
@@ -600,12 +622,31 @@ class _SparseOnlineLayerState:
         ]
         abf_srcs: list[torch.Tensor] = list(feats_stack.unbind(0))
         b2c_srcs: list[torch.Tensor] = list(clusters_stack.unbind(0))
+        if _record is not None and _t is not None:
+            _record(
+                "_update_sparse_online_index:ba_views",
+                time.perf_counter() - _t,
+            )
 
+        _t = time.perf_counter() if _stats_on else None
         # ``torch._foreach_copy_`` is a multi-tensor fused copy available since
-        # PyTorch 2.0.  It is the only stable way to execute ``U`` element-wise
-        # copies with a single kernel launch for non-overlapping destinations.
-        torch._foreach_copy_(abf_dsts, abf_srcs)
-        torch._foreach_copy_(b2c_dsts, b2c_srcs)
+        # PyTorch 2.0.  Fall back to a plain per-tensor ``copy_`` loop when
+        # unavailable (e.g. a stripped-down test build); correctness is
+        # identical, only the fusion speedup is lost.
+        foreach_copy = getattr(torch, "_foreach_copy_", None)
+        if foreach_copy is not None:
+            foreach_copy(abf_dsts, abf_srcs)
+            foreach_copy(b2c_dsts, b2c_srcs)
+        else:
+            for dst, src in zip(abf_dsts, abf_srcs, strict=True):
+                dst.copy_(src)
+            for dst, src in zip(b2c_dsts, b2c_srcs, strict=True):
+                dst.copy_(src)
+        if _record is not None and _t is not None:
+            _record(
+                "_update_sparse_online_index:ba_foreach",
+                time.perf_counter() - _t,
+            )
 
         for s in states:
             s._len += 1
@@ -8442,6 +8483,10 @@ class GPUModelRunner(
             # Python loop (which used to dominate the decode critical path –
             # 28 layers x 4 kv_heads x ~3 kernels / unit ~= 300 launches).
             # ------------------------------------------------------------
+            _t_sub = (
+                time.perf_counter()
+                if self._sparse_perf_stats_enabled else None
+            )
             pass1_states: list[_SparseOnlineLayerState] = []
             pass1_feats: list[torch.Tensor] = []
             pass1_specs: list[SparseAttentionSpec] = []
@@ -8472,6 +8517,12 @@ class GPUModelRunner(
                     pass1_feats.append(feat_t)
                     pass1_specs.append(spec)
 
+            if _t_sub is not None:
+                self._sparse_perf_record(
+                    "_update_sparse_online_index:pass1_gather",
+                    time.perf_counter() - _t_sub,
+                )
+
             if not pass1_states:
                 return
 
@@ -8489,6 +8540,10 @@ class GPUModelRunner(
             # small matmul per unit.  In the common homogeneous case there is
             # exactly one bucket, collapsing up to ~L*KH launches into O(1).
             # ------------------------------------------------------------
+            _t_sub = (
+                time.perf_counter()
+                if self._sparse_perf_stats_enabled else None
+            )
             buckets: dict[
                 tuple[int, int], list[int]
             ] = {}
@@ -8499,8 +8554,17 @@ class GPUModelRunner(
                     if s.mean_key.dim() >= 1 else 0
                 )
                 buckets.setdefault((k, d), []).append(i)
+            if _t_sub is not None:
+                self._sparse_perf_record(
+                    "_update_sparse_online_index:bucket",
+                    time.perf_counter() - _t_sub,
+                )
 
             for (k, d), idxs in buckets.items():
+                _t_sub = (
+                    time.perf_counter()
+                    if self._sparse_perf_stats_enabled else None
+                )
                 bucket_states = [pass1_states[i] for i in idxs]
                 bucket_feats = [pass1_feats[i] for i in idxs]
                 feats_g = torch.stack(bucket_feats, dim=0)  # [G, D]
@@ -8513,6 +8577,11 @@ class GPUModelRunner(
                     nearest_g = torch.zeros(
                         g, dtype=torch.int64, device=device
                     )
+                    if _t_sub is not None:
+                        self._sparse_perf_record(
+                            "_update_sparse_online_index:stack_bmm",
+                            time.perf_counter() - _t_sub,
+                        )
                 else:
                     means_g = torch.stack(
                         [s.mean_key for s in bucket_states], dim=0
@@ -8524,10 +8593,24 @@ class GPUModelRunner(
                     centred_c = centres_g - means_g.unsqueeze(1)  # [G, K, D]
                     dots = torch.bmm(centred_c, centered).squeeze(-1)  # [G, K]
                     nearest_g = dots.argmax(dim=-1).to(dtype=torch.int64)
+                    if _t_sub is not None:
+                        self._sparse_perf_record(
+                            "_update_sparse_online_index:stack_bmm",
+                            time.perf_counter() - _t_sub,
+                        )
 
-                _SparseOnlineLayerState.bulk_append(
-                    bucket_states, feats_g, nearest_g
+                _t_sub = (
+                    time.perf_counter()
+                    if self._sparse_perf_stats_enabled else None
                 )
+                _SparseOnlineLayerState.bulk_append(
+                    bucket_states, feats_g, nearest_g, perf_recorder=self
+                )
+                if _t_sub is not None:
+                    self._sparse_perf_record(
+                        "_update_sparse_online_index:bulk_append",
+                        time.perf_counter() - _t_sub,
+                    )
 
             # ------------------------------------------------------------
             # Pass 4: per-state bookkeeping that stays in Python (it's
@@ -8536,6 +8619,10 @@ class GPUModelRunner(
             # ``update_threshold_tokens`` decode steps) so we keep the
             # existing path intact instead of trying to batch them.
             # ------------------------------------------------------------
+            _t_sub = (
+                time.perf_counter()
+                if self._sparse_perf_stats_enabled else None
+            )
             for state, feat_t, spec in zip(
                 pass1_states, pass1_feats, pass1_specs, strict=True
             ):
@@ -8545,6 +8632,11 @@ class GPUModelRunner(
                     >= int(spec.update_threshold_tokens)
                 ):
                     self._sparse_online_dynamic_update(state)
+            if _t_sub is not None:
+                self._sparse_perf_record(
+                    "_update_sparse_online_index:bookkeep",
+                    time.perf_counter() - _t_sub,
+                )
         finally:
             if _t0 is not None:
                 self._sparse_perf_record(
