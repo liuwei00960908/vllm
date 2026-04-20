@@ -62,6 +62,12 @@ FULL_PERF_FA_RE = re.compile(
     r"(?:\s+max_seqlen_q=(?P<max_seqlen_q>\d+))?"
     r"(?:\s+max_seqlen_k=(?P<max_seqlen_k>\d+))?"
 )
+DECODE_PERF_E2E_RE = re.compile(
+    r"\[DecodePerfE2E\]\s+mode=(?P<mode>\S+)\s+"
+    r"total_ms=(?P<total_ms>\d+(?:\.\d+)?)\s+"
+    r"execute_model_ms=(?P<execute_model_ms>\d+(?:\.\d+)?)\s+"
+    r"sample_tokens_ms=(?P<sample_tokens_ms>\d+(?:\.\d+)?)"
+)
 DECODE_PERF_RE = re.compile(
     r"\[DecodePerf\]\s+mode=(?P<mode>\S+)\s+"
     r"total_ms=(?P<total_ms>\d+(?:\.\d+)?)\s+"
@@ -180,11 +186,34 @@ class DecodePerfAgg:
         return value / self.calls if self.calls else 0.0
 
 
+@dataclass
+class DecodePerfE2EAgg:
+    total_ms: float = 0.0
+    execute_model_ms: float = 0.0
+    sample_tokens_ms: float = 0.0
+    calls: int = 0
+
+    @property
+    def avg_total_ms(self) -> float:
+        return self.total_ms / self.calls if self.calls else 0.0
+
+    @property
+    def avg_execute_model_ms(self) -> float:
+        return self.execute_model_ms / self.calls if self.calls else 0.0
+
+    @property
+    def avg_sample_tokens_ms(self) -> float:
+        return self.sample_tokens_ms / self.calls if self.calls else 0.0
+
+
 def parse_log(path: Path) -> dict:
     perf_by_key: dict[str, PerfAgg] = defaultdict(PerfAgg)
     fa_by_key: dict[str, FaAgg] = defaultdict(FaAgg)
     full_fa_by_key: dict[str, FaAgg] = defaultdict(FaAgg)
     decode_perf_by_mode: dict[str, DecodePerfAgg] = defaultdict(DecodePerfAgg)
+    decode_perf_e2e_by_mode: dict[str, DecodePerfE2EAgg] = defaultdict(
+        DecodePerfE2EAgg
+    )
     dynamic_update_by_layer: dict[str, dict[str, int]] = defaultdict(
         lambda: {"events": 0, "added_clusters": 0, "last_total_clusters": 0}
     )
@@ -194,6 +223,7 @@ def parse_log(path: Path) -> dict:
     perf_fa_lines = 0
     full_perf_fa_lines = 0
     decode_perf_lines = 0
+    decode_perf_e2e_lines = 0
 
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for raw_line in f:
@@ -256,6 +286,16 @@ def parse_log(path: Path) -> dict:
                     agg.max_seqlen_q_max = max(
                         agg.max_seqlen_q_max, int(m.group("max_seqlen_q"))
                     )
+                continue
+
+            m = DECODE_PERF_E2E_RE.search(line)
+            if m:
+                decode_perf_e2e_lines += 1
+                e2e_agg = decode_perf_e2e_by_mode[m.group("mode")]
+                e2e_agg.total_ms += float(m.group("total_ms"))
+                e2e_agg.execute_model_ms += float(m.group("execute_model_ms"))
+                e2e_agg.sample_tokens_ms += float(m.group("sample_tokens_ms"))
+                e2e_agg.calls += 1
                 continue
 
             m = DECODE_PERF_RE.search(line)
@@ -489,12 +529,65 @@ def parse_log(path: Path) -> dict:
             ),
         }
 
+    decode_perf_e2e_summary = []
+    for mode, e2e_agg in sorted(
+        decode_perf_e2e_by_mode.items(), key=lambda kv: kv[0]
+    ):
+        # Sample-tokens includes _sample, _bookkeeping_sync,
+        # _collect_sparse_features, _update_sparse_online_index, and
+        # ModelRunnerOutput construction.  Diff vs [DecodePerf].total_ms
+        # tells us how much of the end-to-end sits outside execute_model.
+        decode_perf_e2e_summary.append(
+            {
+                "mode": mode,
+                "total_ms": round(e2e_agg.total_ms, 3),
+                "execute_model_ms": round(e2e_agg.execute_model_ms, 3),
+                "sample_tokens_ms": round(e2e_agg.sample_tokens_ms, 3),
+                "calls": e2e_agg.calls,
+                "avg_total_ms": round(e2e_agg.avg_total_ms, 4),
+                "avg_execute_model_ms": round(
+                    e2e_agg.avg_execute_model_ms, 4
+                ),
+                "avg_sample_tokens_ms": round(
+                    e2e_agg.avg_sample_tokens_ms, 4
+                ),
+                "sample_tokens_share": round(
+                    e2e_agg.sample_tokens_ms / e2e_agg.total_ms, 4
+                ) if e2e_agg.total_ms else 0.0,
+            }
+        )
+
+    decode_perf_e2e_comparison = None
+    e2e_by_mode = {row["mode"]: row for row in decode_perf_e2e_summary}
+    if "sparse" in e2e_by_mode and "full" in e2e_by_mode:
+        sparse_e2e = e2e_by_mode["sparse"]
+        full_e2e = e2e_by_mode["full"]
+
+        def _e2e_ratio(key: str) -> float:
+            denom = float(full_e2e.get(key, 0.0))
+            return (
+                round(float(sparse_e2e.get(key, 0.0)) / denom, 4)
+                if denom
+                else 0.0
+            )
+
+        decode_perf_e2e_comparison = {
+            "sparse_vs_full_avg_total_ratio": _e2e_ratio("avg_total_ms"),
+            "sparse_vs_full_avg_execute_model_ratio": _e2e_ratio(
+                "avg_execute_model_ms"
+            ),
+            "sparse_vs_full_avg_sample_tokens_ratio": _e2e_ratio(
+                "avg_sample_tokens_ms"
+            ),
+        }
+
     return {
         "log_path": str(path),
         "perf_window_lines": perf_lines,
         "perf_fa_lines": perf_fa_lines,
         "full_perf_fa_lines": full_perf_fa_lines,
         "decode_perf_lines": decode_perf_lines,
+        "decode_perf_e2e_lines": decode_perf_e2e_lines,
         "empty_windows": empty_windows,
         "window_steps_values": sorted(set(window_steps)),
         "perf_summary": perf_summary,
@@ -502,6 +595,8 @@ def parse_log(path: Path) -> dict:
         "full_fa_summary": full_fa_summary,
         "decode_perf_summary": decode_perf_summary,
         "decode_perf_comparison": decode_perf_comparison,
+        "decode_perf_e2e_summary": decode_perf_e2e_summary,
+        "decode_perf_e2e_comparison": decode_perf_e2e_comparison,
         "dynamic_update_summary": dynamic_summary,
     }
 
@@ -513,6 +608,9 @@ def render_text(summary: dict, top_n: int) -> str:
     lines.append(f"sparse perf fa lines: {summary['perf_fa_lines']}")
     lines.append(f"full perf fa lines: {summary['full_perf_fa_lines']}")
     lines.append(f"decode perf lines: {summary['decode_perf_lines']}")
+    lines.append(
+        f"decode perf e2e lines: {summary.get('decode_perf_e2e_lines', 0)}"
+    )
     lines.append(f"empty windows: {summary['empty_windows']}")
     if summary["window_steps_values"]:
         vals = ", ".join(str(v) for v in summary["window_steps_values"])
@@ -606,6 +704,31 @@ def render_text(summary: dict, top_n: int) -> str:
             "compute_logits={sparse_vs_full_avg_compute_logits_ratio:.4f} "
             "postprocess_unaccounted="
             "{sparse_vs_full_avg_postprocess_unaccounted_ratio:.4f}".format(
+                **cmp_row
+            )
+        )
+
+    lines.append("")
+    lines.append("DecodePerfE2E summary (full decode step incl. sample_tokens):")
+    e2e_rows = summary.get("decode_perf_e2e_summary", [])
+    if not e2e_rows:
+        lines.append("  (none)")
+    else:
+        for row in e2e_rows:
+            lines.append(
+                "  {mode}: total_ms={total_ms:.3f} calls={calls} "
+                "avg_total_ms={avg_total_ms:.4f} "
+                "avg_execute_model_ms={avg_execute_model_ms:.4f} "
+                "avg_sample_tokens_ms={avg_sample_tokens_ms:.4f} "
+                "sample_tokens_share={sample_tokens_share:.2%}".format(**row)
+            )
+    if summary.get("decode_perf_e2e_comparison"):
+        cmp_row = summary["decode_perf_e2e_comparison"]
+        lines.append(
+            "  sparse/full ratios: "
+            "avg_total={sparse_vs_full_avg_total_ratio:.4f} "
+            "execute_model={sparse_vs_full_avg_execute_model_ratio:.4f} "
+            "sample_tokens={sparse_vs_full_avg_sample_tokens_ratio:.4f}".format(
                 **cmp_row
             )
         )

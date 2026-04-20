@@ -784,6 +784,15 @@ class GPUModelRunner(
         self._decode_perf_stats_enabled: bool = bool(
             int(os.getenv("VLLM_DECODE_PERF_STATS", "0"))
         )
+        # Wall-clock start of the current step, captured at ``execute_model``
+        # entry so ``sample_tokens`` can close an end-to-end window covering
+        # both halves of the two-phase decode RPC (execute_model +
+        # sample_tokens).  The ``avg_total_ms`` field inside ``[DecodePerf]``
+        # only covers ``execute_model``; ``[DecodePerfE2E]`` logged from
+        # ``sample_tokens`` covers the whole step.  ``None`` when stats are
+        # disabled or when no step is in flight.
+        self._decode_perf_step_t0: float | None = None
+        self._decode_perf_step_exec_ms: float = 0.0
         self._sparse_perf_log_interval: int = max(
             1, int(os.getenv("VLLM_SPARSE_PERF_LOG_INTERVAL", "50"))
         )
@@ -4587,6 +4596,13 @@ class GPUModelRunner(
         _decode_perf_t0 = (
             time.perf_counter() if self._decode_perf_stats_enabled else None
         )
+        if self._decode_perf_stats_enabled and _decode_perf_t0 is not None:
+            # Seed the step-level end-to-end window.  ``sample_tokens`` reads
+            # this on exit to compute ``[DecodePerfE2E] total_ms`` spanning
+            # both RPC halves; cleared there so we do not attribute a stale
+            # timestamp to the next step on PP/async paths.
+            self._decode_perf_step_t0 = _decode_perf_t0
+            self._decode_perf_step_exec_ms = 0.0
         _decode_perf_preprocess_ms = 0.0
         _decode_perf_update_states_ms = 0.0
         _decode_perf_prepare_inputs_ms = 0.0
@@ -5066,12 +5082,23 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+        if self._decode_perf_stats_enabled and not _decode_perf_decode_only:
+            # Non-decode-only step (e.g. prefill / mixed).  We do not want
+            # ``[DecodePerfE2E]`` to fire from ``sample_tokens`` in that case
+            # – drop the step-level window so the next call is a fresh
+            # start.
+            self._decode_perf_step_t0 = None
+            self._decode_perf_step_exec_ms = 0.0
         if (
             self._decode_perf_stats_enabled
             and _decode_perf_decode_only
             and _decode_perf_t0 is not None
         ):
             total_ms = (time.perf_counter() - _decode_perf_t0) * 1000.0
+            # Remember for end-to-end log emitted by ``sample_tokens``.  Safe
+            # to write outside the ``decode_only`` branch: we only read it in
+            # ``sample_tokens`` under the same guard.
+            self._decode_perf_step_exec_ms = total_ms
             known_ms = (
                 _decode_perf_preprocess_ms
                 + _decode_perf_forward_ms
@@ -5113,6 +5140,12 @@ class GPUModelRunner(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         if self.execute_model_state is None:
+            # These short-circuit branches do not correspond to a completed
+            # decode step (PP pass-through / empty KV-transfer).  Drop the
+            # pending e2e timer so the next real step starts from a fresh
+            # execute_model entry.
+            self._decode_perf_step_t0 = None
+            self._decode_perf_step_exec_ms = 0.0
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
@@ -5351,6 +5384,7 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
+            self._decode_perf_flush_e2e()
             return output
 
         with record_function_or_nullcontext(
@@ -5374,6 +5408,7 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        self._decode_perf_flush_e2e()
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
@@ -8055,6 +8090,186 @@ class GPUModelRunner(
                     time.perf_counter() - _t0,
                 )
 
+    def _sparse_online_select_tokens_batched(
+        self,
+        states: "list[_SparseOnlineLayerState]",
+        q_list: "list[torch.Tensor]",
+        total_tokens: int,
+        spec: "SparseAttentionSpec",
+    ) -> "list[torch.Tensor]":
+        """Batched variant of ``_sparse_online_select_tokens``.
+
+        All ``(state, q)`` pairs must share the same request (``total_tokens``)
+        and ``spec``.  The implementation stacks them along a new batch
+        dimension to replace ``G`` copies of the kernel soup with a single
+        set of 3D kernels, cutting launch overhead by ~G×.
+
+        Pre-conditions for the fast path (validated inside):
+
+        * ``len(states) == len(q_list)`` and ``G >= 1``.
+        * All ``q`` tensors are 2-D with identical ``(H, D)``.
+        * All ``state.cluster_centres`` are non-empty with identical ``(K, D)``.
+        * All ``state.block_to_cluster`` are non-empty with identical length.
+
+        On pre-condition miss we fall back to the per-state method so behaviour
+        stays bitwise-equivalent.  The fast path produces results that match
+        ``_sparse_online_select_tokens`` within floating-point rounding on
+        ``scores_c`` (same ``matmul`` math, just batched as ``bmm``).
+
+        Returns a list of ``[H, total_tokens]`` bool masks in input order.
+        """
+        G = len(states)
+        if G == 0:
+            return []
+        if G == 1:
+            return [
+                self._sparse_online_select_tokens(
+                    state=states[0],
+                    q=q_list[0],
+                    total_tokens=total_tokens,
+                    spec=spec,
+                )
+            ]
+
+        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        try:
+            # Normalise q to 2-D and check homogeneity; bail on any mismatch.
+            q0 = q_list[0]
+            if q0.dim() == 1:
+                q0 = q0.unsqueeze(0)
+            H = int(q0.shape[0])
+            D = int(q0.shape[-1])
+            device = q0.device
+            N = int(total_tokens)
+            budget = int(spec.sparse_selection_budget())
+
+            def _fallback() -> "list[torch.Tensor]":
+                return [
+                    self._sparse_online_select_tokens(
+                        state=s, q=q, total_tokens=N, spec=spec
+                    )
+                    for s, q in zip(states, q_list, strict=True)
+                ]
+
+            if budget <= 0:
+                return [
+                    torch.zeros((H, N), dtype=torch.bool, device=device)
+                    for _ in range(G)
+                ]
+
+            q_norm: list[torch.Tensor] = []
+            for q in q_list:
+                if q.dim() == 1:
+                    q = q.unsqueeze(0)
+                if int(q.shape[0]) != H or int(q.shape[-1]) != D:
+                    return _fallback()
+                q_norm.append(q)
+
+            K0 = int(states[0].cluster_centres.shape[0]) \
+                if states[0].cluster_centres.numel() > 0 else 0
+            N_idx0 = int(states[0].block_to_cluster.shape[0]) \
+                if states[0].block_to_cluster.numel() > 0 else 0
+            if K0 == 0 or N_idx0 == 0:
+                return _fallback()
+            for s in states[1:]:
+                if (
+                    s.cluster_centres.numel() == 0
+                    or s.block_to_cluster.numel() == 0
+                    or int(s.cluster_centres.shape[0]) != K0
+                    or int(s.block_to_cluster.shape[0]) != N_idx0
+                    or int(s.cluster_centres.shape[-1]) != D
+                ):
+                    return _fallback()
+
+            indexed_tokens = min(N, N_idx0)
+            if indexed_tokens <= 0:
+                return _fallback()
+
+            # ── Steady mask (shared across all G) ─────────────────────────
+            head_n = min(int(spec.static_pattern_start), N)
+            tail_start = max(0, N - int(spec.static_pattern_end))
+            if head_n >= tail_start:
+                steady_count = N
+            else:
+                steady_count = head_n + (N - tail_start)
+            steady_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            if head_n > 0:
+                steady_mask[:head_n] = True
+            if tail_start < N:
+                steady_mask[tail_start:] = True
+            steady_row = steady_mask.view(1, 1, N)  # [1,1,N] broadcastable
+
+            cap = max(0, budget - steady_count)
+            nprobe = min(int(spec.nprobe), K0)
+            if nprobe <= 0 or cap <= 0:
+                full_steady = steady_row.expand(G, H, N).contiguous()
+                return list(full_steady.unbind(0))
+
+            # ── Stacked inputs ────────────────────────────────────────────
+            q_stack = torch.stack(q_norm, dim=0).to(dtype=torch.float32)
+            # [G, H, D]
+            centres = torch.stack(
+                [s.cluster_centres for s in states], dim=0
+            )  # [G, K, D]
+            labels = torch.stack(
+                [s.block_to_cluster[:indexed_tokens] for s in states], dim=0
+            )  # [G, N_idx]
+            if labels.dtype != torch.int64:
+                labels = labels.to(dtype=torch.int64)
+
+            # ── Cluster scores & top-nprobe ───────────────────────────────
+            scores_c = torch.bmm(
+                q_stack, centres.transpose(1, 2)
+            ) / float(max(D, 1)) ** 0.5  # [G, H, K]
+            top_clusters = torch.topk(
+                scores_c, k=nprobe, dim=-1
+            ).indices.to(dtype=torch.int64)  # [G, H, nprobe]
+
+            cluster_mask = torch.zeros(
+                (G, H, K0), dtype=torch.bool, device=device
+            )
+            cluster_mask.scatter_(2, top_clusters, True)
+
+            # retr_mask[g, h, n] = cluster_mask[g, h, labels[g, n]] for n<idx
+            labels_exp = labels.unsqueeze(1).expand(G, H, indexed_tokens)
+            retr_mask_indexed = cluster_mask.gather(2, labels_exp)
+
+            retr_mask = torch.zeros(
+                (G, H, N), dtype=torch.bool, device=device
+            )
+            retr_mask[:, :, :indexed_tokens] = retr_mask_indexed
+
+            nonsteady_retr_mask = retr_mask & ~steady_row
+
+            # Per-token retrieval scores (only defined for n<indexed_tokens)
+            token_scores_indexed = scores_c.gather(2, labels_exp)
+            # [G, H, N_idx]
+            token_scores = torch.full(
+                (G, H, N),
+                float("-inf"),
+                dtype=token_scores_indexed.dtype,
+                device=device,
+            )
+            token_scores[:, :, :indexed_tokens] = token_scores_indexed
+            masked_scores = token_scores.masked_fill(
+                ~nonsteady_retr_mask, float("-inf")
+            )
+
+            k = min(cap, N)
+            top_vals, top_idx = torch.topk(masked_scores, k=k, dim=-1)
+            valid = torch.isfinite(top_vals)
+            selected_nonsteady = torch.zeros_like(nonsteady_retr_mask)
+            selected_nonsteady.scatter_(2, top_idx, valid)
+
+            out = selected_nonsteady | steady_row  # [G, H, N]
+            return list(out.unbind(0))
+        finally:
+            if _t0 is not None:
+                self._sparse_perf_record(
+                    "_sparse_online_select_tokens_batched",
+                    time.perf_counter() - _t0,
+                )
+
     def _build_sparse_runtime_q_head_gather(
         self,
         *,
@@ -8199,18 +8414,34 @@ class GPUModelRunner(
                     device=query.device,
                 )
                 _t_select = time.perf_counter() if perf_enabled else None
+                # Collect per-kv_head inputs first so we can hand the whole
+                # layer's kv_heads to the batched selector in one call.  This
+                # replaces G × (cluster-score, topk, scatter, gather, topk)
+                # micro-kernels with 3-D variants, shaving the bulk of the
+                # launch overhead that ``_sparse_online_select_tokens``
+                # otherwise accumulates on decode (8 layers × 4 kv_heads = 32
+                # dispatches / layer on our reference model).
+                batched_states: list[_SparseOnlineLayerState] = []
+                batched_q: list[torch.Tensor] = []
+                batched_qh_indices: list[torch.Tensor] = []
                 for kv_idx, qh_indices_t in kv_to_qh_tensor.items():
                     unit_key = sparse_kv_unit_key(layer_name, kv_idx)
                     state = req_states.get(unit_key)
                     if state is None:
                         return None
                     q_group = q_tok.index_select(0, qh_indices_t)
-                    group_mask = self._sparse_online_select_tokens(
-                        state=state,
-                        q=q_group,
-                        total_tokens=seq_len,
-                        spec=spec,
-                    )
+                    batched_states.append(state)
+                    batched_q.append(q_group)
+                    batched_qh_indices.append(qh_indices_t)
+                group_masks = self._sparse_online_select_tokens_batched(
+                    states=batched_states,
+                    q_list=batched_q,
+                    total_tokens=seq_len,
+                    spec=spec,
+                )
+                for qh_indices_t, group_mask in zip(
+                    batched_qh_indices, group_masks, strict=True
+                ):
                     selected_mask[qh_indices_t] = group_mask
                 _perf_add(
                     "_build_sparse_runtime_q_head_gather:select_tokens",
@@ -8643,6 +8874,34 @@ class GPUModelRunner(
                     "_update_sparse_online_index",
                     time.perf_counter() - _t0,
                 )
+
+    def _decode_perf_flush_e2e(self) -> None:
+        """Emit the step-level end-to-end ``[DecodePerfE2E]`` log.
+
+        Covers both ``execute_model`` and ``sample_tokens`` halves of the
+        decode RPC, so callers can diff against ``[DecodePerf] total_ms``
+        (which only covers ``execute_model``) to isolate work that happens
+        between the two halves – notably the sparse feature collect and
+        online index update executed inside ``sample_tokens``.
+        """
+        if (
+            not self._decode_perf_stats_enabled
+            or self._decode_perf_step_t0 is None
+        ):
+            return
+        total_ms = (time.perf_counter() - self._decode_perf_step_t0) * 1000.0
+        exec_ms = self._decode_perf_step_exec_ms
+        sample_ms = max(0.0, total_ms - exec_ms)
+        logger.info(
+            "[DecodePerfE2E] mode=%s total_ms=%.3f execute_model_ms=%.3f "
+            "sample_tokens_ms=%.3f",
+            "sparse" if self._has_sparse_attn else "full",
+            total_ms,
+            exec_ms,
+            sample_ms,
+        )
+        self._decode_perf_step_t0 = None
+        self._decode_perf_step_exec_ms = 0.0
 
     def _sparse_perf_record(self, key: str, elapsed_s: float) -> None:
         if not self._sparse_perf_stats_enabled or not self._has_sparse_attn:
@@ -9133,6 +9392,11 @@ class GPUModelRunner(
         pending_async_feat: list[tuple[str, str, torch.Tensor]] = []
         pending_async_meta: list[tuple[str, str, dict[str, torch.Tensor]]] = []
 
+        # Diagnostic: full per-req body wall-clock (covers q_extract_total,
+        # k_extract_total, and the Python bookkeeping between them).  Running
+        # outer - (q_extract_total + k_extract_total) tells us how much time
+        # is spent in per-req Python glue that is currently not sub-timed.
+        _t_per_req_loop = time.perf_counter() if perf_enabled else None
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
             if req_id not in scheduler_output.num_scheduled_tokens:
@@ -9413,7 +9677,9 @@ class GPUModelRunner(
                                         sparse_kv_unit_key(layer_name, kv_h)
                                     ] = k_last_np[kv_h]
             _perf_add("collect:k_extract_total", _t_k_extract)
+        _perf_add("collect:per_req_loop_total", _t_per_req_loop)
 
+        _t_post_loop = time.perf_counter() if perf_enabled else None
         if pending_async_feat or pending_async_meta:
             _t_wait = time.perf_counter() if perf_enabled else None
             assert self._sparse_d2h_stream is not None
@@ -9441,6 +9707,7 @@ class GPUModelRunner(
                     .astype(np.float32, copy=False),
                 }
             _perf_add("collect:async_d2h_finalize_numpy", _t_finalize)
+        _perf_add("collect:post_loop_total", _t_post_loop)
 
         if self._sparse_probe_info_enabled:
             logger.info(
