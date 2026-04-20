@@ -622,9 +622,6 @@ class KVCacheManager:
         sel = mgr._selected_block_indices_by_layer.get(request_id)
         if not sel:
             return True, "select_empty"
-        tok = mgr._selected_token_indices_by_layer.get(request_id)
-        if mgr._token_mode() and (not tok):
-            return True, "token_mode_no_tok"
         chrono = mgr.get_chrono_phys_block_ids(request_id)
         if len(chrono) == 0:
             return True, "empty_chrono"
@@ -684,18 +681,6 @@ class KVCacheManager:
         if mgr is None:
             return None
         by_layer = mgr._selected_block_indices_by_layer.get(request_id)
-        if not by_layer:
-            return None
-        return {k: list(v) for k, v in by_layer.items()}
-
-    def get_sparse_selected_token_indices_by_layer(
-        self, request_id: str
-    ) -> dict[str, list[int]] | None:
-        """Global token indices per query-head key (``layer##qh{i}``, token sparse mode)."""
-        mgr = self.get_sparse_manager()
-        if mgr is None:
-            return None
-        by_layer = mgr._selected_token_indices_by_layer.get(request_id)
         if not by_layer:
             return None
         return {k: list(v) for k, v in by_layer.items()}

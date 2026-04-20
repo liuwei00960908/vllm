@@ -51,11 +51,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.utils impo
     mla_enabled,
 )
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank, get_tp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.core.sparse_kv_cache_manager import parse_sparse_qh_key
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -75,39 +75,6 @@ def _sort_unique_prompt_token_indices(indices: list[int]) -> list[int]:
     Values must be **sequence indices**, not vocabulary token ids.
     """
     return sorted(set(indices))
-
-
-def _sparse_token_map_to_per_head_rows(
-    tok_by_qh: dict[str, list[int]],
-) -> tuple[list[list[int]] | None, dict[str, list[list[int]]] | None]:
-    """Convert sparse manager's ``layer##qh{i}`` map into LMCache per-head rows.
-
-    Each inner list is **0-based indices** into the request's token sequence
-    (prompt + generated prefix as scheduled), **not** vocabulary token ids.
-    Lists are sorted ascending with duplicates removed.
-    """
-    if not tok_by_qh:
-        return None, None
-    by_layer: dict[str, list[tuple[int, str]]] = {}
-    noparse_keys: list[str] = []
-    for k in tok_by_qh:
-        parsed = parse_sparse_qh_key(k)
-        if parsed is None:
-            noparse_keys.append(k)
-            continue
-        layer, qh = parsed
-        by_layer.setdefault(layer, []).append((qh, k))
-
-    flat_rows: list[list[int]] = []
-    per_layer: dict[str, list[list[int]]] = {}
-    for layer in sorted(by_layer.keys()):
-        pairs = sorted(by_layer[layer], key=lambda x: x[0])
-        layer_rows = [_sort_unique_prompt_token_indices(list(tok_by_qh[key])) for _, key in pairs]
-        per_layer[layer] = layer_rows
-        flat_rows.extend(layer_rows)
-    for k in sorted(noparse_keys):
-        flat_rows.append(_sort_unique_prompt_token_indices(list(tok_by_qh[k])))
-    return flat_rows or None, per_layer or None
 
 
 def _truncate_head_index_rows(
@@ -547,14 +514,37 @@ class ReqMeta:
         )
 
 
-def _attach_sparse_head_token_indices(
-    req_meta: ReqMeta | None, tok_by_qh: dict[str, list[int]] | None
+def _apply_sparse_head_token_overrides(
+    req_meta: ReqMeta,
+    additional_kwargs: dict[str, Any],
 ) -> None:
-    if req_meta is None or not tok_by_qh:
-        return
-    flat, by_layer = _sparse_token_map_to_per_head_rows(tok_by_qh)
-    req_meta.per_head_token_indices = flat
-    req_meta.per_head_token_indices_by_layer = by_layer
+    # Overrides use sequence indices (position in prompt+context), not
+    # vocabulary token ids. Each row is sorted and deduplicated after clipping
+    # at the LMCache call site.
+    ovr = additional_kwargs.get("lmcache_per_head_token_indices_by_req_id")
+    ovr_bl = additional_kwargs.get(
+        "lmcache_per_head_token_indices_by_layer_by_req_id"
+    )
+    if isinstance(ovr, dict) and req_meta.req_id in ovr:
+        raw_rows = ovr[req_meta.req_id]
+        if isinstance(raw_rows, list):
+            req_meta.per_head_token_indices = [
+                _sort_unique_prompt_token_indices(list(r))
+                for r in raw_rows
+                if isinstance(r, list)
+            ]
+    if isinstance(ovr_bl, dict) and req_meta.req_id in ovr_bl:
+        raw_bl = ovr_bl[req_meta.req_id]
+        if isinstance(raw_bl, dict):
+            req_meta.per_head_token_indices_by_layer = {
+                ln: [
+                    _sort_unique_prompt_token_indices(list(r))
+                    for r in rows
+                    if isinstance(r, list)
+                ]
+                for ln, rows in raw_bl.items()
+                if isinstance(rows, list)
+            }
 
 
 def need_gpu_interim_buffer(lmcache_config: LMCacheEngineConfig):
@@ -982,6 +972,14 @@ class LMCacheConnectorV1Impl:
             return
 
         assert self.lmcache_engine is not None
+        if any(
+            (req.save_spec is not None and req.save_spec.can_save)
+            or self.kv_role == "kv_producer"
+            for req in metadata.requests
+        ):
+            forward_context.additional_kwargs[
+                "lmcache_collect_sparse_per_head_token_indices"
+            ] = True
 
         self.lmcache_engine.post_init(kvcaches=kvcaches)
 
@@ -1066,31 +1064,9 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            # Overrides: use **sequence indices** (position in prompt+context), not
-            # vocabulary token ids. Each inner list is sorted ascending after clip.
-            add_kw = getattr(forward_context, "additional_kwargs", None) or {}
-            ovr = add_kw.get("lmcache_per_head_token_indices_by_req_id")
-            ovr_bl = add_kw.get("lmcache_per_head_token_indices_by_layer_by_req_id")
-            if isinstance(ovr, dict) and request.req_id in ovr:
-                raw_rows = ovr[request.req_id]
-                if isinstance(raw_rows, list):
-                    request.per_head_token_indices = [
-                        _sort_unique_prompt_token_indices(list(r))
-                        for r in raw_rows
-                        if isinstance(r, list)
-                    ]
-            if isinstance(ovr_bl, dict) and request.req_id in ovr_bl:
-                raw_bl = ovr_bl[request.req_id]
-                if isinstance(raw_bl, dict):
-                    request.per_head_token_indices_by_layer = {
-                        ln: [
-                            _sort_unique_prompt_token_indices(list(r))
-                            for r in rows
-                            if isinstance(r, list)
-                        ]
-                        for ln, rows in raw_bl.items()
-                        if isinstance(rows, list)
-                    }
+            _apply_sparse_head_token_overrides(
+                request, getattr(forward_context, "additional_kwargs", None) or {}
+            )
 
             head_rows = _truncate_head_index_rows(
                 request.per_head_token_indices, lmcache_cached_tokens
@@ -1230,6 +1206,11 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
         if self.current_layer == 0:
             self.layerwise_storers = []
+            add_kw = (
+                get_forward_context().additional_kwargs
+                if is_forward_context_available()
+                else {}
+            )
 
             is_first = True
 
@@ -1284,6 +1265,7 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                 )
+                _apply_sparse_head_token_overrides(request, add_kw)
                 n_save = len(token_ids)
                 h_rows = _truncate_head_index_rows(request.per_head_token_indices, n_save)
                 h_bl = _truncate_head_index_by_layer(
@@ -1325,6 +1307,11 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
 
         assert self.lmcache_engine is not None
+        add_kw = (
+            get_forward_context().additional_kwargs
+            if is_forward_context_available()
+            else {}
+        )
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
@@ -1394,6 +1381,7 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
             )
+            _apply_sparse_head_token_overrides(request, add_kw)
             h_rows = _truncate_head_index_rows(request.per_head_token_indices, n_save)
             h_bl = _truncate_head_index_by_layer(
                 request.per_head_token_indices_by_layer, n_save
@@ -1598,11 +1586,6 @@ class LMCacheConnectorV1Impl:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
 
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        sparse_tok_by_req: dict[str, dict[str, list[int]]] | None = None
-        if not isinstance(cached_reqs, list):
-            sparse_tok_by_req = cached_reqs.sparse_selected_token_indices_by_layer
-
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
             load_spec = self.load_specs.pop(request.req_id, None)
@@ -1655,15 +1638,12 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
-                if sparse_tok_by_req:
-                    _attach_sparse_head_token_indices(
-                        req_meta, sparse_tok_by_req.get(request.req_id)
-                    )
                 meta.add_request(req_meta)
 
         # NOTE: For backward compatibility with vllm version < 0.9.2,
         # In the latest vllm version, the type of scheduled_cached_reqs has
         # changed from list to object `CachedRequestData`
+        cached_reqs = scheduler_output.scheduled_cached_reqs
         if isinstance(cached_reqs, list):
             for i, req in enumerate(cached_reqs):
                 request_tracker = self._request_trackers[req.req_id]
@@ -1706,10 +1686,6 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
-                if sparse_tok_by_req:
-                    _attach_sparse_head_token_indices(
-                        req_meta, sparse_tok_by_req.get(req_id)
-                    )
                 meta.add_request(req_meta)
 
         return meta

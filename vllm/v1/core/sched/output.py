@@ -132,10 +132,6 @@ class CachedRequestData:
     sparse_selected_block_indices_by_layer: dict[str, dict[str, list[int]]] | None = (
         None
     )
-    # Token-sparse: per-query-head global token indices for compact KV gather.
-    sparse_selected_token_indices_by_layer: dict[str, dict[str, list[int]]] | None = (
-        None
-    )
     # Token-sparse: chronological physical block ids (see SparseKVManager).
     sparse_chrono_phys_block_ids: dict[str, list[int]] | None = None
 
@@ -191,7 +187,6 @@ class CachedRequestData:
             sparse_selected_block_indices=None,
             sparse_retrieve_block_indices=None,
             sparse_selected_block_indices_by_layer=None,
-            sparse_selected_token_indices_by_layer=None,
             sparse_chrono_phys_block_ids=None,
         )
 
