@@ -450,7 +450,15 @@ class _SparseOnlineLayerState:
 
         n = int(all_block_features.shape[0])
         head_size = int(all_block_features.shape[1]) if all_block_features.dim() >= 2 else 0
-        cap = max(n * 2, 128)
+        # Init with exact capacity – prefill features can span the full prompt
+        # length (thousands of tokens) and we are holding one buffer per
+        # (layer, kv_head, req).  Over-allocating here would double the
+        # persistent sparse-state footprint right when the prefill K-Means
+        # scratch (e.g. ``torch.bmm`` in ``segment_kmeans_centered_torch_batched``)
+        # needs headroom, which triggered OOM in practice.  The first decode
+        # append goes through ``_grow_if_needed`` which doubles the buffer;
+        # by that point all prefill scratch tensors are already freed.
+        cap = max(n, 1)
         self._abf_storage = torch.empty(
             (cap, head_size) if head_size > 0 else (cap,),
             dtype=all_block_features.dtype,
