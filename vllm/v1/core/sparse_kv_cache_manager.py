@@ -85,7 +85,7 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 
@@ -399,6 +399,50 @@ class SparseKVManager(FullAttentionManager):
         # Last observed num_tokens_main_model to estimate decode tokens
         # scheduled in the current step.
         self._last_num_tokens_main_model: dict[str, int] = {}
+
+        # request_id -> _ClusterManager
+        self._req_to_cluster_blocks: dict[str, list[KVCacheBlock]] = {}
+        self._req_to_unused_cluster_blocks_id: dict[str, list[int]] = {}
+
+    def _get_cluster_block_size(self):
+        # Since the cluster of each head cannot be shared with other heads, we will reshape 
+        # the kv_cache. For clusters, the block_size needs to be multiplied by head_num.
+        return self._spec.num_kv_heads * self.block_size
+    
+    def _allocate_blocks_for_cluster(self, req_id, num_new_token):
+        cluster_block_size = self._get_cluster_block_size()
+
+        # A redundant block for each cluster
+        num_required_blocks = cdiv(max(0, num_new_token - self._spec.num_kv_heads * self._spec.num_clusters), 
+                                   cluster_block_size) + self._spec.num_kv_heads * self._spec.num_clusters
+        num_required_blocks = num_required_blocks * self._spec.num_layer
+        num_required_blocks += self._spec.num_clusters
+
+        unused_blocks_id_list = self._req_to_unused_cluster_blocks_id.setdefault(req_id, [])
+        num_required_blocks -= len(unused_blocks_id_list)
+        num_required_blocks = max(0, num_required_blocks)
+        
+        new_blocks = self.block_pool.get_new_blocks(num_required_blocks)
+        self._req_to_cluster_blocks.setdefault(req_id, []).extend(new_blocks)
+
+        unused_blocks_id_list.extend([block.block_id for block in new_blocks])
+        return None
+    
+    def _notify_blocks_for_cluster_used(self, req_id, num_block_used):
+        del self._req_to_unused_cluster_blocks_id[req_id][0:num_block_used]
+        return None
+
+    def generate_cluster_block_info(self, req_id, num_new_token):
+        info = dict()
+
+        info["allocated_block_ids"] = self._req_to_unused_cluster_blocks_id.setdefault(req_id, [])
+        info["cluster_block_size"] = self._get_cluster_block_size()
+        info["used_count"] = 0
+        info["num_cluster"] = self._spec.num_clusters
+        info["num_segment"] = self._spec.n_segment
+        info["nprobe"] = self._spec.nprobe
+        
+        return info
 
     def _debug_log_state(self, request_id: str, phase: str, **kwargs) -> None:
         if not self._debug_state_transitions:

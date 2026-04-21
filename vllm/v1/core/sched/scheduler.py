@@ -51,6 +51,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -353,6 +354,7 @@ class Scheduler(SchedulerInterface):
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        cluster_info: dict[str, object] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -503,6 +505,11 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
+            cluster_info[request_id] = tuple(
+                manager.generate_cluster_block_info(request_id, num_new_tokens)
+                if isinstance(manager, SparseKVManager) else None
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+            )
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
@@ -798,6 +805,11 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
+                cluster_info[request_id] = tuple(
+                    manager.generate_cluster_block_info(request_id, num_new_tokens)
+                    if isinstance(manager, SparseKVManager) else None
+                    for manager in self.kv_cache_manager.coordinator.single_type_managers
+                )
                 selected_probe = self.kv_cache_manager.get_sparse_selected_block_indices(
                     request_id
                 )
@@ -927,6 +939,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            cluster_info=cluster_info
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1466,7 +1479,15 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
-
+        if model_runner_output.cluster_info is not None:
+            for req_id, cluster_info in model_runner_output.cluster_info.items():
+                for i in range(len(cluster_info)):
+                    if cluster_info[i] is None:
+                        continue
+                        
+                    kv_cache_manager = self.kv_cache_manager.coordinator.single_type_managers[i]
+                    kv_cache_manager._notify_blocks_for_cluster_used(req_id, cluster_info[i]["used_count"])
+        
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)

@@ -142,6 +142,7 @@ from vllm.v1.core.sparse_kv_cache_manager import (
     sparse_kv_unit_key,
     sparse_qh_unit_key,
 )
+from vllm.v1.core.sparse_kv_utils import Clusters
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -992,6 +993,15 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
+
+        # head_id -> Clusters
+        HeadItem: TypeAlias = list[Clusters]
+        # layer_name -> HeadItem
+        LayerItem: TypeAlias = dict[str, HeadItem]
+        # req_id -> LayerItem
+        SparseClusterInfo: TypeAlias = dict[str, LayerItem]
+
+        self._sparse_cluster_info: SparseClusterInfo = {}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -2397,6 +2407,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        cluster_info: dict[str, object] | None = None
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2921,6 +2932,45 @@ class GPUModelRunner(
             spec_decode_common_attn_metadata = (
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
+        
+        # currently not support list
+        if isinstance(attn_metadata, dict) and cluster_info is not None:
+            cluster_info_list = []
+            num_cluster = None
+            num_segment = None
+            nprobe = None
+            for ri in range(num_reqs):
+                rid = self.input_batch.req_ids[ri]
+                if cluster_info[rid][0] is None:
+                    continue
+
+                cluster_info_list.append(cluster_info[rid])
+                assert(len(cluster_info[rid]) == 1)
+                if num_cluster is None:
+                    num_cluster = cluster_info[rid][0]["num_cluster"]
+                    num_segment = cluster_info[rid][0]["num_segment"]
+                    nprobe = cluster_info[rid][0]["nprobe"]
+                else:
+                    assert num_cluster == cluster_info[rid][0]["num_cluster"]
+                    assert num_segment == cluster_info[rid][0]["num_segment"]
+                    assert nprobe == cluster_info[rid][0]["nprobe"]
+            
+            for layer_name, layer_attn in attn_metadata.items():
+                if not isinstance(layer_attn, FlashAttentionMetadata):
+                    continue
+
+                layer_attn.extra_cluster_info["req_id_list"] = self.input_batch.req_ids
+                layer_attn.extra_cluster_info["layer_name"] = layer_name
+                layer_attn.extra_cluster_info["num_cluster"] = num_cluster
+                layer_attn.extra_cluster_info["num_segment"] = num_segment
+                layer_attn.extra_cluster_info["nprobe"] = nprobe    
+                layer_attn.cluster_allocated_block_info = cluster_info_list
+                layer_attn.cluster_base_info = []
+                for ri in range(num_reqs):
+                    rid = self.input_batch.req_ids[ri]
+
+                    cluster_base_info = self._sparse_cluster_info.setdefault(rid, {}).setdefault(layer_name, [])
+                    layer_attn.cluster_base_info.append(cluster_base_info)
 
         return attn_metadata, spec_decode_common_attn_metadata
 
@@ -4582,6 +4632,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    cluster_info=scheduler_output.cluster_info
                 )
             )
             if _t0_attn_meta is not None:
@@ -4941,6 +4992,8 @@ class GPUModelRunner(
             # Clear per-step Q captures to free GPU memory references.
             self._sparse_q_captures.clear()
             self._sparse_perf_flush_if_needed()
+
+            cluster_info = self._collect_sparse_cluster_info(scheduler_output)
             # ──────────────────────────────────────────────────────────────
 
             output = ModelRunnerOutput(
@@ -4959,6 +5012,7 @@ class GPUModelRunner(
                 sparse_query_vectors=sparse_query_vectors,
                 sparse_new_block_features=sparse_new_block_features,
                 sparse_prefill_cluster_meta=sparse_prefill_cluster_meta,
+                cluster_info=cluster_info,
             )
 
         if not self.use_async_scheduling:
@@ -8934,6 +8988,22 @@ class GPUModelRunner(
                         "collect:prefill_feat_cpu_numpy",
                         time.perf_counter() - _t_feat_copy,
                     )
+    
+    def _collect_sparse_cluster_info(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ):
+        res = dict()
+        for req_id, cluster_info_src in scheduler_output.cluster_info.items():
+            cluster_info_dst = res.setdefault(req_id, [])
+            for i in range(len(cluster_info_src)):
+                if cluster_info_src[i] is None:
+                    cluster_info_dst.append(None)
+                else:
+                    cluster_info_dst.append({
+                    "used_count": cluster_info_src[i]["used_count"]
+                })
+        return res
 
     def _collect_sparse_features(
         self,

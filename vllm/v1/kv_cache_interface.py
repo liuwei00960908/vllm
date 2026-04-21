@@ -398,6 +398,8 @@ class SparseAttentionSpec(FullAttentionSpec):
     """Total K-Means centroids (distributed evenly across segments)."""
     n_segment: int = 8
     """Position segments for segment K-Means."""
+    num_layer: int = 24
+    """layer num"""
 
     # ── Retrieve zone ───────────────────────────────────────────────────
     nprobe: int = 16
@@ -439,7 +441,7 @@ class SparseAttentionSpec(FullAttentionSpec):
     (steady zone + retrieve zone combined).
     """
 
-    cluster_granularity: Literal["block", "token"] = "block"
+    cluster_granularity: Literal["block", "token"] = "token"
     """
     ``block`` – cluster mean key features per KV block (RetroInfer default).
     ``token`` – one feature vector per prompt / history token; Top-K and
