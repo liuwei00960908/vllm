@@ -818,7 +818,21 @@ class GPUModelRunner(
         self._sparse_perf_log_interval: int = max(
             1, int(os.getenv("VLLM_SPARSE_PERF_LOG_INTERVAL", "50"))
         )
+        # Post-warmup step counter — used for ``window_steps`` modulo
+        # logging.  Only ticks once the warmup-skip gate below has
+        # cleared.
         self._sparse_perf_steps: int = 0
+        # Total steps seen (including warmup).  Records emitted while
+        # ``total < warmup_skip`` are dropped so that steady-state
+        # timings aren't polluted by CUDA / allocator / GPU-clock
+        # warmup (observed: early decode steps sit ~10% higher than
+        # steady-state).  Defaults to 0 for backwards-compat; set
+        # ``VLLM_SPARSE_PERF_WARMUP_SKIP=N`` to drop the first ``N``
+        # post-prefill decode flush cycles before aggregating.
+        self._sparse_perf_total_steps: int = 0
+        self._sparse_perf_warmup_skip: int = max(
+            0, int(os.getenv("VLLM_SPARSE_PERF_WARMUP_SKIP", "0"))
+        )
         self._sparse_perf_accum_ms: dict[str, float] = defaultdict(float)
         self._sparse_perf_accum_calls: dict[str, int] = defaultdict(int)
         # Optional sparse decode token debug logs.
@@ -900,8 +914,10 @@ class GPUModelRunner(
         if self._sparse_perf_stats_enabled:
             logger.info(
                 "Sparse perf stats enabled: VLLM_SPARSE_PERF_STATS=1 "
-                "VLLM_SPARSE_PERF_LOG_INTERVAL=%d",
+                "VLLM_SPARSE_PERF_LOG_INTERVAL=%d "
+                "VLLM_SPARSE_PERF_WARMUP_SKIP=%d",
                 self._sparse_perf_log_interval,
+                self._sparse_perf_warmup_skip,
             )
         if self._decode_perf_stats_enabled:
             logger.info("Decode perf stats enabled: VLLM_DECODE_PERF_STATS=1")
@@ -8979,9 +8995,17 @@ class GPUModelRunner(
             )
 
             if perf_enabled and perf_local_ms:
-                for k, ms in perf_local_ms.items():
-                    self._sparse_perf_accum_ms[k] += ms
-                    self._sparse_perf_accum_calls[k] += 1
+                # Respect the same warmup-skip gate as ``_sparse_perf_record``
+                # so this hot-path accumulator doesn't pollute the
+                # steady-state window with early-step JIT / allocator /
+                # GPU-clock ramp noise.
+                if (
+                    self._sparse_perf_total_steps
+                    >= self._sparse_perf_warmup_skip
+                ):
+                    for k, ms in perf_local_ms.items():
+                        self._sparse_perf_accum_ms[k] += ms
+                        self._sparse_perf_accum_calls[k] += 1
             if publish_lmcache_rows and lmcache_rows_by_req:
                 by_req = forward_additional_kwargs.setdefault(
                     "lmcache_per_head_token_indices_by_layer_by_req_id", {}
@@ -9398,11 +9422,31 @@ class GPUModelRunner(
     def _sparse_perf_record(self, key: str, elapsed_s: float) -> None:
         if not self._sparse_perf_stats_enabled or not self._has_sparse_attn:
             return
+        # Drop records emitted during the warmup window.  Checking the
+        # counter here (rather than only gating at flush) keeps the
+        # accumulators from growing unboundedly across a warmup window
+        # that happens to straddle a log-interval boundary.
+        if self._sparse_perf_total_steps < self._sparse_perf_warmup_skip:
+            return
         self._sparse_perf_accum_ms[key] += float(elapsed_s) * 1000.0
         self._sparse_perf_accum_calls[key] += 1
 
     def _sparse_perf_flush_if_needed(self) -> None:
         if not self._sparse_perf_stats_enabled or not self._has_sparse_attn:
+            return
+        self._sparse_perf_total_steps += 1
+        if self._sparse_perf_total_steps <= self._sparse_perf_warmup_skip:
+            # Still within the warmup window.  Any records that slipped
+            # through before the gate took effect (first step) are
+            # cleared so the first post-warmup window starts clean.
+            if self._sparse_perf_total_steps == self._sparse_perf_warmup_skip:
+                self._sparse_perf_accum_ms.clear()
+                self._sparse_perf_accum_calls.clear()
+                logger.info(
+                    "[SparsePerf] warmup complete after %d steps; "
+                    "steady-state aggregation starts now",
+                    self._sparse_perf_total_steps,
+                )
             return
         self._sparse_perf_steps += 1
         if self._sparse_perf_steps % self._sparse_perf_log_interval != 0:
@@ -10212,9 +10256,15 @@ class GPUModelRunner(
             )
 
         if perf_enabled and perf_local_ms:
-            for k, ms in perf_local_ms.items():
-                self._sparse_perf_accum_ms[k] += ms
-                self._sparse_perf_accum_calls[k] += 1
+            # Same warmup-skip gate as ``_sparse_perf_record`` to keep
+            # the aggregated window clean of early-step ramp noise.
+            if (
+                self._sparse_perf_total_steps
+                >= self._sparse_perf_warmup_skip
+            ):
+                for k, ms in perf_local_ms.items():
+                    self._sparse_perf_accum_ms[k] += ms
+                    self._sparse_perf_accum_calls[k] += 1
 
         return (
             sparse_block_features or None,
