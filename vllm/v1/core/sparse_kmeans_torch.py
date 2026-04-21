@@ -17,6 +17,8 @@ import torch
 _PREFILL_CLUSTER_DEVICE = os.environ.get(
     "VLLM_SPARSE_PREFILL_CLUSTER_DEVICE", "auto"
 ).lower()
+_KMEANS_ASSIGN_CHUNK_BYTES_ENV = "VLLM_SPARSE_KMEANS_ASSIGN_CHUNK_BYTES"
+_DEFAULT_KMEANS_ASSIGN_CHUNK_BYTES = 256 * 1024 * 1024
 
 
 def sparse_prefill_cluster_use_device_kmeans(feat: torch.Tensor) -> bool:
@@ -27,6 +29,38 @@ def sparse_prefill_cluster_use_device_kmeans(feat: torch.Tensor) -> bool:
         return feat.is_cuda
     # auto
     return feat.is_cuda
+
+
+def _kmeans_assignment_chunk_bytes() -> int:
+    raw = os.environ.get(_KMEANS_ASSIGN_CHUNK_BYTES_ENV)
+    if raw is None:
+        return _DEFAULT_KMEANS_ASSIGN_CHUNK_BYTES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_KMEANS_ASSIGN_CHUNK_BYTES
+
+
+def _assign_dot_labels_batched(
+    feat: torch.Tensor,
+    centres: torch.Tensor,
+) -> torch.Tensor:
+    """Assign labels without always materializing full ``[H, N, K]`` scores."""
+    h, n, _d = feat.shape
+    k = centres.shape[1]
+    sim_bytes = h * n * k * torch.finfo(feat.dtype).bits // 8
+    max_sim_bytes = _kmeans_assignment_chunk_bytes()
+    centres_t = centres.transpose(1, 2)
+    if sim_bytes <= max_sim_bytes:
+        return torch.bmm(feat, centres_t).argmax(dim=-1)
+
+    tokens_per_chunk = max(1, max_sim_bytes // (h * k * feat.element_size()))
+    labels = torch.empty(h, n, dtype=torch.int64, device=feat.device)
+    for start in range(0, n, tokens_per_chunk):
+        end = min(start + tokens_per_chunk, n)
+        sims = torch.bmm(feat[:, start:end, :], centres_t)
+        labels[:, start:end] = sims.argmax(dim=-1)
+    return labels
 
 
 def _kmeans_dot_torch_batched(
@@ -58,8 +92,7 @@ def _kmeans_dot_torch_batched(
 
     labels = torch.zeros(h, n, dtype=torch.int64, device=features.device)
     for _ in range(n_iter):
-        sims = torch.bmm(feat, centres.transpose(1, 2))
-        labels = sims.argmax(dim=-1)
+        labels = _assign_dot_labels_batched(feat, centres)
         new_centres = torch.zeros_like(centres)
         for hi in range(h):
             lh = labels[hi]

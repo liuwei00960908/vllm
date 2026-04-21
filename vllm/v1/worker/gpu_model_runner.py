@@ -788,8 +788,14 @@ class GPUModelRunner(
         # count from ~5 down to 2 (count + pack).  Defaults to on; set
         # ``VLLM_SPARSE_TRITON_PACK=0`` to fall back to the legacy path
         # for bisection.
+        # Experimental Triton pack kernel (disabled by default after
+        # measuring a ~0.2 ms/layer regression vs the tuned CUDA
+        # ``torch.nonzero`` path at H=28, S~5k shapes — the kernels are
+        # launch-bound and hit only ~21% SM occupancy on H100).  The
+        # kernel source remains in place for potential reuse by future
+        # fused designs.
         self._sparse_triton_pack_enabled: bool = (
-            int(os.getenv("VLLM_SPARSE_TRITON_PACK", "1")) == 1
+            int(os.getenv("VLLM_SPARSE_TRITON_PACK", "0")) == 1
         )
         # Per-layer scratch: when the Triton pack fast path runs in the
         # per-req loop, it already computes the int32 exclusive-prefix
@@ -8731,20 +8737,28 @@ class GPUModelRunner(
                 # Skip the per-layer H2D block-table copy: the block-table
                 # buffer keeps a committed GPU mirror (``block_table.gpu``,
                 # int32) that the core attention path already consumes.
-                # The row view ``bt_gpu[req_idx]`` is zero-kernel.
+                # The row view ``bt_gpu[req_idx]`` is zero-kernel, and
+                # ``index_select`` on int32 produces an int32 result with
+                # no follow-up cast.
                 bt_row_gpu = blk_tbl.block_table.gpu[req_idx]
-
-                # Phase-A fused pack: for the decode-dominant
-                # ``num_reqs == 1`` case, a single Triton kernel pair
-                # replaces ``nonzero`` + ``//`` + ``-*`` +
-                # ``index_select`` + ``sum(dim=1)`` (5 ops → 2 ops).
-                # Bitwise-equivalent, same implicit sync count (the
-                # total-count sync matches ``nonzero``'s size sync).
-                # ``head_ids_r`` is never consumed in the
-                # ``num_reqs == 1`` finalize path, so it is not
-                # returned; ``per_req_head_ids`` stores a zero-length
-                # placeholder to keep list lengths consistent for any
-                # multi-layer accounting elsewhere.
+                # ``nonzero`` produces ``[N, 2]`` with row-major ordering:
+                # primary key = head id, secondary key = token id.  Output
+                # size is data-dependent → one implicit GPU sync per req,
+                # matching the legacy ``.cpu().numpy()`` sync footprint.
+                #
+                # Phase-A note: we experimented with a 2-kernel Triton
+                # pack (count + cumsum + data) to replace this chain.
+                # At H=28, S~5k shapes the kernels were launch-bound
+                # and ran at ~21% SM occupancy on H100, landing at
+                # ~+0.2 ms/layer vs the tuned CUDA ``nonzero`` primitive
+                # (which is a heavily optimised multi-block reduction).
+                # The kernel code still lives in
+                # ``vllm/v1/attention/ops/triton_sparse_pack.py`` for
+                # potential future use (e.g., coupled with a custom
+                # paged-sparse FA kernel that consumes masked-tile
+                # input directly, eliminating this sync entirely), but
+                # the per-layer integration is off.  Toggle
+                # ``VLLM_SPARSE_TRITON_PACK=1`` to experiment.
                 use_triton = (
                     self._sparse_triton_pack_enabled
                     and num_reqs == 1
@@ -8758,18 +8772,11 @@ class GPUModelRunner(
                             int(bsz),
                         )
                     )
-                    # Stash the already-computed head_offsets so the
-                    # num_reqs==1 finalize can reuse it (skip the
-                    # redundant ``empty + cumsum`` pair).
                     self._sparse_triton_head_offsets_cache = triton_head_offsets
                     head_ids_r = torch.empty(
                         0, dtype=torch.int64, device=query.device
                     )
                 else:
-                    # Legacy path (num_reqs > 1 or explicit fallback):
-                    # ``nonzero`` produces [N, 2] row-major (head first,
-                    # token second), matching one implicit GPU sync per
-                    # req as the legacy ``.cpu().numpy()`` had.
                     self._sparse_triton_head_offsets_cache = None
                     nz = torch.nonzero(selected_mask, as_tuple=False)
                     head_ids_r = nz[:, 0]

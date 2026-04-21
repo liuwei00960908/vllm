@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.v1.core.sparse_kmeans_torch import (
+    _kmeans_dot_torch_batched,
     prefill_cluster_meta_from_features_torch,
     prefill_cluster_meta_from_features_torch_batched,
 )
@@ -62,3 +63,21 @@ def test_prefill_cluster_meta_single_delegates_to_batched() -> None:
         via["cluster_size"][0].to(torch.float32),
     )
     torch.testing.assert_close(direct["mean_key"], via["mean_key"][0])
+
+
+def test_kmeans_chunked_assignment_matches_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(2)
+    feat = torch.randn(3, 64, 16, dtype=torch.float32)
+
+    monkeypatch.setenv("VLLM_SPARSE_KMEANS_ASSIGN_CHUNK_BYTES", str(1 << 30))
+    centres_full, labels_full = _kmeans_dot_torch_batched(
+        feat, k=12, n_iter=4, seed=17
+    )
+
+    monkeypatch.setenv("VLLM_SPARSE_KMEANS_ASSIGN_CHUNK_BYTES", "256")
+    centres_chunked, labels_chunked = _kmeans_dot_torch_batched(
+        feat, k=12, n_iter=4, seed=17
+    )
+
+    torch.testing.assert_close(centres_chunked, centres_full, rtol=0, atol=0)
+    torch.testing.assert_close(labels_chunked, labels_full, rtol=0, atol=0)
