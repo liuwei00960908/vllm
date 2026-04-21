@@ -72,8 +72,10 @@ def _sparse_pack_data_kernel(
     mask_ptr,  # [H, S] bool
     bt_row_ptr,  # [num_blocks_for_req] int32 (row view of block table)
     head_offsets_ptr,  # [H + 1] int32 — exclusive prefix of counts
-    phys_out_ptr,  # [total_N] int32
-    slots_out_ptr,  # [total_N] int32
+    kv_head_ids_ptr,  # [H] int64 — precomputed kv_head id per q head
+    phys_out_ptr,  # [total_N] int64
+    slots_out_ptr,  # [total_N] int64
+    kv_token_ids_out_ptr,  # [total_N] int64 (kv_head id broadcast per entry)
     S: tl.int32,
     BLOCK_SIZE_KV: tl.int32,  # kv paged block size (``bsz``)
     mask_stride_h: tl.int64,
@@ -93,10 +95,20 @@ def _sparse_pack_data_kernel(
     The block-table gather is fused inline: ``phys = bt_row[block_idx]``
     is one ``tl.load`` gather; the slot offset is recovered by
     ``offs - block_idx * BLOCK_SIZE_KV``.
+
+    Phase B: outputs are int64 (widened from int32) and a third
+    ``kv_token_ids`` output replays the static ``kv_head_ids`` mapping
+    for every selected entry.  This folds the legacy
+    ``flat_phys.to(int64)``, ``flat_slots.to(int64)`` and
+    ``torch.repeat_interleave(kv_head_ids, counts)`` chain into a
+    single kernel, saving 3 torch ops per sparse layer in decode.
     """
     h = tl.program_id(axis=0)
     row_ptr = mask_ptr + h.to(tl.int64) * mask_stride_h
     base_offset = tl.load(head_offsets_ptr + h).to(tl.int64)
+    # ``kv_head_ids`` is a layer-static tensor (computed once at ctx
+    # init and cached).  Loading a scalar per program is free on H100.
+    kv_head_id_self = tl.load(kv_head_ids_ptr + h)
 
     running = tl.zeros((), tl.int32)
     for tile_base in tl.range(0, S, TILE_S):
@@ -115,8 +127,23 @@ def _sparse_pack_data_kernel(
 
         abs_pos = base_offset + running.to(tl.int64) + excl.to(tl.int64)
         write_mask = tile_mask & (m != 0)
-        tl.store(phys_out_ptr + abs_pos, phys, mask=write_mask)
-        tl.store(slots_out_ptr + abs_pos, slot_off, mask=write_mask)
+        # Int32 → int64 widening is free at the store site (Triton emits
+        # a register extend), so the outputs are declared int64.
+        tl.store(
+            phys_out_ptr + abs_pos, phys.to(tl.int64), mask=write_mask
+        )
+        tl.store(
+            slots_out_ptr + abs_pos,
+            slot_off.to(tl.int64),
+            mask=write_mask,
+        )
+        # Every selected entry carries the same ``kv_head_id_self``.
+        # Broadcasting a scalar across the tile is a register-level op.
+        tl.store(
+            kv_token_ids_out_ptr + abs_pos,
+            tl.full((TILE_S,), kv_head_id_self, tl.int64),
+            mask=write_mask,
+        )
 
         running += tl.sum(m)
 
@@ -124,10 +151,11 @@ def _sparse_pack_data_kernel(
 def sparse_pack_single_req(
     selected_mask: torch.Tensor,
     bt_row_gpu: torch.Tensor,
+    kv_head_ids: torch.Tensor,
     block_size_kv: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bitwise-equivalent replacement for the legacy ``num_reqs == 1``
-    pack chain:
+    pack + Tier-2 int64/kv_token_ids precompute chain:
 
     .. code-block:: python
 
@@ -138,18 +166,30 @@ def sparse_pack_single_req(
         slots_r = (tok_ids_r - block_idx * bsz).to(torch.int32)
         phys_r = bt_row_gpu.index_select(0, block_idx)
         counts_r = selected_mask.sum(dim=1).to(torch.int64)
+        # ... then later in finalize:
+        flat_phys_int64 = flat_phys.to(torch.int64)
+        flat_slots_int64 = flat_slots.to(torch.int64)
+        kv_token_ids = torch.repeat_interleave(kv_head_ids, counts_r)
 
-    Outputs ``(flat_phys, flat_slots, counts, head_offsets)`` where:
+    Outputs ``(flat_phys64, flat_slots64, kv_token_ids, counts,
+    head_offsets)`` where:
 
-    - ``flat_phys`` is head-major, token-ascending int32 [N]
-    - ``flat_slots`` is head-major, token-ascending int32 [N]
+    - ``flat_phys64`` is head-major, token-ascending int64 [N]
+    - ``flat_slots64`` is head-major, token-ascending int64 [N]
+    - ``kv_token_ids`` is int64 [N] with ``kv_head_ids[h]`` at each
+      entry belonging to head ``h``
     - ``counts`` is int64 [H] — per-head selected count
     - ``head_offsets`` is int32 [H+1] — exclusive prefix of ``counts``
 
     ``head_ids_r`` (the legacy per-entry head id) is not returned: the
     decode fast path (``num_reqs == 1``) does not consume it (it was
-    only needed for the multi-req stable argsort).  ``slots_r`` is
-    int32 for FA's ``_forward_per_head_compact_kv_gather`` contract.
+    only needed for the multi-req stable argsort).
+
+    Widening phys/slots directly to int64 and emitting ``kv_token_ids``
+    in the same kernel eliminates three torch-level kernels per sparse
+    layer (two ``.to(int64)`` casts plus ``repeat_interleave``) that
+    Phase-A's finalize still ran — observed savings ~0.8 ms/step at
+    H=28, 20 sparse layers.
 
     One GPU sync is required to size the flat output buffers (via
     ``head_offsets[-1].item()``).  This matches the single implicit
@@ -159,7 +199,11 @@ def sparse_pack_single_req(
     assert selected_mask.dim() == 2, "selected_mask must be [H, S]"
     assert selected_mask.dtype == torch.bool
     assert bt_row_gpu.dim() == 1
+    assert kv_head_ids.dim() == 1
     H, S = selected_mask.shape
+    assert int(kv_head_ids.shape[0]) == int(H), (
+        "kv_head_ids must have one entry per q head"
+    )
     device = selected_mask.device
 
     counts = torch.empty(H, dtype=torch.int64, device=device)
@@ -189,20 +233,23 @@ def sparse_pack_single_req(
     # Matches the implicit sync from the legacy ``torch.nonzero``.
     total_n = int(head_offsets[-1].item())
 
-    flat_phys = torch.empty(total_n, dtype=torch.int32, device=device)
-    flat_slots = torch.empty(total_n, dtype=torch.int32, device=device)
+    flat_phys64 = torch.empty(total_n, dtype=torch.int64, device=device)
+    flat_slots64 = torch.empty(total_n, dtype=torch.int64, device=device)
+    kv_token_ids = torch.empty(total_n, dtype=torch.int64, device=device)
 
     if total_n > 0:
         _sparse_pack_data_kernel[grid](
             selected_mask,
             bt_row_gpu,
             head_offsets,
-            flat_phys,
-            flat_slots,
+            kv_head_ids,
+            flat_phys64,
+            flat_slots64,
+            kv_token_ids,
             int(S),
             int(block_size_kv),
             selected_mask.stride(0),
             TILE_S=TILE_S,
         )
 
-    return flat_phys, flat_slots, counts, head_offsets
+    return flat_phys64, flat_slots64, kv_token_ids, counts, head_offsets

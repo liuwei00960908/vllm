@@ -785,9 +785,14 @@ class GPUModelRunner(
         # Fused Triton pack kernel for the sparse decode ``num_reqs == 1``
         # fast path.  Bitwise-equivalent to the legacy nonzero + divmod +
         # index_select + sum chain, but cuts the per-layer kernel launch
-        # count from ~5 down to 2 (count + pack).  Defaults to on; set
-        # ``VLLM_SPARSE_TRITON_PACK=0`` to fall back to the legacy path
-        # for bisection.
+        # count from ~5 down to 2 (count + pack).  Measured steady-state
+        # (VLLM_SPARSE_PERF_WARMUP_SKIP=20 on a 20-sparse-layer Qwen-
+        # style decode): forward_ms 54.59 → 52.07 (-2.52 ms/step), with
+        # the bulk of the win coming from the num_reqs==1 finalize
+        # reusing the Triton-produced int32 ``head_offsets`` (skipping
+        # a redundant ``empty + zero + cumsum`` chain).  Defaults to
+        # on; set ``VLLM_SPARSE_TRITON_PACK=0`` to fall back to the
+        # legacy path for bisection.
         self._sparse_triton_pack_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_TRITON_PACK", "1")) == 1
         )
@@ -797,6 +802,11 @@ class GPUModelRunner(
         # attribute to avoid a redundant ``empty + cumsum`` pair in
         # the num_reqs==1 finalize.  Cleared after each use.
         self._sparse_triton_head_offsets_cache: torch.Tensor | None = None
+        # Phase-B: Triton pack also emits the per-entry ``kv_token_ids``
+        # (int64, one kv_head id per selected entry) in the same
+        # kernel.  Stash it here so the finalize can reuse directly,
+        # skipping ``torch.repeat_interleave(kv_head_ids, counts)``.
+        self._sparse_triton_kv_token_ids_cache: torch.Tensor | None = None
         self._decode_perf_stats_enabled: bool = bool(
             int(os.getenv("VLLM_DECODE_PERF_STATS", "0"))
         )
@@ -8542,6 +8552,26 @@ class GPUModelRunner(
                     sparse_kv_unit_key(layer_name, k)
                     for k in range(num_kv_heads_i)
                 )
+                # Phase-B static tensors for the num_reqs==1 decode
+                # finalize.  At num_reqs==1, ``cu_q_flat`` collapses to
+                # ``arange(num_heads + 1, int32)`` and ``req_ids_flat``
+                # is a zero-filled int64 vector of length ``num_heads``.
+                # Both are purely layer-static (only depend on
+                # ``num_heads``) and identical across layers that
+                # share the same (num_heads, num_kv_heads) shape, so
+                # we build them once here and the hot path just
+                # returns the cached tensor.  Eliminates 2 tiny kernel
+                # launches per sparse layer (``arange`` + ``zeros``).
+                cu_q_flat_nreqs1_int32 = torch.arange(
+                    num_heads_i + 1,
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+                req_ids_flat_nreqs1_zero = torch.zeros(
+                    num_heads_i,
+                    dtype=torch.int64,
+                    device=query.device,
+                )
                 ctx = {
                     "num_heads": num_heads_i,
                     "num_kv_heads": num_kv_heads_i,
@@ -8552,6 +8582,8 @@ class GPUModelRunner(
                     "kv_head_ids_int64": kv_head_ids_int64,
                     "gqa_regular": gqa_regular,
                     "unit_keys_in_kv_order": unit_keys_in_kv_order,
+                    "cu_q_flat_nreqs1_int32": cu_q_flat_nreqs1_int32,
+                    "req_ids_flat_nreqs1_zero": req_ids_flat_nreqs1_zero,
                 }
                 self._sparse_layer_ctx[layer_name] = ctx
                 _perf_add(
@@ -8597,6 +8629,20 @@ class GPUModelRunner(
                 ctx["unit_keys_in_kv_order"] = tuple(
                     sparse_kv_unit_key(layer_name, k)
                     for k in range(int(ctx["num_kv_heads"]))
+                )
+            # Phase-B backfill: if the ctx was built by an older build
+            # that predates these cached statics, lazy-init on first use.
+            if "cu_q_flat_nreqs1_int32" not in ctx:
+                ctx["cu_q_flat_nreqs1_int32"] = torch.arange(
+                    num_heads + 1,
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+            if "req_ids_flat_nreqs1_zero" not in ctx:
+                ctx["req_ids_flat_nreqs1_zero"] = torch.zeros(
+                    num_heads,
+                    dtype=torch.int64,
+                    device=query.device,
                 )
 
             num_reqs = int(self.input_batch.num_reqs)
@@ -8767,17 +8813,33 @@ class GPUModelRunner(
                     and selected_mask.is_cuda
                 )
                 if use_triton:
-                    phys_r, slots_r, counts_r, triton_head_offsets = (
-                        sparse_pack_single_req(
-                            selected_mask,
-                            bt_row_gpu,
-                            int(bsz),
-                        )
+                    # Phase-B: Triton emits int64 phys/slots +
+                    # per-entry kv_token_ids in one kernel, folding
+                    # the three legacy finalize ops (two
+                    # ``.to(int64)`` casts plus
+                    # ``torch.repeat_interleave``) into the pack step.
+                    # The returned ``phys_r`` / ``slots_r`` are int64
+                    # (the FA fast path consumes them unchanged via
+                    # ``phys_int64`` / ``slots_int64``).
+                    (
+                        phys_r,
+                        slots_r,
+                        triton_kv_token_ids,
+                        counts_r,
+                        triton_head_offsets,
+                    ) = sparse_pack_single_req(
+                        selected_mask,
+                        bt_row_gpu,
+                        kv_head_ids_int64,
+                        int(bsz),
                     )
-                    # Stash the already-computed head_offsets so the
-                    # num_reqs==1 finalize can reuse it (skip the
-                    # redundant ``empty + cumsum`` pair).
-                    self._sparse_triton_head_offsets_cache = triton_head_offsets
+                    # Stash for num_reqs==1 finalize fast-path reuse.
+                    self._sparse_triton_head_offsets_cache = (
+                        triton_head_offsets
+                    )
+                    self._sparse_triton_kv_token_ids_cache = (
+                        triton_kv_token_ids
+                    )
                     head_ids_r = torch.empty(
                         0, dtype=torch.int64, device=query.device
                     )
@@ -8787,6 +8849,7 @@ class GPUModelRunner(
                     # token second), matching one implicit GPU sync per
                     # req as the legacy ``.cpu().numpy()`` had.
                     self._sparse_triton_head_offsets_cache = None
+                    self._sparse_triton_kv_token_ids_cache = None
                     nz = torch.nonzero(selected_mask, as_tuple=False)
                     head_ids_r = nz[:, 0]
                     tok_ids_r = nz[:, 1]
@@ -8856,6 +8919,9 @@ class GPUModelRunner(
                 triton_head_offsets = getattr(
                     self, "_sparse_triton_head_offsets_cache", None
                 )
+                triton_kv_token_ids = getattr(
+                    self, "_sparse_triton_kv_token_ids_cache", None
+                )
                 if triton_head_offsets is not None:
                     head_offsets = triton_head_offsets
                     # Zero-copy view (contiguous slice from element 1).
@@ -8879,26 +8945,37 @@ class GPUModelRunner(
                 )
                 total_per_head = counts_r
 
-                flat_phys_int64 = flat_phys.to(torch.int64)
-                flat_slots_int64 = flat_slots.to(torch.int64)
-                kv_token_ids = torch.repeat_interleave(
-                    kv_head_ids_int64, total_per_head.to(torch.int64)
-                )
+                # Phase-B: when the Triton pack ran, ``flat_phys`` /
+                # ``flat_slots`` are already int64 and ``kv_token_ids``
+                # is already built (all three in one fused kernel), so
+                # the ``.to(int64)`` / ``repeat_interleave`` triplet is
+                # skipped.  Falls back to the explicit ops when the
+                # Triton path is disabled or bypassed (num_reqs > 1,
+                # CPU input).
+                if triton_kv_token_ids is not None:
+                    flat_phys_int64 = flat_phys
+                    flat_slots_int64 = flat_slots
+                    kv_token_ids = triton_kv_token_ids
+                    self._sparse_triton_kv_token_ids_cache = None
+                else:
+                    flat_phys_int64 = flat_phys.to(torch.int64)
+                    flat_slots_int64 = flat_slots.to(torch.int64)
+                    kv_token_ids = torch.repeat_interleave(
+                        kv_head_ids_int64, total_per_head.to(torch.int64)
+                    )
 
                 # cu_k_flat == head_offsets when num_reqs == 1 (they both
                 # encode the same per-head cumulative counts, just with
                 # different flat/2D shapes).  Share the tensor.
                 cu_k_flat = head_offsets
                 num_q_flat = num_heads
-                cu_q_flat = torch.arange(
-                    num_q_flat + 1,
-                    dtype=torch.int32,
-                    device=query.device,
-                )
-                # req_ids_flat has shape [num_heads], all zero (only one req).
-                req_ids_flat = torch.zeros(
-                    num_heads, dtype=torch.int64, device=query.device
-                )
+                # Phase-B: ``cu_q_flat`` and ``req_ids_flat`` are
+                # purely layer-static at num_reqs==1 (they only depend
+                # on ``num_heads``).  Use the cached tensors built
+                # once in the ctx init to skip per-layer ``arange`` +
+                # ``zeros`` allocations.
+                cu_q_flat = ctx["cu_q_flat_nreqs1_int32"]
+                req_ids_flat = ctx["req_ids_flat_nreqs1_zero"]
                 # kv_pair_ids_flat == kv_head_ids_int64 when num_reqs == 1.
                 kv_pair_ids_flat = kv_head_ids_int64
             else:
