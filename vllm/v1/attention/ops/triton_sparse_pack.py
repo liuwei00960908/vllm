@@ -34,6 +34,9 @@ exact-sized flat buffer; the same sync is already paid for by
 
 from __future__ import annotations
 
+import time
+from typing import Callable
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -153,6 +156,7 @@ def sparse_pack_single_req(
     bt_row_gpu: torch.Tensor,
     kv_head_ids: torch.Tensor,
     block_size_kv: int,
+    perf_record: Callable[[str, float], None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bitwise-equivalent replacement for the legacy ``num_reqs == 1``
     pack + Tier-2 int64/kv_token_ids precompute chain:
@@ -206,15 +210,23 @@ def sparse_pack_single_req(
     )
     device = selected_mask.device
 
-    counts = torch.empty(H, dtype=torch.int64, device=device)
-
     # Tile choice: 1024 fits a row tile into a single warp-scan step in
     # Triton (``tl.cumsum`` scales linearly, 1024 is the sweet spot on
     # H100/A100 measured separately).  Kernels are launched on the
     # current CUDA stream by Triton.
     TILE_S = 1024 if S > 1024 else max(32, triton.next_power_of_2(max(int(S), 1)))
-
     grid = (int(H),)
+
+    # Phase-C profiling: optional fine-grained sub-timers to locate the
+    # dominant cost inside pack (kernel launches, cumsum, ``.item()``
+    # sync, output allocations, data-kernel launch).  Each timer stop
+    # placement is deliberate — wall time from submit-A to submit-B on
+    # a single CUDA stream reflects "work-through-to-this-point" because
+    # the only blocking call (``.item()``) drains the queue.
+    if perf_record is not None:
+        _t_count_start = time.perf_counter()
+
+    counts = torch.empty(H, dtype=torch.int64, device=device)
     _sparse_pack_count_kernel[grid](
         selected_mask,
         counts,
@@ -223,19 +235,38 @@ def sparse_pack_single_req(
         TILE_S=TILE_S,
     )
 
+    if perf_record is not None:
+        perf_record("pack_sub:launch_count", time.perf_counter() - _t_count_start)
+        _t_cumsum_start = time.perf_counter()
+
     # head_offsets: int32 [H+1]; [0]=0, [1:] = cumsum(counts) (int32).
     # The consumer (``cu_mat``/``head_offsets``) expects int32 already.
     head_offsets = torch.empty(int(H) + 1, dtype=torch.int32, device=device)
     head_offsets[0] = 0
     torch.cumsum(counts.to(torch.int32), dim=0, out=head_offsets[1:])
 
+    if perf_record is not None:
+        perf_record("pack_sub:cumsum", time.perf_counter() - _t_cumsum_start)
+        _t_sync_start = time.perf_counter()
+
     # Sync: we need the true total to size the flat output buffers.
     # Matches the implicit sync from the legacy ``torch.nonzero``.
+    # NOTE: this ``.item()`` also drains the count kernel + cumsum, so
+    # ``pack_sub:item_sync`` subsumes their exec time (their launch
+    # time is captured above).
     total_n = int(head_offsets[-1].item())
+
+    if perf_record is not None:
+        perf_record("pack_sub:item_sync", time.perf_counter() - _t_sync_start)
+        _t_alloc_start = time.perf_counter()
 
     flat_phys64 = torch.empty(total_n, dtype=torch.int64, device=device)
     flat_slots64 = torch.empty(total_n, dtype=torch.int64, device=device)
     kv_token_ids = torch.empty(total_n, dtype=torch.int64, device=device)
+
+    if perf_record is not None:
+        perf_record("pack_sub:alloc_outputs", time.perf_counter() - _t_alloc_start)
+        _t_data_start = time.perf_counter()
 
     if total_n > 0:
         _sparse_pack_data_kernel[grid](
@@ -251,5 +282,8 @@ def sparse_pack_single_req(
             selected_mask.stride(0),
             TILE_S=TILE_S,
         )
+
+    if perf_record is not None:
+        perf_record("pack_sub:launch_data", time.perf_counter() - _t_data_start)
 
     return flat_phys64, flat_slots64, kv_token_ids, counts, head_offsets

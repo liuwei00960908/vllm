@@ -8832,6 +8832,15 @@ class GPUModelRunner(
                         bt_row_gpu,
                         kv_head_ids_int64,
                         int(bsz),
+                        # Phase-C: forward the perf recorder so the
+                        # ``pack_sub:*`` breakdown (launch_count, cumsum,
+                        # item_sync, alloc_outputs, launch_data) is
+                        # captured only when ``VLLM_SPARSE_PERF_DEBUG``
+                        # is on.  The conditional keeps the hot path
+                        # overhead-free when stats are disabled.
+                        perf_record=(
+                            self._sparse_perf_record if perf_enabled else None
+                        ),
                     )
                     # Stash for num_reqs==1 finalize fast-path reuse.
                     self._sparse_triton_head_offsets_cache = (
