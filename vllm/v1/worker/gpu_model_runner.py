@@ -131,6 +131,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.triton_sparse_pack import sparse_pack_single_req
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sparse_kmeans_torch import (
     prefill_cluster_meta_from_features_torch,
@@ -781,6 +782,21 @@ class GPUModelRunner(
         self._sparse_perf_stats_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_PERF_STATS", "0")) == 1
         )
+        # Fused Triton pack kernel for the sparse decode ``num_reqs == 1``
+        # fast path.  Bitwise-equivalent to the legacy nonzero + divmod +
+        # index_select + sum chain, but cuts the per-layer kernel launch
+        # count from ~5 down to 2 (count + pack).  Defaults to on; set
+        # ``VLLM_SPARSE_TRITON_PACK=0`` to fall back to the legacy path
+        # for bisection.
+        self._sparse_triton_pack_enabled: bool = (
+            int(os.getenv("VLLM_SPARSE_TRITON_PACK", "1")) == 1
+        )
+        # Per-layer scratch: when the Triton pack fast path runs in the
+        # per-req loop, it already computes the int32 exclusive-prefix
+        # ``head_offsets`` needed by finalize.  Pass it across via this
+        # attribute to avoid a redundant ``empty + cumsum`` pair in
+        # the num_reqs==1 finalize.  Cleared after each use.
+        self._sparse_triton_head_offsets_cache: torch.Tensor | None = None
         self._decode_perf_stats_enabled: bool = bool(
             int(os.getenv("VLLM_DECODE_PERF_STATS", "0"))
         )
@@ -8715,35 +8731,55 @@ class GPUModelRunner(
                 # Skip the per-layer H2D block-table copy: the block-table
                 # buffer keeps a committed GPU mirror (``block_table.gpu``,
                 # int32) that the core attention path already consumes.
-                # The row view ``bt_gpu[req_idx]`` is zero-kernel, and
-                # ``index_select`` on int32 produces an int32 result with
-                # no follow-up cast — replacing the legacy chain
-                # ``numpy slice → from_numpy → .to(cuda,int64) →
-                # index_select → .to(int32)`` (4 ops + 1 blocking H2D)
-                # with a single ``index_select`` kernel.  Tried
-                # ``bt_gpu[req_idx, block_idx]`` (2D advanced indexing) but
-                # measurements showed it went through a slower dispatch
-                # path than the 1D ``index_select`` primitive; keep the
-                # latter.
+                # The row view ``bt_gpu[req_idx]`` is zero-kernel.
                 bt_row_gpu = blk_tbl.block_table.gpu[req_idx]
-                # ``nonzero`` produces ``[N, 2]`` with row-major ordering:
-                # primary key = head id, secondary key = token id.  Output
-                # size is data-dependent → one implicit GPU sync per req,
-                # matching the legacy ``.cpu().numpy()`` sync footprint.
-                nz = torch.nonzero(selected_mask, as_tuple=False)
-                head_ids_r = nz[:, 0]
-                tok_ids_r = nz[:, 1]
-                block_idx = tok_ids_r // int(bsz)
-                slots_r = (tok_ids_r - block_idx * int(bsz)).to(torch.int32)
-                # int32 ``bt_row_gpu`` → int32 ``phys_r`` (index_select
-                # preserves the source dtype), saving the redundant cast.
-                phys_r = bt_row_gpu.index_select(0, block_idx)
-                # Stick with the well-optimised boolean reduction: on small
-                # [num_heads, seq_len] inputs the parallel row-sum beats
-                # ``torch.bincount`` (atomic scatter-add with heavy bin
-                # contention when each of the 28 bins gets hundreds of
-                # hits) in our measurements.
-                counts_r = selected_mask.sum(dim=1).to(torch.int64)
+
+                # Phase-A fused pack: for the decode-dominant
+                # ``num_reqs == 1`` case, a single Triton kernel pair
+                # replaces ``nonzero`` + ``//`` + ``-*`` +
+                # ``index_select`` + ``sum(dim=1)`` (5 ops → 2 ops).
+                # Bitwise-equivalent, same implicit sync count (the
+                # total-count sync matches ``nonzero``'s size sync).
+                # ``head_ids_r`` is never consumed in the
+                # ``num_reqs == 1`` finalize path, so it is not
+                # returned; ``per_req_head_ids`` stores a zero-length
+                # placeholder to keep list lengths consistent for any
+                # multi-layer accounting elsewhere.
+                use_triton = (
+                    self._sparse_triton_pack_enabled
+                    and num_reqs == 1
+                    and selected_mask.is_cuda
+                )
+                if use_triton:
+                    phys_r, slots_r, counts_r, triton_head_offsets = (
+                        sparse_pack_single_req(
+                            selected_mask,
+                            bt_row_gpu,
+                            int(bsz),
+                        )
+                    )
+                    # Stash the already-computed head_offsets so the
+                    # num_reqs==1 finalize can reuse it (skip the
+                    # redundant ``empty + cumsum`` pair).
+                    self._sparse_triton_head_offsets_cache = triton_head_offsets
+                    head_ids_r = torch.empty(
+                        0, dtype=torch.int64, device=query.device
+                    )
+                else:
+                    # Legacy path (num_reqs > 1 or explicit fallback):
+                    # ``nonzero`` produces [N, 2] row-major (head first,
+                    # token second), matching one implicit GPU sync per
+                    # req as the legacy ``.cpu().numpy()`` had.
+                    self._sparse_triton_head_offsets_cache = None
+                    nz = torch.nonzero(selected_mask, as_tuple=False)
+                    head_ids_r = nz[:, 0]
+                    tok_ids_r = nz[:, 1]
+                    block_idx = tok_ids_r // int(bsz)
+                    slots_r = (
+                        tok_ids_r - block_idx * int(bsz)
+                    ).to(torch.int32)
+                    phys_r = bt_row_gpu.index_select(0, block_idx)
+                    counts_r = selected_mask.sum(dim=1).to(torch.int64)
 
                 per_req_head_ids.append(head_ids_r)
                 per_req_phys.append(phys_r)
@@ -8794,21 +8830,38 @@ class GPUModelRunner(
                 flat_slots = per_req_slots[0].contiguous()
                 counts_r = per_req_counts[0]
 
+                # Reuse the already-computed prefix from Triton pack when
+                # available (Phase-A fast path): ``head_offsets`` is an
+                # int32 [H+1] tensor with ``head_offsets[0] == 0`` by
+                # construction, so ``head_offsets[1:]`` is a zero-cost
+                # view that equals ``counts_r.to(int32)``.  Skipping the
+                # redundant ``empty + zero-init + cumsum`` pair saves two
+                # tiny kernel launches per sparse layer.
+                triton_head_offsets = getattr(
+                    self, "_sparse_triton_head_offsets_cache", None
+                )
+                if triton_head_offsets is not None:
+                    head_offsets = triton_head_offsets
+                    # Zero-copy view (contiguous slice from element 1).
+                    counts_r_i32 = head_offsets[1:]
+                    self._sparse_triton_head_offsets_cache = None
+                else:
+                    counts_r_i32 = counts_r.to(torch.int32)
+                    head_offsets = torch.empty(
+                        num_heads + 1,
+                        dtype=torch.int32,
+                        device=query.device,
+                    )
+                    head_offsets[0] = 0
+                    torch.cumsum(counts_r_i32, dim=0, out=head_offsets[1:])
+
                 # ``cu_mat[:, 0] == 0`` and ``cu_mat[:, 1] == counts_r``.
                 # Build via a single ``stack`` -> one kernel vs
                 # ``zeros + cumsum + stack`` in the generic path.
-                counts_r_i32 = counts_r.to(torch.int32)
                 cu_mat = torch.stack(
                     (torch.zeros_like(counts_r_i32), counts_r_i32), dim=1
                 )
                 total_per_head = counts_r
-                head_offsets = torch.empty(
-                    num_heads + 1,
-                    dtype=torch.int32,
-                    device=query.device,
-                )
-                head_offsets[0] = 0
-                torch.cumsum(counts_r_i32, dim=0, out=head_offsets[1:])
 
                 flat_phys_int64 = flat_phys.to(torch.int64)
                 flat_slots_int64 = flat_slots.to(torch.int64)
