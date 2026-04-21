@@ -8715,11 +8715,17 @@ class GPUModelRunner(
                 # Skip the per-layer H2D block-table copy: the block-table
                 # buffer keeps a committed GPU mirror (``block_table.gpu``,
                 # int32) that the core attention path already consumes.
-                # We index into it directly so ``phys_r`` comes out int32
-                # in a single kernel, avoiding the legacy
-                # ``numpy slice → torch.from_numpy → .to(cuda,int64) →
-                # index_select → .to(int32)`` chain.
-                bt_gpu = blk_tbl.block_table.gpu
+                # The row view ``bt_gpu[req_idx]`` is zero-kernel, and
+                # ``index_select`` on int32 produces an int32 result with
+                # no follow-up cast — replacing the legacy chain
+                # ``numpy slice → from_numpy → .to(cuda,int64) →
+                # index_select → .to(int32)`` (4 ops + 1 blocking H2D)
+                # with a single ``index_select`` kernel.  Tried
+                # ``bt_gpu[req_idx, block_idx]`` (2D advanced indexing) but
+                # measurements showed it went through a slower dispatch
+                # path than the 1D ``index_select`` primitive; keep the
+                # latter.
+                bt_row_gpu = blk_tbl.block_table.gpu[req_idx]
                 # ``nonzero`` produces ``[N, 2]`` with row-major ordering:
                 # primary key = head id, secondary key = token id.  Output
                 # size is data-dependent → one implicit GPU sync per req,
@@ -8729,18 +8735,15 @@ class GPUModelRunner(
                 tok_ids_r = nz[:, 1]
                 block_idx = tok_ids_r // int(bsz)
                 slots_r = (tok_ids_r - block_idx * int(bsz)).to(torch.int32)
-                # Advanced-index directly into the int32 GPU block table:
-                # ``bt_gpu[req_idx, block_idx]`` returns int32 values in one
-                # kernel, avoiding the legacy H2D + int64 materialisation
-                # + int32 cast chain that cost 3 ops per layer.
-                phys_r = bt_gpu[req_idx, block_idx]
-                # ``bincount`` over ``head_ids_r`` (length == ``nz.shape[0]``)
-                # gives the same per-head counts as
-                # ``selected_mask.sum(dim=1)`` but reads only the non-zero
-                # positions (~budget * num_heads) instead of the full
-                # [num_heads, seq_len] boolean matrix.  ``head_ids_r`` is
-                # already int64 from ``nonzero``, so no cast is needed.
-                counts_r = torch.bincount(head_ids_r, minlength=num_heads)
+                # int32 ``bt_row_gpu`` → int32 ``phys_r`` (index_select
+                # preserves the source dtype), saving the redundant cast.
+                phys_r = bt_row_gpu.index_select(0, block_idx)
+                # Stick with the well-optimised boolean reduction: on small
+                # [num_heads, seq_len] inputs the parallel row-sum beats
+                # ``torch.bincount`` (atomic scatter-add with heavy bin
+                # contention when each of the 28 bins gets hundreds of
+                # hits) in our measurements.
+                counts_r = selected_mask.sum(dim=1).to(torch.int64)
 
                 per_req_head_ids.append(head_ids_r)
                 per_req_phys.append(phys_r)
