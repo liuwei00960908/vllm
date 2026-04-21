@@ -181,6 +181,7 @@ def prefill_cluster_meta_from_features_torch_batched(
     n_segment: int,
     n_iter: int = 15,
     seed: int = 42,
+    granularity = "block"
 ) -> dict[str, torch.Tensor]:
     """
     Mean-center, run segment K-Means per batch row, return **original** key space.
@@ -206,7 +207,7 @@ def prefill_cluster_meta_from_features_torch_batched(
     centres = centres_c + mean_key.unsqueeze(1)
     return {
         "cluster_centres": centres,
-        "block_to_cluster": labels,
+        "{}_to_cluster".format(granularity): labels,
         "cluster_size": sizes,
         "mean_key": mean_key,
     }

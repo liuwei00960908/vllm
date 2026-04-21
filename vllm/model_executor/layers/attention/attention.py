@@ -533,6 +533,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     f"'block' or 'token', got {_cg!r}"
                 )
             return SparseAttentionSpec(
+                num_layer=vllm_config.model_config.hf_config.num_hidden_layers,
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
@@ -702,11 +703,13 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
+        if hasattr(attn_layer.impl, "set_attn_metadata_for_update"):
+            attn_layer.impl.set_attn_metadata_for_update(attn_metadata)
         attn_layer.impl.do_kv_cache_update(
             attn_layer,
             key,

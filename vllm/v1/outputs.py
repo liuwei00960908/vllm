@@ -298,6 +298,8 @@ class ModelRunnerOutput:
     # TODO(estimation-zone): populate from model runner for Estimation Zone.
     sparse_block_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
+    # req_id -> kv_manager_list -> name : value
+    cluster_info: "dict[str, tuple[dict[str, object]]] | None" = None
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

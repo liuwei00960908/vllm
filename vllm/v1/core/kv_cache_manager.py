@@ -17,8 +17,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
-if TYPE_CHECKING:
-    from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager
+from vllm.v1.core.sparse_kv_cache_manager import SparseKVManager
 
 logger = init_logger(__name__)
 
@@ -339,6 +338,10 @@ class KVCacheManager:
         self.coordinator.remove_skipped_blocks(
             request.request_id, total_computed_tokens
         )
+
+        for kv_cache_manager in self.coordinator.single_type_managers:
+            if isinstance(kv_cache_manager, SparseKVManager):
+                kv_cache_manager._allocate_blocks_for_cluster(request.request_id, num_new_tokens)
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,

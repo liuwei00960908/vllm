@@ -3,7 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
 import numpy as np
@@ -25,6 +25,9 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+
+from vllm.v1.core.sparse_kmeans_torch import prefill_cluster_meta_from_features_torch_batched
+from vllm.v1.core.sparse_kv_utils import BlockContainer, Clusters
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -245,6 +248,13 @@ class FlashAttentionMetadata:
     # Per query-head block-table sparse decode: [H, num_seqs, max_blocks], [H, num_seqs].
     sparse_per_head_block_table: torch.Tensor | None = None
     sparse_per_head_seq_lens: torch.Tensor | None = None
+
+    # All layers share the same cluster_allocated_block_info
+    cluster_allocated_block_info: list[dict[str, object]] | None = None
+    # Each layer has its own cluster_base_vector_info
+    # req_index -> head -> Clusters
+    cluster_base_info: list[list[Clusters]] | None = None
+    extra_cluster_info: dict[str, object] = field(default_factory=dict)
 
 
 def _get_sliding_window_configs(
@@ -640,6 +650,8 @@ class FlashAttentionImpl(AttentionImpl):
         )
         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
 
+        self.attn_metadata_for_update = None
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -752,6 +764,94 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
+                use_sparse_cluster = (
+                    len(attn_metadata.cluster_base_info[0]) != 0 and
+                    query.shape[0] == 1
+                )
+                if use_sparse_cluster:
+                    cluster_storage = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4])
+                    req_index = 0
+
+                    cluster_allocated_block_info = attn_metadata.cluster_allocated_block_info[req_index][0]
+                    num_head = len(attn_metadata.cluster_base_info[req_index])
+                    cluster_block_size = cluster_storage.shape[2]
+                    head_group_size = query.shape[1] // num_head
+                    for h in range(num_head):
+                        cluster_base_info = attn_metadata.cluster_base_info[req_index][h]
+                        q_centered = query[:num_actual_tokens, h*head_group_size:(h+1)*head_group_size, :] - cluster_base_info.mean
+                        scores_c = torch.matmul(
+                            q_centered.to(dtype=torch.float32), cluster_base_info.cluster_centers.transpose(0, 1)
+                        )
+                        nprobe = min(attn_metadata.extra_cluster_info["nprobe"], 
+                                        attn_metadata.cluster_base_info[req_index][h].cluster_centers.shape[0])
+                        top_clusters = torch.topk(scores_c, k=nprobe, dim=-1).indices.to(dtype=torch.int)
+
+                        for i in range(top_clusters.shape[0]):
+                            for j in range(top_clusters.shape[1]):
+                                temp_block = -1
+                                temp_block_usage = cluster_block_size
+                                temp_block_count = 0
+
+                                block_ids = []
+                                total_token_size = 0
+                                for k in range(top_clusters.shape[2]):
+                                    cluster_id = top_clusters[i, j, k].item()
+                                    cluster_blocks = cluster_base_info.cluster_blocks[cluster_id]
+                                    
+                                    size = cluster_blocks.size
+                                    total_token_size += size
+                                    if size % cluster_block_size == 0:
+                                        block_ids.extend(cluster_blocks.block_ids)
+                                    else:
+                                        block_ids.extend(cluster_blocks.block_ids[:-1])
+
+                                        remain = size - cluster_block_size * (len(cluster_blocks.block_ids) - 1)
+                                        target_block = cluster_blocks.block_ids[-1]
+                                        while remain > 0:
+                                            if temp_block_usage == cluster_block_size:
+                                                if temp_block != -1:
+                                                    block_ids.append(temp_block)
+                                                
+                                                temp_block = self._get_one_allocated_cluster_block(cluster_allocated_block_info)
+                                                temp_block_usage = 0
+                                                temp_block_count += 1
+                                            
+                                            take = min(cluster_block_size - temp_block_usage, remain)
+                                            cluster_storage[:, temp_block, temp_block_usage:temp_block_usage+take, :] = \
+                                                cluster_storage[:, target_block, 0:take, :]
+                                            temp_block_usage += take
+                                            remain -= take
+                                if temp_block != -1:
+                                    block_ids.append(temp_block)
+
+                                flash_attn_varlen_func(
+                                    q=query[i, h*head_group_size+j][None, None, :],
+                                    k=cluster_storage[0, :, :, None, :],
+                                    v=cluster_storage[1, :, :, None, :],
+                                    out=output[i, h*head_group_size+j][None, None, :],
+                                    cu_seqlens_q=torch.tensor([0, 1], device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype),
+                                    max_seqlen_q=1,
+                                    seqused_k=torch.tensor([total_token_size], device=seqused_k.device, dtype=seqused_k.dtype),
+                                    max_seqlen_k=total_token_size,
+                                    softmax_scale=self.scale,
+                                    causal=attn_metadata.causal,
+                                    alibi_slopes=self.alibi_slopes,
+                                    window_size=sliding_window_size,
+                                    block_table=torch.tensor(block_ids, device=block_table.device, dtype=block_table.dtype)[None, :],
+                                    softcap=self.logits_soft_cap,
+                                    scheduler_metadata=None,
+                                    fa_version=self.vllm_flash_attn_version,
+                                    q_descale=q_descale,
+                                    k_descale=k_descale,
+                                    v_descale=v_descale,
+                                    num_splits=attn_metadata.max_num_splits,
+                                    s_aux=self.sinks,
+                                )
+
+                                self._free_temp_cluster_block(cluster_allocated_block_info, temp_block_count)
+
+                    return output
+
                 use_q_head_gather = (
                     attn_metadata.sparse_q_head_gather is not None
                     and self.alibi_slopes is None
@@ -782,7 +882,7 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 use_per_head_bt = attn_metadata.sparse_per_head_block_table is not None
                 # TODO(sparse-debug): remove after locating compact-gather routing issues.
-                logger.info(
+                logger.debug(
                     "[SparseDebug] FA sparse branch layer=%s num_tok=%d "
                     "use_q_head_gather=%s use_gather=%s use_per_head_bt=%s | "
                     "sparse_q_head_gather=%s sparse_gather_phys=%s sparse_per_head_bt=%s | "
@@ -969,7 +1069,7 @@ class FlashAttentionImpl(AttentionImpl):
         """One compact-KV varlen FA call per query head (token-sparse)."""
         assert attn_metadata.sparse_q_head_gather is not None
         # TODO(sparse-debug): remove after locating compact-gather routing issues.
-        logger.info(
+        logger.debug(
             "[SparseDebug] _forward_per_head_compact_kv_gather ENTER "
             "num_q_heads_gather=%d q_shape0=%d max_seqlen_q=%d",
             len(attn_metadata.sparse_q_head_gather),
@@ -1042,7 +1142,7 @@ class FlashAttentionImpl(AttentionImpl):
             total_end.record()
             total_end.synchronize()
             total_ms = float(total_start.elapsed_time(total_end))
-        logger.info(
+        logger.debug(
             "[SparsePerfFA] compact_kv_gather total_ms=%.3f gather_ms=%.3f "
             "fa_ms=%.3f num_q_heads=%d num_tok=%d max_seqlen_q=%d",
             total_ms,
@@ -1126,6 +1226,23 @@ class FlashAttentionImpl(AttentionImpl):
                 num_splits=attn_metadata.max_num_splits,
                 s_aux=sinks_h,
             )
+    
+    def set_attn_metadata_for_update(self, attn_metadata: FlashAttentionMetadata) -> None:
+        self.attn_metadata_for_update = attn_metadata
+    def get_attn_metadata_for_update(self) -> FlashAttentionMetadata | None:
+        return self.attn_metadata_for_update
+    def clear_attn_metadata_for_update(self) -> None:
+        self.attn_metadata_for_update = None
+
+    def _get_one_allocated_cluster_block(self, cluster_allocated_block_info):
+        used_count = cluster_allocated_block_info["used_count"]
+        block_id = cluster_allocated_block_info["allocated_block_ids"][used_count]
+        cluster_allocated_block_info["used_count"] = used_count + 1
+        return block_id
+    
+    def _free_temp_cluster_block(self, cluster_allocated_block_info, temp_block_count):
+        cluster_allocated_block_info["used_count"] -= temp_block_count
+        return None
 
     def do_kv_cache_update(
         self,
@@ -1135,6 +1252,92 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        attn_metadata = self.get_attn_metadata_for_update()
+        self.clear_attn_metadata_for_update()
+        use_sparse_cluster = False
+        if attn_metadata is not None and len(attn_metadata.cluster_allocated_block_info) != 0:
+            # TODO: there may exist several request
+            assert(len(attn_metadata.cluster_allocated_block_info) == 1)
+            req_index = 0
+            # TODO: there may exist several kv_manager
+            assert(len(attn_metadata.cluster_allocated_block_info[req_index]) == 1)
+            # TODO: there may exist several segment
+            assert(attn_metadata.extra_cluster_info["num_segment"] == 1)
+            use_sparse_cluster = (
+                attn_metadata.cluster_allocated_block_info[req_index][0] is not None
+            )
+        
+        if use_sparse_cluster:
+            def append_to_cluster(block_container: BlockContainer, token_ids: torch.Tensor, head: int):
+                cluster_storage = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4])
+                cluster_allocated_block_info = attn_metadata.cluster_allocated_block_info[req_index][0]
+                cluster_block_size = cluster_allocated_block_info["cluster_block_size"]
+                
+                if block_container.size % cluster_block_size == 0:
+                    start = cluster_block_size
+                else:
+                    start = block_container.size % cluster_block_size
+                remain = token_ids.shape[0]
+                total = token_ids.shape[0]
+                while remain > 0: 
+                    if start == cluster_block_size:
+                        target_block_id = self._get_one_allocated_cluster_block(cluster_allocated_block_info)
+                        
+                        block_container.block_ids.append(target_block_id)
+                        start = 0
+                    else:
+                        target_block_id = block_container.block_ids[-1]
+                    take = min(cluster_block_size - start, remain)
+
+                    this_time_take_token_ids = token_ids[total - remain: total - remain + take] 
+                    cluster_storage[0, target_block_id, start:start+take, :] = key[this_time_take_token_ids, head, :]
+                    cluster_storage[1, target_block_id, start:start+take, :] = value[this_time_take_token_ids, head, :]
+                    
+                    block_container.size += take
+                    start += take
+                    remain -= take
+
+            is_prefill = len(attn_metadata.cluster_base_info[req_index]) == 0
+            cluster_base_info = attn_metadata.cluster_base_info[req_index]
+            num_head = key.shape[1]
+            if is_prefill:
+                res = prefill_cluster_meta_from_features_torch_batched(
+                    key.transpose(0, 1),
+                    attn_metadata.extra_cluster_info["num_cluster"],
+                    attn_metadata.extra_cluster_info["num_segment"],
+                    granularity = "token"
+                )
+                for h in range(num_head):
+                    cluster_centers = res["cluster_centres"][h]
+                    mean_key = res["mean_key"][h]
+                    block_container_list = [BlockContainer(block_ids=[], size=0) 
+                                            for _ in range(attn_metadata.extra_cluster_info["num_cluster"])]
+                    cluster_base_info.append(Clusters(cluster_blocks=block_container_list,
+                        cluster_centers=cluster_centers, mean=mean_key))
+                    block_container_list = cluster_base_info[h].cluster_blocks
+                    token_to_cluster = res["token_to_cluster"][h]
+                    for cluster_id in range(attn_metadata.extra_cluster_info["num_cluster"]):
+                        token_ids = torch.where(token_to_cluster==cluster_id)[0]
+                        append_to_cluster(block_container_list[cluster_id], token_ids, h)
+            else:
+                # For decode, we assume there is only one new token
+                assert(key.shape[0] == 1)
+                for h in range(num_head):
+                    if cluster_base_info[h].cluster_centers.shape[0] < attn_metadata.extra_cluster_info["num_cluster"]:
+                        cluster_base_info[h].cluster_centers = torch.cat([cluster_base_info[h].cluster_centers, key[0, h:h+1, :]], dim=0)
+                        cluster_id = cluster_base_info[h].cluster_centers.shape[0] - 1
+                    else:
+                        mean = cluster_base_info[h].mean
+                        key_centered = key[0, h, :] - mean
+                        cluster_id = torch.argmax(
+                            torch.matmul(cluster_base_info[h].cluster_centers, key_centered)
+                        ).item()
+                    append_to_cluster(cluster_base_info[h].cluster_blocks[cluster_id], torch.tensor([0], dtype=torch.int, device=key.device), h)
+            
+            # Currently, we reuse the conservational path to calculate attention output
+            # when prefill. This can be removed later.
+            # return
+
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
