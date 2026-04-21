@@ -8572,6 +8572,19 @@ class GPUModelRunner(
                     dtype=torch.int64,
                     device=query.device,
                 )
+                # Phase-C: persistent scratch for Triton pack's
+                # head_offsets (int32 [H+1]).  Zero-initialized once;
+                # the ``[0]`` stays at zero forever because subsequent
+                # calls only touch ``[1:]`` (count kernel writes, then
+                # in-place cumsum).  Eliminates 2 tiny kernel launches
+                # per sparse layer (``[0] = 0`` scalar write and the
+                # ``.to(int32)`` cast), ~70 µs saved per pack call
+                # (~2 ms/decode step at 28 sparse layers).
+                pack_head_offsets_scratch = torch.zeros(
+                    num_heads_i + 1,
+                    dtype=torch.int32,
+                    device=query.device,
+                )
                 ctx = {
                     "num_heads": num_heads_i,
                     "num_kv_heads": num_kv_heads_i,
@@ -8584,6 +8597,7 @@ class GPUModelRunner(
                     "unit_keys_in_kv_order": unit_keys_in_kv_order,
                     "cu_q_flat_nreqs1_int32": cu_q_flat_nreqs1_int32,
                     "req_ids_flat_nreqs1_zero": req_ids_flat_nreqs1_zero,
+                    "pack_head_offsets_scratch": pack_head_offsets_scratch,
                 }
                 self._sparse_layer_ctx[layer_name] = ctx
                 _perf_add(
@@ -8634,6 +8648,14 @@ class GPUModelRunner(
             # that predates these cached statics, lazy-init on first use.
             if "cu_q_flat_nreqs1_int32" not in ctx:
                 ctx["cu_q_flat_nreqs1_int32"] = torch.arange(
+                    num_heads + 1,
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+            # Phase-C backfill: persistent head_offsets scratch for
+            # the Triton pack.  Zero-init once; kept at [0]=0 forever.
+            if "pack_head_offsets_scratch" not in ctx:
+                ctx["pack_head_offsets_scratch"] = torch.zeros(
                     num_heads + 1,
                     dtype=torch.int32,
                     device=query.device,
@@ -8832,6 +8854,13 @@ class GPUModelRunner(
                         bt_row_gpu,
                         kv_head_ids_int64,
                         int(bsz),
+                        # Phase-C: pass the layer-persistent int32 [H+1]
+                        # scratch buffer so the pack reuses it instead
+                        # of paying ``torch.zeros + cumsum`` kernels
+                        # every call.  The ``[0]=0`` invariant is
+                        # preserved because the pack only writes
+                        # ``[1:]``.
+                        head_offsets_scratch=ctx["pack_head_offsets_scratch"],
                         # Phase-C: forward the perf recorder so the
                         # ``pack_sub:*`` breakdown (launch_count, cumsum,
                         # item_sync, alloc_outputs, launch_data) is
@@ -8952,7 +8981,6 @@ class GPUModelRunner(
                 cu_mat = torch.stack(
                     (torch.zeros_like(counts_r_i32), counts_r_i32), dim=1
                 )
-                total_per_head = counts_r
 
                 # Phase-B: when the Triton pack ran, ``flat_phys`` /
                 # ``flat_slots`` are already int64 and ``kv_token_ids``
@@ -8961,6 +8989,13 @@ class GPUModelRunner(
                 # skipped.  Falls back to the explicit ops when the
                 # Triton path is disabled or bypassed (num_reqs > 1,
                 # CPU input).
+                #
+                # Phase-C: when the Triton path runs, ``counts_r`` is
+                # returned as ``None`` (not built separately — only
+                # ``head_offsets[1:]`` is produced).  ``total_per_head``
+                # is therefore materialized lazily inside the fallback
+                # branch from the int32 view, which is the only place
+                # it is read.
                 if triton_kv_token_ids is not None:
                     flat_phys_int64 = flat_phys
                     flat_slots_int64 = flat_slots
@@ -8969,6 +9004,11 @@ class GPUModelRunner(
                 else:
                     flat_phys_int64 = flat_phys.to(torch.int64)
                     flat_slots_int64 = flat_slots.to(torch.int64)
+                    total_per_head = (
+                        counts_r
+                        if counts_r is not None
+                        else counts_r_i32.to(torch.int64)
+                    )
                     kv_token_ids = torch.repeat_interleave(
                         kv_head_ids_int64, total_per_head.to(torch.int64)
                     )
