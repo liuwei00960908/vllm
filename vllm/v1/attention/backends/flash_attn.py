@@ -266,6 +266,23 @@ class FlashAttentionMetadata:
     # ``max_k`` key on the runtime gather dict, which lets FA skip a
     # ``.max().item()`` GPU sync when calling ``flash_attn_varlen_func``.
     sparse_q_head_gather_max_k: int | None = None
+    # Pre-computed Tier-2 templates for the compact KV gather fast path.
+    # Populated by ``_build_sparse_runtime_q_head_gather`` once per sparse
+    # layer per step and consumed by
+    # ``FlashAttentionImpl._forward_per_head_compact_kv_gather`` to avoid
+    # rebuilding ~15 tiny tensor-op kernels on every layer forward.  All
+    # fields are ``None`` when running full attention or when the builder
+    # didn't run (fallback to per-call construction is retained in FA).
+    sparse_q_head_gather_phys_int64: torch.Tensor | None = None
+    sparse_q_head_gather_slots_int64: torch.Tensor | None = None
+    sparse_q_head_gather_kv_token_ids: torch.Tensor | None = None
+    sparse_q_head_gather_cu_k_flat: torch.Tensor | None = None
+    sparse_q_head_gather_cu_q_flat: torch.Tensor | None = None
+    sparse_q_head_gather_req_ids_flat: torch.Tensor | None = None
+    sparse_q_head_gather_kv_pair_ids_flat: torch.Tensor | None = None
+    sparse_q_head_gather_num_q_flat: int | None = None
+    sparse_q_head_gather_num_q_heads: int | None = None
+    sparse_q_head_gather_num_reqs: int | None = None
 
 
 def _get_sliding_window_configs(
@@ -806,6 +823,39 @@ class FlashAttentionImpl(AttentionImpl):
                             sparse_q_head_gather_max_k=(
                                 runtime_q_head_gather.get("max_k")
                             ),
+                            # Tier-2 precomputed fields (may be absent when
+                            # the builder was produced by an older dict
+                            # schema; FA falls back to on-the-fly build).
+                            sparse_q_head_gather_phys_int64=(
+                                runtime_q_head_gather.get("phys_int64")
+                            ),
+                            sparse_q_head_gather_slots_int64=(
+                                runtime_q_head_gather.get("slots_int64")
+                            ),
+                            sparse_q_head_gather_kv_token_ids=(
+                                runtime_q_head_gather.get("kv_token_ids")
+                            ),
+                            sparse_q_head_gather_cu_k_flat=(
+                                runtime_q_head_gather.get("cu_k_flat")
+                            ),
+                            sparse_q_head_gather_cu_q_flat=(
+                                runtime_q_head_gather.get("cu_q_flat")
+                            ),
+                            sparse_q_head_gather_req_ids_flat=(
+                                runtime_q_head_gather.get("req_ids_flat")
+                            ),
+                            sparse_q_head_gather_kv_pair_ids_flat=(
+                                runtime_q_head_gather.get("kv_pair_ids_flat")
+                            ),
+                            sparse_q_head_gather_num_q_flat=(
+                                runtime_q_head_gather.get("num_q_flat")
+                            ),
+                            sparse_q_head_gather_num_q_heads=(
+                                runtime_q_head_gather.get("num_q_heads")
+                            ),
+                            sparse_q_head_gather_num_reqs=(
+                                runtime_q_head_gather.get("num_reqs")
+                            ),
                             sparse_gather_phys=None,
                             sparse_gather_slots=None,
                             sparse_gather_cu_seqlens_k=None,
@@ -819,6 +869,16 @@ class FlashAttentionImpl(AttentionImpl):
                             sparse_q_head_gather_flat_cu_seqlens_k=None,
                             sparse_q_head_gather_head_offsets=None,
                             sparse_q_head_gather_max_k=None,
+                            sparse_q_head_gather_phys_int64=None,
+                            sparse_q_head_gather_slots_int64=None,
+                            sparse_q_head_gather_kv_token_ids=None,
+                            sparse_q_head_gather_cu_k_flat=None,
+                            sparse_q_head_gather_cu_q_flat=None,
+                            sparse_q_head_gather_req_ids_flat=None,
+                            sparse_q_head_gather_kv_pair_ids_flat=None,
+                            sparse_q_head_gather_num_q_flat=None,
+                            sparse_q_head_gather_num_q_heads=None,
+                            sparse_q_head_gather_num_reqs=None,
                             sparse_gather_phys=None,
                             sparse_gather_slots=None,
                             sparse_gather_cu_seqlens_k=None,
@@ -1103,18 +1163,87 @@ class FlashAttentionImpl(AttentionImpl):
                 fa_end = torch.cuda.Event(enable_timing=True)
                 gather_start.record()
             num_reqs = int(query.shape[0])
-            head_ids = torch.arange(
-                num_q_heads_gather, dtype=torch.int64, device=query.device
+            # Tier-2 fast path: the sparse runtime gather builder has already
+            # moved the int64 conversions, kv_token_ids repeat, cu_k_flat
+            # cumsum and descale index templates into one-shot step-scoped
+            # kernels, exposed via ``attn_metadata``.  When present, this
+            # branch runs only the two advanced-indexing gathers + Q layout
+            # copy + one FA launch (bitwise-equivalent to the legacy in-FA
+            # rebuild below, but ~15 fewer tiny kernel launches per layer).
+            phys64_pre = attn_metadata.sparse_q_head_gather_phys_int64
+            slots64_pre = attn_metadata.sparse_q_head_gather_slots_int64
+            kv_token_ids_pre = attn_metadata.sparse_q_head_gather_kv_token_ids
+            cu_k_flat_pre = attn_metadata.sparse_q_head_gather_cu_k_flat
+            cu_q_flat_pre = attn_metadata.sparse_q_head_gather_cu_q_flat
+            req_ids_pre = attn_metadata.sparse_q_head_gather_req_ids_flat
+            kv_pair_ids_pre = (
+                attn_metadata.sparse_q_head_gather_kv_pair_ids_flat
             )
-            kv_head_ids = head_ids // max(self.num_queries_per_kv, 1)
-            head_token_counts = (
-                head_offsets[1:].to(dtype=torch.int64)
-                - head_offsets[:-1].to(dtype=torch.int64)
+            have_pre = (
+                phys64_pre is not None
+                and slots64_pre is not None
+                and kv_token_ids_pre is not None
+                and cu_k_flat_pre is not None
+                and cu_q_flat_pre is not None
+                and req_ids_pre is not None
+                and kv_pair_ids_pre is not None
             )
-            kv_token_ids = kv_head_ids.repeat_interleave(head_token_counts)
-            phys64 = flat_phys.to(dtype=torch.int64, device=key_cache.device)
-            slots64 = flat_slots.to(dtype=torch.int64, device=key_cache.device)
-            kv_token_ids = kv_token_ids.to(device=key_cache.device)
+            if have_pre:
+                phys64 = phys64_pre
+                slots64 = slots64_pre
+                kv_token_ids = kv_token_ids_pre
+                cu_q_flat = cu_q_flat_pre
+                cu_k_flat = cu_k_flat_pre
+                req_ids = req_ids_pre
+                kv_pair_ids = kv_pair_ids_pre
+            else:
+                # Legacy fallback: rebuild everything from ``flat_*`` tensors.
+                # Kept so the FA path still works with builders that return
+                # the pre-Tier-2 dict schema (older clients, partial rollout).
+                head_ids = torch.arange(
+                    num_q_heads_gather, dtype=torch.int64, device=query.device
+                )
+                kv_head_ids = head_ids // max(self.num_queries_per_kv, 1)
+                head_token_counts = (
+                    head_offsets[1:].to(dtype=torch.int64)
+                    - head_offsets[:-1].to(dtype=torch.int64)
+                )
+                kv_token_ids = kv_head_ids.repeat_interleave(head_token_counts)
+                phys64 = flat_phys.to(
+                    dtype=torch.int64, device=key_cache.device
+                )
+                slots64 = flat_slots.to(
+                    dtype=torch.int64, device=key_cache.device
+                )
+                kv_token_ids = kv_token_ids.to(device=key_cache.device)
+                q_lens = torch.ones(
+                    num_q_heads_gather * num_reqs,
+                    dtype=cu_seqlens_q.dtype,
+                    device=query.device,
+                )
+                cu_q_flat = torch.empty(
+                    int(q_lens.numel()) + 1,
+                    dtype=cu_seqlens_q.dtype,
+                    device=query.device,
+                )
+                cu_q_flat[0] = 0
+                cu_q_flat[1:] = torch.cumsum(q_lens, dim=0)
+                k_lens_fallback = (flat_cu[:, 1:] - flat_cu[:, :-1]).reshape(-1)
+                cu_k_flat = torch.empty(
+                    int(k_lens_fallback.numel()) + 1,
+                    dtype=flat_cu.dtype,
+                    device=flat_cu.device,
+                )
+                cu_k_flat[0] = 0
+                cu_k_flat[1:] = torch.cumsum(k_lens_fallback, dim=0)
+                req_ids = torch.arange(
+                    num_reqs, dtype=torch.int64, device=query.device
+                ).repeat(num_q_heads_gather)
+                kv_pair_ids = kv_head_ids.repeat_interleave(num_reqs)
+
+            # The hot-path gather: these two advanced-indexing reads are the
+            # only genuinely Tier-3 (per-layer, K/V-cache-dependent) work
+            # that cannot be pre-computed.
             k_slice = key_cache[phys64, slots64, kv_token_ids]
             v_slice = value_cache[phys64, slots64, kv_token_ids]
             k_compact = k_slice.unsqueeze(1)
@@ -1126,35 +1255,15 @@ class FlashAttentionImpl(AttentionImpl):
                 .view(num_q_heads_gather * num_reqs, 1, query.shape[-1])
             )
             out_flat = torch.empty_like(q_flat)
-            q_lens = torch.ones(
-                num_q_heads_gather * num_reqs,
-                dtype=cu_seqlens_q.dtype,
-                device=query.device,
-            )
-            cu_q_flat = torch.empty(
-                int(q_lens.numel()) + 1,
-                dtype=cu_seqlens_q.dtype,
-                device=query.device,
-            )
-            cu_q_flat[0] = 0
-            cu_q_flat[1:] = torch.cumsum(q_lens, dim=0)
 
-            k_lens = (flat_cu[:, 1:] - flat_cu[:, :-1]).reshape(-1)
-            cu_k_flat = torch.empty(
-                int(k_lens.numel()) + 1,
-                dtype=flat_cu.dtype,
-                device=flat_cu.device,
-            )
-            cu_k_flat[0] = 0
-            cu_k_flat[1:] = torch.cumsum(k_lens, dim=0)
+            # ``max_seqlen_k`` uses the static budget hint from the builder
+            # when available, avoiding a per-call ``.max().item()`` sync.
             if max_k_hint is not None:
                 max_seqlen_k = int(max_k_hint)
             else:
-                max_seqlen_k = int(k_lens.max().item())
+                k_lens_sync = (flat_cu[:, 1:] - flat_cu[:, :-1]).reshape(-1)
+                max_seqlen_k = int(k_lens_sync.max().item())
 
-            req_ids = torch.arange(num_reqs, dtype=torch.int64, device=query.device)
-            req_ids = req_ids.repeat(num_q_heads_gather)
-            kv_pair_ids = kv_head_ids.repeat_interleave(num_reqs)
             q_descale_flat = q_descale[req_ids, kv_pair_ids].view(-1, 1)
             k_descale_flat = k_descale[req_ids, kv_pair_ids].view(-1, 1)
             v_descale_flat = v_descale[req_ids, kv_pair_ids].view(-1, 1)
