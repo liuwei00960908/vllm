@@ -8485,6 +8485,31 @@ class GPUModelRunner(
                     num_heads_i, dtype=torch.int64, device=query.device
                 )
                 kv_head_ids_int64 = head_ids_int64 // num_queries_per_kv_i
+                # GQA-regular layout check: when ``num_heads == num_kv *
+                # num_queries_per_kv`` and kv_idx ``k`` owns the contiguous
+                # head range ``[k*npk, (k+1)*npk)``, we can replace the G
+                # per-kv ``index_select`` + G per-kv scatter with a single
+                # ``torch.cat`` at the end (and the per-kv q slice becomes
+                # a zero-kernel view).  This pattern holds for every
+                # mainstream GQA / MQA model (Llama, Qwen, Mistral, ...).
+                # We cache the flag + ordered unit-keys so the hot path
+                # does at most one dict lookup per kv_head.
+                gqa_regular = (
+                    num_heads_i == num_kv_heads_i * num_queries_per_kv_i
+                ) and all(
+                    kv_to_qh.get(k)
+                    == list(
+                        range(
+                            k * num_queries_per_kv_i,
+                            (k + 1) * num_queries_per_kv_i,
+                        )
+                    )
+                    for k in range(num_kv_heads_i)
+                )
+                unit_keys_in_kv_order = tuple(
+                    sparse_kv_unit_key(layer_name, k)
+                    for k in range(num_kv_heads_i)
+                )
                 ctx = {
                     "num_heads": num_heads_i,
                     "num_kv_heads": num_kv_heads_i,
@@ -8493,6 +8518,8 @@ class GPUModelRunner(
                     "kv_to_qh_tensor": kv_to_qh_tensor,
                     "head_ids_int64": head_ids_int64,
                     "kv_head_ids_int64": kv_head_ids_int64,
+                    "gqa_regular": gqa_regular,
+                    "unit_keys_in_kv_order": unit_keys_in_kv_order,
                 }
                 self._sparse_layer_ctx[layer_name] = ctx
                 _perf_add(
@@ -8521,6 +8548,24 @@ class GPUModelRunner(
                 kv_head_ids_int64 = head_ids_int64 // num_queries_per_kv
                 ctx["kv_head_ids_int64"] = kv_head_ids_int64
             ctx.setdefault("num_queries_per_kv", num_queries_per_kv)
+            # Backfill GQA-layout hints for older ctx dicts.
+            if "gqa_regular" not in ctx:
+                num_kv_heads_bf = int(ctx["num_kv_heads"])
+                ctx["gqa_regular"] = (
+                    num_heads == num_kv_heads_bf * num_queries_per_kv
+                ) and all(
+                    len(kv_to_qh_tensor.get(k, torch.empty(0))) == num_queries_per_kv
+                    and int(kv_to_qh_tensor[k][0].item())
+                    == k * num_queries_per_kv
+                    and int(kv_to_qh_tensor[k][-1].item())
+                    == (k + 1) * num_queries_per_kv - 1
+                    for k in range(num_kv_heads_bf)
+                )
+            if "unit_keys_in_kv_order" not in ctx:
+                ctx["unit_keys_in_kv_order"] = tuple(
+                    sparse_kv_unit_key(layer_name, k)
+                    for k in range(int(ctx["num_kv_heads"]))
+                )
 
             num_reqs = int(self.input_batch.num_reqs)
             if num_reqs <= 0:
@@ -8579,41 +8624,85 @@ class GPUModelRunner(
                     return None
 
                 q_tok = q_flat[tok_end - 1].to(dtype=torch.float32)
-                selected_mask = torch.zeros(
-                    (num_heads, seq_len),
-                    dtype=torch.bool,
-                    device=query.device,
-                )
                 _t_select = time.perf_counter() if perf_enabled else None
                 # Collect per-kv_head inputs first so we can hand the whole
                 # layer's kv_heads to the batched selector in one call.  This
                 # replaces G × (cluster-score, topk, scatter, gather, topk)
                 # micro-kernels with 3-D variants, shaving the bulk of the
                 # launch overhead that ``_sparse_online_select_tokens``
-                # otherwise accumulates on decode (8 layers × 4 kv_heads = 32
-                # dispatches / layer on our reference model).
-                batched_states: list[_SparseOnlineLayerState] = []
-                batched_q: list[torch.Tensor] = []
-                batched_qh_indices: list[torch.Tensor] = []
-                for kv_idx, qh_indices_t in kv_to_qh_tensor.items():
-                    unit_key = sparse_kv_unit_key(layer_name, kv_idx)
-                    state = req_states.get(unit_key)
-                    if state is None:
-                        return None
-                    q_group = q_tok.index_select(0, qh_indices_t)
-                    batched_states.append(state)
-                    batched_q.append(q_group)
-                    batched_qh_indices.append(qh_indices_t)
-                group_masks = self._sparse_online_select_tokens_batched(
-                    states=batched_states,
-                    q_list=batched_q,
-                    total_tokens=seq_len,
-                    spec=spec,
-                )
-                for qh_indices_t, group_mask in zip(
-                    batched_qh_indices, group_masks, strict=True
+                # otherwise accumulates on decode.
+                #
+                # Fast path (GQA-regular layout): ``q_tok`` already lays out
+                # q-heads in kv-head-major order, so each kv-group's q slice
+                # is a zero-kernel view (``q_tok[k*npk:(k+1)*npk]``) instead
+                # of an ``index_select`` kernel.  The per-kv scatter back
+                # into ``selected_mask`` also collapses to a single
+                # ``torch.cat`` that *is* the final mask, dropping the
+                # initial ``zeros`` allocation.  Saves ~8 kernels / layer
+                # (G index_selects + G scatters + zeros alloc).  The
+                # fallback path below is retained for exotic layouts where
+                # kv-heads own non-contiguous q-head ranges.
+                gqa_regular = bool(ctx.get("gqa_regular", False))
+                unit_keys_in_kv_order = ctx.get("unit_keys_in_kv_order", ())
+                if gqa_regular and len(unit_keys_in_kv_order) == int(
+                    ctx["num_kv_heads"]
                 ):
-                    selected_mask[qh_indices_t] = group_mask
+                    num_kv_heads = int(ctx["num_kv_heads"])
+                    npk = num_queries_per_kv
+                    batched_states = []
+                    missing_state = False
+                    for unit_key in unit_keys_in_kv_order:
+                        state = req_states.get(unit_key)
+                        if state is None:
+                            missing_state = True
+                            break
+                        batched_states.append(state)
+                    if missing_state:
+                        return None
+                    # Zero-kernel q split: slices share q_tok's storage.
+                    q_list_views = [
+                        q_tok[k * npk : (k + 1) * npk]
+                        for k in range(num_kv_heads)
+                    ]
+                    group_masks = self._sparse_online_select_tokens_batched(
+                        states=batched_states,
+                        q_list=q_list_views,
+                        total_tokens=seq_len,
+                        spec=spec,
+                    )
+                    # Concatenation in kv-head order == head-order under
+                    # GQA-regular layout, so this is the final mask with
+                    # no scatter.  ``cat`` guarantees a contiguous tensor
+                    # that downstream ``nonzero`` / indexing expects.
+                    selected_mask = torch.cat(group_masks, dim=0)
+                else:
+                    selected_mask = torch.zeros(
+                        (num_heads, seq_len),
+                        dtype=torch.bool,
+                        device=query.device,
+                    )
+                    batched_states = []
+                    batched_q: list[torch.Tensor] = []
+                    batched_qh_indices: list[torch.Tensor] = []
+                    for kv_idx, qh_indices_t in kv_to_qh_tensor.items():
+                        unit_key = sparse_kv_unit_key(layer_name, kv_idx)
+                        state = req_states.get(unit_key)
+                        if state is None:
+                            return None
+                        q_group = q_tok.index_select(0, qh_indices_t)
+                        batched_states.append(state)
+                        batched_q.append(q_group)
+                        batched_qh_indices.append(qh_indices_t)
+                    group_masks = self._sparse_online_select_tokens_batched(
+                        states=batched_states,
+                        q_list=batched_q,
+                        total_tokens=seq_len,
+                        spec=spec,
+                    )
+                    for qh_indices_t, group_mask in zip(
+                        batched_qh_indices, group_masks, strict=True
+                    ):
+                        selected_mask[qh_indices_t] = group_mask
                 _perf_add(
                     "_build_sparse_runtime_q_head_gather:select_tokens",
                     _t_select,
@@ -8623,11 +8712,14 @@ class GPUModelRunner(
                 selected_mask[:, p_count:seq_len] = True
 
                 _t_pack = time.perf_counter() if perf_enabled else None
-                n_blks = int(blk_tbl.num_blocks_per_row[req_idx])
-                bt_row_np = blk_tbl.block_table.np[req_idx, :n_blks]
-                bt_row_gpu = torch.from_numpy(
-                    np.ascontiguousarray(bt_row_np)
-                ).to(device=query.device, dtype=torch.int64)
+                # Skip the per-layer H2D block-table copy: the block-table
+                # buffer keeps a committed GPU mirror (``block_table.gpu``,
+                # int32) that the core attention path already consumes.
+                # We index into it directly so ``phys_r`` comes out int32
+                # in a single kernel, avoiding the legacy
+                # ``numpy slice → torch.from_numpy → .to(cuda,int64) →
+                # index_select → .to(int32)`` chain.
+                bt_gpu = blk_tbl.block_table.gpu
                 # ``nonzero`` produces ``[N, 2]`` with row-major ordering:
                 # primary key = head id, secondary key = token id.  Output
                 # size is data-dependent → one implicit GPU sync per req,
@@ -8637,8 +8729,18 @@ class GPUModelRunner(
                 tok_ids_r = nz[:, 1]
                 block_idx = tok_ids_r // int(bsz)
                 slots_r = (tok_ids_r - block_idx * int(bsz)).to(torch.int32)
-                phys_r = bt_row_gpu.index_select(0, block_idx).to(torch.int32)
-                counts_r = selected_mask.sum(dim=1).to(torch.int64)
+                # Advanced-index directly into the int32 GPU block table:
+                # ``bt_gpu[req_idx, block_idx]`` returns int32 values in one
+                # kernel, avoiding the legacy H2D + int64 materialisation
+                # + int32 cast chain that cost 3 ops per layer.
+                phys_r = bt_gpu[req_idx, block_idx]
+                # ``bincount`` over ``head_ids_r`` (length == ``nz.shape[0]``)
+                # gives the same per-head counts as
+                # ``selected_mask.sum(dim=1)`` but reads only the non-zero
+                # positions (~budget * num_heads) instead of the full
+                # [num_heads, seq_len] boolean matrix.  ``head_ids_r`` is
+                # already int64 from ``nonzero``, so no cast is needed.
+                counts_r = torch.bincount(head_ids_r, minlength=num_heads)
 
                 per_req_head_ids.append(head_ids_r)
                 per_req_phys.append(phys_r)
