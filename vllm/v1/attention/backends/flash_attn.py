@@ -1753,6 +1753,38 @@ class FlashAttentionImpl(AttentionImpl):
             # = ``[1, H]`` in our heads-as-batches layout.
             lse_ret_h = lse_ret.view(H).to(dtype=torch.float32)
             out_ret_h = out_ret.view(H, D)
+            if _SPARSE_DEBUG_ASSERT:
+                # Reference cross-check: manual softmax per head over the
+                # packed ``k_packed`` / ``v_packed``.  If FA's output
+                # diverges here, the bug is inside the FA call (dtype
+                # handling, descale, causal, etc.) rather than upstream
+                # gather / downstream copy.  fp32 reference math; loose
+                # tolerance because FA uses tensor-cores in bf16/fp16.
+                q_ref = q_flat.view(H, D).to(torch.float32)
+                out_ref = torch.empty(
+                    H, D, dtype=torch.float32, device=device
+                )
+                for _h in range(H):
+                    _s = int(cu_k[_h].item())
+                    _e = int(cu_k[_h + 1].item())
+                    if _e == _s:
+                        out_ref[_h] = 0.0
+                        continue
+                    _k = k_packed[_s:_e, 0, :].to(torch.float32)
+                    _v = v_packed[_s:_e, 0, :].to(torch.float32)
+                    _scores = (q_ref[_h] @ _k.T) * float(self.scale)
+                    _probs = torch.softmax(_scores, dim=-1)
+                    out_ref[_h] = _probs @ _v
+                _diff = (out_ret_h.to(torch.float32) - out_ref).abs()
+                _max = float(_diff.max().item())
+                if _max > 5e-2:
+                    _bad_h = int(_diff.amax(dim=-1).argmax().item())
+                    raise ValueError(
+                        "[SparseDebug] retroinfer FA output diverges from "
+                        f"manual softmax reference: max_abs_diff={_max:.4f} "
+                        f"first_bad_head={_bad_h} "
+                        f"K_len={int(cu_k[_bad_h + 1].item() - cu_k[_bad_h].item())}"
+                    )
         if use_cuda_timing:
             fa_end.record()
 
