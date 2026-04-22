@@ -9007,20 +9007,25 @@ class GPUModelRunner(
         tail_start = max(
             0, int(prefill_len) - int(static_pattern_end)
         )
+        # Order: pending first, then tail, then head.  If the caller-supplied
+        # ``max_budget`` ever turns out to be too small, the ``[:max_budget]``
+        # truncation below drops from the end; this order preserves the
+        # newest output tokens (pending) and the local window (tail) first,
+        # and only sacrifices the attention sink (head) on extreme overflow.
         parts: list[torch.Tensor] = []
-        if head_n > 0:
+        if current_len > prefill_len:
             parts.append(torch.arange(
-                0, head_n, dtype=torch.int32, device=device
+                prefill_len, current_len,
+                dtype=torch.int32, device=device,
             ))
         if tail_start < prefill_len:
             parts.append(torch.arange(
                 tail_start, prefill_len,
                 dtype=torch.int32, device=device,
             ))
-        if current_len > prefill_len:
+        if head_n > 0:
             parts.append(torch.arange(
-                prefill_len, current_len,
-                dtype=torch.int32, device=device,
+                0, head_n, dtype=torch.int32, device=device
             ))
         steady_pending = (
             torch.cat(parts) if parts
@@ -9140,6 +9145,51 @@ class GPUModelRunner(
                 exec_buf_v[h_total, :total_count] = v_cache[
                     phys_blocks, slots, g, :
                 ]
+                if _SPARSE_DEBUG_ASSERT:
+                    # Cross-check: re-gather via a per-entry kv_head_ids
+                    # tensor (legacy compact-gather pattern at
+                    # ``flash_attn.py:_forward_per_head_compact_kv_gather``
+                    # line 1401) and assert bit-identical results against
+                    # the scalar-``g`` gather above.  If this diverges,
+                    # the scalar + advanced-index mix is producing wrong
+                    # K/V values under the current cache stride/layout,
+                    # and the retroinfer exec_buf is being populated with
+                    # garbage before FA ever sees it.
+                    kv_ids = torch.full_like(phys_blocks, int(g))
+                    k_check = k_cache[phys_blocks, slots, kv_ids, :]
+                    v_check = v_cache[phys_blocks, slots, kv_ids, :]
+                    if not torch.equal(
+                        exec_buf_k[h_total, :total_count], k_check
+                    ):
+                        mism = (
+                            exec_buf_k[h_total, :total_count] != k_check
+                        ).any(dim=-1).sum().item()
+                        raise ValueError(
+                            "[SparseDebug] retroinfer K gather mismatch: "
+                            f"h_total={h_total} g={g} "
+                            f"mismatched_rows={mism}/{total_count}"
+                        )
+                    if not torch.equal(
+                        exec_buf_v[h_total, :total_count], v_check
+                    ):
+                        mism = (
+                            exec_buf_v[h_total, :total_count] != v_check
+                        ).any(dim=-1).sum().item()
+                        raise ValueError(
+                            "[SparseDebug] retroinfer V gather mismatch: "
+                            f"h_total={h_total} g={g} "
+                            f"mismatched_rows={mism}/{total_count}"
+                        )
+                    # Sanity: all_positions must be strictly below
+                    # current_len; a stale pending range would silently
+                    # over-index into uninitialised KV slots.
+                    max_pos = int(all_positions.max().item())
+                    if max_pos >= int(current_len):
+                        raise ValueError(
+                            "[SparseDebug] retroinfer position overflow: "
+                            f"max={max_pos} current_len={int(current_len)} "
+                            f"h_total={h_total}"
+                        )
 
         # ── Estimation zone gather (cheap: K × D per head) ───────────────
         if es > 0:
@@ -9485,12 +9535,27 @@ class GPUModelRunner(
             kv_cache = self.kv_caches[kv_cache_gid]
             blk_tbl = self.input_batch.block_table[kv_cache_gid]
             bt_row_gpu = blk_tbl.block_table.gpu[0]
-            # ``sparse_selection_budget`` gives the legacy per-head token
-            # cap; it covers nprobe*avg_cluster_size + steady + pending
-            # comfortably in practice.  The gather helper truncates to
-            # this cap and valid_lengths records the real fill, so the
-            # fixed-shape contract with FA is preserved either way.
-            max_budget = int(spec.sparse_selection_budget())
+            # ``sparse_selection_budget`` is the legacy per-head retrieval
+            # cap.  The retroinfer exec buffer also has to hold the always-on
+            # steady zone (head + tail) and the pending zone (output tokens
+            # generated so far); when ``static_pattern_start +
+            # static_pattern_end`` already exceeds the retrieval cap those
+            # positions would otherwise fall off the end of ``steady_pending``
+            # inside the gather and silently corrupt decode.  Mirror the
+            # legacy ``max_k_hint = max(budget, steady + pending)`` invariant.
+            head_n = min(int(spec.static_pattern_start), int(p_count))
+            tail_start = max(
+                0, int(p_count) - int(spec.static_pattern_end)
+            )
+            steady_count = (
+                int(p_count) if head_n >= tail_start
+                else head_n + (int(p_count) - tail_start)
+            )
+            pending_count = max(0, int(seq_len) - int(p_count))
+            max_budget = max(
+                int(spec.sparse_selection_budget()),
+                steady_count + pending_count,
+            )
 
             out = self._sparse_retroinfer_expand_and_gather_single_req(
                 states=batched_states,
