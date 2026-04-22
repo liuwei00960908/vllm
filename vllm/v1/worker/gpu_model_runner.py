@@ -434,6 +434,32 @@ class _SparseOnlineLayerState:
         "_abf_storage",
         "_b2c_storage",
         "_len",
+        # Retroinfer-style cluster-retrieval additions.
+        #
+        # ``value_sum``: per-cluster accumulated V rows, float32
+        # ``[K, D]``.  Written once at prefill (and extended at each dynamic
+        # k-means refresh, mirroring retroinfer's ``torch.cat`` pattern); used
+        # by the estimation zone to approximate the non-retrieved clusters'
+        # softmax-attention contribution.  Lives alongside ``cluster_centres``
+        # / ``cluster_size`` and is kept consistent with them.
+        #
+        # ``_cs_storage`` / ``_cs_len``: CSR data array for the
+        # cluster→token inverted index.  Stores **logical token positions**
+        # within the request (int32), sorted by cluster id.  Resolution to
+        # paged physical slots happens inside the gather kernel, so we avoid
+        # holding a second copy of the vLLM block_table.
+        #
+        # ``cluster_offsets``: CSR row-pointer int32 ``[K+1]``.  Cluster ``c``
+        # occupies ``cluster_slots[cluster_offsets[c]:cluster_offsets[c+1]]``.
+        #
+        # Note: tokens in the steady zone
+        # (``static_pattern_start``/``static_pattern_end``) are intentionally
+        # **excluded** from the CSR at prefill-time so the expand kernel does
+        # not have to deduplicate against an always-on steady region.
+        "value_sum",
+        "_cs_storage",
+        "_cs_len",
+        "cluster_offsets",
     )
 
     def __init__(
@@ -443,6 +469,9 @@ class _SparseOnlineLayerState:
         block_to_cluster: torch.Tensor,
         all_block_features: torch.Tensor,
         mean_key: torch.Tensor,
+        value_sum: torch.Tensor | None = None,
+        cluster_slots: torch.Tensor | None = None,
+        cluster_offsets: torch.Tensor | None = None,
     ) -> None:
         self.cluster_centres = cluster_centres
         self.cluster_size = cluster_size
@@ -475,6 +504,54 @@ class _SparseOnlineLayerState:
         if n > 0:
             self._b2c_storage[:n].copy_(block_to_cluster)
         self._len = n
+
+        # --- retroinfer-style CSR + value_sum init ---
+        k_clusters = int(cluster_centres.shape[0]) if cluster_centres.dim() >= 2 else 0
+        d_head = (
+            int(cluster_centres.shape[1])
+            if cluster_centres.dim() >= 2 and k_clusters > 0
+            else head_size
+        )
+        dev = cluster_centres.device
+
+        if value_sum is not None:
+            # Caller supplied a pre-built accumulator – trust shape/dtype.
+            self.value_sum = value_sum
+        else:
+            # Empty placeholder; Phase 2 prefill path fills this in.
+            self.value_sum = torch.zeros(
+                (k_clusters, d_head), dtype=torch.float32, device=dev
+            )
+
+        if cluster_slots is not None:
+            cs_n = int(cluster_slots.numel())
+            cs_cap = max(cs_n, 1)
+            self._cs_storage = torch.empty(
+                cs_cap, dtype=torch.int32, device=dev
+            )
+            if cs_n > 0:
+                src = cluster_slots
+                if src.dtype != torch.int32:
+                    src = src.to(dtype=torch.int32)
+                self._cs_storage[:cs_n].copy_(src)
+            self._cs_len = cs_n
+        else:
+            # Placeholder; Phase 2 prefill will rebuild via
+            # ``rebuild_cluster_csr_from_labels``.
+            self._cs_storage = torch.empty(1, dtype=torch.int32, device=dev)
+            self._cs_len = 0
+
+        if cluster_offsets is not None:
+            off = cluster_offsets
+            if off.dtype != torch.int32:
+                off = off.to(dtype=torch.int32)
+            self.cluster_offsets = off
+        else:
+            # Placeholder with a valid ``[0]`` sentinel so consumers can
+            # always dereference ``cluster_offsets[0]`` without a shape check.
+            self.cluster_offsets = torch.zeros(
+                max(k_clusters + 1, 1), dtype=torch.int32, device=dev
+            )
 
     @property
     def block_to_cluster(self) -> torch.Tensor:
@@ -525,6 +602,115 @@ class _SparseOnlineLayerState:
             )
         self._abf_storage[:n].copy_(value)
         self._len = n
+
+    # --- retroinfer-style CSR helpers ----------------------------------
+
+    @property
+    def cluster_slots(self) -> torch.Tensor:
+        """Read-side view of the current CSR data array.
+
+        Shape ``[cluster_offsets[-1]]`` int32, i.e. the number of clustered
+        (non-steady) tokens registered into the inverted index so far.
+        """
+        return self._cs_storage[: self._cs_len]
+
+    def rebuild_cluster_csr_from_labels(
+        self,
+        labels: torch.Tensor,
+        positions: torch.Tensor,
+        num_clusters: int,
+    ) -> None:
+        """Rebuild the CSR (``cluster_slots`` / ``cluster_offsets``) in-place.
+
+        Args:
+            labels: ``[M]`` int (any int dtype); cluster id per entry.
+            positions: ``[M]`` int; the logical-token position to store.
+            num_clusters: total cluster count ``K`` (including empty clusters).
+
+        Runs on ``labels.device``.  Uses ``argsort`` on the cluster ids so the
+        CSR data is laid out grouped-by-cluster, with ``torch.bincount`` +
+        ``cumsum`` producing the offsets – this mirrors retroinfer's offline
+        index layout but stays fully on-device and avoids any per-cluster
+        Python loop.
+        """
+        m = int(labels.numel())
+        dev = labels.device
+        if m == 0:
+            self._cs_storage = torch.empty(1, dtype=torch.int32, device=dev)
+            self._cs_len = 0
+            self.cluster_offsets = torch.zeros(
+                max(int(num_clusters) + 1, 1), dtype=torch.int32, device=dev
+            )
+            return
+
+        # Stable sort by cluster id so slot order within a cluster is
+        # deterministic (helps reproducibility of downstream debug traces
+        # and keeps ``exec_buf`` ordering predictable across runs).
+        lab64 = labels if labels.dtype == torch.int64 else labels.to(torch.int64)
+        order = torch.argsort(lab64, stable=True)
+        sorted_positions = positions.to(dtype=torch.int32)[order].contiguous()
+
+        # Grow storage if needed; reuse the existing allocator-friendly
+        # ``*2`` doubling so repeated dynamic refreshes converge on a stable
+        # capacity.
+        cap = int(self._cs_storage.shape[0])
+        if m > cap:
+            new_cap = cap if cap > 0 else 128
+            while new_cap < m:
+                new_cap *= 2
+            self._cs_storage = torch.empty(
+                new_cap, dtype=torch.int32, device=dev
+            )
+        self._cs_storage[:m].copy_(sorted_positions)
+        self._cs_len = m
+
+        # CSR offsets: bincount of labels + cumsum, prepended with 0.
+        # ``torch.cumsum`` on int32 is not supported on all backends, so we
+        # go through int64 scratch and cast back to int32 – the ``K`` axis
+        # here is tiny (hundreds to low thousands) so the conversion cost is
+        # noise compared to the attention passes downstream.
+        counts64 = torch.bincount(lab64, minlength=int(num_clusters))
+        offs = torch.empty(
+            int(num_clusters) + 1, dtype=torch.int32, device=dev
+        )
+        offs[0] = 0
+        offs[1:].copy_(torch.cumsum(counts64, dim=0).to(torch.int32))
+        self.cluster_offsets = offs
+
+    def accumulate_value_sum(
+        self,
+        values: torch.Tensor,
+        labels: torch.Tensor,
+        num_clusters: int,
+    ) -> None:
+        """Scatter-add ``values`` into ``self.value_sum`` bucketed by ``labels``.
+
+        Args:
+            values: ``[M, D]`` float (any float dtype); V rows to aggregate.
+            labels: ``[M]`` int; cluster id per row.
+            num_clusters: target cluster count ``K``.
+
+        Always stores accumulation in float32 for stability (mirrors
+        retroinfer which materialises ``value_sum`` in the model dtype only
+        lazily; we keep it fp32 to tolerate K-Means refreshes).
+        """
+        if values.numel() == 0:
+            d = int(self.value_sum.shape[-1]) if self.value_sum.dim() == 2 else 0
+            self.value_sum = torch.zeros(
+                (int(num_clusters), d),
+                dtype=torch.float32,
+                device=values.device,
+            )
+            return
+        d = int(values.shape[-1])
+        vs = torch.zeros(
+            (int(num_clusters), d),
+            dtype=torch.float32,
+            device=values.device,
+        )
+        lab64 = labels if labels.dtype == torch.int64 else labels.to(torch.int64)
+        vs.index_add_(0, lab64, values.to(dtype=torch.float32))
+        self.value_sum = vs
 
     def _grow_if_needed(self, extra: int) -> None:
         needed = self._len + extra
