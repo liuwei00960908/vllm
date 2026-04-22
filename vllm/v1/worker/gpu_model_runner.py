@@ -8648,6 +8648,576 @@ class GPUModelRunner(
                     time.perf_counter() - _t0,
                 )
 
+    def _sparse_online_select_clusters_batched(
+        self,
+        states: "list[_SparseOnlineLayerState]",
+        q_list: "list[torch.Tensor]",
+        spec: "SparseAttentionSpec",
+        *,
+        estimation_budget: int = 0,
+    ) -> "tuple[torch.Tensor, torch.Tensor] | None":
+        """Retroinfer-style cluster-level top-k selector.
+
+        Scores ``Q`` against cluster **centroids only** (never per-token), then
+        partitions the top ranks into a retrieval zone (exact FA over the
+        expanded tokens) and an estimation zone (approximate FA over centroid
+        summaries).  This replaces the legacy
+        ``_sparse_online_select_tokens[_batched]`` which produced an
+        ``[H, N]`` boolean token mask – under retroinfer we never build a
+        per-token mask, so the whole mask → nonzero → pack → gather chain
+        downstream collapses to "cluster id → CSR expand → paged gather"
+        (Phase 4 consumers).
+
+        Args:
+            states: per-kv-head online states for one request, length ``G``.
+            q_list: matching per-kv-head Q projections ``[H_per_kv, D]``.
+            spec: shared sparse-attention spec (we read ``nprobe`` and the
+                centroid dim from here).
+            estimation_budget: number of clusters to reserve for the
+                estimation zone, ranked immediately below the retrieval
+                zone.  ``0`` = estimation disabled (Phase 6 wires the
+                real default; Phase 9 plumbs it through config).
+
+        Returns:
+            ``(retrieval_cids, estimation_cids)`` int32 tensors of shape
+            ``[G, H, nprobe_eff]`` and ``[G, H, es_eff]`` respectively, or
+            ``None`` if the fast path's homogeneity checks fail (caller
+            should fall back to the legacy per-token selector).  The two
+            returned ranges are disjoint by construction (``topk`` slice
+            at ``[:nprobe]`` vs ``[nprobe:nprobe+es]``).
+
+        Notes:
+            * All cluster ids stay on ``q_list[0].device``.
+            * Cluster ids are int32 – typical ``K`` is well below 2³¹.
+            * Returns empty trailing dim (still int32, shape ``[G, H, 0]``)
+              when ``nprobe_eff`` or ``es_eff`` clips to zero, so downstream
+              callers do not need to special-case ``None`` vs empty.
+        """
+        G = len(states)
+        if G == 0:
+            return None
+        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        try:
+            q0 = q_list[0]
+            if q0.dim() == 1:
+                q0 = q0.unsqueeze(0)
+            H = int(q0.shape[0])
+            D = int(q0.shape[-1])
+            device = q0.device
+
+            # Homogeneity checks – mirror _sparse_online_select_tokens_batched.
+            # If any pair mismatches we bail with ``None`` and let the
+            # caller route to the legacy token-level selector.  This keeps
+            # the cluster path a strict fast path; we never silently cross
+            # into slower heterogeneous territory.
+            K0 = (
+                int(states[0].cluster_centres.shape[0])
+                if states[0].cluster_centres.numel() > 0
+                else 0
+            )
+            if K0 == 0:
+                return None
+            for s in states[1:]:
+                if (
+                    s.cluster_centres.numel() == 0
+                    or int(s.cluster_centres.shape[0]) != K0
+                    or int(s.cluster_centres.shape[-1]) != D
+                ):
+                    return None
+            q_norm: list[torch.Tensor] = []
+            for q in q_list:
+                if q.dim() == 1:
+                    q = q.unsqueeze(0)
+                if int(q.shape[0]) != H or int(q.shape[-1]) != D:
+                    return None
+                q_norm.append(q)
+
+            nprobe_eff = max(0, min(int(spec.nprobe), K0))
+            es_eff = max(0, min(int(estimation_budget), K0 - nprobe_eff))
+            total_k = nprobe_eff + es_eff
+            if total_k == 0:
+                # Degenerate – caller can synthesise empty outputs itself.
+                empty = torch.empty(
+                    (G, H, 0), dtype=torch.int32, device=device
+                )
+                return empty, empty
+
+            # Stacked scoring path.  Using ``bmm`` (one kernel) instead of
+            # a per-state ``matmul`` loop collapses G launches to 1 and is
+            # a significant win at num_kv_heads=8~32.
+            q_stack = torch.stack(q_norm, dim=0).to(dtype=torch.float32)
+            # [G, H, D]
+            centres = torch.stack(
+                [s.cluster_centres for s in states], dim=0
+            )  # [G, K, D]
+            scores_c = torch.bmm(
+                q_stack, centres.transpose(1, 2)
+            ) / float(max(D, 1)) ** 0.5  # [G, H, K]
+
+            # Single top-(nprobe+es) call – retrieval vs estimation split
+            # is just an index slice on the result; topk's own partial
+            # sort within the top-k values guarantees retrieval gets the
+            # strictly-higher scores.
+            top_idx = torch.topk(
+                scores_c, k=total_k, dim=-1
+            ).indices.to(dtype=torch.int32)  # [G, H, total_k]
+
+            retrieval_cids = top_idx[..., :nprobe_eff].contiguous()
+            estimation_cids = (
+                top_idx[..., nprobe_eff:total_k].contiguous()
+                if es_eff > 0
+                else torch.empty(
+                    (G, H, 0), dtype=torch.int32, device=device
+                )
+            )
+            return retrieval_cids, estimation_cids
+        finally:
+            if _t0 is not None:
+                self._sparse_perf_record(
+                    "_sparse_online_select_clusters_batched",
+                    time.perf_counter() - _t0,
+                )
+
+    def _sparse_retroinfer_expand_and_gather_single_req(
+        self,
+        *,
+        states: "list[_SparseOnlineLayerState]",
+        retrieval_cids: torch.Tensor,
+        estimation_cids: torch.Tensor,
+        block_table_row: torch.Tensor,
+        kv_cache: "torch.Tensor | tuple[torch.Tensor, torch.Tensor]",
+        block_size: int,
+        prefill_len: int,
+        current_len: int,
+        static_pattern_start: int,
+        static_pattern_end: int,
+        max_budget: int,
+    ) -> "dict[str, torch.Tensor]":
+        """Phase 4a — retroinfer-style cluster-expand + paged-KV gather.
+
+        Produces the fixed-shape ``exec_buf_k/v`` / ``valid_lengths`` inputs
+        that Phase 5's FA pass will consume in place of the legacy
+        ``phys``/``slots``/``head_offsets`` per-head compact gather, **plus**
+        the estimation-zone centroid / value_sum / cluster_size tensors that
+        Phase 6's second FA pass + LSE merge will consume.
+
+        This is the unfused pytorch baseline.  Correctness here matters more
+        than speed: it is the reference the Phase 4b Triton
+        ``cluster_expand_and_gather`` kernel will be diffed against.  All of
+        the slow parts (per-head Python loop, per-cluster ``torch.cat``)
+        collapse to a single fused kernel in 4b.
+
+        Assumptions / scope:
+
+        * Single request (``num_reqs == 1``).  The select-clusters fast path
+          already gates on GQA-regular + uniform K, so per-group states
+          share ``K``, ``D``, and ``cluster_offsets``/``cluster_slots``
+          layout shapes (though the contents differ per kv head).
+        * GQA-regular layout – q heads within a kv group are contiguous.
+          ``retrieval_cids``/``estimation_cids`` are laid out
+          ``[G = num_kv_heads, H_per_kv, ...]`` matching Phase 3's output.
+        * Paged KV cache shape ``[num_blocks, block_size, num_kv_heads, D]``
+          (the dominant vLLM layout).  A 3D fallback is accepted and
+          treated as ``num_kv_heads == 1``.
+        * ``max_budget`` is the caller-sized capacity of the output buffer.
+          It must cover the worst-case retrieval expansion plus steady +
+          pending zones (Phase 8 CUDA-Graph wiring derives it from
+          ``nprobe * max_cluster_size + static + pending_cap`` so the shape
+          is replay-stable).  Excess retrieval tokens are truncated; FA
+          never reads past ``valid_lengths[h]`` regardless.
+
+        Output layout:
+
+        * ``exec_buf_k`` / ``exec_buf_v``: ``[H_total, max_budget, D]`` in
+          the KV cache's native dtype.  ``H_total = G * H_per_kv`` in q-head
+          index order so downstream FA's ``[num_heads, seqlen, D]`` path is
+          drop-in.
+        * ``valid_lengths``: ``[H_total]`` int32 – FA's ``cache_seqlens`` /
+          ``seqused_k`` argument.
+        * ``centres_es`` / ``value_sum_es`` / ``cluster_size_es``:
+          per-head gathered estimation-zone tensors.  ``cluster_size_es``
+          is fp32 so Phase 6 can apply the ``log(cluster_size)`` reweight
+          with a single ``torch.log`` op instead of a cast + log chain.
+
+        Position composition (what ends up in ``exec_buf_*[h, :valid_lengths[h]]``):
+
+          1. **Retrieval positions** (cluster-expanded) – ``sum_k sizes[h,k]``
+             entries from ``cluster_slots`` via the ``cids → CSR`` lookup.
+          2. **Steady zone** – prefill prefix ``[0, static_pattern_start)``
+             and suffix ``[N_prefill - static_pattern_end, N_prefill)``.
+             Always included; excluded from CSR by Phase 2a so no dup.
+          3. **Pending zone** – decoded-so-far tokens
+             ``[N_prefill, current_len)``.  Not yet re-clustered (Phase 7
+             handles the refresh); always included as a linear tail.
+
+        The ordering mirrors retroinfer so FA's attention weights match
+        their reference – retrieval first, steady / pending appended.
+        """
+        device = retrieval_cids.device
+        if retrieval_cids.dim() != 3:
+            raise ValueError(
+                "retrieval_cids must be [G, H_per_kv, nprobe], got "
+                f"{tuple(retrieval_cids.shape)}"
+            )
+        G, H_per_kv, nprobe = (
+            int(retrieval_cids.shape[0]),
+            int(retrieval_cids.shape[1]),
+            int(retrieval_cids.shape[2]),
+        )
+        es = int(estimation_cids.shape[-1]) if estimation_cids.numel() else 0
+        H_total = G * H_per_kv
+
+        if isinstance(kv_cache, tuple):
+            k_cache, v_cache = kv_cache
+        else:
+            # Legacy stacked ``[2, num_blocks, block_size, H, D]``.
+            k_cache = kv_cache[0]
+            v_cache = kv_cache[1]
+        if k_cache.dim() == 3:
+            # Squeezed ``[num_blocks, block_size, D]`` → treat as one kv head.
+            k_cache = k_cache.unsqueeze(2)
+            v_cache = v_cache.unsqueeze(2)
+        head_dim = int(k_cache.shape[-1])
+        cache_dtype = k_cache.dtype
+
+        # ── Fixed-shape output buffers ────────────────────────────────────
+        # Zero init is safe padding: FA's ``cache_seqlens`` mechanism caps
+        # reads at ``valid_lengths[h]``, so the unused tail is never
+        # touched.  Keeping pad = 0 (instead of a sentinel) makes Phase 8's
+        # CUDA-graph capture less picky about buffer aliasing across steps.
+        exec_buf_k = torch.zeros(
+            (H_total, max_budget, head_dim),
+            dtype=cache_dtype, device=device,
+        )
+        exec_buf_v = torch.zeros(
+            (H_total, max_budget, head_dim),
+            dtype=cache_dtype, device=device,
+        )
+        valid_lengths = torch.zeros(
+            H_total, dtype=torch.int32, device=device
+        )
+
+        # ── Shared steady + pending position vector ───────────────────────
+        # Built once per request and re-used for every head to avoid
+        # ``3 * H_total`` tiny ``arange`` launches.  ``torch.cat`` of up to
+        # 3 pieces keeps the result contiguous so the downstream gather can
+        # do a single ``index_select`` per head.
+        head_n = min(int(static_pattern_start), int(prefill_len))
+        tail_start = max(
+            0, int(prefill_len) - int(static_pattern_end)
+        )
+        parts: list[torch.Tensor] = []
+        if head_n > 0:
+            parts.append(torch.arange(
+                0, head_n, dtype=torch.int32, device=device
+            ))
+        if tail_start < prefill_len:
+            parts.append(torch.arange(
+                tail_start, prefill_len,
+                dtype=torch.int32, device=device,
+            ))
+        if current_len > prefill_len:
+            parts.append(torch.arange(
+                prefill_len, current_len,
+                dtype=torch.int32, device=device,
+            ))
+        steady_pending = (
+            torch.cat(parts) if parts
+            else torch.empty(0, dtype=torch.int32, device=device)
+        )
+        steady_pending_cnt = int(steady_pending.numel())
+
+        # ── Per-head retrieval expansion (Python loop – Phase 4b fuses) ──
+        # We do one ``cluster_offsets.index_select`` at the G scope to
+        # amortise the K→H_per_kv broadcast, but the inner per-cluster
+        # ``cluster_slots[s:e]`` slicing still forces a
+        # ``.item()`` per (head, cluster) pair.  For num_kv_heads=8 and
+        # nprobe=32 that is 256 syncs per layer which is unacceptable
+        # long-term; 4b replaces this with a single fused kernel.
+        for g in range(G):
+            state = states[g]
+            offsets_g = state.cluster_offsets.to(torch.int64)
+            slots_g = state.cluster_slots
+
+            # [H_per_kv * nprobe] → starts/ends in one gather.
+            cids_flat = retrieval_cids[g].reshape(-1).to(torch.int64)
+            starts_flat = offsets_g.index_select(0, cids_flat)
+            ends_flat = offsets_g.index_select(0, cids_flat + 1)
+            sizes_flat = (ends_flat - starts_flat)
+            starts_hn = starts_flat.view(H_per_kv, nprobe)
+            sizes_hn = sizes_flat.view(H_per_kv, nprobe)
+
+            # One D2H sync per kv group rather than per (head, cluster).
+            # ``sizes_cpu`` / ``starts_cpu`` drive the subsequent Python
+            # slice plan without any further GPU roundtrip.
+            starts_cpu = starts_hn.to(
+                device="cpu", dtype=torch.int64
+            ).numpy()
+            sizes_cpu = sizes_hn.to(
+                device="cpu", dtype=torch.int64
+            ).numpy()
+
+            for h in range(H_per_kv):
+                h_total = g * H_per_kv + h
+                retr_slices: list[torch.Tensor] = []
+                retr_cnt = 0
+                # Truncate if retrieval alone would overrun the budget
+                # minus steady/pending reserve – steady/pending must
+                # always fit (they are always-on).
+                retr_budget = max(0, max_budget - steady_pending_cnt)
+                for k_idx in range(nprobe):
+                    n = int(sizes_cpu[h, k_idx])
+                    if n <= 0:
+                        continue
+                    if retr_cnt + n > retr_budget:
+                        n = retr_budget - retr_cnt
+                        if n <= 0:
+                            break
+                    s = int(starts_cpu[h, k_idx])
+                    retr_slices.append(slots_g[s : s + n])
+                    retr_cnt += n
+                if retr_slices:
+                    retr_positions = torch.cat(retr_slices)
+                else:
+                    retr_positions = slots_g.new_empty(0)
+
+                # Final position list: retrieval ⊕ steady ⊕ pending.
+                if steady_pending_cnt > 0 and retr_cnt > 0:
+                    all_positions = torch.cat(
+                        [retr_positions, steady_pending]
+                    )
+                elif steady_pending_cnt > 0:
+                    all_positions = steady_pending
+                else:
+                    all_positions = retr_positions
+                total_count = int(all_positions.numel())
+                if total_count > max_budget:
+                    all_positions = all_positions[:max_budget]
+                    total_count = max_budget
+                valid_lengths[h_total] = total_count
+                if total_count == 0:
+                    continue
+
+                # Logical position → physical (block, slot).
+                # block_table_row holds int32 phys_block ids; we cast
+                # to int64 once to match the advanced-indexing expected
+                # dtype and keep the gather on the fast path.
+                all64 = all_positions.to(torch.int64)
+                phys_blocks = block_table_row.to(torch.int64) \
+                    .index_select(0, all64 // int(block_size))
+                slots = all64 % int(block_size)
+
+                # Paged gather.  Advanced indexing over 4 dims produces
+                # a contiguous ``[total_count, head_dim]`` result in one
+                # CUDA kernel.  Kept per-head to match the exec_buf
+                # row structure.
+                exec_buf_k[h_total, :total_count] = k_cache[
+                    phys_blocks, slots, g, :
+                ]
+                exec_buf_v[h_total, :total_count] = v_cache[
+                    phys_blocks, slots, g, :
+                ]
+
+        # ── Estimation zone gather (cheap: K × D per head) ───────────────
+        if es > 0:
+            centres_es = torch.empty(
+                (H_total, es, head_dim),
+                dtype=torch.float32, device=device,
+            )
+            value_sum_es = torch.empty(
+                (H_total, es, head_dim),
+                dtype=torch.float32, device=device,
+            )
+            cluster_size_es = torch.empty(
+                (H_total, es), dtype=torch.float32, device=device,
+            )
+            for g in range(G):
+                state = states[g]
+                est_g = estimation_cids[g].to(torch.int64)  # [H_per_kv, es]
+                flat_idx = est_g.reshape(-1)
+                # state.cluster_centres: [K, D] fp32
+                # state.value_sum: [K, D] fp32
+                # state.cluster_size: [K] int32
+                c_flat = state.cluster_centres.to(torch.float32) \
+                    .index_select(0, flat_idx)
+                vs_flat = state.value_sum.to(torch.float32) \
+                    .index_select(0, flat_idx)
+                sz_flat = state.cluster_size.to(torch.float32) \
+                    .index_select(0, flat_idx)
+                centres_es[
+                    g * H_per_kv : (g + 1) * H_per_kv
+                ] = c_flat.view(H_per_kv, es, head_dim)
+                value_sum_es[
+                    g * H_per_kv : (g + 1) * H_per_kv
+                ] = vs_flat.view(H_per_kv, es, head_dim)
+                cluster_size_es[
+                    g * H_per_kv : (g + 1) * H_per_kv
+                ] = sz_flat.view(H_per_kv, es)
+        else:
+            centres_es = torch.empty(
+                (H_total, 0, head_dim),
+                dtype=torch.float32, device=device,
+            )
+            value_sum_es = torch.empty(
+                (H_total, 0, head_dim),
+                dtype=torch.float32, device=device,
+            )
+            cluster_size_es = torch.empty(
+                (H_total, 0), dtype=torch.float32, device=device,
+            )
+
+        return {
+            "exec_buf_k": exec_buf_k,
+            "exec_buf_v": exec_buf_v,
+            "valid_lengths": valid_lengths,
+            "centres_es": centres_es,
+            "value_sum_es": value_sum_es,
+            "cluster_size_es": cluster_size_es,
+        }
+
+    @staticmethod
+    def _sparse_retroinfer_estimation_attn(
+        q: torch.Tensor,
+        centres_es: torch.Tensor,
+        value_sum_es: torch.Tensor,
+        cluster_size_es: torch.Tensor,
+        scale: float,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Phase 6 — estimation-zone softmax attention, closed-form.
+
+        Approximates the softmax contribution of the **non-retrieved**
+        clusters by treating each cluster as a single super-token with:
+
+        * logit = ``Q · centroid / sqrt(D)``      (one dot-product per cluster)
+        * unnormalised value = ``value_sum[c]``   (sum of V across the
+          cluster, precomputed at prefill / dynamic refresh)
+        * occupancy weight   = ``cluster_size[c]`` (how many real tokens
+          this super-token stands in for)
+
+        The closed-form softmax aggregate is then::
+
+            numerator   = Σ_c  exp(logit_c) · value_sum[c]
+            denominator = Σ_c  exp(logit_c) · cluster_size[c]
+            out = numerator / denominator
+            lse = logsumexp(logit_c + log(cluster_size[c]))
+
+        Mirrors retroinfer's fused estimation kernel (their
+        ``batch_gemm_softmax`` + estimation epilogue) but as plain torch
+        ops – fine for Phase 4a's baseline; Phase 4b fuses this with the
+        cluster-expand kernel so the ``Q @ centres`` GEMM stays on-chip.
+
+        ``lse`` is returned in the **same absolute reference frame** as
+        FA's own ``softmax_lse`` output (log of the unshifted softmax
+        denominator), so the caller's
+        :meth:`_sparse_retroinfer_lse_merge` can combine it with the
+        retrieval zone's LSE without per-zone re-normalisation.
+
+        Args:
+            q: ``[H, D]`` float query vectors (one per query head).
+            centres_es: ``[H, es, D]`` per-head estimation-zone centroids.
+            value_sum_es: ``[H, es, D]`` matching ``value_sum`` gather.
+            cluster_size_es: ``[H, es]`` float cluster occupancies.
+            scale: ``1 / sqrt(D)`` multiplier applied to the logits.
+
+        Returns:
+            ``(out_est [H, D] fp32, lse_est [H] fp32)``.  Shape carries
+            H_total so the caller can feed it straight into the LSE merge
+            alongside FA's per-head output.
+        """
+        if centres_es.shape[1] == 0:
+            # No estimation clusters allocated – caller's LSE merge
+            # treats ``lse = -inf`` as a zero-weight branch, so the
+            # retrieval-only path falls through unchanged.
+            H = int(q.shape[0])
+            D = int(q.shape[-1])
+            device, dtype = q.device, torch.float32
+            return (
+                torch.zeros((H, D), dtype=dtype, device=device),
+                torch.full(
+                    (H,), float("-inf"), dtype=dtype, device=device
+                ),
+            )
+        q_f = q.to(dtype=torch.float32)
+        c_f = centres_es.to(dtype=torch.float32)
+        vs_f = value_sum_es.to(dtype=torch.float32)
+        sz_f = cluster_size_es.to(dtype=torch.float32).clamp_min(1.0)
+
+        # Logits ``[H, es]``.  ``einsum`` here is a single GEMM per head
+        # (batched via the leading H dim); ``bmm`` would work too but
+        # einsum keeps the index semantics self-documenting.
+        logits = torch.einsum("hd,hed->he", q_f, c_f) * float(scale)
+        log_sizes = torch.log(sz_f)
+
+        # Stable closed-form softmax aggregate:
+        # Subtract a shared scalar max so ``exp`` doesn't overflow.  We
+        # use the ``logit`` max (not ``logit + log_size``) because the
+        # numerator exponent is pure ``logit`` – matching max keeps
+        # ``w_c = exp(logit - max)`` in ``(0, 1]`` with full precision on
+        # the dominant cluster.
+        logits_max = logits.max(dim=-1, keepdim=True).values  # [H, 1]
+        w = torch.exp(logits - logits_max)  # [H, es]
+        num = torch.einsum("he,hed->hd", w, vs_f)  # [H, D]
+        den = (w * sz_f).sum(dim=-1, keepdim=True)  # [H, 1]
+        out = num / den.clamp_min(1e-12)  # [H, D]
+
+        # ``lse`` in absolute units: logsumexp(logit + log_size)
+        #   = max_shift + log( Σ_c exp(logit - max_shift) · size_c )
+        #   = logits_max + log(den)
+        # which is exactly the form FA reports.
+        lse = (
+            logits_max.squeeze(-1)
+            + torch.log(den.squeeze(-1).clamp_min(1e-12))
+        )
+        return out, lse
+
+    @staticmethod
+    def _sparse_retroinfer_lse_merge(
+        out_a: torch.Tensor,
+        lse_a: torch.Tensor,
+        out_b: torch.Tensor,
+        lse_b: torch.Tensor,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Merge two softmax zones via their outputs + per-row LSE.
+
+        Both branches are assumed to report LSE in the **same absolute
+        reference frame** (FA's convention – log of unshifted softmax
+        denominator).  The merged output is the softmax-weighted average::
+
+            w_a = exp(lse_a - m),  w_b = exp(lse_b - m),  m = max(lse_a, lse_b)
+            out = (w_a · out_a + w_b · out_b) / (w_a + w_b)
+            lse = m + log(w_a + w_b)
+
+        Treats ``lse = -inf`` as a zero-weight branch (e.g. empty
+        estimation zone), in which case ``out`` falls through to the
+        non-inf side and ``lse`` equals that side's LSE.  No NaNs even
+        when both branches are ``-inf`` (an all-steady-empty-est
+        pathological case) – caller should not reach this with a
+        populated retrieval zone.
+
+        Args:
+            out_a, out_b: ``[H, D]`` per-row softmax outputs.
+            lse_a, lse_b: ``[H]`` matching log-sum-exp.
+
+        Returns:
+            ``(out [H, D], lse [H])`` in the same dtype as ``out_a``.
+        """
+        out_a_f = out_a.to(dtype=torch.float32)
+        out_b_f = out_b.to(dtype=torch.float32)
+        la = lse_a.to(dtype=torch.float32)
+        lb = lse_b.to(dtype=torch.float32)
+        m = torch.maximum(la, lb)
+        # ``exp(-inf - m) = 0`` so zero-branch contributions drop cleanly.
+        w_a = torch.exp(la - m)
+        w_b = torch.exp(lb - m)
+        w_sum = w_a + w_b
+        out = (
+            (w_a.unsqueeze(-1) * out_a_f
+             + w_b.unsqueeze(-1) * out_b_f)
+            / w_sum.unsqueeze(-1).clamp_min(1e-12)
+        )
+        lse = m + torch.log(w_sum.clamp_min(1e-12))
+        return out.to(dtype=out_a.dtype), lse
+
     def _build_sparse_runtime_q_head_gather(
         self,
         *,
