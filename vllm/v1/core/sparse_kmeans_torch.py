@@ -316,6 +316,108 @@ def prefill_cluster_meta_from_features_torch(
     }
 
 
+def value_sum_from_kv_cache_torch(
+    v_cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    num_tokens: int,
+    labels: torch.Tensor,
+    num_clusters: int,
+    *,
+    middle_start: int = 0,
+    middle_end: int | None = None,
+) -> torch.Tensor:
+    """Bucket-sum V rows by cluster directly from a paged V cache.
+
+    Mirrors retroinfer's ``value_sum`` accumulator: for each K-Means cluster
+    ``c``, the sum over all clustered-token V vectors that landed in ``c``.
+    Used by the retroinfer-style "estimation zone" to approximate the softmax
+    contribution of clusters not selected into the retrieval zone, via the
+    identity ``softmax_like_score(c) ≈ Q · (value_sum[c] / cluster_size[c])``
+    weighted by ``log(cluster_size[c])``.
+
+    The read path intentionally mirrors ``kmeans_features_from_kv_cache_torch``
+    so that reuse of ``block_ids`` stays one ``kv_cache[block_ids]`` gather –
+    the V-side computation adds O(N·D) FLOPs beyond the K-side but does not
+    introduce any extra block-table indirection.  Computation is kept in
+    fp32 to keep the accumulator numerically stable across arbitrarily long
+    prompts (retroinfer does the same via CUTLASS fp32 epilogue).
+
+    Args:
+        v_cache: V cache, ``[num_blocks, block_size, num_heads, head_dim]``.
+            Legacy 3D ``[num_blocks, block_size, head_dim]`` is accepted as
+            one KV head.
+        block_ids: Physical block ids for this request.
+        num_tokens: Number of valid request tokens covered by ``block_ids``.
+        labels: Cluster label per request token, ``[H, N]`` or ``[N]`` int.
+        num_clusters: ``K`` – output leading size.
+        middle_start: First token index to include.  Tokens in
+            ``[0, middle_start)`` are treated as the retroinfer "steady head
+            zone" and excluded from the value_sum accumulation (they are
+            always merged into the executable buffer, so letting them
+            contribute to an estimated cluster score would double-count).
+        middle_end: Exclusive upper bound; defaults to ``num_tokens``.
+            ``[middle_end, num_tokens)`` is the steady tail zone.
+
+    Returns:
+        ``[H, K, head_dim]`` fp32 value_sum tensor (squeezed to ``[K, D]``
+        when ``labels`` was 1D).
+    """
+    v_cache, kv_squeezed = _as_batched_kv_cache(v_cache, "v_cache")
+    if block_ids.dim() != 1:
+        raise ValueError(
+            f"block_ids must be [num_selected_blocks], got {tuple(block_ids.shape)}"
+        )
+
+    num_blocks = int(block_ids.numel())
+    block_size = int(v_cache.shape[1])
+    num_heads = int(v_cache.shape[2])
+    head_dim = int(v_cache.shape[3])
+    max_tokens = num_blocks * block_size
+    valid_tokens = max(0, min(int(num_tokens), max_tokens))
+
+    lo = max(0, int(middle_start))
+    hi = valid_tokens if middle_end is None else min(int(middle_end), valid_tokens)
+    lo = min(lo, hi)
+    m = hi - lo
+
+    labels, lbl_squeezed = _as_batched_features(
+        labels.unsqueeze(-1), "labels"
+    )
+    # labels is now [H, N, 1]; drop trailing dim.
+    labels = labels.squeeze(-1)
+    h_labels = int(labels.shape[0])
+
+    if h_labels != num_heads:
+        raise ValueError(
+            f"labels head dim ({h_labels}) must match v_cache num_heads "
+            f"({num_heads})"
+        )
+
+    out = v_cache.new_zeros(
+        (num_heads, int(num_clusters), head_dim), dtype=torch.float32
+    )
+    if m <= 0 or num_blocks == 0 or num_heads == 0 or num_clusters == 0:
+        return _maybe_squeeze(out, lbl_squeezed and kv_squeezed)
+
+    # Gather the V rows covering [lo, hi) once.  ``kv_cache[block_ids]``
+    # returns ``[num_blocks, block_size, H, D]``; we flatten and slice.
+    v_blocks = v_cache[block_ids].to(dtype=torch.float32)
+    v_flat = v_blocks.reshape(num_blocks * block_size, num_heads, head_dim)[
+        lo:hi
+    ]  # [M, H, D]
+    lab_slice = labels[:, lo:hi].to(torch.int64)  # [H, M]
+
+    # Per-head scatter-add: one bincount-style accumulation per head.  The
+    # loop body is ``H`` ``index_add_`` launches which is fine for the
+    # realistic head counts (8–128) and keeps us from materialising a
+    # ``[H·K, D]`` fused tensor for a single prefill call.
+    v_flat_hmd = v_flat.transpose(0, 1).contiguous()  # [H, M, D]
+    for h in range(num_heads):
+        out[h].index_add_(0, lab_slice[h], v_flat_hmd[h])
+
+    return _maybe_squeeze(out, lbl_squeezed and kv_squeezed)
+
+
 def prefill_cluster_meta_from_kv_cache_torch(
     kv_cache: torch.Tensor,
     block_ids: torch.Tensor,

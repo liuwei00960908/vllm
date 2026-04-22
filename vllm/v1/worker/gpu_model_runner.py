@@ -138,6 +138,7 @@ from vllm.v1.core.sparse_kmeans_torch import (
     prefill_cluster_meta_from_features_torch,
     prefill_cluster_meta_from_kv_cache_torch,
     sparse_prefill_cluster_use_device_kmeans,
+    value_sum_from_kv_cache_torch,
 )
 from vllm.v1.core.sparse_kv_cache_manager import (
     SparseKVManager,
@@ -1051,6 +1052,16 @@ class GPUModelRunner(
         # does not rebuild them every step.
         self._sparse_layer_ctx: dict[str, dict[str, object]] = {}
         self._sparse_online_index: dict[str, dict[str, _SparseOnlineLayerState]] = {}
+        # GPU-resident handoff: per-(req, unit_key) precomputed ``value_sum``
+        # ``[K, D]`` fp32 tensors written during ``_collect_sparse_features``
+        # (next to the K-Means call, while V rows are still hot in the paged
+        # cache's L2) and consumed one line later in
+        # ``_update_sparse_online_index`` to avoid a redundant D2H→numpy→H2D
+        # roundtrip.  Intentionally not a function parameter: the two callers
+        # are adjacent in ``sample_tokens`` and bouncing it through a tuple
+        # would bloat the already-wide return signature of
+        # ``_collect_sparse_features``.  Cleared at the end of each update.
+        self._sparse_pending_value_sum_gpu: dict[str, dict[str, torch.Tensor]] = {}
         # Snapshot of per-request output length BEFORE this step appends sampled
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
@@ -9473,13 +9484,67 @@ class GPUModelRunner(
                                 dtype=torch.float32,
                                 device=self.device,
                             )
-                        req_states[unit_key] = _SparseOnlineLayerState(
+                        # --- Phase 2b: consume GPU-resident value_sum -----
+                        # Populated by ``_collect_sparse_features`` on the
+                        # device-kmeans path.  Absent on the CPU fallback
+                        # path or when the prompt is entirely steady zone;
+                        # constructor falls back to zeros which is a
+                        # correct (if less selective) estimation prior.
+                        pending_vs_map = (
+                            self._sparse_pending_value_sum_gpu.get(req_id)
+                        )
+                        vs_tensor = None
+                        if pending_vs_map is not None:
+                            vs_tensor = pending_vs_map.get(unit_key)
+                        state_new = _SparseOnlineLayerState(
                             cluster_centres=centres_t,
                             cluster_size=sizes_t,
                             block_to_cluster=labels_t,
                             all_block_features=feat_t,
                             mean_key=mean_t,
+                            value_sum=vs_tensor,
                         )
+                        # --- Phase 2a: build cluster→tokens CSR -----------
+                        # Retrieval-zone expand looks up "which logical token
+                        # positions belong to cluster c" in O(|c|) via CSR.
+                        # ``block_to_cluster`` alone is the forward mapping
+                        # (token→cluster); without this inverted index the
+                        # per-step expand would have to scan all N tokens,
+                        # cancelling retroinfer's sparsity win.
+                        #
+                        # Steady zone (``static_pattern_start`` prefix /
+                        # ``static_pattern_end`` suffix) is intentionally
+                        # **excluded** from the CSR.  Those tokens are always
+                        # merged into the executable buffer via a separate
+                        # fixed path; if they were also present in the CSR,
+                        # picking any cluster that contained a steady token
+                        # would double-count it in softmax, breaking the
+                        # (steady ⊔ retrieved) partition invariant.
+                        n_tokens = int(labels_t.numel())
+                        k_clusters = int(centres_t.shape[0]) \
+                            if centres_t.dim() >= 2 else 0
+                        head_n = min(
+                            int(spec.static_pattern_start), n_tokens
+                        )
+                        tail_start = max(
+                            0, n_tokens - int(spec.static_pattern_end)
+                        )
+                        if head_n < tail_start and k_clusters > 0:
+                            positions = torch.arange(
+                                head_n,
+                                tail_start,
+                                dtype=torch.int32,
+                                device=labels_t.device,
+                            )
+                            state_new.rebuild_cluster_csr_from_labels(
+                                labels=labels_t[head_n:tail_start],
+                                positions=positions,
+                                num_clusters=k_clusters,
+                            )
+                        # else: whole prompt is steady (or k=0).  CSR stays
+                        # at its zero-init placeholder; select fallback
+                        # drives a steady-only exec buffer.
+                        req_states[unit_key] = state_new
             if _t_prefill_init is not None:
                 # Isolates the prefill-only state-materialisation block so
                 # we can compare it cleanly against the batched decode path
@@ -9679,6 +9744,13 @@ class GPUModelRunner(
                     time.perf_counter() - _t_sub,
                 )
         finally:
+            # Phase 2b: release the GPU-resident value_sum handoff so the
+            # prefill V tensors (``[H, K, D]`` per req) stop pinning memory
+            # after they've been stitched into their ``_SparseOnlineLayerState``
+            # counterparts.  Safe to clear unconditionally even when the
+            # dict was never populated this step.
+            if self._sparse_pending_value_sum_gpu:
+                self._sparse_pending_value_sum_gpu.clear()
             if _t0 is not None:
                 self._sparse_perf_record(
                     "_update_sparse_online_index",
@@ -10427,6 +10499,63 @@ class GPUModelRunner(
                                             time.perf_counter() - _t_kmeans,
                                         )
                                     k_heads = raw_b["features"]
+                                    # --- Phase 2b: per-cluster V accumulator ---
+                                    # Compute ``value_sum`` on the same stream
+                                    # while K-Means output ``block_to_cluster``
+                                    # is still hot.  Uses ``kv[1]`` (V side of
+                                    # the paged cache) with the same block_ids
+                                    # gather; no extra D2H.  Only fires on the
+                                    # device-kmeans path – CPU fallback leaves
+                                    # ``value_sum`` as zeros (estimation zone
+                                    # degrades to uniform, retrieval zone is
+                                    # unaffected).
+                                    head_n_cv = min(
+                                        int(spec.static_pattern_start),
+                                        valid_len,
+                                    )
+                                    tail_start_cv = max(
+                                        0,
+                                        valid_len
+                                        - int(spec.static_pattern_end),
+                                    )
+                                    if head_n_cv < tail_start_cv:
+                                        _t_vs = (
+                                            time.perf_counter()
+                                            if perf_enabled
+                                            else None
+                                        )
+                                        actual_k = int(
+                                            raw_b["cluster_centres"].shape[1]
+                                        )
+                                        vs_hkd = value_sum_from_kv_cache_torch(
+                                            kv[1],
+                                            block_ids_t,
+                                            valid_len,
+                                            labels=raw_b[
+                                                "block_to_cluster"
+                                            ],
+                                            num_clusters=actual_k,
+                                            middle_start=head_n_cv,
+                                            middle_end=tail_start_cv,
+                                        )
+                                        if vs_hkd.dim() == 2:
+                                            vs_hkd = vs_hkd.unsqueeze(0)
+                                        req_vs_map = (
+                                            self
+                                            ._sparse_pending_value_sum_gpu
+                                            .setdefault(req_id, {})
+                                        )
+                                        for kv_h in range(num_kv):
+                                            req_vs_map[
+                                                sparse_kv_unit_key(
+                                                    layer_name, kv_h
+                                                )
+                                            ] = vs_hkd[kv_h]
+                                        if _t_vs is not None:
+                                            self._sparse_perf_record(
+                                                "collect:prefill_value_sum",
+                                                time.perf_counter() - _t_vs,
+                                            )
                                 else:
                                     k_heads = kmeans_features_from_kv_cache_torch(
                                         kv[0],
