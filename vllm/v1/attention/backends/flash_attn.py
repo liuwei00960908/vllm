@@ -1549,19 +1549,19 @@ class FlashAttentionImpl(AttentionImpl):
         #   q_flat : [H, 1, D]       (one query per "batch")
         #   k_flat : [H*max_budget, 1, D]
         #   v_flat : [H*max_budget, 1, D]
-        # ``cu_seqlens_k`` marches by ``max_budget`` while ``seqused_k``
-        # carries the actual per-head valid length – FA reads only the
-        # first ``seqused_k[b]`` rows of each batch's K/V stripe.
+        # Packed K layout: batch ``b`` occupies rows ``[b*max_budget,
+        # (b+1)*max_budget)`` in ``k_flat``.  Per-batch **valid** key count
+        # is ``seqused_k[b]`` (``<= max_budget``); padding rows are never
+        # read.  **Do not** pass ``cu_seqlens_k`` together with ``seqused_k``
+        # – ``flash_attn_varlen_func`` asserts they are mutually exclusive;
+        # the FA2 path substitutes an internal dummy ``cu_seqlens_k`` when
+        # only ``seqused_k`` is supplied (see ``flash_attn_interface.py``).
         q_flat = (
             query.view(1, H, D).transpose(0, 1).contiguous().view(H, 1, D)
         )
         k_flat = exec_buf_k.reshape(H * max_budget, 1, D)
         v_flat = exec_buf_v.reshape(H * max_budget, 1, D)
         cu_q = torch.arange(0, H + 1, dtype=torch.int32, device=device)
-        cu_k = (
-            torch.arange(0, H + 1, dtype=torch.int32, device=device)
-            * max_budget
-        )
         seqused_k = valid_lengths.to(dtype=torch.int32)
 
         # Per-batch descale: FA expects ``[batch, num_heads]`` = ``[H, 1]``.
@@ -1590,7 +1590,7 @@ class FlashAttentionImpl(AttentionImpl):
             out=None,
             cu_seqlens_q=cu_q,
             max_seqlen_q=1,
-            cu_seqlens_k=cu_k,
+            cu_seqlens_k=None,
             seqused_k=seqused_k,
             max_seqlen_k=max_budget,
             softmax_scale=self.scale,

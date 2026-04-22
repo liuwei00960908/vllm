@@ -399,21 +399,28 @@ def value_sum_from_kv_cache_torch(
     if m <= 0 or num_blocks == 0 or num_heads == 0 or num_clusters == 0:
         return _maybe_squeeze(out, lbl_squeezed and kv_squeezed)
 
-    # Gather the V rows covering [lo, hi) once.  ``kv_cache[block_ids]``
-    # returns ``[num_blocks, block_size, H, D]``; we flatten and slice.
-    v_blocks = v_cache[block_ids].to(dtype=torch.float32)
+    # Gather the V rows covering [lo, hi) once – **in cache dtype** so
+    # we don't carry a transient ``[M, H, D]`` fp32 copy of the whole
+    # V-cache slice through the rest of prefill (observed: 770 MiB OOM
+    # at long prompts on a 24 GiB card).  The fp32 upcast is deferred to
+    # the per-head slice inside the scatter loop so peak is ``[M, D]``
+    # fp32 instead of ``[M, H, D]``.  ``index_add_`` on a non-contiguous
+    # (strided) fp32 source is well-supported by PyTorch's CUDA
+    # implementation – no need for the pre-loop ``transpose+contiguous``.
+    v_blocks = v_cache[block_ids]
     v_flat = v_blocks.reshape(num_blocks * block_size, num_heads, head_dim)[
         lo:hi
-    ]  # [M, H, D]
+    ]  # [M, H, D]  (cache dtype)
     lab_slice = labels[:, lo:hi].to(torch.int64)  # [H, M]
 
-    # Per-head scatter-add: one bincount-style accumulation per head.  The
-    # loop body is ``H`` ``index_add_`` launches which is fine for the
-    # realistic head counts (8–128) and keeps us from materialising a
-    # ``[H·K, D]`` fused tensor for a single prefill call.
-    v_flat_hmd = v_flat.transpose(0, 1).contiguous()  # [H, M, D]
+    # Per-head scatter-add: one bincount-style accumulation per head.
+    # The fp32 cast happens on the per-head slice so only ``[M, D]``
+    # fp32 is live at any time (~M*D*4 bytes, vs the prior
+    # ``[M, H, D]`` fp32 = M*H*D*4).
     for h in range(num_heads):
-        out[h].index_add_(0, lab_slice[h], v_flat_hmd[h])
+        out[h].index_add_(
+            0, lab_slice[h], v_flat[:, h, :].to(dtype=torch.float32)
+        )
 
     return _maybe_squeeze(out, lbl_squeezed and kv_squeezed)
 

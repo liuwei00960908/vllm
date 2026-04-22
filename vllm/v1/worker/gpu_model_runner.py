@@ -11324,6 +11324,21 @@ class GPUModelRunner(
                                     # ``value_sum`` as zeros (estimation zone
                                     # degrades to uniform, retrieval zone is
                                     # unaffected).
+                                    #
+                                    # Gate on the estimation budget: when the
+                                    # runtime has no estimation zone configured
+                                    # (``VLLM_SPARSE_ESTIMATION_BUDGET=0`` – the
+                                    # default), the retroinfer path never reads
+                                    # ``value_sum``, and computing it here
+                                    # triggered a large transient FP32 upcast of
+                                    # the V-cache slice in prefill (observed:
+                                    # 770 MiB OOM in a 23.7 GiB card at long
+                                    # prompts).  Skipping it keeps the prefill
+                                    # peak memory equivalent to the
+                                    # pre-Phase 2b path; the state constructor
+                                    # still allocates a tiny ``[K, D]`` zeros
+                                    # placeholder so FA's fallback path is
+                                    # type-stable.
                                     head_n_cv = min(
                                         int(spec.static_pattern_start),
                                         valid_len,
@@ -11333,7 +11348,13 @@ class GPUModelRunner(
                                         valid_len
                                         - int(spec.static_pattern_end),
                                     )
-                                    if head_n_cv < tail_start_cv:
+                                    need_value_sum = (
+                                        head_n_cv < tail_start_cv
+                                        and int(
+                                            self._sparse_estimation_budget
+                                        ) > 0
+                                    )
+                                    if need_value_sum:
                                         _t_vs = (
                                             time.perf_counter()
                                             if perf_enabled
