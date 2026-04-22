@@ -134,7 +134,9 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.triton_sparse_pack import sparse_pack_single_req
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sparse_kmeans_torch import (
+    kmeans_features_from_kv_cache_torch,
     prefill_cluster_meta_from_features_torch,
+    prefill_cluster_meta_from_kv_cache_torch,
     sparse_prefill_cluster_use_device_kmeans,
 )
 from vllm.v1.core.sparse_kv_cache_manager import (
@@ -9752,6 +9754,7 @@ class GPUModelRunner(
         sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]],
         pending_async_feat: list[tuple[str, str, torch.Tensor]],
         pending_async_meta: list[tuple[str, str, dict[str, torch.Tensor]]],
+        precomputed_meta: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Copy prefill K features to CPU and optionally run K-Means on device."""
         perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
@@ -9760,7 +9763,8 @@ class GPUModelRunner(
             and self._sparse_d2h_stream is not None
             and k_feat.is_cuda
         )
-        if sparse_prefill_cluster_use_device_kmeans(k_feat):
+        raw = precomputed_meta
+        if raw is None and sparse_prefill_cluster_use_device_kmeans(k_feat):
             _t_kmeans = time.perf_counter() if perf_enabled else None
             raw = prefill_cluster_meta_from_features_torch(
                 k_feat,
@@ -9772,6 +9776,7 @@ class GPUModelRunner(
                     "collect:prefill_device_kmeans",
                     time.perf_counter() - _t_kmeans,
                 )
+        if raw is not None:
             if use_async_d2h:
                 _t_meta_copy = time.perf_counter() if perf_enabled else None
                 pending_async_meta.append(
@@ -9859,6 +9864,7 @@ class GPUModelRunner(
         sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]],
         pending_async_feat: list[tuple[str, str, torch.Tensor]],
         pending_async_meta: list[tuple[str, str, dict[str, torch.Tensor]]],
+        precomputed_meta: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Prefill sparse features for all KV heads of one layer in one batched K-Means.
 
@@ -9878,7 +9884,8 @@ class GPUModelRunner(
         )
         num_kv = int(k_heads.shape[0])
 
-        if sparse_prefill_cluster_use_device_kmeans(k_heads):
+        raw_b = precomputed_meta
+        if raw_b is None and sparse_prefill_cluster_use_device_kmeans(k_heads):
             _t_kmeans = time.perf_counter() if perf_enabled else None
             raw_b = prefill_cluster_meta_from_features_torch(
                 k_heads,
@@ -9890,6 +9897,7 @@ class GPUModelRunner(
                     "collect:prefill_device_kmeans",
                     time.perf_counter() - _t_kmeans,
                 )
+        if raw_b is not None:
             for kv_h in range(num_kv):
                 unit_key = sparse_kv_unit_key(layer_name, kv_h)
                 raw = {
@@ -10191,14 +10199,18 @@ class GPUModelRunner(
                         and is_decode_committed
                         and not is_prefill_done
                     )
-                    if decode_only_token_sparse:
-                        k_blocks = None
-                    else:
-                        _t_k_cache_read = (
-                            time.perf_counter() if perf_enabled else None
-                        )
-                        k_blocks = kv[0][block_ids_t]
-                        _perf_add("collect:k_cache_read", _t_k_cache_read)
+                    k_blocks: torch.Tensor | None = None
+
+                    def _read_k_blocks() -> torch.Tensor:
+                        nonlocal k_blocks
+                        if k_blocks is None:
+                            _t_k_cache_read = (
+                                time.perf_counter() if perf_enabled else None
+                            )
+                            k_blocks = kv[0][block_ids_t]
+                            _perf_add("collect:k_cache_read", _t_k_cache_read)
+                        return k_blocks
+
                     num_kv = int(attn_mod.num_kv_heads)
                     if token_sparse:
                         if is_prefill_done:
@@ -10208,22 +10220,57 @@ class GPUModelRunner(
                                 _t_prefill_store = (
                                     time.perf_counter() if perf_enabled else None
                                 )
-                                k_flat = k_blocks.reshape(-1, *k_blocks.shape[2:])[
-                                    :valid_len
-                                ].float()
+                                raw_b = None
+                                if sparse_prefill_cluster_use_device_kmeans(kv[0]):
+                                    _t_kmeans = (
+                                        time.perf_counter()
+                                        if perf_enabled
+                                        else None
+                                    )
+                                    raw_b = prefill_cluster_meta_from_kv_cache_torch(
+                                        kv[0],
+                                        block_ids_t,
+                                        valid_len,
+                                        num_clusters=spec.num_clusters,
+                                        n_segment=spec.n_segment,
+                                        is_centered=False,
+                                    )
+                                    if _t_kmeans is not None:
+                                        self._sparse_perf_record(
+                                            "collect:prefill_device_kmeans",
+                                            time.perf_counter() - _t_kmeans,
+                                        )
+                                    k_heads = raw_b["features"]
+                                else:
+                                    k_heads = kmeans_features_from_kv_cache_torch(
+                                        kv[0],
+                                        block_ids_t,
+                                        valid_len,
+                                        is_centered=False,
+                                    )
                                 if num_kv == 1:
+                                    raw = None if raw_b is None else {
+                                        "cluster_centres": raw_b[
+                                            "cluster_centres"
+                                        ][0],
+                                        "block_to_cluster": raw_b[
+                                            "block_to_cluster"
+                                        ][0],
+                                        "cluster_size": raw_b["cluster_size"][0],
+                                        "mean_key": raw_b["mean_key"][0],
+                                    }
                                     self._sparse_store_prefill_block_features(
                                         req_id,
                                         sparse_kv_unit_key(layer_name, 0),
-                                        k_flat,
+                                        k_heads[0],
                                         spec,
                                         sparse_block_features,
                                         sparse_prefill_cluster_meta,
                                         pending_async_feat,
                                         pending_async_meta,
+                                        precomputed_meta=raw,
                                     )
                                 else:
-                                    k_heads = k_flat.transpose(0, 1).contiguous()
                                     self._sparse_store_prefill_kv_heads_block_features(
                                         req_id,
                                         layer_name,
@@ -10233,6 +10280,7 @@ class GPUModelRunner(
                                         sparse_prefill_cluster_meta,
                                         pending_async_feat,
                                         pending_async_meta,
+                                        precomputed_meta=raw_b,
                                     )
                                 _perf_add(
                                     "collect:prefill_store_features",
@@ -10253,7 +10301,7 @@ class GPUModelRunner(
                                     "collect:k_cache_read", _t_k_cache_read
                                 )
                             else:
-                                k_row_gpu = k_blocks[-1][slot].float()
+                                k_row_gpu = _read_k_blocks()[-1][slot].float()
                             _t_decode_cpu = (
                                 time.perf_counter() if perf_enabled else None
                             )
@@ -10264,12 +10312,22 @@ class GPUModelRunner(
                             for kv_h in range(num_kv):
                                 unit_key = sparse_kv_unit_key(layer_name, kv_h)
                                 if num_kv == 1:
+                                    k_row_one_np = (
+                                        k_row_np[0]
+                                        if k_row_gpu.dim() == 2
+                                        else k_row_np
+                                    )
+                                    k_row_one_gpu = (
+                                        k_row_gpu[0]
+                                        if k_row_gpu.dim() == 2
+                                        else k_row_gpu
+                                    )
                                     sparse_new_block_features.setdefault(
                                         req_id, {}
-                                    )[unit_key] = k_row_np
+                                    )[unit_key] = k_row_one_np
                                     sparse_new_block_features_gpu.setdefault(
                                         req_id, {}
-                                    )[unit_key] = k_row_gpu
+                                    )[unit_key] = k_row_one_gpu
                                 else:
                                     sparse_new_block_features.setdefault(
                                         req_id, {}
@@ -10278,18 +10336,69 @@ class GPUModelRunner(
                                         req_id, {}
                                     )[unit_key] = k_row_gpu[kv_h]
                     else:
-                        _t_block_mean = time.perf_counter() if perf_enabled else None
-                        k_blk = k_blocks.mean(dim=1).float()
-                        _perf_add("collect:k_block_mean", _t_block_mean)
+                        k_blk: torch.Tensor | None = None
+                        raw_b = None
+                        if is_prefill_done:
+                            if sparse_prefill_cluster_use_device_kmeans(kv[0]):
+                                _t_kmeans = (
+                                    time.perf_counter()
+                                    if perf_enabled
+                                    else None
+                                )
+                                raw_b = prefill_cluster_meta_from_kv_cache_torch(
+                                    kv[0],
+                                    block_ids_t,
+                                    num_prompt_tokens,
+                                    num_clusters=spec.num_clusters,
+                                    n_segment=spec.n_segment,
+                                    is_centered=True,
+                                )
+                                if _t_kmeans is not None:
+                                    self._sparse_perf_record(
+                                        "collect:prefill_device_kmeans",
+                                        time.perf_counter() - _t_kmeans,
+                                    )
+                                k_heads = raw_b["features"]
+                            else:
+                                _t_block_mean = (
+                                    time.perf_counter()
+                                    if perf_enabled
+                                    else None
+                                )
+                                k_heads = kmeans_features_from_kv_cache_torch(
+                                    kv[0],
+                                    block_ids_t,
+                                    num_prompt_tokens,
+                                    is_centered=True,
+                                )
+                                _perf_add("collect:k_block_mean", _t_block_mean)
+                            k_blk = (
+                                k_heads[0]
+                                if num_kv == 1
+                                else k_heads.transpose(0, 1).contiguous()
+                            )
+                        elif is_decode_committed:
+                            _t_block_mean = (
+                                time.perf_counter() if perf_enabled else None
+                            )
+                            k_blk = _read_k_blocks().mean(dim=1).float()
+                            _perf_add("collect:k_block_mean", _t_block_mean)
                         if is_prefill_done:
                             _t_prefill_store = (
                                 time.perf_counter() if perf_enabled else None
                             )
-                            if k_blk.dim() == 2:
+                            assert k_blk is not None
+                            if num_kv == 1:
                                 assert num_kv == 1, (
                                     "KV cache layout: expected num_kv_heads==1 "
                                     "when block mean has rank 2"
                                 )
+                                raw = None if raw_b is None else {
+                                    "cluster_centres": raw_b["cluster_centres"][0],
+                                    "block_to_cluster": raw_b["block_to_cluster"][0],
+                                    "cluster_size": raw_b["cluster_size"][0],
+                                    "mean_key": raw_b["mean_key"][0],
+                                }
                                 self._sparse_store_prefill_block_features(
                                     req_id,
                                     sparse_kv_unit_key(layer_name, 0),
@@ -10299,9 +10408,9 @@ class GPUModelRunner(
                                     sparse_prefill_cluster_meta,
                                     pending_async_feat,
                                     pending_async_meta,
+                                    precomputed_meta=raw,
                                 )
                             else:
-                                k_heads = k_blk.transpose(0, 1).contiguous()
                                 self._sparse_store_prefill_kv_heads_block_features(
                                     req_id,
                                     layer_name,
@@ -10311,12 +10420,14 @@ class GPUModelRunner(
                                     sparse_prefill_cluster_meta,
                                     pending_async_feat,
                                     pending_async_meta,
+                                    precomputed_meta=raw_b,
                                 )
                             _perf_add(
                                 "collect:prefill_store_features",
                                 _t_prefill_store,
                             )
                         if is_decode_committed:
+                            assert k_blk is not None
                             if k_blk.dim() == 2:
                                 assert num_kv == 1
                                 _t_decode_cpu = (

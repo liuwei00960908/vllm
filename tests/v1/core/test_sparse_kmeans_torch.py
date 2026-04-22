@@ -5,8 +5,10 @@ import pytest
 import torch
 
 from vllm.v1.core.sparse_kmeans_torch import (
+    kmeans_features_from_kv_cache_torch,
     prefill_cluster_meta_from_features_torch,
     prefill_cluster_meta_from_features_torch_batched,
+    prefill_cluster_meta_from_kv_cache_torch,
     segment_kmeans_centered_torch,
 )
 
@@ -94,3 +96,61 @@ def test_segment_kmeans_centered_preserves_input_rank() -> None:
     torch.testing.assert_close(
         batched[2][0].to(torch.float32), single[2].to(torch.float32)
     )
+
+
+def test_kmeans_features_from_kv_cache_block_centres_use_valid_tokens() -> None:
+    kv_cache = torch.arange(
+        3 * 4 * 2 * 1, dtype=torch.float32
+    ).reshape(3, 4, 2, 1)
+    block_ids = torch.tensor([2, 0], dtype=torch.long)
+
+    features = kmeans_features_from_kv_cache_torch(
+        kv_cache, block_ids, num_tokens=6, is_centered=True
+    )
+
+    selected = kv_cache[block_ids]
+    expected = torch.stack(
+        [
+            selected[0].mean(dim=0),
+            selected[1, :2].mean(dim=0),
+        ],
+        dim=0,
+    ).transpose(0, 1)
+    torch.testing.assert_close(features, expected)
+
+
+def test_kmeans_features_from_kv_cache_token_rows() -> None:
+    kv_cache = torch.arange(
+        2 * 3 * 2 * 2, dtype=torch.float32
+    ).reshape(2, 3, 2, 2)
+    block_ids = torch.tensor([1, 0], dtype=torch.long)
+
+    features = kmeans_features_from_kv_cache_torch(
+        kv_cache, block_ids, num_tokens=4, is_centered=False
+    )
+
+    expected = kv_cache[block_ids].reshape(6, 2, 2)[:4].transpose(0, 1)
+    torch.testing.assert_close(features, expected)
+
+
+def test_prefill_cluster_meta_from_kv_cache_matches_feature_path() -> None:
+    torch.manual_seed(4)
+    kv_cache = torch.randn(5, 4, 3, 8, dtype=torch.float32)
+    block_ids = torch.tensor([3, 1, 4], dtype=torch.long)
+    args = dict(num_clusters=6, n_segment=2, seed=17)
+
+    raw = prefill_cluster_meta_from_kv_cache_torch(
+        kv_cache,
+        block_ids,
+        num_tokens=10,
+        is_centered=True,
+        **args,
+    )
+    feat = kmeans_features_from_kv_cache_torch(
+        kv_cache, block_ids, num_tokens=10, is_centered=True
+    )
+    ref = prefill_cluster_meta_from_features_torch(feat, **args)
+
+    torch.testing.assert_close(raw["features"], feat)
+    for key in ("cluster_centres", "block_to_cluster", "cluster_size", "mean_key"):
+        torch.testing.assert_close(raw[key], ref[key])

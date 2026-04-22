@@ -105,6 +105,85 @@ def _maybe_squeeze(tensor: torch.Tensor, squeeze: bool) -> torch.Tensor:
     return tensor[0] if squeeze else tensor
 
 
+def _as_batched_kv_cache(
+    kv_cache: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, bool]:
+    if kv_cache.dim() == 3:
+        return kv_cache.unsqueeze(2), True
+    if kv_cache.dim() == 4:
+        return kv_cache, False
+    raise ValueError(
+        f"{name} must be [B, S, D] or [B, S, H, D], "
+        f"got {tuple(kv_cache.shape)}"
+    )
+
+
+def kmeans_features_from_kv_cache_torch(
+    kv_cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    num_tokens: int,
+    *,
+    is_centered: bool,
+) -> torch.Tensor:
+    """Build K-Means input features directly from a paged K cache.
+
+    Args:
+        kv_cache: K cache, ``[num_blocks, block_size, num_heads, head_dim]``.
+            A legacy squeezed ``[num_blocks, block_size, head_dim]`` layout is
+            also accepted and treated as one KV head.
+        block_ids: Physical block ids for this request, ``[num_selected_blocks]``.
+        num_tokens: Number of valid request tokens covered by ``block_ids``.
+        is_centered: If True, return one key-centre feature per selected block
+            by averaging valid token slots in that block. If False, return one
+            feature per valid token.
+
+    Returns:
+        Batched per-head features ``[num_heads, N, head_dim]``.
+    """
+    kv_cache, _ = _as_batched_kv_cache(kv_cache, "kv_cache")
+    if block_ids.dim() != 1:
+        raise ValueError(
+            f"block_ids must be [num_selected_blocks], got {tuple(block_ids.shape)}"
+        )
+
+    num_blocks = int(block_ids.numel())
+    block_size = int(kv_cache.shape[1])
+    num_heads = int(kv_cache.shape[2])
+    head_dim = int(kv_cache.shape[3])
+    max_tokens = num_blocks * block_size
+    valid_tokens = max(0, min(int(num_tokens), max_tokens))
+    if valid_tokens == 0 or num_blocks == 0:
+        return kv_cache.new_zeros((num_heads, 0, head_dim), dtype=torch.float32)
+
+    if is_centered:
+        valid_blocks = (valid_tokens + block_size - 1) // block_size
+        k_blocks = kv_cache[block_ids[:valid_blocks]].to(dtype=torch.float32)
+        out = kv_cache.new_empty(
+            (num_heads, valid_blocks, head_dim), dtype=torch.float32
+        )
+        full_blocks = valid_tokens // block_size
+        tail_tokens = valid_tokens % block_size
+        if full_blocks:
+            out[:, :full_blocks, :] = k_blocks[:full_blocks].mean(dim=1).transpose(
+                0, 1
+            )
+        if tail_tokens:
+            out[:, full_blocks, :] = k_blocks[full_blocks, :tail_tokens].mean(
+                dim=0
+            )
+        return out.contiguous()
+
+    k_blocks = kv_cache[block_ids].to(dtype=torch.float32)
+    return (
+        k_blocks.reshape(num_blocks * block_size, num_heads, head_dim)[
+            :valid_tokens
+        ]
+        .transpose(0, 1)
+        .contiguous()
+    )
+
+
 def segment_kmeans_centered_torch(
     features_centered: torch.Tensor,
     n_clusters: int,
@@ -235,6 +314,41 @@ def prefill_cluster_meta_from_features_torch(
         "cluster_size": _maybe_squeeze(sizes, squeeze),
         "mean_key": _maybe_squeeze(mean_key, squeeze),
     }
+
+
+def prefill_cluster_meta_from_kv_cache_torch(
+    kv_cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    num_tokens: int,
+    *,
+    num_clusters: int,
+    n_segment: int,
+    is_centered: bool,
+    n_iter: int = 15,
+    seed: int = 42,
+) -> dict[str, torch.Tensor]:
+    """Build prefill K-Means metadata directly from raw paged K cache.
+
+    ``is_centered=True`` clusters block key centres; ``is_centered=False``
+    clusters individual token keys. The returned ``features`` tensor is the
+    exact ``[H, N, D]`` feature matrix used for clustering so callers can copy it
+    to CPU without re-reading the KV cache.
+    """
+    features = kmeans_features_from_kv_cache_torch(
+        kv_cache,
+        block_ids,
+        num_tokens,
+        is_centered=is_centered,
+    )
+    raw = prefill_cluster_meta_from_features_torch(
+        features,
+        num_clusters=num_clusters,
+        n_segment=n_segment,
+        n_iter=n_iter,
+        seed=seed,
+    )
+    raw["features"] = features
+    return raw
 
 
 def prefill_cluster_meta_from_features_torch_batched(
