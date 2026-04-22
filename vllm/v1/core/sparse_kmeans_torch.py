@@ -88,7 +88,24 @@ def _kmeans_dot_torch(
     return c_b[0], l_b[0]
 
 
-def segment_kmeans_centered_torch_batched(
+def _as_batched_features(
+    features: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, bool]:
+    if features.dim() == 2:
+        return features.unsqueeze(0), True
+    if features.dim() == 3:
+        return features, False
+    raise ValueError(
+        f"{name} must be [N, D] or [H, N, D], got {tuple(features.shape)}"
+    )
+
+
+def _maybe_squeeze(tensor: torch.Tensor, squeeze: bool) -> torch.Tensor:
+    return tensor[0] if squeeze else tensor
+
+
+def segment_kmeans_centered_torch(
     features_centered: torch.Tensor,
     n_clusters: int,
     n_segments: int,
@@ -96,22 +113,27 @@ def segment_kmeans_centered_torch_batched(
     seed: int = 42,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Segment K-Means on **already mean-centered** features, batched on dim 0.
+    Segment K-Means on **already mean-centered** features.
 
     Args:
-        features_centered: ``[H, N, D]``.
+        features_centered: ``[N, D]`` or ``[H, N, D]``.
 
     Returns:
-        centres_c: ``[H, total_k, D]`` float32 in centered space.
-        labels:    ``[H, N]`` int64 global cluster ids per head.
-        sizes:     ``[H, total_k]`` int32 cluster sizes per head.
+        For 2D input, ``centres_c`` is ``[total_k, D]``, ``labels`` is ``[N]``,
+        and ``sizes`` is ``[total_k]``.  For 3D input, the same tensors keep the
+        leading head dimension: ``[H, total_k, D]``, ``[H, N]``, ``[H, total_k]``.
     """
+    features_centered, squeeze = _as_batched_features(
+        features_centered, "features_centered"
+    )
     h, n, d = features_centered.shape
     if n == 0:
         zc = features_centered.new_zeros((h, 0, d))
         zl = torch.zeros(h, 0, dtype=torch.int64, device=features_centered.device)
         zs = torch.zeros(h, 0, dtype=torch.int32, device=features_centered.device)
-        return zc, zl, zs
+        return _maybe_squeeze(zc, squeeze), _maybe_squeeze(
+            zl, squeeze
+        ), _maybe_squeeze(zs, squeeze)
 
     n_seg = min(int(n_segments), int(n))
     k_per_seg = max(1, int(n_clusters) // n_seg)
@@ -140,76 +162,40 @@ def segment_kmeans_centered_torch_batched(
     if not all_centres:
         zc = fc.new_zeros((h, 0, d))
         zs = torch.zeros(h, 0, dtype=torch.int32, device=features_centered.device)
-        return zc, labels, zs
+        return _maybe_squeeze(zc, squeeze), _maybe_squeeze(
+            labels, squeeze
+        ), _maybe_squeeze(zs, squeeze)
 
     all_c = torch.cat(all_centres, dim=1)
     total_k = all_c.shape[1]
     sizes = torch.zeros(h, total_k, dtype=torch.int32, device=features_centered.device)
     for hi in range(h):
         sizes[hi] = torch.bincount(labels[hi], minlength=total_k).to(torch.int32)
-    return all_c, labels, sizes
+    return _maybe_squeeze(all_c, squeeze), _maybe_squeeze(
+        labels, squeeze
+    ), _maybe_squeeze(sizes, squeeze)
 
 
-def segment_kmeans_centered_torch(
+def segment_kmeans_centered_torch_batched(
     features_centered: torch.Tensor,
     n_clusters: int,
     n_segments: int,
     n_iter: int = 15,
     seed: int = 42,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Segment K-Means on **already mean-centered** features.
-
-    Returns:
-        centres_c: ``[total_k, D]`` float32 in centered space.
-        labels:    ``[N]`` int64 global cluster ids.
-        sizes:     ``[total_k]`` int32 cluster sizes.
-    """
-    c_b, l_b, s_b = segment_kmeans_centered_torch_batched(
-        features_centered.unsqueeze(0),
+    """Compatibility wrapper for callers that still pass batched features."""
+    if features_centered.dim() != 3:
+        raise ValueError(
+            "features_centered must be [H, N, D], "
+            f"got {tuple(features_centered.shape)}"
+        )
+    return segment_kmeans_centered_torch(
+        features_centered,
         n_clusters=n_clusters,
         n_segments=n_segments,
         n_iter=n_iter,
         seed=seed,
     )
-    return c_b[0], l_b[0], s_b[0]
-
-
-def prefill_cluster_meta_from_features_torch_batched(
-    feat: torch.Tensor,
-    num_clusters: int,
-    n_segment: int,
-    n_iter: int = 15,
-    seed: int = 42,
-) -> dict[str, torch.Tensor]:
-    """
-    Mean-center, run segment K-Means per batch row, return **original** key space.
-
-    Args:
-        feat: ``[H, N, D]`` – ``H`` independent heads (e.g. KV heads).
-
-    Keys:
-        ``cluster_centres`` (float32 ``[H, K, D]``),
-        ``block_to_cluster`` (int64 ``[H, N]``),
-        ``cluster_size`` (int32 ``[H, K]``),
-        ``mean_key`` (float32 ``[H, D]``).
-    """
-    f = feat.to(dtype=torch.float32)
-    h, n_tokens, _d = f.shape
-    mean_key = f.mean(dim=1)
-    centered = f - mean_key.unsqueeze(1)
-    k = min(int(num_clusters), int(n_tokens))
-    n_seg = min(int(n_segment), int(n_tokens))
-    centres_c, labels, sizes = segment_kmeans_centered_torch_batched(
-        centered, n_clusters=k, n_segments=n_seg, n_iter=n_iter, seed=seed
-    )
-    centres = centres_c + mean_key.unsqueeze(1)
-    return {
-        "cluster_centres": centres,
-        "block_to_cluster": labels,
-        "cluster_size": sizes,
-        "mean_key": mean_key,
-    }
 
 
 def prefill_cluster_meta_from_features_torch(
@@ -222,19 +208,49 @@ def prefill_cluster_meta_from_features_torch(
     """
     Mean-center, run segment K-Means, return tensors in **original** key space.
 
-    Keys: ``cluster_centres`` (float32 [K,D]), ``block_to_cluster`` (int64 [N]),
-    ``cluster_size`` (int32 [K]), ``mean_key`` (float32 [D]).
+    Args:
+        feat: ``[N, D]`` or ``[H, N, D]``. With 3D input, ``H`` independent
+        heads are clustered in one batched K-Means call.
+
+    Keys:
+        For 2D input, ``cluster_centres`` is float32 ``[K, D]``,
+        ``block_to_cluster`` is int64 ``[N]``, ``cluster_size`` is int32
+        ``[K]``, and ``mean_key`` is float32 ``[D]``. For 3D input, the same
+        tensors keep the leading head dimension.
     """
-    batched = prefill_cluster_meta_from_features_torch_batched(
-        feat.unsqueeze(0),
+    feat, squeeze = _as_batched_features(feat, "feat")
+    f = feat.to(dtype=torch.float32)
+    _h, n_tokens, _d = f.shape
+    mean_key = f.mean(dim=1)
+    centered = f - mean_key.unsqueeze(1)
+    k = min(int(num_clusters), int(n_tokens))
+    n_seg = min(int(n_segment), int(n_tokens))
+    centres_c, labels, sizes = segment_kmeans_centered_torch(
+        centered, n_clusters=k, n_segments=n_seg, n_iter=n_iter, seed=seed
+    )
+    centres = centres_c + mean_key.unsqueeze(1)
+    return {
+        "cluster_centres": _maybe_squeeze(centres, squeeze),
+        "block_to_cluster": _maybe_squeeze(labels, squeeze),
+        "cluster_size": _maybe_squeeze(sizes, squeeze),
+        "mean_key": _maybe_squeeze(mean_key, squeeze),
+    }
+
+
+def prefill_cluster_meta_from_features_torch_batched(
+    feat: torch.Tensor,
+    num_clusters: int,
+    n_segment: int,
+    n_iter: int = 15,
+    seed: int = 42,
+) -> dict[str, torch.Tensor]:
+    """Compatibility wrapper for callers that still pass batched features."""
+    if feat.dim() != 3:
+        raise ValueError(f"feat must be [H, N, D], got {tuple(feat.shape)}")
+    return prefill_cluster_meta_from_features_torch(
+        feat,
         num_clusters=num_clusters,
         n_segment=n_segment,
         n_iter=n_iter,
         seed=seed,
     )
-    return {
-        "cluster_centres": batched["cluster_centres"][0],
-        "block_to_cluster": batched["block_to_cluster"][0],
-        "cluster_size": batched["cluster_size"][0],
-        "mean_key": batched["mean_key"][0],
-    }

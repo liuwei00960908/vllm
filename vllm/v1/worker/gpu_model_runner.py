@@ -135,8 +135,6 @@ from vllm.v1.attention.ops.triton_sparse_pack import sparse_pack_single_req
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sparse_kmeans_torch import (
     prefill_cluster_meta_from_features_torch,
-    prefill_cluster_meta_from_features_torch_batched,
-    segment_kmeans_centered_torch,
     sparse_prefill_cluster_use_device_kmeans,
 )
 from vllm.v1.core.sparse_kv_cache_manager import (
@@ -455,7 +453,7 @@ class _SparseOnlineLayerState:
         # length (thousands of tokens) and we are holding one buffer per
         # (layer, kv_head, req).  Over-allocating here would double the
         # persistent sparse-state footprint right when the prefill K-Means
-        # scratch (e.g. ``torch.bmm`` in ``segment_kmeans_centered_torch_batched``)
+        # scratch (e.g. ``torch.bmm`` in ``segment_kmeans_centered_torch``)
         # needs headroom, which triggered OOM in practice.  The first decode
         # append goes through ``_grow_if_needed`` which doubles the buffer;
         # by that point all prefill scratch tensors are already freed.
@@ -9179,17 +9177,17 @@ class GPUModelRunner(
             feat = torch.stack(state.decode_block_buffer, dim=0).to(
                 dtype=torch.float32
             )
-            mean_key_new = feat.mean(dim=0)
-            centered = feat - mean_key_new
             m = int(feat.shape[0])
             k_new = max(1, m // 16)
             k_new = (k_new // max(1, 32)) * 32
             k_new = max(k_new, 1)
             k_new = min(k_new, m)
-            centres_c, labels_new, sizes_new = segment_kmeans_centered_torch(
-                centered, n_clusters=k_new, n_segments=1
+            raw = prefill_cluster_meta_from_features_torch(
+                feat, num_clusters=k_new, n_segment=1
             )
-            centres_new = centres_c + mean_key_new
+            centres_new = raw["cluster_centres"]
+            labels_new = raw["block_to_cluster"]
+            sizes_new = raw["cluster_size"]
             n_existing = int(state.cluster_centres.shape[0])
             state.cluster_centres = torch.cat(
                 [state.cluster_centres, centres_new.to(dtype=torch.float32)], dim=0
@@ -9882,7 +9880,7 @@ class GPUModelRunner(
 
         if sparse_prefill_cluster_use_device_kmeans(k_heads):
             _t_kmeans = time.perf_counter() if perf_enabled else None
-            raw_b = prefill_cluster_meta_from_features_torch_batched(
+            raw_b = prefill_cluster_meta_from_features_torch(
                 k_heads,
                 num_clusters=spec.num_clusters,
                 n_segment=spec.n_segment,
