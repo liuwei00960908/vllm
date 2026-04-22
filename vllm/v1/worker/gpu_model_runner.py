@@ -983,6 +983,32 @@ class GPUModelRunner(
         self._sparse_triton_pack_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_TRITON_PACK", "1")) == 1
         )
+        # ── Retroinfer-style cluster retrieval (Phase 5) ────────────────
+        # The new path replaces the per-token top-k selector with a
+        # cluster-level selector (``_sparse_online_select_clusters_batched``)
+        # + pre-gathered per-head exec buffers
+        # (``_sparse_retroinfer_expand_and_gather_single_req``).  FA consumes
+        # these via the ``_forward_retroinfer_exec_buf`` dispatch.  Two
+        # env vars govern rollout so we can bisect regressions without a
+        # code-level revert:
+        #
+        # * ``VLLM_SPARSE_LEGACY_TOKEN_TOPK=1`` — force the old per-token
+        #   topk + compact-kv gather path for every sparse layer.  Useful
+        #   for regression bisection during Phase 5 rollout.  Defaults off.
+        #
+        # * ``VLLM_SPARSE_ESTIMATION_BUDGET=K`` — how many additional
+        #   clusters to allocate to the estimation zone (on top of
+        #   ``spec.nprobe`` for the retrieval zone).  ``K=0`` degenerates
+        #   to a retrieval-only path (matches the legacy semantic up to
+        #   cluster-vs-token granularity).  Defaults to 0 so an initial
+        #   rollout step can be validated against the previous reference
+        #   before enabling the estimation zone.
+        self._sparse_legacy_token_topk: bool = (
+            int(os.getenv("VLLM_SPARSE_LEGACY_TOKEN_TOPK", "0")) == 1
+        )
+        self._sparse_estimation_budget: int = max(
+            0, int(os.getenv("VLLM_SPARSE_ESTIMATION_BUDGET", "0"))
+        )
         # Per-layer scratch: when the Triton pack fast path runs in the
         # per-req loop, it already computes the int32 exclusive-prefix
         # ``head_offsets`` needed by finalize.  Pass it across via this
@@ -8298,6 +8324,11 @@ class GPUModelRunner(
                                     "_vllm_sparse_runtime_q_head_gather",
                                     None,
                                 )
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_retroinfer",
+                                    None,
+                                )
                                 return
                             try:
                                 if q.is_cuda and torch.cuda.is_current_stream_capturing():
@@ -8306,18 +8337,60 @@ class GPUModelRunner(
                                         "_vllm_sparse_runtime_q_head_gather",
                                         None,
                                     )
+                                    setattr(
+                                        module,
+                                        "_vllm_sparse_runtime_retroinfer",
+                                        None,
+                                    )
                                     return
                             except Exception:
                                 pass
-                            setattr(
-                                module,
-                                "_vllm_sparse_runtime_q_head_gather",
-                                self._build_sparse_runtime_q_head_gather(
+                            # Retroinfer fast path is the default under
+                            # ``cluster_granularity == "token"`` once the
+                            # Phase 1–6 code is in.  ``VLLM_SPARSE_LEGACY_TOKEN_TOPK=1``
+                            # forces the legacy per-token topk + compact
+                            # gather path for regression bisection.  The
+                            # retroinfer builder returns ``None`` when its
+                            # own fast-path checks don't hold (num_reqs!=1,
+                            # non-GQA-regular layout, prefill step, etc.),
+                            # in which case we cleanly fall back to the
+                            # legacy builder without running retroinfer.
+                            retro: dict | None = None
+                            if not self._sparse_legacy_token_topk:
+                                retro = self._build_sparse_runtime_retroinfer(
                                     layer_name=name,
                                     query=q,
                                     spec=spec,
-                                ),
-                            )
+                                )
+                            if retro is not None:
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_retroinfer",
+                                    retro,
+                                )
+                                # Suppress the legacy runtime handle for
+                                # this step so FA's dispatch selects the
+                                # retroinfer exec_buf path unambiguously.
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_q_head_gather",
+                                    None,
+                                )
+                            else:
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_retroinfer",
+                                    None,
+                                )
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_q_head_gather",
+                                    self._build_sparse_runtime_q_head_gather(
+                                        layer_name=name,
+                                        query=q,
+                                        spec=spec,
+                                    ),
+                                )
 
                     return _hook
 
@@ -9217,6 +9290,178 @@ class GPUModelRunner(
         )
         lse = m + torch.log(w_sum.clamp_min(1e-12))
         return out.to(dtype=out_a.dtype), lse
+
+    def _build_sparse_runtime_retroinfer(
+        self,
+        *,
+        layer_name: str,
+        query: torch.Tensor,
+        spec: "SparseAttentionSpec",
+    ) -> "dict[str, torch.Tensor] | None":
+        """Phase 5 — retroinfer-style runtime builder for FA.
+
+        Composes the Phase 3 cluster-level selector with the Phase 4a
+        cluster-expand + paged-KV gather to produce the dict consumed by
+        :meth:`FlashAttentionImpl._forward_retroinfer_exec_buf`:
+
+            {"exec_buf_k":  [H, max_budget, D]  (cache dtype),
+             "exec_buf_v":  [H, max_budget, D]  (cache dtype),
+             "valid_lengths": [H]               int32,
+             "centres_es":    [H, es, D]        fp32,
+             "value_sum_es":  [H, es, D]        fp32,
+             "cluster_size_es":[H, es]          fp32}
+
+        Returns ``None`` when the retroinfer fast path can't run for this
+        layer/step – in that case the caller falls back to the legacy
+        ``_build_sparse_runtime_q_head_gather`` path (guarded by the
+        ``VLLM_SPARSE_LEGACY_TOKEN_TOPK`` bisection switch at the
+        hook-level dispatcher).  Reasons we bail:
+
+        * ``num_reqs != 1`` – Phase 5 is the decode fast path only.  The
+          per-request for-loop variant lives in Phase 8 (CUDA graph wiring),
+          which also wants a single-req shape contract.
+        * ``spec`` isn't GQA-regular (exotic head-group layouts) – the
+          shared layer ctx cache flags this; the legacy builder already
+          handles the slow path correctly.
+        * Prefill / mixed prefill-decode – the retroinfer path needs a
+          populated ``value_sum`` + CSR (Phase 2b prefill) and a tok_end
+          of 1; prefill falls through to dense FA via the usual mechanism.
+        * ``cluster_centres`` / ``value_sum`` haven't been materialised yet
+          (pre-first-decode warmup window, or spec reconfigured mid-run).
+
+        All ``None`` returns are benign: the hook leaves
+        ``_vllm_sparse_runtime_retroinfer`` unset and FA dispatches through
+        the legacy path with identical (slower) semantics.
+        """
+        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        try:
+            kv_cache_gid = self._sparse_layer_gid_by_name.get(layer_name)
+            if kv_cache_gid is None:
+                return None
+            num_reqs = int(self.input_batch.num_reqs)
+            if num_reqs != 1:
+                return None
+            # Decode fast path requires exactly 1 query token for the
+            # sole active request.  ``query_start_loc`` encodes the
+            # cumulative token offsets so the delta is the per-req query
+            # token count.
+            tok_end = int(self.query_start_loc.np[1])
+            if tok_end != 1:
+                return None
+
+            rid = self.input_batch.req_ids[0]
+            req_states = self._sparse_online_index.get(rid)
+            if not req_states:
+                return None
+            req_state = self.requests.get(rid)
+            if req_state is None:
+                return None
+            seq_len = int(self.seq_lens.np[0])
+            p_count = int(self.input_batch.num_prompt_tokens[0])
+            if seq_len <= p_count:
+                return None
+            out_before_step = self._sparse_output_tokens_before_step.get(
+                rid, len(req_state.output_token_ids)
+            )
+            if out_before_step <= 0:
+                return None
+
+            ctx = self._sparse_layer_ctx.get(layer_name)
+            if ctx is None:
+                # Ctx gets warmed by the legacy builder on its first call
+                # for a given layer.  Returning ``None`` here lets the
+                # hook dispatcher fall back to the legacy path for a
+                # single step; subsequent steps hit the retroinfer path
+                # once ctx is cached.  Self-healing and one-shot only.
+                return None
+            if not bool(ctx.get("gqa_regular", False)):
+                return None
+            num_heads = int(ctx["num_heads"])
+            head_size = int(ctx["head_size"])
+            num_kv_heads = int(ctx["num_kv_heads"])
+            if num_kv_heads <= 0:
+                return None
+            npk = max(1, num_heads // num_kv_heads)
+            unit_keys_in_kv_order = ctx.get("unit_keys_in_kv_order", ())
+            if len(unit_keys_in_kv_order) != num_kv_heads:
+                return None
+
+            # Zero-kernel q split (GQA-regular layout).  Same pattern as
+            # ``_build_sparse_runtime_q_head_gather``'s fast path so that
+            # the two builders share layout invariants and the cluster
+            # selector sees an identical q slice.
+            q_flat = (
+                query.view(-1, num_heads, head_size)
+                if query.dim() != 3 else query
+            )
+            q_tok = q_flat[tok_end - 1].to(dtype=torch.float32)
+            q_list_views = [
+                q_tok[k * npk : (k + 1) * npk]
+                for k in range(num_kv_heads)
+            ]
+
+            batched_states: list[_SparseOnlineLayerState] = []
+            for uk in unit_keys_in_kv_order:
+                st = req_states.get(uk)
+                if st is None:
+                    return None
+                # Retroinfer requires both the centroid table *and* the
+                # per-cluster value_sum.  Empty centroids indicate the
+                # online state hasn't clustered yet (rare – only at the
+                # very first decode step after a reconfigure).  Missing
+                # ``value_sum`` is a harder failure: Phase 2b fills it
+                # during prefill collection, so a non-zero centroid
+                # table with a zero-numel ``value_sum`` signals an
+                # out-of-sync state and we must bail.
+                if st.cluster_centres.numel() == 0:
+                    return None
+                if st.value_sum.numel() == 0:
+                    return None
+                batched_states.append(st)
+
+            sel = self._sparse_online_select_clusters_batched(
+                states=batched_states,
+                q_list=q_list_views,
+                spec=spec,
+                estimation_budget=self._sparse_estimation_budget,
+            )
+            if sel is None:
+                return None
+            retrieval_cids, estimation_cids = sel
+
+            # ``kv_caches`` is a per-group list keyed by layer group id;
+            # the sparse layer context already resolved ``kv_cache_gid``
+            # above so this lookup is a direct slot access.
+            kv_cache = self.kv_caches[kv_cache_gid]
+            blk_tbl = self.input_batch.block_table[kv_cache_gid]
+            bt_row_gpu = blk_tbl.block_table.gpu[0]
+            # ``sparse_selection_budget`` gives the legacy per-head token
+            # cap; it covers nprobe*avg_cluster_size + steady + pending
+            # comfortably in practice.  The gather helper truncates to
+            # this cap and valid_lengths records the real fill, so the
+            # fixed-shape contract with FA is preserved either way.
+            max_budget = int(spec.sparse_selection_budget())
+
+            out = self._sparse_retroinfer_expand_and_gather_single_req(
+                states=batched_states,
+                retrieval_cids=retrieval_cids,
+                estimation_cids=estimation_cids,
+                block_table_row=bt_row_gpu,
+                kv_cache=kv_cache,
+                block_size=int(spec.block_size),
+                prefill_len=p_count,
+                current_len=seq_len,
+                static_pattern_start=int(spec.static_pattern_start),
+                static_pattern_end=int(spec.static_pattern_end),
+                max_budget=max_budget,
+            )
+            return out
+        finally:
+            if _t0 is not None:
+                self._sparse_perf_record(
+                    "_build_sparse_runtime_retroinfer",
+                    time.perf_counter() - _t0,
+                )
 
     def _build_sparse_runtime_q_head_gather(
         self,

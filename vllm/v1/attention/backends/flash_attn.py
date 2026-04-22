@@ -284,6 +284,35 @@ class FlashAttentionMetadata:
     sparse_q_head_gather_num_q_heads: int | None = None
     sparse_q_head_gather_num_reqs: int | None = None
 
+    # ── Retroinfer-style pre-gathered KV + estimation zone ──────────────────
+    # Populated by the runner when running the new cluster-based sparse path
+    # (Phase 4a builder + Phase 5 dispatcher).  Presence of
+    # ``sparse_retroinfer_exec_buf_k`` is the sole branch switch that routes
+    # ``FlashAttentionImpl.forward`` through
+    # ``_forward_retroinfer_exec_buf`` instead of the legacy per-head
+    # compact gather path.  All fields are ``None`` on layers / steps that
+    # have not been converted to the retroinfer path, so the cluster rollout
+    # can proceed layer-by-layer without forcing an all-or-nothing cutover.
+    #
+    # Shape contract (matching
+    # ``GPUModelRunner._sparse_retroinfer_expand_and_gather_single_req``):
+    #   exec_buf_k / exec_buf_v : [H_total, max_budget, D]   (cache dtype)
+    #   valid_lengths           : [H_total]                   int32
+    #   centres_es              : [H_total, es, D]            fp32
+    #   value_sum_es            : [H_total, es, D]            fp32
+    #   cluster_size_es         : [H_total, es]               fp32
+    # ``H_total`` equals ``num_q_heads`` at num_reqs==1 (Phase 5 is decode
+    # fast path only); the second FA pass over centres treats ``H_total`` as
+    # an FA "batch" dimension so each query head gets its own per-row
+    # ``valid_lengths`` – matching the legacy per-head compact gather's
+    # per-head selection granularity.
+    sparse_retroinfer_exec_buf_k: torch.Tensor | None = None
+    sparse_retroinfer_exec_buf_v: torch.Tensor | None = None
+    sparse_retroinfer_valid_lengths: torch.Tensor | None = None
+    sparse_retroinfer_centres_es: torch.Tensor | None = None
+    sparse_retroinfer_value_sum_es: torch.Tensor | None = None
+    sparse_retroinfer_cluster_size_es: torch.Tensor | None = None
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -800,8 +829,59 @@ class FlashAttentionImpl(AttentionImpl):
                     and sliding_window_size == [-1, -1]
                     and not self.kv_cache_dtype.startswith("fp8")
                 )
-                runtime_q_head_gather = getattr(
-                    layer, "_vllm_sparse_runtime_q_head_gather", None
+                # Retroinfer-style cluster retrieval (Phase 5): the runner
+                # attaches a pre-built ``exec_buf`` dict to the layer just
+                # before invoking FA.  If present and compatible with the
+                # current FA config (no alibi/sinks/sliding/fp8-kv), we run
+                # the two-zone retrieval+estimation path.  The attribute is
+                # cleared after consumption so a subsequent step that
+                # doesn't populate it cleanly falls back to the legacy
+                # sparse (or dense) path.
+                runtime_retroinfer = getattr(
+                    layer, "_vllm_sparse_runtime_retroinfer", None
+                )
+                use_retroinfer = (
+                    runtime_retroinfer is not None
+                    and self.alibi_slopes is None
+                    and self.sinks is None
+                    and sliding_window_size == [-1, -1]
+                    and not self.kv_cache_dtype.startswith("fp8")
+                )
+                if use_retroinfer:
+                    attn_metadata = replace(
+                        attn_metadata,
+                        sparse_retroinfer_exec_buf_k=(
+                            runtime_retroinfer["exec_buf_k"]
+                        ),
+                        sparse_retroinfer_exec_buf_v=(
+                            runtime_retroinfer["exec_buf_v"]
+                        ),
+                        sparse_retroinfer_valid_lengths=(
+                            runtime_retroinfer["valid_lengths"]
+                        ),
+                        sparse_retroinfer_centres_es=(
+                            runtime_retroinfer.get("centres_es")
+                        ),
+                        sparse_retroinfer_value_sum_es=(
+                            runtime_retroinfer.get("value_sum_es")
+                        ),
+                        sparse_retroinfer_cluster_size_es=(
+                            runtime_retroinfer.get("cluster_size_es")
+                        ),
+                        # Disable the legacy sparse paths for this step –
+                        # the exec_buf has already folded in their work.
+                        sparse_q_head_gather=None,
+                        sparse_q_head_gather_flat_phys=None,
+                        sparse_gather_phys=None,
+                        sparse_per_head_block_table=None,
+                    )
+                    use_q_head_gather = False
+                runtime_q_head_gather = (
+                    None
+                    if use_retroinfer
+                    else getattr(
+                        layer, "_vllm_sparse_runtime_q_head_gather", None
+                    )
                 )
                 if runtime_q_head_gather is not None:
                     if isinstance(runtime_q_head_gather, dict):
@@ -915,7 +995,21 @@ class FlashAttentionImpl(AttentionImpl):
                         sliding_window_size,
                         bool(self.kv_cache_dtype.startswith("fp8")),
                     )
-                if use_q_head_gather:
+                if use_retroinfer:
+                    self._forward_retroinfer_exec_buf(
+                        query[:num_actual_tokens],
+                        output[:num_actual_tokens],
+                        attn_metadata,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+                    # Clear the per-layer runtime handle so the next step
+                    # either re-populates it or cleanly falls back to the
+                    # dense / legacy-sparse path.  Mirrors the clearing
+                    # pattern used by the q_head_gather branch below.
+                    layer._vllm_sparse_runtime_retroinfer = None
+                elif use_q_head_gather:
                     self._forward_per_head_compact_kv_gather(
                         query[:num_actual_tokens],
                         key_cache,
@@ -1381,6 +1475,222 @@ class FlashAttentionImpl(AttentionImpl):
                 num_q_heads_gather,
                 int(query.shape[0]),
                 int(max_seqlen_q),
+            )
+
+    def _forward_retroinfer_exec_buf(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: "FlashAttentionMetadata",
+        *,
+        q_descale: torch.Tensor,
+        k_descale: torch.Tensor,
+        v_descale: torch.Tensor,
+    ) -> None:
+        """Phase 5 — retroinfer-style two-zone attention.
+
+        The runner has already:
+          1. Picked ``retrieval`` + ``estimation`` cluster IDs via
+             ``GPUModelRunner._sparse_online_select_clusters_batched``.
+          2. Materialised the retrieval zone as per-head fixed-shape
+             execution buffers
+             (``exec_buf_k/v: [H, max_budget, D]`` + ``valid_lengths: [H]``)
+             via ``_sparse_retroinfer_expand_and_gather_single_req``.
+          3. Copied the estimation zone's centroids / cluster value-sums /
+             cluster sizes into matching ``[H, es, D]`` / ``[H, es, D]`` /
+             ``[H, es]`` tensors.
+
+        This method runs **one** FA launch over the pre-gathered exec_buf
+        (treating each query head as an FA "batch" so ``seqused_k`` can
+        carry per-head valid lengths against a fixed ``max_budget`` K-cache
+        stride), then evaluates the estimation zone's closed-form softmax
+        and merges the two via LSE.  The output layout
+        (``[num_tokens=1, H, D]``) matches what callers expect from the
+        legacy per-head compact gather path, so the upstream attention
+        layer sees no change.
+
+        Decode-only fast path: ``query.shape[0] == 1``.  Prefill falls back
+        to the legacy gather path via the retroinfer dispatch guard.
+        """
+        assert attn_metadata.sparse_retroinfer_exec_buf_k is not None
+        assert attn_metadata.sparse_retroinfer_exec_buf_v is not None
+        assert attn_metadata.sparse_retroinfer_valid_lengths is not None
+        exec_buf_k = attn_metadata.sparse_retroinfer_exec_buf_k
+        exec_buf_v = attn_metadata.sparse_retroinfer_exec_buf_v
+        valid_lengths = attn_metadata.sparse_retroinfer_valid_lengths
+        centres_es = attn_metadata.sparse_retroinfer_centres_es
+        value_sum_es = attn_metadata.sparse_retroinfer_value_sum_es
+        cluster_size_es = attn_metadata.sparse_retroinfer_cluster_size_es
+
+        assert query.shape[0] == 1, (
+            "retroinfer exec_buf path is decode-only (num_tokens==1); "
+            "caller must dispatch prefill through the legacy gather path"
+        )
+        H = int(query.shape[1])
+        D = int(query.shape[2])
+        assert exec_buf_k.shape[0] == H and exec_buf_k.shape[2] == D
+        max_budget = int(exec_buf_k.shape[1])
+        device = query.device
+
+        use_cuda_timing = _SPARSE_PERF_DEBUG and bool(query.is_cuda)
+        if use_cuda_timing:
+            total_start = torch.cuda.Event(enable_timing=True)
+            total_end = torch.cuda.Event(enable_timing=True)
+            fa_start = torch.cuda.Event(enable_timing=True)
+            fa_end = torch.cuda.Event(enable_timing=True)
+            est_start = torch.cuda.Event(enable_timing=True)
+            est_end = torch.cuda.Event(enable_timing=True)
+            total_start.record()
+
+        # ── retrieval zone: varlen FA over ``[H, max_budget, D]`` ──
+        # Heads-as-batches with ``num_heads_q=1`` keeps FA's seqlen
+        # dispatch working per head without needing a second varlen call.
+        # Memory layout:
+        #   q_flat : [H, 1, D]       (one query per "batch")
+        #   k_flat : [H*max_budget, 1, D]
+        #   v_flat : [H*max_budget, 1, D]
+        # ``cu_seqlens_k`` marches by ``max_budget`` while ``seqused_k``
+        # carries the actual per-head valid length – FA reads only the
+        # first ``seqused_k[b]`` rows of each batch's K/V stripe.
+        q_flat = (
+            query.view(1, H, D).transpose(0, 1).contiguous().view(H, 1, D)
+        )
+        k_flat = exec_buf_k.reshape(H * max_budget, 1, D)
+        v_flat = exec_buf_v.reshape(H * max_budget, 1, D)
+        cu_q = torch.arange(0, H + 1, dtype=torch.int32, device=device)
+        cu_k = (
+            torch.arange(0, H + 1, dtype=torch.int32, device=device)
+            * max_budget
+        )
+        seqused_k = valid_lengths.to(dtype=torch.int32)
+
+        # Per-batch descale: FA expects ``[batch, num_heads]`` = ``[H, 1]``.
+        # Upstream ``q_descale`` etc. are ``[num_reqs=1, num_kv_heads]``;
+        # each q-head reads from its mapped kv-head.  ``num_queries_per_kv``
+        # is the GQA ratio exposed on ``FlashAttentionImpl``.
+        q_per_kv = max(self.num_queries_per_kv, 1)
+        kv_head_ids = (
+            torch.arange(H, dtype=torch.long, device=device) // q_per_kv
+        )
+        q_des_ret = q_descale[0, kv_head_ids].view(H, 1)
+        k_des_ret = k_descale[0, kv_head_ids].view(H, 1)
+        v_des_ret = v_descale[0, kv_head_ids].view(H, 1)
+
+        if use_cuda_timing:
+            fa_start.record()
+        # All K tokens come from strictly-past positions (retrieval zone
+        # is materialised against tokens ``< current_len - 1``, the
+        # steady zone ends at ``current_len - 1``, and pending tokens
+        # are appended in-order), so ``causal=False`` is equivalent and
+        # avoids FA's causal mask bookkeeping for the single-query case.
+        out_ret, lse_ret = flash_attn_varlen_func(
+            q=q_flat,
+            k=k_flat,
+            v=v_flat,
+            out=None,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=1,
+            cu_seqlens_k=cu_k,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_budget,
+            softmax_scale=self.scale,
+            causal=False,
+            alibi_slopes=None,
+            window_size=[-1, -1],
+            softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_des_ret,
+            k_descale=k_des_ret,
+            v_descale=v_des_ret,
+            num_splits=0,
+        )
+        if use_cuda_timing:
+            fa_end.record()
+
+        # FA reports ``softmax_lse`` with shape ``[num_heads_q, total_q]``
+        # (see DCP forward comment: "FA returns LSE in shape [H, B]").  In
+        # our heads-as-batches layout that's ``[1, H]`` – squeeze to ``[H]``.
+        lse_ret_h = lse_ret.view(H).to(dtype=torch.float32)
+        out_ret_h = out_ret.view(H, D)
+
+        es = int(centres_es.shape[1]) if centres_es is not None else 0
+        if es == 0:
+            # Retrieval-only: no estimation zone allocated this step.
+            output.view(1, H, D).copy_(
+                out_ret_h.view(1, H, D).to(dtype=output.dtype)
+            )
+            if use_cuda_timing:
+                total_end.record()
+                total_end.synchronize()
+                total_ms = float(total_start.elapsed_time(total_end))
+                fa_ms = float(fa_start.elapsed_time(fa_end))
+                logger.info(
+                    "[SparsePerfFA] retroinfer total_ms=%.3f fa_ms=%.3f "
+                    "est_ms=0.000 H=%d max_budget=%d es=0",
+                    total_ms,
+                    fa_ms,
+                    H,
+                    max_budget,
+                )
+            return
+
+        # ── estimation zone: closed-form softmax over cluster stats ──
+        # Mirror of ``GPUModelRunner._sparse_retroinfer_estimation_attn``
+        # but kept inline so FA has no reverse import on the runner.  Math
+        # is kept in fp32 for numerical stability; FA's dtype is restored
+        # at the final ``output.copy_`` cast.
+        if use_cuda_timing:
+            est_start.record()
+        assert value_sum_es is not None and cluster_size_es is not None
+        q_est = query.view(H, D).to(dtype=torch.float32)
+        c_f = centres_es.to(dtype=torch.float32)
+        vs_f = value_sum_es.to(dtype=torch.float32)
+        sz_f = cluster_size_es.to(dtype=torch.float32).clamp_min(1.0)
+        logits = torch.einsum("hd,hed->he", q_est, c_f) * float(self.scale)
+        logits_max = logits.max(dim=-1, keepdim=True).values  # [H, 1]
+        w_est = torch.exp(logits - logits_max)                # [H, es]
+        num = torch.einsum("he,hed->hd", w_est, vs_f)         # [H, D]
+        den = (w_est * sz_f).sum(dim=-1, keepdim=True)        # [H, 1]
+        out_est = num / den.clamp_min(1e-12)                  # [H, D]
+        # ``lse`` in FA's absolute reference frame (log of unshifted
+        # softmax denominator) so we can merge with ``lse_ret_h`` directly.
+        lse_est = (
+            logits_max.squeeze(-1)
+            + torch.log(den.squeeze(-1).clamp_min(1e-12))
+        )                                                     # [H]
+
+        # ── LSE merge (stable two-zone softmax average) ──
+        la = lse_ret_h
+        lb = lse_est
+        m = torch.maximum(la, lb)
+        w_a = torch.exp(la - m)
+        w_b = torch.exp(lb - m)
+        w_sum = w_a + w_b
+        out_ret_f = out_ret_h.to(dtype=torch.float32)
+        out_final = (
+            (w_a.unsqueeze(-1) * out_ret_f + w_b.unsqueeze(-1) * out_est)
+            / w_sum.unsqueeze(-1).clamp_min(1e-12)
+        )
+        output.view(1, H, D).copy_(
+            out_final.view(1, H, D).to(dtype=output.dtype)
+        )
+        if use_cuda_timing:
+            est_end.record()
+            total_end.record()
+            total_end.synchronize()
+            total_ms = float(total_start.elapsed_time(total_end))
+            fa_ms = float(fa_start.elapsed_time(fa_end))
+            est_ms = float(est_start.elapsed_time(est_end))
+            logger.info(
+                "[SparsePerfFA] retroinfer total_ms=%.3f fa_ms=%.3f "
+                "est_ms=%.3f H=%d max_budget=%d es=%d",
+                total_ms,
+                fa_ms,
+                est_ms,
+                H,
+                max_budget,
+                es,
             )
 
     def _forward_per_head_block_table_sparse(
