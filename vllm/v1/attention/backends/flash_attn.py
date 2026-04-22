@@ -1658,68 +1658,103 @@ class FlashAttentionImpl(AttentionImpl):
                 max_budget + 1,
             )
 
-        # Use FA's paged-KV contract to preserve the fixed stride between
-        # per-head exec-buffer rows.  Passing block_table=None with only
-        # seqused_k does not describe the h * max_budget row offset for
-        # regular packed K/V tensors, so kernels may read the wrong slice.
-        k_paged = exec_buf_k.view(H, max_budget, 1, D)
-        v_paged = exec_buf_v.view(H, max_budget, 1, D)
-        block_table_ret = torch.arange(
-            H, dtype=torch.int32, device=device
-        ).view(H, 1)
+        # Varlen packing: FA's paged-KV contract only supports
+        # block_size % 16 == 0, and with a single block per "batch" it was
+        # also observed to silently corrupt outputs at non-trivial
+        # max_budget values on FA2.  Compact the valid per-head prefixes
+        # of ``exec_buf_k/v`` into a flat ``[sum(valid_lengths), 1, D]``
+        # tensor and hand FA a plain varlen call with ``cu_seqlens_k`` –
+        # the same pattern the legacy ``_forward_per_head_compact_kv_gather``
+        # uses successfully.
         cu_q = torch.arange(0, H + 1, dtype=torch.int32, device=device)
-        seqused_k = valid_lengths.to(dtype=torch.int32)
+        valid_i64 = valid_lengths.to(dtype=torch.int64)
+        cu_k = torch.empty(H + 1, dtype=torch.int32, device=device)
+        cu_k[0] = 0
+        cu_k[1:] = torch.cumsum(valid_i64, dim=0).to(torch.int32)
+        # Build advanced-index gather: for each batch h, copy
+        # exec_buf[h, 0:valid[h]] to rows cu_k[h]:cu_k[h+1] of the flat
+        # output.  ``batch_idx_flat[i]`` = which head row i came from;
+        # ``row_in_batch_flat[i]`` = 0..valid[h]-1 within that head.
+        total_k = int(cu_k[-1].item())
+        if total_k == 0:
+            # Degenerate: no K tokens for any head this step.  Return zero
+            # output and a sentinel LSE so the estimation merge below
+            # behaves sanely.  Also fire the FA-timing events so the
+            # downstream ``fa_end.record()`` has a valid ``fa_start`` to
+            # elapsed-time from.
+            if use_cuda_timing:
+                fa_start.record()
+            out_ret_h = torch.zeros((H, D), dtype=query.dtype, device=device)
+            lse_ret_h = torch.full(
+                (H,), float("-inf"), dtype=torch.float32, device=device
+            )
+        else:
+            batch_idx_flat = torch.repeat_interleave(
+                torch.arange(H, dtype=torch.int64, device=device),
+                valid_i64,
+            )  # [total_k]
+            row_in_batch_flat = (
+                torch.arange(total_k, dtype=torch.int64, device=device)
+                - cu_k[batch_idx_flat].to(torch.int64)
+            )
+            # Gather into packed varlen layout [total_k, 1, D].
+            k_packed = exec_buf_k[batch_idx_flat, row_in_batch_flat].view(
+                total_k, 1, D
+            )
+            v_packed = exec_buf_v[batch_idx_flat, row_in_batch_flat].view(
+                total_k, 1, D
+            )
 
-        # Per-batch descale: FA expects ``[batch, num_heads]`` = ``[H, 1]``.
-        # Upstream ``q_descale`` etc. are ``[num_reqs=1, num_kv_heads]``;
-        # each q-head reads from its mapped kv-head.  ``num_queries_per_kv``
-        # is the GQA ratio exposed on ``FlashAttentionImpl``.
-        q_per_kv = max(self.num_queries_per_kv, 1)
-        kv_head_ids = (
-            torch.arange(H, dtype=torch.long, device=device) // q_per_kv
-        )
-        q_des_ret = q_descale[0, kv_head_ids].view(H, 1)
-        k_des_ret = k_descale[0, kv_head_ids].view(H, 1)
-        v_des_ret = v_descale[0, kv_head_ids].view(H, 1)
+            # Per-batch descale: FA expects ``[batch, num_heads]`` = ``[H, 1]``.
+            # Upstream ``q_descale`` etc. are ``[num_reqs=1, num_kv_heads]``;
+            # each q-head reads from its mapped kv-head.
+            q_per_kv = max(self.num_queries_per_kv, 1)
+            kv_head_ids = (
+                torch.arange(H, dtype=torch.long, device=device) // q_per_kv
+            )
+            q_des_ret = q_descale[0, kv_head_ids].view(H, 1)
+            k_des_ret = k_descale[0, kv_head_ids].view(H, 1)
+            v_des_ret = v_descale[0, kv_head_ids].view(H, 1)
 
-        if use_cuda_timing:
-            fa_start.record()
-        # All K tokens come from strictly-past positions (retrieval zone
-        # is materialised against tokens ``< current_len - 1``, the
-        # steady zone ends at ``current_len - 1``, and pending tokens
-        # are appended in-order), so ``causal=False`` is equivalent and
-        # avoids FA's causal mask bookkeeping for the single-query case.
-        out_ret, lse_ret = flash_attn_varlen_func(
-            q=q_flat,
-            k=k_paged,
-            v=v_paged,
-            out=None,
-            cu_seqlens_q=cu_q,
-            max_seqlen_q=1,
-            cu_seqlens_k=None,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_budget,
-            softmax_scale=self.scale,
-            causal=False,
-            alibi_slopes=None,
-            window_size=[-1, -1],
-            block_table=block_table_ret,
-            softcap=self.logits_soft_cap,
-            return_softmax_lse=True,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=q_des_ret,
-            k_descale=k_des_ret,
-            v_descale=v_des_ret,
-            num_splits=0,
-        )
+            # ``max_seqlen_k`` is the per-batch max of valid_lengths.  Using
+            # max_budget as a safe upper bound avoids an extra sync.
+            max_seqlen_k_varlen = int(max_budget)
+
+            if use_cuda_timing:
+                fa_start.record()
+            # Varlen FA over the packed K/V.  ``causal=False`` is equivalent
+            # here because every K position is <= the current query position
+            # by construction (retrieval < prefill_len, steady ends at
+            # prefill_len, pending is [prefill_len, current_len)).
+            out_ret, lse_ret = flash_attn_varlen_func(
+                q=q_flat,
+                k=k_packed,
+                v=v_packed,
+                out=None,
+                cu_seqlens_q=cu_q,
+                max_seqlen_q=1,
+                cu_seqlens_k=cu_k,
+                seqused_k=None,
+                max_seqlen_k=max_seqlen_k_varlen,
+                softmax_scale=self.scale,
+                causal=False,
+                alibi_slopes=None,
+                window_size=[-1, -1],
+                block_table=None,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_des_ret,
+                k_descale=k_des_ret,
+                v_descale=v_des_ret,
+                num_splits=0,
+            )
+            # FA reports ``softmax_lse`` with shape ``[num_heads_q, total_q]``
+            # = ``[1, H]`` in our heads-as-batches layout.
+            lse_ret_h = lse_ret.view(H).to(dtype=torch.float32)
+            out_ret_h = out_ret.view(H, D)
         if use_cuda_timing:
             fa_end.record()
-
-        # FA reports ``softmax_lse`` with shape ``[num_heads_q, total_q]``
-        # (see DCP forward comment: "FA returns LSE in shape [H, B]").  In
-        # our heads-as-batches layout that's ``[1, H]`` – squeeze to ``[H]``.
-        lse_ret_h = lse_ret.view(H).to(dtype=torch.float32)
-        out_ret_h = out_ret.view(H, D)
 
         es = int(centres_es.shape[1]) if centres_es is not None else 0
         if es == 0:
