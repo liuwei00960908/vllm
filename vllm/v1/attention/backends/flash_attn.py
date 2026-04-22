@@ -68,6 +68,57 @@ logger = init_logger(__name__)
 # are skipped when this is 0, which removes a substantial stall budget from the
 # sparse decode hot path.  Default off.
 _SPARSE_PERF_DEBUG: bool = int(os.getenv("VLLM_SPARSE_PERF_DEBUG", "0")) == 1
+_SPARSE_DEBUG_ASSERT: bool = int(os.getenv("VLLM_SPARSE_DEBUG_ASSERT", "0")) == 1
+
+
+def _sparse_tensor_range(
+    name: str,
+    tensor: torch.Tensor,
+    upper: int,
+) -> None:
+    """Debug-only CUDA sync to turn sparse index corruption into ValueError."""
+    if tensor.numel() == 0:
+        return
+    lo = int(tensor.min().item())
+    hi = int(tensor.max().item())
+    if lo < 0 or hi >= int(upper):
+        raise ValueError(
+            f"{name} out of range: min={lo} max={hi} upper={int(upper)}"
+        )
+
+
+def _sparse_assert_compact_gather_inputs(
+    *,
+    phys: torch.Tensor,
+    slots: torch.Tensor,
+    kv_heads: torch.Tensor,
+    cu_k: torch.Tensor,
+    key_cache: torch.Tensor,
+    num_q_flat: int,
+) -> None:
+    """Debug-only validation before sparse compact-gather advanced indexing."""
+    n = int(phys.numel())
+    if int(slots.numel()) != n or int(kv_heads.numel()) != n:
+        raise ValueError(
+            "sparse compact gather metadata length mismatch: "
+            f"phys={int(phys.numel())} slots={int(slots.numel())} "
+            f"kv_heads={int(kv_heads.numel())}"
+        )
+    if int(cu_k.numel()) != int(num_q_flat) + 1:
+        raise ValueError(
+            "sparse compact gather cu_k length mismatch: "
+            f"cu_k={int(cu_k.numel())} expected={int(num_q_flat) + 1}"
+        )
+    if int(cu_k[0].item()) != 0 or int(cu_k[-1].item()) != n:
+        raise ValueError(
+            "sparse compact gather cu_k endpoints mismatch: "
+            f"first={int(cu_k[0].item())} last={int(cu_k[-1].item())} n={n}"
+        )
+    if cu_k.numel() > 1 and bool((cu_k[1:] < cu_k[:-1]).any().item()):
+        raise ValueError("sparse compact gather cu_k is not monotonic")
+    _sparse_tensor_range("sparse phys", phys, int(key_cache.shape[0]))
+    _sparse_tensor_range("sparse slots", slots, int(key_cache.shape[1]))
+    _sparse_tensor_range("sparse kv_head", kv_heads, int(key_cache.shape[2]))
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -1338,6 +1389,15 @@ class FlashAttentionImpl(AttentionImpl):
             # The hot-path gather: these two advanced-indexing reads are the
             # only genuinely Tier-3 (per-layer, K/V-cache-dependent) work
             # that cannot be pre-computed.
+            if _SPARSE_DEBUG_ASSERT:
+                _sparse_assert_compact_gather_inputs(
+                    phys=phys64,
+                    slots=slots64,
+                    kv_heads=kv_token_ids,
+                    cu_k=cu_k_flat,
+                    key_cache=key_cache,
+                    num_q_flat=num_q_heads_gather * num_reqs,
+                )
             k_slice = key_cache[phys64, slots64, kv_token_ids]
             v_slice = value_cache[phys64, slots64, kv_token_ids]
             k_compact = k_slice.unsqueeze(1)
@@ -1421,6 +1481,33 @@ class FlashAttentionImpl(AttentionImpl):
                 phys64 = phys.to(dtype=torch.int64, device=key_cache.device)
                 slots64 = slots.to(dtype=torch.int64, device=key_cache.device)
                 kv_h = qh // max(self.num_queries_per_kv, 1)
+                if _SPARSE_DEBUG_ASSERT:
+                    if int(cu_k[0].item()) != 0 or int(cu_k[-1].item()) != int(
+                        phys64.numel()
+                    ):
+                        raise ValueError(
+                            "sparse compact gather per-head cu_k endpoints "
+                            f"mismatch for qh={qh}: first={int(cu_k[0].item())} "
+                            f"last={int(cu_k[-1].item())} n={int(phys64.numel())}"
+                        )
+                    if cu_k.numel() > 1 and bool(
+                        (cu_k[1:] < cu_k[:-1]).any().item()
+                    ):
+                        raise ValueError(
+                            f"sparse compact gather per-head cu_k is not "
+                            f"monotonic for qh={qh}"
+                        )
+                    _sparse_tensor_range(
+                        f"sparse phys qh={qh}", phys64, int(key_cache.shape[0])
+                    )
+                    _sparse_tensor_range(
+                        f"sparse slots qh={qh}", slots64, int(key_cache.shape[1])
+                    )
+                    if kv_h < 0 or kv_h >= int(key_cache.shape[2]):
+                        raise ValueError(
+                            f"sparse kv_head out of range for qh={qh}: "
+                            f"{kv_h} not in [0, {int(key_cache.shape[2])})"
+                        )
                 k_slice = key_cache[phys64, slots64, kv_h]
                 v_slice = value_cache[phys64, slots64, kv_h]
                 k_compact = k_slice.unsqueeze(1)
@@ -1559,8 +1646,27 @@ class FlashAttentionImpl(AttentionImpl):
         q_flat = (
             query.view(1, H, D).transpose(0, 1).contiguous().view(H, 1, D)
         )
-        k_flat = exec_buf_k.reshape(H * max_budget, 1, D)
-        v_flat = exec_buf_v.reshape(H * max_budget, 1, D)
+        if _SPARSE_DEBUG_ASSERT:
+            if exec_buf_v.shape != exec_buf_k.shape:
+                raise ValueError(
+                    "retroinfer exec buffers must have identical shape: "
+                    f"k={tuple(exec_buf_k.shape)} v={tuple(exec_buf_v.shape)}"
+                )
+            _sparse_tensor_range(
+                "retroinfer valid_lengths",
+                valid_lengths.to(dtype=torch.int64),
+                max_budget + 1,
+            )
+
+        # Use FA's paged-KV contract to preserve the fixed stride between
+        # per-head exec-buffer rows.  Passing block_table=None with only
+        # seqused_k does not describe the h * max_budget row offset for
+        # regular packed K/V tensors, so kernels may read the wrong slice.
+        k_paged = exec_buf_k.view(H, max_budget, 1, D)
+        v_paged = exec_buf_v.view(H, max_budget, 1, D)
+        block_table_ret = torch.arange(
+            H, dtype=torch.int32, device=device
+        ).view(H, 1)
         cu_q = torch.arange(0, H + 1, dtype=torch.int32, device=device)
         seqused_k = valid_lengths.to(dtype=torch.int32)
 
@@ -1585,8 +1691,8 @@ class FlashAttentionImpl(AttentionImpl):
         # avoids FA's causal mask bookkeeping for the single-query case.
         out_ret, lse_ret = flash_attn_varlen_func(
             q=q_flat,
-            k=k_flat,
-            v=v_flat,
+            k=k_paged,
+            v=v_paged,
             out=None,
             cu_seqlens_q=cu_q,
             max_seqlen_q=1,
@@ -1597,6 +1703,7 @@ class FlashAttentionImpl(AttentionImpl):
             causal=False,
             alibi_slopes=None,
             window_size=[-1, -1],
+            block_table=block_table_ret,
             softcap=self.logits_soft_cap,
             return_softmax_lse=True,
             fa_version=self.vllm_flash_attn_version,

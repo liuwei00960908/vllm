@@ -229,6 +229,19 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+_SPARSE_DEBUG_ASSERT: bool = int(os.getenv("VLLM_SPARSE_DEBUG_ASSERT", "0")) == 1
+
+
+def _sparse_debug_range(name: str, tensor: torch.Tensor, upper: int) -> None:
+    """Debug-only sync to catch sparse index corruption before CUDA kernels."""
+    if tensor.numel() == 0:
+        return
+    lo = int(tensor.min().item())
+    hi = int(tensor.max().item())
+    if lo < 0 or hi >= int(upper):
+        raise ValueError(
+            f"{name} out of range: min={lo} max={hi} upper={int(upper)}"
+        )
 
 # ---------------------------------------------------------------------------
 # Sparse first-decode hard debug (NO env vars).
@@ -9076,9 +9089,31 @@ class GPUModelRunner(
                 # to int64 once to match the advanced-indexing expected
                 # dtype and keep the gather on the fast path.
                 all64 = all_positions.to(torch.int64)
+                if _SPARSE_DEBUG_ASSERT:
+                    _sparse_debug_range(
+                        "retroinfer logical positions",
+                        all64,
+                        int(current_len),
+                    )
+                    _sparse_debug_range(
+                        "retroinfer block_idx",
+                        all64 // int(block_size),
+                        int(block_table_row.numel()),
+                    )
                 phys_blocks = block_table_row.to(torch.int64) \
                     .index_select(0, all64 // int(block_size))
                 slots = all64 % int(block_size)
+                if _SPARSE_DEBUG_ASSERT:
+                    _sparse_debug_range(
+                        "retroinfer physical block ids",
+                        phys_blocks,
+                        int(k_cache.shape[0]),
+                    )
+                    _sparse_debug_range(
+                        "retroinfer slots",
+                        slots,
+                        int(k_cache.shape[1]),
+                    )
 
                 # Paged gather.  Advanced indexing over 4 dims produces
                 # a contiguous ``[total_count, head_dim]`` result in one
@@ -9843,6 +9878,7 @@ class GPUModelRunner(
                 # multi-layer accounting elsewhere.
                 use_triton = (
                     self._sparse_triton_pack_enabled
+                    and not _SPARSE_DEBUG_ASSERT
                     and num_reqs == 1
                     and selected_mask.is_cuda
                 )
@@ -9907,7 +9943,26 @@ class GPUModelRunner(
                     slots_r = (
                         tok_ids_r - block_idx * int(bsz)
                     ).to(torch.int32)
+                    if _SPARSE_DEBUG_ASSERT:
+                        _sparse_debug_range(
+                            "sparse token ids",
+                            tok_ids_r,
+                            int(seq_len),
+                        )
+                        _sparse_debug_range(
+                            "sparse block_idx",
+                            block_idx,
+                            int(bt_row_gpu.numel()),
+                        )
                     phys_r = bt_row_gpu.index_select(0, block_idx)
+                    if _SPARSE_DEBUG_ASSERT:
+                        _sparse_debug_range(
+                            "sparse physical block ids",
+                            phys_r.to(torch.int64),
+                            int(self.kv_caches[kv_cache_gid][0].shape[0])
+                            if isinstance(self.kv_caches[kv_cache_gid], tuple)
+                            else int(self.kv_caches[kv_cache_gid].shape[1]),
+                        )
                     counts_r = selected_mask.sum(dim=1).to(torch.int64)
 
                 per_req_head_ids.append(head_ids_r)
