@@ -8436,6 +8436,7 @@ class GPUModelRunner(
         q: torch.Tensor,
         total_tokens: int,
         spec: SparseAttentionSpec,
+        budget_override: int | None = None,
     ) -> torch.Tensor:
         """Return ``[num_q_heads, total_tokens]`` bool selection mask.
 
@@ -8469,7 +8470,11 @@ class GPUModelRunner(
             device = q.device
             H = int(q.shape[0])
             N = int(total_tokens)
-            budget = int(spec.sparse_selection_budget())
+            budget = (
+                int(spec.sparse_selection_budget())
+                if budget_override is None
+                else int(budget_override)
+            )
             if budget <= 0:
                 return torch.zeros((H, N), dtype=torch.bool, device=device)
 
@@ -8560,6 +8565,7 @@ class GPUModelRunner(
         q_list: "list[torch.Tensor]",
         total_tokens: int,
         spec: "SparseAttentionSpec",
+        budget_override: int | None = None,
     ) -> "list[torch.Tensor]":
         """Batched variant of ``_sparse_online_select_tokens``.
 
@@ -8592,6 +8598,7 @@ class GPUModelRunner(
                     q=q_list[0],
                     total_tokens=total_tokens,
                     spec=spec,
+                    budget_override=budget_override,
                 )
             ]
 
@@ -8605,12 +8612,20 @@ class GPUModelRunner(
             D = int(q0.shape[-1])
             device = q0.device
             N = int(total_tokens)
-            budget = int(spec.sparse_selection_budget())
+            budget = (
+                int(spec.sparse_selection_budget())
+                if budget_override is None
+                else int(budget_override)
+            )
 
             def _fallback() -> "list[torch.Tensor]":
                 return [
                     self._sparse_online_select_tokens(
-                        state=s, q=q, total_tokens=N, spec=spec
+                        state=s,
+                        q=q,
+                        total_tokens=N,
+                        spec=spec,
+                        budget_override=budget,
                     )
                     for s, q in zip(states, q_list, strict=True)
                 ]
@@ -9747,6 +9762,7 @@ class GPUModelRunner(
             per_req_phys: list[torch.Tensor] = []
             per_req_slots: list[torch.Tensor] = []
             per_req_counts: list[torch.Tensor] = []
+            max_k_hint = budget
 
             for req_idx in range(num_reqs):
                 _t_req = time.perf_counter() if perf_enabled else None
@@ -9761,6 +9777,19 @@ class GPUModelRunner(
                 p_count = int(self.input_batch.num_prompt_tokens[req_idx])
                 if seq_len <= p_count:
                     return None
+                prompt_len = min(p_count, seq_len)
+                pending_count = max(0, seq_len - prompt_len)
+                head_n = min(int(spec.static_pattern_start), prompt_len)
+                tail_start = max(
+                    0, prompt_len - int(spec.static_pattern_end)
+                )
+                steady_count = (
+                    prompt_len
+                    if head_n >= tail_start
+                    else head_n + (prompt_len - tail_start)
+                )
+                select_budget = max(0, budget - pending_count)
+                max_k_hint = max(max_k_hint, steady_count + pending_count)
                 out_before_step = self._sparse_output_tokens_before_step.get(
                     rid, len(req_state.output_token_ids)
                 )
@@ -9814,8 +9843,9 @@ class GPUModelRunner(
                     group_masks = self._sparse_online_select_tokens_batched(
                         states=batched_states,
                         q_list=q_list_views,
-                        total_tokens=seq_len,
+                        total_tokens=prompt_len,
                         spec=spec,
+                        budget_override=select_budget,
                     )
                     # Concatenation in kv-head order == head-order under
                     # GQA-regular layout, so this is the final mask with
@@ -9843,8 +9873,9 @@ class GPUModelRunner(
                     group_masks = self._sparse_online_select_tokens_batched(
                         states=batched_states,
                         q_list=batched_q,
-                        total_tokens=seq_len,
+                        total_tokens=prompt_len,
                         spec=spec,
+                        budget_override=select_budget,
                     )
                     for qh_indices_t, group_mask in zip(
                         batched_qh_indices, group_masks, strict=True
@@ -9855,8 +9886,19 @@ class GPUModelRunner(
                     _t_select,
                 )
 
-                # Post-prompt tokens are always included.
-                selected_mask[:, p_count:seq_len] = True
+                # Post-prompt tokens are always included, but they must be
+                # reserved from the sparse budget before prompt retrieval.
+                # Otherwise actual per-head K length can exceed the
+                # ``max_k`` hint passed to FA, which corrupts decode outputs.
+                if int(selected_mask.shape[1]) != seq_len:
+                    selected_prompt = selected_mask
+                    selected_mask = torch.zeros(
+                        (num_heads, seq_len),
+                        dtype=torch.bool,
+                        device=query.device,
+                    )
+                    selected_mask[:, :prompt_len] = selected_prompt
+                selected_mask[:, prompt_len:seq_len] = True
 
                 _t_pack = time.perf_counter() if perf_enabled else None
                 # Skip the per-layer H2D block-table copy: the block-table
@@ -10211,7 +10253,7 @@ class GPUModelRunner(
                 "slots": flat_slots,
                 "cu": cu_mat,
                 "head_offsets": head_offsets,
-                "max_k": budget,
+                "max_k": max_k_hint,
                 # Tier-2 pre-computed tensors consumed by the FA
                 # ``_forward_per_head_compact_kv_gather`` fast path.  Their
                 # presence lets FA skip ~15 tiny kernel launches per sparse
