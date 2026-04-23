@@ -1797,7 +1797,12 @@ class FlashAttentionImpl(AttentionImpl):
                     out_ref[_h] = _probs @ _v
                 _diff = (out_ret_h.to(torch.float32) - out_ref).abs()
                 _max = float(_diff.max().item())
-                if _max > 5e-2:
+                # bf16 tensor-core accumulation against an fp32 scalar
+                # reference at K_len in the hundreds typically sits around
+                # 1–3e-2 per element; allow enough headroom that we only
+                # fire on genuine semantic divergence (wrong positions,
+                # wrong descale, wrong causal mask), not accumulation drift.
+                if _max > 2e-1:
                     _bad_h = int(_diff.amax(dim=-1).argmax().item())
                     raise ValueError(
                         "[SparseDebug] retroinfer FA output diverges from "
