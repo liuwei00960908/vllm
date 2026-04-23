@@ -433,11 +433,13 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
-        if envs.VLLM_LOG_REQUEST_TIMING and not log_stats:
+        if (
+            envs.VLLM_LOG_REQUEST_TIMING or envs.VLLM_E2E_PERF_TRACE
+        ) and not log_stats:
             logger.warning_once(
-                "VLLM_LOG_REQUEST_TIMING requires request stats, but request "
-                "stats are disabled. Remove --disable-log-stats to enable "
-                "per-request timing reports."
+                "Request timing reports require request stats, but request stats "
+                "are disabled. Remove --disable-log-stats to enable per-request "
+                "timing reports."
             )
 
     def get_num_unfinished_requests(self):
@@ -824,7 +826,7 @@ class OutputProcessor:
         finish_reason: FinishReason,
         iteration_stats: IterationStats,
     ) -> None:
-        if not envs.VLLM_LOG_REQUEST_TIMING:
+        if not (envs.VLLM_LOG_REQUEST_TIMING or envs.VLLM_E2E_PERF_TRACE):
             return
 
         stats = req_state.stats

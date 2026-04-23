@@ -1036,6 +1036,7 @@ class GPUModelRunner(
         self._decode_perf_stats_enabled: bool = bool(
             int(os.getenv("VLLM_DECODE_PERF_STATS", "0"))
         )
+        self._e2e_perf_trace_enabled: bool = envs.VLLM_E2E_PERF_TRACE
         # Wall-clock start of the current step, captured at ``execute_model``
         # entry so ``sample_tokens`` can close an end-to-end window covering
         # both halves of the two-phase decode RPC (execute_model +
@@ -1167,6 +1168,8 @@ class GPUModelRunner(
             )
         if self._decode_perf_stats_enabled:
             logger.info("Decode perf stats enabled: VLLM_DECODE_PERF_STATS=1")
+        if self._e2e_perf_trace_enabled:
+            logger.info("E2E perf trace enabled: VLLM_E2E_PERF_TRACE=1")
         # Async sparse prefill D2H copy (independent switch).
         self._sparse_async_d2h_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_ASYNC_D2H", "0")) == 1
@@ -4871,6 +4874,85 @@ class GPUModelRunner(
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    def _e2e_trace_batch_info(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> tuple[str, int, int, int, int, list[str], list[str]]:
+        prefill_req_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
+        prefill_tokens = sum(
+            scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            for req_id in prefill_req_ids
+        )
+        decode_req_ids: list[str] = []
+        decode_tokens = 0
+
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, num_output_tokens in zip(
+            cached.req_ids, cached.num_output_tokens, strict=True
+        ):
+            num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if num_output_tokens == 0:
+                prefill_req_ids.append(req_id)
+                prefill_tokens += num_tokens
+            else:
+                decode_req_ids.append(req_id)
+                decode_tokens += num_tokens
+
+        if prefill_req_ids and decode_req_ids:
+            phase = "mixed"
+        elif prefill_req_ids:
+            phase = "prefill"
+        elif decode_req_ids:
+            phase = "decode"
+        else:
+            phase = "empty"
+        return (
+            phase,
+            len(prefill_req_ids),
+            len(decode_req_ids),
+            prefill_tokens,
+            decode_tokens,
+            prefill_req_ids,
+            decode_req_ids,
+        )
+
+    def _log_e2e_perf_trace(
+        self,
+        label: str,
+        phase: str,
+        prefill_reqs: int,
+        decode_reqs: int,
+        prefill_tokens: int,
+        decode_tokens: int,
+        prefill_req_ids: list[str],
+        decode_req_ids: list[str],
+        marks: list[tuple[str, float]],
+    ) -> None:
+        if len(marks) < 2:
+            return
+
+        start = marks[0][1]
+        prev = start
+        parts: list[str] = []
+        for name, timestamp in marks[1:]:
+            parts.append(f"{name}_ms={(timestamp - prev) * 1000.0:.3f}")
+            prev = timestamp
+
+        logger.info(
+            "[E2EPerf][GPUModelRunner] label=%s phase=%s total_ms=%.3f "
+            "prefill_reqs=%d decode_reqs=%d prefill_tokens=%d "
+            "decode_tokens=%d prefill_ids=%s decode_ids=%s %s",
+            label,
+            phase,
+            (marks[-1][1] - start) * 1000.0,
+            prefill_reqs,
+            decode_reqs,
+            prefill_tokens,
+            decode_tokens,
+            prefill_req_ids,
+            decode_req_ids,
+            " ".join(parts),
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4880,6 +4962,25 @@ class GPUModelRunner(
         _decode_perf_t0 = (
             time.perf_counter() if self._decode_perf_stats_enabled else None
         )
+        _e2e_trace_marks: list[tuple[str, float]] | None = None
+        _e2e_trace_phase = "unknown"
+        _e2e_trace_prefill_reqs = 0
+        _e2e_trace_decode_reqs = 0
+        _e2e_trace_prefill_tokens = 0
+        _e2e_trace_decode_tokens = 0
+        _e2e_trace_prefill_ids: list[str] = []
+        _e2e_trace_decode_ids: list[str] = []
+        if self._e2e_perf_trace_enabled:
+            _e2e_trace_marks = [("start", time.perf_counter())]
+            (
+                _e2e_trace_phase,
+                _e2e_trace_prefill_reqs,
+                _e2e_trace_decode_reqs,
+                _e2e_trace_prefill_tokens,
+                _e2e_trace_decode_tokens,
+                _e2e_trace_prefill_ids,
+                _e2e_trace_decode_ids,
+            ) = self._e2e_trace_batch_info(scheduler_output)
         if self._decode_perf_stats_enabled and _decode_perf_t0 is not None:
             # Seed the step-level end-to-end window.  ``sample_tokens`` reads
             # this on exit to compute ``[DecodePerfE2E] total_ms`` spanning
@@ -4950,6 +5051,8 @@ class GPUModelRunner(
                 time.perf_counter() if self._decode_perf_stats_enabled else None
             )
             self._update_states(scheduler_output)
+            if _e2e_trace_marks is not None:
+                _e2e_trace_marks.append(("update_states", time.perf_counter()))
             if _t_decode_update_states is not None:
                 _decode_perf_update_states_ms = (
                     time.perf_counter() - _t_decode_update_states
@@ -5014,6 +5117,8 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if _e2e_trace_marks is not None:
+                _e2e_trace_marks.append(("prepare_inputs", time.perf_counter()))
             if _t_decode_prepare_inputs is not None:
                 _decode_perf_prepare_inputs_ms = (
                     time.perf_counter() - _t_decode_prepare_inputs
@@ -5082,6 +5187,8 @@ class GPUModelRunner(
                 _decode_perf_batch_plan_ms = (
                     time.perf_counter() - _t_decode_batch_plan
                 ) * 1000.0
+            if _e2e_trace_marks is not None:
+                _e2e_trace_marks.append(("batch_plan", time.perf_counter()))
 
             # True if any attention backend handles KV cache update separately
             # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
@@ -5134,6 +5241,8 @@ class GPUModelRunner(
                 _decode_perf_slot_mapping_ms = (
                     time.perf_counter() - _t_decode_slot_mapping
                 ) * 1000.0
+            if _e2e_trace_marks is not None:
+                _e2e_trace_marks.append(("slot_mapping", time.perf_counter()))
 
             _t0_attn_meta = (
                 time.perf_counter()
@@ -5175,6 +5284,8 @@ class GPUModelRunner(
                     "_build_attention_metadata",
                     _attn_metadata_elapsed,
                 )
+            if _e2e_trace_marks is not None:
+                _e2e_trace_marks.append(("attn_metadata", time.perf_counter()))
 
             _t_decode_model_preprocess = (
                 time.perf_counter()
@@ -5198,11 +5309,15 @@ class GPUModelRunner(
                 _decode_perf_model_preprocess_ms = (
                     time.perf_counter() - _t_decode_model_preprocess
                 ) * 1000.0
+            if _e2e_trace_marks is not None:
+                _e2e_trace_marks.append(("model_preprocess", time.perf_counter()))
 
         if self._decode_perf_stats_enabled and _t_decode_preprocess is not None:
             _decode_perf_preprocess_ms = (
                 time.perf_counter() - _t_decode_preprocess
             ) * 1000.0
+        if _e2e_trace_marks is not None:
+            _e2e_trace_marks.append(("preprocess_total", time.perf_counter()))
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -5259,6 +5374,8 @@ class GPUModelRunner(
             _decode_perf_forward_ms = (
                 time.perf_counter() - _t_decode_forward
             ) * 1000.0
+        if _e2e_trace_marks is not None:
+            _e2e_trace_marks.append(("forward", time.perf_counter()))
 
         _t_decode_postprocess = (
             time.perf_counter()
@@ -5352,6 +5469,8 @@ class GPUModelRunner(
             _decode_perf_postprocess_ms = (
                 time.perf_counter() - _t_decode_postprocess
             ) * 1000.0
+        if _e2e_trace_marks is not None:
+            _e2e_trace_marks.append(("postprocess", time.perf_counter()))
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -5366,6 +5485,19 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+        if _e2e_trace_marks is not None:
+            _e2e_trace_marks.append(("state_ready", time.perf_counter()))
+            self._log_e2e_perf_trace(
+                "execute_model",
+                _e2e_trace_phase,
+                _e2e_trace_prefill_reqs,
+                _e2e_trace_decode_reqs,
+                _e2e_trace_prefill_tokens,
+                _e2e_trace_decode_tokens,
+                _e2e_trace_prefill_ids,
+                _e2e_trace_decode_ids,
+                _e2e_trace_marks,
+            )
         if self._decode_perf_stats_enabled and not _decode_perf_decode_only:
             # Non-decode-only step (e.g. prefill / mixed).  We do not want
             # ``[DecodePerfE2E]`` to fire from ``sample_tokens`` in that case
@@ -5451,6 +5583,25 @@ class GPUModelRunner(
             self._sparse_perf_stats_enabled and self._has_sparse_attn
         )
         _st_t0 = time.perf_counter() if _sp_perf_enabled else None
+        _e2e_sample_marks: list[tuple[str, float]] | None = None
+        _e2e_sample_phase = "unknown"
+        _e2e_sample_prefill_reqs = 0
+        _e2e_sample_decode_reqs = 0
+        _e2e_sample_prefill_tokens = 0
+        _e2e_sample_decode_tokens = 0
+        _e2e_sample_prefill_ids: list[str] = []
+        _e2e_sample_decode_ids: list[str] = []
+        if self._e2e_perf_trace_enabled and self.execute_model_state is not None:
+            _e2e_sample_marks = [("start", time.perf_counter())]
+            (
+                _e2e_sample_phase,
+                _e2e_sample_prefill_reqs,
+                _e2e_sample_decode_reqs,
+                _e2e_sample_prefill_tokens,
+                _e2e_sample_decode_tokens,
+                _e2e_sample_prefill_ids,
+                _e2e_sample_decode_ids,
+            ) = self._e2e_trace_batch_info(self.execute_model_state.scheduler_output)
         if _st_t0 is not None and self._decode_perf_step_exec_exit_t is not None:
             self._sparse_perf_record(
                 "sample_tokens:entry_gap_after_execute_model",
@@ -5529,13 +5680,19 @@ class GPUModelRunner(
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
+        if _e2e_sample_marks is not None:
+            _e2e_sample_marks.append(("grammar", time.perf_counter()))
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if _e2e_sample_marks is not None:
+            _e2e_sample_marks.append(("sample", time.perf_counter()))
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        if _e2e_sample_marks is not None:
+            _e2e_sample_marks.append(("update_states_after", time.perf_counter()))
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -5666,6 +5823,8 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        if _e2e_sample_marks is not None:
+            _e2e_sample_marks.append(("bookkeeping_sync", time.perf_counter()))
         if _t_bookkeep is not None:
             # ``_bookkeeping_sync`` is the major GPU→CPU sync point (pulls
             # sampled token ids, logprobs, num_nans, etc.).  If the forward
@@ -5688,6 +5847,8 @@ class GPUModelRunner(
         # draft model to also save its KV cache.
         if spec_config is not None:
             self.finalize_kv_connector()
+        if _e2e_sample_marks is not None:
+            _e2e_sample_marks.append(("draft_kv_finalize", time.perf_counter()))
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
@@ -5733,6 +5894,8 @@ class GPUModelRunner(
                 sparse_new_block_features,
                 sparse_new_block_features_gpu,
             )
+            if _e2e_sample_marks is not None:
+                _e2e_sample_marks.append(("sparse_features", time.perf_counter()))
             if _t0_sparse_collect is not None:
                 # Keep ``_collect_sparse_features`` key bitwise-compatible with
                 # earlier logs (covers both ``_collect_sparse_features`` and
@@ -5789,6 +5952,8 @@ class GPUModelRunner(
                     "sample_tokens:output_build",
                     time.perf_counter() - _t_tail,
                 )
+            if _e2e_sample_marks is not None:
+                _e2e_sample_marks.append(("output_build", time.perf_counter()))
 
         if not self.use_async_scheduling:
             if _sp_perf_enabled and _st_t0 is not None:
@@ -5797,6 +5962,19 @@ class GPUModelRunner(
                     time.perf_counter() - _st_t0,
                 )
             self._decode_perf_flush_e2e(st_t0=_st_t0)
+            if _e2e_sample_marks is not None:
+                _e2e_sample_marks.append(("return", time.perf_counter()))
+                self._log_e2e_perf_trace(
+                    "sample_tokens",
+                    _e2e_sample_phase,
+                    _e2e_sample_prefill_reqs,
+                    _e2e_sample_decode_reqs,
+                    _e2e_sample_prefill_tokens,
+                    _e2e_sample_decode_tokens,
+                    _e2e_sample_prefill_ids,
+                    _e2e_sample_decode_ids,
+                    _e2e_sample_marks,
+                )
             return output
 
         with record_function_or_nullcontext(
@@ -5826,6 +6004,19 @@ class GPUModelRunner(
                 time.perf_counter() - _st_t0,
             )
         self._decode_perf_flush_e2e(st_t0=_st_t0)
+        if _e2e_sample_marks is not None:
+            _e2e_sample_marks.append(("return", time.perf_counter()))
+            self._log_e2e_perf_trace(
+                "sample_tokens",
+                _e2e_sample_phase,
+                _e2e_sample_prefill_reqs,
+                _e2e_sample_decode_reqs,
+                _e2e_sample_prefill_tokens,
+                _e2e_sample_decode_tokens,
+                _e2e_sample_prefill_ids,
+                _e2e_sample_decode_ids,
+                _e2e_sample_marks,
+            )
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(

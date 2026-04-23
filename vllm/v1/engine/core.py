@@ -107,6 +107,10 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self.e2e_perf_trace_enabled = envs.VLLM_E2E_PERF_TRACE
+        self._e2e_perf_step_id = 0
+        if self.e2e_perf_trace_enabled:
+            logger.info("E2E perf trace enabled: VLLM_E2E_PERF_TRACE=1")
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -375,6 +379,66 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _e2e_trace_batch_info(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[str, list[str], list[str]]:
+        prefill_req_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
+        cached = scheduler_output.scheduled_cached_reqs
+        decode_req_ids: list[str] = []
+        for req_id in cached.req_ids:
+            if cached.is_context_phase(req_id):
+                prefill_req_ids.append(req_id)
+            else:
+                decode_req_ids.append(req_id)
+
+        if prefill_req_ids and decode_req_ids:
+            phase = "mixed"
+        elif prefill_req_ids:
+            phase = "prefill"
+        elif decode_req_ids:
+            phase = "decode"
+        else:
+            phase = "empty"
+        return phase, prefill_req_ids, decode_req_ids
+
+    def _next_e2e_perf_step_id(self) -> int:
+        self._e2e_perf_step_id += 1
+        return self._e2e_perf_step_id
+
+    def _log_e2e_perf_trace(
+        self,
+        step_id: int,
+        scheduler_output: SchedulerOutput,
+        phase: str,
+        prefill_req_ids: list[str],
+        decode_req_ids: list[str],
+        marks: list[tuple[str, float]],
+    ) -> None:
+        if len(marks) < 2:
+            return
+
+        start = marks[0][1]
+        prev = start
+        parts: list[str] = []
+        for name, timestamp in marks[1:]:
+            parts.append(f"{name}_ms={(timestamp - prev) * 1000.0:.3f}")
+            prev = timestamp
+
+        logger.info(
+            "[E2EPerf][EngineCore] step=%d phase=%s total_ms=%.3f "
+            "prefill_reqs=%d decode_reqs=%d scheduled_tokens=%d "
+            "prefill_ids=%s decode_ids=%s %s",
+            step_id,
+            phase,
+            (marks[-1][1] - start) * 1000.0,
+            len(prefill_req_ids),
+            len(decode_req_ids),
+            scheduler_output.total_num_scheduled_tokens,
+            prefill_req_ids,
+            decode_req_ids,
+            " ".join(parts),
+        )
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -386,23 +450,56 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        trace_marks: list[tuple[str, float]] | None = None
+        trace_step_id = 0
+        if self.e2e_perf_trace_enabled:
+            trace_step_id = self._next_e2e_perf_step_id()
+            trace_marks = [("start", time.perf_counter())]
         scheduler_output = self.scheduler.schedule()
+        phase = "unknown"
+        prefill_req_ids: list[str] = []
+        decode_req_ids: list[str] = []
+        if trace_marks is not None:
+            trace_marks.append(("schedule", time.perf_counter()))
+            phase, prefill_req_ids, decode_req_ids = self._e2e_trace_batch_info(
+                scheduler_output
+            )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        if trace_marks is not None:
+            trace_marks.append(("execute_submit", time.perf_counter()))
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        if trace_marks is not None:
+            trace_marks.append(("grammar", time.perf_counter()))
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
+            if trace_marks is not None:
+                trace_marks.append(("execute_wait", time.perf_counter()))
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+                if trace_marks is not None:
+                    trace_marks.append(("sample", time.perf_counter()))
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        if trace_marks is not None:
+            trace_marks.append(("aborts", time.perf_counter()))
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if trace_marks is not None:
+            trace_marks.append(("update_output", time.perf_counter()))
+            self._log_e2e_perf_trace(
+                trace_step_id,
+                scheduler_output,
+                phase,
+                prefill_req_ids,
+                decode_req_ids,
+                trace_marks,
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -1168,13 +1265,23 @@ class EngineCoreProc(EngineCore):
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        trace_marks: list[tuple[str, float]] | None = None
+        if self.e2e_perf_trace_enabled:
+            trace_marks = [("start", time.perf_counter())]
+
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        if trace_marks is not None:
+            trace_marks.append(("step_fn", time.perf_counter()))
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
+        if trace_marks is not None:
+            trace_marks.append(("output_queue", time.perf_counter()))
         # Post-step hook.
         self.post_step(model_executed)
+        if trace_marks is not None:
+            trace_marks.append(("post_step", time.perf_counter()))
 
         # If no model execution happened but there are waiting requests
         # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
@@ -1182,6 +1289,21 @@ class EngineCoreProc(EngineCore):
         # Without this, the tight polling loop can starve background threads.
         if not model_executed and self.scheduler.has_unfinished_requests():
             time.sleep(0.001)
+
+        if trace_marks is not None:
+            trace_marks.append(("done", time.perf_counter()))
+            start = trace_marks[0][1]
+            prev = start
+            parts: list[str] = []
+            for name, timestamp in trace_marks[1:]:
+                parts.append(f"{name}_ms={(timestamp - prev) * 1000.0:.3f}")
+                prev = timestamp
+            logger.info(
+                "[E2EPerf][EngineLoop] total_ms=%.3f model_executed=%d %s",
+                (trace_marks[-1][1] - start) * 1000.0,
+                int(model_executed),
+                " ".join(parts),
+            )
 
         return model_executed
 

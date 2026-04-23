@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_LOG_REQUEST_TIMING: bool = False
+    VLLM_E2E_PERF_TRACE: bool = False
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -692,6 +693,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, vllm will log a per-request timing report when a request finishes.
     "VLLM_LOG_REQUEST_TIMING": lambda: os.environ.get(
         "VLLM_LOG_REQUEST_TIMING", "False"
+    ).lower()
+    in ("1", "true"),
+    # If set, log per-engine-step end-to-end timing breakdowns.
+    "VLLM_E2E_PERF_TRACE": lambda: os.environ.get(
+        "VLLM_E2E_PERF_TRACE", "False"
     ).lower()
     in ("1", "true"),
     # Trace function calls
@@ -1766,6 +1772,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_LOG_REQUEST_TIMING",
+        "VLLM_E2E_PERF_TRACE",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
