@@ -9429,12 +9429,39 @@ class GPUModelRunner(
         the legacy path with identical (slower) semantics.
         """
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        # One-shot bail diagnostics: count which gate trips each layer/step
+        # and log once per unique (gate, layer) pair so we can tell whether
+        # the retroinfer path is silently falling back to the legacy
+        # builder (e.g. under async scheduling).  Guarded on the debug env
+        # var so production runs pay nothing.
+        def _bail(gate: str) -> None:
+            if not _SPARSE_DEBUG_ASSERT:
+                return
+            key = (layer_name, gate)
+            if not hasattr(self, "_retroinfer_bail_seen"):
+                self._retroinfer_bail_seen: set = set()
+                self._retroinfer_bail_count: dict = {}
+            self._retroinfer_bail_count[gate] = (
+                self._retroinfer_bail_count.get(gate, 0) + 1
+            )
+            if key not in self._retroinfer_bail_seen:
+                self._retroinfer_bail_seen.add(key)
+                logger.info(
+                    "[SparseDebug] retroinfer bail gate=%s layer=%s "
+                    "cumulative_count_for_gate=%d",
+                    gate,
+                    layer_name,
+                    self._retroinfer_bail_count[gate],
+                )
+
         try:
             kv_cache_gid = self._sparse_layer_gid_by_name.get(layer_name)
             if kv_cache_gid is None:
+                _bail("kv_cache_gid_none")
                 return None
             num_reqs = int(self.input_batch.num_reqs)
             if num_reqs != 1:
+                _bail(f"num_reqs={num_reqs}")
                 return None
             # Decode fast path requires exactly 1 query token for the
             # sole active request.  ``query_start_loc`` encodes the
@@ -9442,23 +9469,28 @@ class GPUModelRunner(
             # token count.
             tok_end = int(self.query_start_loc.np[1])
             if tok_end != 1:
+                _bail(f"tok_end={tok_end}")
                 return None
 
             rid = self.input_batch.req_ids[0]
             req_states = self._sparse_online_index.get(rid)
             if not req_states:
+                _bail("req_states_empty")
                 return None
             req_state = self.requests.get(rid)
             if req_state is None:
+                _bail("req_state_none")
                 return None
             seq_len = int(self.seq_lens.np[0])
             p_count = int(self.input_batch.num_prompt_tokens[0])
             if seq_len <= p_count:
+                _bail(f"seq_len<=p_count seq_len={seq_len} p_count={p_count}")
                 return None
             out_before_step = self._sparse_output_tokens_before_step.get(
                 rid, len(req_state.output_token_ids)
             )
             if out_before_step <= 0:
+                _bail(f"out_before_step={out_before_step}")
                 return None
 
             ctx = self._sparse_layer_ctx.get(layer_name)
@@ -9468,17 +9500,25 @@ class GPUModelRunner(
                 # hook dispatcher fall back to the legacy path for a
                 # single step; subsequent steps hit the retroinfer path
                 # once ctx is cached.  Self-healing and one-shot only.
+                _bail("ctx_none")
                 return None
             if not bool(ctx.get("gqa_regular", False)):
+                _bail("not_gqa_regular")
                 return None
             num_heads = int(ctx["num_heads"])
             head_size = int(ctx["head_size"])
             num_kv_heads = int(ctx["num_kv_heads"])
             if num_kv_heads <= 0:
+                _bail(f"num_kv_heads={num_kv_heads}")
                 return None
             npk = max(1, num_heads // num_kv_heads)
             unit_keys_in_kv_order = ctx.get("unit_keys_in_kv_order", ())
             if len(unit_keys_in_kv_order) != num_kv_heads:
+                _bail(
+                    "unit_keys_mismatch "
+                    f"len={len(unit_keys_in_kv_order)} "
+                    f"num_kv_heads={num_kv_heads}"
+                )
                 return None
 
             # Zero-kernel q split (GQA-regular layout).  Same pattern as
@@ -9499,6 +9539,7 @@ class GPUModelRunner(
             for uk in unit_keys_in_kv_order:
                 st = req_states.get(uk)
                 if st is None:
+                    _bail(f"state_missing_unit_key={uk}")
                     return None
                 # Retroinfer requires both the centroid table *and* the
                 # per-cluster value_sum.  Empty centroids indicate the
@@ -9509,8 +9550,10 @@ class GPUModelRunner(
                 # table with a zero-numel ``value_sum`` signals an
                 # out-of-sync state and we must bail.
                 if st.cluster_centres.numel() == 0:
+                    _bail(f"cluster_centres_empty unit_key={uk}")
                     return None
                 if st.value_sum.numel() == 0:
+                    _bail(f"value_sum_empty unit_key={uk}")
                     return None
                 batched_states.append(st)
 
@@ -9521,6 +9564,7 @@ class GPUModelRunner(
                 estimation_budget=self._sparse_estimation_budget,
             )
             if sel is None:
+                _bail("cluster_selector_returned_none")
                 return None
             retrieval_cids, estimation_cids = sel
 
