@@ -9609,6 +9609,19 @@ class GPUModelRunner(
                 static_pattern_end=int(spec.static_pattern_end),
                 max_budget=max_budget,
             )
+            if _SPARSE_DEBUG_ASSERT:
+                if not hasattr(self, "_retroinfer_success_seen"):
+                    self._retroinfer_success_seen: set = set()
+                    self._retroinfer_success_count: int = 0
+                self._retroinfer_success_count += 1
+                if layer_name not in self._retroinfer_success_seen:
+                    self._retroinfer_success_seen.add(layer_name)
+                    logger.info(
+                        "[SparseDebug] retroinfer SUCCESS layer=%s "
+                        "cumulative_global_success=%d",
+                        layer_name,
+                        self._retroinfer_success_count,
+                    )
             return out
         finally:
             if _t0 is not None:
