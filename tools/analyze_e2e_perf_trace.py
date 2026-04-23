@@ -21,6 +21,9 @@ KV_RE = re.compile(rf"([A-Za-z0-9_]+)=({NUMBER_RE})")
 ENGINE_RE = re.compile(
     rf"\[E2EPerf\]\[(EngineLoop|EngineCore)\].*?total_ms=({NUMBER_RE})(.*)"
 )
+SCHEDULER_UPDATE_RE = re.compile(
+    rf"\[E2EPerf\]\[SchedulerUpdate\].*?total_ms=({NUMBER_RE})(.*)"
+)
 GPU_RE = re.compile(
     rf"\[E2EPerf\]\[GPUModelRunner\]\s+label=(\S+)\s+phase=(\S+)"
     rf".*?total_ms=({NUMBER_RE})(.*)"
@@ -118,6 +121,19 @@ def parse_log(path: Path) -> tuple[list[TraceRecord], list[RequestRecord]]:
                     TraceRecord(
                         source=source,
                         label=source,
+                        total_ms=float(total_ms),
+                        fields=parse_kv_fields(rest),
+                        line_no=line_no,
+                    )
+                )
+                continue
+
+            if match := SCHEDULER_UPDATE_RE.search(line):
+                total_ms, rest = match.groups()
+                traces.append(
+                    TraceRecord(
+                        source="SchedulerUpdate",
+                        label="update_from_output",
                         total_ms=float(total_ms),
                         fields=parse_kv_fields(rest),
                         line_no=line_no,

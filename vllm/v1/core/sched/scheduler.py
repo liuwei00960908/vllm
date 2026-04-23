@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -62,6 +63,42 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _sparse_payload_summary(payload: object) -> str:
+    if not payload:
+        return "reqs=0 units=0 rows=0 elems=0 max_shape=[]"
+
+    reqs = 0
+    units = 0
+    rows = 0
+    elems = 0
+    max_shape: tuple[int, ...] = ()
+
+    if not isinstance(payload, dict):
+        return f"type={type(payload).__name__}"
+
+    reqs = len(payload)
+    for value in payload.values():
+        if isinstance(value, dict):
+            for arr in value.values():
+                units += 1
+                if isinstance(arr, np.ndarray):
+                    rows += int(arr.shape[0]) if arr.ndim > 0 else 1
+                    elems += int(arr.size)
+                    if arr.size > math.prod(max_shape or (0,)):
+                        max_shape = tuple(int(dim) for dim in arr.shape)
+        elif isinstance(value, np.ndarray):
+            units += 1
+            rows += int(value.shape[0]) if value.ndim > 0 else 1
+            elems += int(value.size)
+            if value.size > math.prod(max_shape or (0,)):
+                max_shape = tuple(int(dim) for dim in value.shape)
+
+    return (
+        f"reqs={reqs} units={units} rows={rows} elems={elems} "
+        f"max_shape={list(max_shape)}"
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -1441,6 +1478,19 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        e2e_trace_enabled = envs.VLLM_E2E_PERF_TRACE
+        trace_start = time.perf_counter() if e2e_trace_enabled else 0.0
+        trace_prev = trace_start
+        trace_parts: list[str] = []
+
+        def trace_mark(name: str) -> None:
+            nonlocal trace_prev
+            if not e2e_trace_enabled:
+                return
+            now = time.perf_counter()
+            trace_parts.append(f"{name}_ms={(now - trace_prev) * 1000.0:.3f}")
+            trace_prev = now
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1463,6 +1513,7 @@ class Scheduler(SchedulerInterface):
             kv_stats = self.connector.get_kv_connector_stats()
             if kv_stats:
                 kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+        trace_mark("init")
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1612,6 +1663,7 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+        trace_mark("output_loop")
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -1634,10 +1686,12 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
+        trace_mark("stopped_cleanup")
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
+        trace_mark("kv_connector_update")
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
@@ -1655,6 +1709,7 @@ class Scheduler(SchedulerInterface):
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+        trace_mark("kv_events")
 
         # ── Sparse KV attention hooks ────────────────────────────────────
         # These are no-ops when no SparseAttentionSpec group is present.
@@ -1677,6 +1732,7 @@ class Scheduler(SchedulerInterface):
                 model_runner_output.sparse_new_block_features,
                 model_runner_output.sparse_new_value_features,
             )
+        trace_mark("sparse_post_decode_rebalance")
         if model_runner_output.sparse_block_features:
             vfeat_map = model_runner_output.sparse_block_value_features or {}
             meta_map = model_runner_output.sparse_prefill_cluster_meta or {}
@@ -1687,10 +1743,12 @@ class Scheduler(SchedulerInterface):
                     vfeat_map.get(req_id),
                     prefill_cluster_meta=meta_map.get(req_id),
                 )
+        trace_mark("sparse_notify_prefill_done")
         if model_runner_output.sparse_query_vectors:
             self.kv_cache_manager.sparse_update_query_vectors(
                 model_runner_output.sparse_query_vectors
             )
+        trace_mark("sparse_update_query_vectors")
         # ─────────────────────────────────────────────────────────────────
 
         # Create EngineCoreOutputs for all clients that have requests with
@@ -1699,6 +1757,7 @@ class Scheduler(SchedulerInterface):
             client_index: EngineCoreOutputs(outputs=outs)
             for client_index, outs in outputs.items()
         }
+        trace_mark("engine_outputs_build")
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:
@@ -1713,6 +1772,7 @@ class Scheduler(SchedulerInterface):
                         finished_requests=finished_set
                     )
             finished_req_ids.clear()
+        trace_mark("finished_req_ids")
 
         if (
             stats := self.make_stats(
@@ -1725,6 +1785,22 @@ class Scheduler(SchedulerInterface):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+        trace_mark("make_stats")
+
+        if e2e_trace_enabled:
+            logger.info(
+                "[E2EPerf][SchedulerUpdate] total_ms=%.3f scheduled_reqs=%d "
+                "scheduled_tokens=%d outputs=%d sparse_new={%s} "
+                "sparse_prefill={%s} sparse_query={%s} %s",
+                (time.perf_counter() - trace_start) * 1000.0,
+                len(num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                sum(len(outs) for outs in outputs.values()),
+                _sparse_payload_summary(model_runner_output.sparse_new_block_features),
+                _sparse_payload_summary(model_runner_output.sparse_block_features),
+                _sparse_payload_summary(model_runner_output.sparse_query_vectors),
+                " ".join(trace_parts),
+            )
 
         return engine_core_outputs
 
