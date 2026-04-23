@@ -1106,6 +1106,14 @@ class GPUModelRunner(
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
         self._sparse_output_tokens_before_step: dict[str, int] = {}
+        # Prefill-features-emitted guard: ``is_prefill_done`` can re-fire on
+        # subsequent steps (async placeholder / first-decode boundary – see
+        # comment near ``_collect_sparse_features``).  Re-sending the full
+        # ``[N_prompt_tokens, D]`` feature dict forces the scheduler to redo
+        # ``SparseKVManager.indexing()`` which rebuilds per-token Python state
+        # at ~7-8s per prompt.  Track emission here and gate so the payload
+        # goes out exactly once per request.
+        self._sparse_prefill_emitted: set[str] = set()
         # Track requests whose first-step commit was deferred under async
         # scheduling so the deferral does not repeat indefinitely.
         self._sparse_deferred_once: set[str] = set()
@@ -1729,6 +1737,7 @@ class GPUModelRunner(
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
             self._sparse_deferred_once.discard(req_id)
+            self._sparse_prefill_emitted.discard(req_id)
             self._sparse_online_index.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
@@ -11581,9 +11590,14 @@ class GPUModelRunner(
                 num_output_before == 0
                 and seq_len_after > num_prompt_tokens
             )
-            # Treat decode as committed only when output existed before this
-            # step. Boundary forwards (including async placeholder transitions)
-            # should not emit decode new-block features.
+            # Idempotence guard: once the prefill features were sent to the
+            # scheduler (and consumed into the online index), the boundary case
+            # above can fire a second time on the first decode step.  Re-sending
+            # the [N_prompt_tokens, D] payload makes SparseKVManager.indexing()
+            # rebuild per-token Python state again (~7-8s for N=24640).  Clear
+            # the flag only when the request is finished (_update_states).
+            if is_prefill_done and req_id in self._sparse_prefill_emitted:
+                is_prefill_done = False
             # Treat decode as committed only when output existed before this
             # step. Boundary forwards (including async placeholder transitions)
             # should not emit decode new-block features.
@@ -12004,6 +12018,10 @@ class GPUModelRunner(
                                         sparse_kv_unit_key(layer_name, kv_h)
                                     ] = k_last_np[kv_h]
             _perf_add("collect:k_extract_total", _t_k_extract)
+            if is_prefill_done:
+                # Latch so a repeat boundary fire on the next step cannot
+                # push the same prefill payload through again.
+                self._sparse_prefill_emitted.add(req_id)
         _perf_add("collect:per_req_loop_total", _t_per_req_loop)
 
         _t_post_loop = time.perf_counter() if perf_enabled else None

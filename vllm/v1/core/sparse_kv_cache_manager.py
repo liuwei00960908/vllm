@@ -156,16 +156,41 @@ def _normalize_kv_feature_map(m: dict[str, np.ndarray]) -> dict[str, np.ndarray]
     return out
 
 
+def _empty_b2c() -> np.ndarray:
+    return np.empty((0,), dtype=np.int32)
+
+
+def _empty_feats() -> np.ndarray:
+    return np.empty((0, 0), dtype=np.float32)
+
+
+def _append_row(buf: np.ndarray, row: np.ndarray) -> np.ndarray:
+    """Append one ``[D]`` row to a ``[N, D]`` float32 buffer (or an empty one)."""
+    row_2d = np.asarray(row, dtype=np.float32).reshape(1, -1)
+    if buf.size == 0:
+        return np.ascontiguousarray(row_2d)
+    return np.concatenate([buf, row_2d], axis=0)
+
+
 @dataclass
 class _SparseLayerIndexState:
-    """Per-(request, attention-layer) clustering and feature buffers."""
+    """Per-(request, attention-layer) clustering and feature buffers.
+
+    ``block_to_cluster`` / ``all_block_features`` / ``all_value_features`` are
+    ndarray-backed (not Python lists).  With token-granularity sparse attention
+    on long prompts, storing one ``[D]`` row per token as a Python list of
+    small ``np.ndarray`` objects plus a parallel ``list[int]`` triggered
+    millions of per-element allocations inside ``indexing()`` – ~7-8 s per
+    prompt for N≈24k × 112 KV units.  Consolidating into ``[N, D]`` / ``[N]``
+    arrays collapses that to a single allocation per layer.
+    """
 
     cluster_centres: np.ndarray
     cluster_value_sum: np.ndarray
     cluster_size: np.ndarray
-    block_to_cluster: list[int]
-    all_block_features: list[np.ndarray] = field(default_factory=list)
-    all_value_features: list[np.ndarray] = field(default_factory=list)
+    block_to_cluster: np.ndarray = field(default_factory=_empty_b2c)
+    all_block_features: np.ndarray = field(default_factory=_empty_feats)
+    all_value_features: np.ndarray = field(default_factory=_empty_feats)
     mean_key: np.ndarray | None = None
     decode_block_buffer: list[np.ndarray] = field(default_factory=list)
     decode_value_buffer: list[np.ndarray] = field(default_factory=list)
@@ -858,21 +883,29 @@ class SparseKVManager(FullAttentionManager):
     ) -> tuple[set[int], dict[int, float]]:
         centres = st.cluster_centres
         b2c = st.block_to_cluster
-        if len(centres) == 0 or not b2c:
+        if len(centres) == 0 or b2c.size == 0:
             return set(), {}
         q = np.asarray(q, dtype=np.float32)
         d = int(q.shape[-1])
         scores_c = (q @ centres.T) / np.sqrt(max(d, 1))
         nprobe = min(self._spec.nprobe, len(centres))
-        top_cluster_ids = set(
-            int(c) for c in np.argpartition(scores_c, -nprobe)[-nprobe:]
+        top_cluster_ids_np = np.argpartition(scores_c, -nprobe)[-nprobe:]
+        # Vectorised retrieve-zone selection: replaces the Python
+        # ``for bidx, cid in enumerate(b2c)`` scan (~24k iterations per
+        # query head × 784 heads = ~19M iters/decode).  ``np.isin`` is
+        # O(N log K) and ``np.nonzero`` gives block indices directly.
+        mask = np.isin(b2c, top_cluster_ids_np, assume_unique=False)
+        retrieve_idx = np.nonzero(mask)[0]
+        if retrieve_idx.size == 0:
+            return set(), {}
+        # Per-block score = score of its cluster.  Build in one fancy-index.
+        per_block_scores = scores_c[b2c[retrieve_idx]].astype(
+            np.float32, copy=False
         )
-        retrieve: set[int] = set()
-        block_scores: dict[int, float] = {}
-        for bidx, cid in enumerate(b2c):
-            if cid in top_cluster_ids:
-                retrieve.add(bidx)
-                block_scores[bidx] = float(scores_c[cid])
+        retrieve = set(retrieve_idx.tolist())
+        block_scores = dict(
+            zip(retrieve_idx.tolist(), per_block_scores.tolist(), strict=True)
+        )
         return retrieve, block_scores
 
     @staticmethod
@@ -895,7 +928,7 @@ class SparseKVManager(FullAttentionManager):
         Returns:
             (sorted full selection, sorted retrieve-only logical block indices).
         """
-        if len(st.cluster_centres) == 0 or not st.block_to_cluster:
+        if len(st.cluster_centres) == 0 or st.block_to_cluster.size == 0:
             fallback = set(range(max(0, total_blocks - budget), total_blocks))
             combined = fallback | steady_set
             sel = sorted(combined)[:budget]
@@ -929,7 +962,7 @@ class SparseKVManager(FullAttentionManager):
         Returns:
             (selected logical blocks, retrieve-only blocks, sorted global token ids).
         """
-        if len(st.cluster_centres) == 0 or not st.block_to_cluster:
+        if len(st.cluster_centres) == 0 or st.block_to_cluster.size == 0:
             fallback = set(range(max(0, total_tokens - budget), total_tokens))
             combined_t = fallback | steady_tokens
             sel_t = sorted(combined_t)[:budget]
@@ -1216,13 +1249,18 @@ class SparseKVManager(FullAttentionManager):
         value_sum = np.zeros((n_k, d), dtype=np.float32)
         np.add.at(value_sum, labels_arr, vfeat)
 
+        # Store ndarray-backed fields directly (no per-row .copy(), no
+        # .tolist()).  ``labels_arr`` is already int32/int64 from either the
+        # precomputed path or _segment_kmeans; cast to a stable int32 so
+        # downstream vectorisation (``np.isin(b2c, ...)``) doesn't fall into
+        # a mixed-dtype slow path.
         state = _SparseLayerIndexState(
             cluster_centres=centres,
             cluster_value_sum=value_sum,
             cluster_size=sizes,
-            block_to_cluster=labels_arr.tolist(),
-            all_block_features=[feat[i].copy() for i in range(num_blocks)],
-            all_value_features=[vfeat[i].copy() for i in range(num_blocks)],
+            block_to_cluster=np.ascontiguousarray(labels_arr, dtype=np.int32),
+            all_block_features=feat,
+            all_value_features=vfeat,
             mean_key=mean_key,
         )
         self._layer_map_for_request(request_id)[layer_name] = state
@@ -1262,6 +1300,30 @@ class SparseKVManager(FullAttentionManager):
         if num_blocks == 0:
             logger.debug("sparse indexing: req %s has 0 blocks – skipped", request_id)
             return
+
+        # Idempotence guard: if the request was already indexed with the same
+        # row count, skip the rebuild.  Defense-in-depth for the case where
+        # the worker accidentally re-emits ``sparse_block_features`` (see
+        # ``_sparse_prefill_emitted`` guard in gpu_model_runner).  Rebuilding
+        # from scratch costs O(num_blocks * num_layers) Python allocations
+        # (~7s for a 24k-token prompt × 112 KV units).
+        existing_ls = self._layer_states.get(request_id)
+        if existing_ls:
+            any_state = next(iter(existing_ls.values()), None)
+            # ``len(all_block_features)`` works for both list[ndarray] and a
+            # single 2D ndarray, so this guard is stable across the upcoming
+            # storage vectorisation.
+            if (
+                any_state is not None
+                and len(any_state.all_block_features) == num_blocks
+            ):
+                logger.debug(
+                    "sparse indexing: req %s already indexed at %d units – "
+                    "skipping idempotent rebuild",
+                    request_id,
+                    num_blocks,
+                )
+                return
 
         self._layer_states[request_id] = {}
         total_k = 0
@@ -1675,21 +1737,25 @@ class SparseKVManager(FullAttentionManager):
             if new_block_value_feature is not None
             else np.zeros_like(feat)
         )
-        st.all_block_features.append(feat.copy())
-        st.all_value_features.append(vfeat.copy())
+        # Append one row to the ndarray-backed history buffers.  Decode
+        # rebalance runs once per decode step so the per-call vstack cost is
+        # negligible next to the attention forward.
+        st.all_block_features = _append_row(st.all_block_features, feat)
+        st.all_value_features = _append_row(st.all_value_features, vfeat)
         st.decode_block_buffer.append(feat.copy())
         st.decode_value_buffer.append(vfeat.copy())
 
         centres = st.cluster_centres
-        b2c = st.block_to_cluster
-        if len(centres) > 0 and b2c is not None:
+        if len(centres) > 0:
             mean_key = st.mean_key if st.mean_key is not None else np.zeros_like(feat)
             centered_feat = feat - mean_key
             centred_c = centres - mean_key
             nearest = int(np.argmax(centered_feat @ centred_c.T))
-            b2c.append(nearest)
         else:
-            b2c.append(0)
+            nearest = 0
+        st.block_to_cluster = np.concatenate(
+            [st.block_to_cluster, np.array([nearest], dtype=np.int32)]
+        )
 
         return len(st.decode_block_buffer)
 
@@ -1759,14 +1825,24 @@ class SparseKVManager(FullAttentionManager):
         st.cluster_value_sum = np.vstack([st.cluster_value_sum, vsum_new])
         st.cluster_size = np.concatenate([st.cluster_size, sizes_new])
 
-        b2c = st.block_to_cluster
+        # labels_new indexes the fresh sub-clusters; remap to the global
+        # cluster-id space (after ``n_existing``) and write into block_to_cluster.
         n_total = len(st.all_block_features)
-        for i, lbl in enumerate(labels_new.tolist()):
-            idx = n_total - m + i
-            if idx < len(b2c):
-                b2c[idx] = n_existing + lbl
-            else:
-                b2c.append(n_existing + lbl)
+        new_slot = (np.asarray(labels_new, dtype=np.int32) + n_existing)
+        b2c = st.block_to_cluster
+        # Overwrite positions [n_total - m, n_total) if they already exist,
+        # otherwise grow b2c to cover them.  In the common case (decode
+        # ``rebalance`` appends one row per step so ``len(b2c) == n_total``)
+        # all ``m`` positions fall into the overwrite branch.
+        start = n_total - m
+        if b2c.shape[0] >= start + m:
+            b2c[start:start + m] = new_slot
+        elif b2c.shape[0] <= start:
+            st.block_to_cluster = np.concatenate([b2c, new_slot])
+        else:
+            tail = b2c.shape[0] - start
+            b2c[start:] = new_slot[:tail]
+            st.block_to_cluster = np.concatenate([b2c, new_slot[tail:]])
 
         st.decode_block_buffer = []
         st.decode_value_buffer = []

@@ -444,7 +444,7 @@ class TestIndexing:
         mgr2.indexing(req, feat)
         st_ref = _flat(mgr2, req)
         np.testing.assert_allclose(st_meta.cluster_centres, st_ref.cluster_centres)
-        assert st_meta.block_to_cluster == st_ref.block_to_cluster
+        np.testing.assert_array_equal(st_meta.block_to_cluster, st_ref.block_to_cluster)
         np.testing.assert_array_equal(st_meta.cluster_size, st_ref.cluster_size)
 
 
