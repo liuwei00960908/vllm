@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     VLLM_LOGGING_COLOR: str = "auto"
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_LOG_REQUEST_TIMING: bool = False
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -688,6 +689,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOG_STATS_INTERVAL": lambda: val
     if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
     else 10.0,
+    # If set, vllm will log a per-request timing report when a request finishes.
+    "VLLM_LOG_REQUEST_TIMING": lambda: os.environ.get(
+        "VLLM_LOG_REQUEST_TIMING", "False"
+    ).lower()
+    in ("1", "true"),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
@@ -1759,6 +1765,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        "VLLM_LOG_REQUEST_TIMING",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

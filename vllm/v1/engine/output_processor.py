@@ -10,6 +10,8 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -37,6 +39,8 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+
+logger = init_logger(__name__)
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -429,6 +433,12 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        if envs.VLLM_LOG_REQUEST_TIMING and not log_stats:
+            logger.warning_once(
+                "VLLM_LOG_REQUEST_TIMING requires request stats, but request "
+                "stats are disabled. Remove --disable-log-stats to enable "
+                "per-request timing reports."
+            )
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -804,4 +814,104 @@ class OutputProcessor:
 
         ParentRequest.observe_finished_request(
             req_state.parent_req, iteration_stats, req_state.stats.num_generation_tokens
+        )
+
+        self._log_request_timing_report(req_state, finish_reason, iteration_stats)
+
+    def _log_request_timing_report(
+        self,
+        req_state: RequestState,
+        finish_reason: FinishReason,
+        iteration_stats: IterationStats,
+    ) -> None:
+        if not envs.VLLM_LOG_REQUEST_TIMING:
+            return
+
+        stats = req_state.stats
+        assert stats is not None
+
+        def ms(seconds: float) -> float:
+            return seconds * 1000.0
+
+        queued_time = stats.scheduled_ts - stats.queued_ts
+        prefill_time = stats.first_token_ts - stats.scheduled_ts
+        decode_time = stats.last_token_ts - stats.first_token_ts
+        inference_time = stats.last_token_ts - stats.scheduled_ts
+        e2e_latency = iteration_stats.iteration_timestamp - stats.arrival_time
+        ttft_server_overhead = stats.first_token_latency - queued_time - prefill_time
+        e2e_server_overhead = e2e_latency - queued_time - inference_time
+
+        decode_latencies = stats.decode_step_latencies
+        decode_token_counts = stats.decode_step_num_tokens
+        decode_step_count = len(decode_latencies)
+        decode_total = sum(decode_latencies)
+        decode_token_total = sum(decode_token_counts)
+        prefill_output_tokens = max(
+            stats.num_generation_tokens - decode_token_total, 0
+        )
+
+        if decode_latencies:
+            decode_mean = decode_total / decode_step_count
+            decode_min = min(decode_latencies)
+            decode_max = max(decode_latencies)
+        else:
+            decode_mean = 0.0
+            decode_min = 0.0
+            decode_max = 0.0
+
+        decode_step_lines = []
+        next_generated_token = prefill_output_tokens + 1
+        for step_idx, (latency, num_tokens) in enumerate(
+            zip(decode_latencies, decode_token_counts, strict=True), start=1
+        ):
+            token_start = next_generated_token
+            token_end = token_start + num_tokens - 1
+            next_generated_token = token_end + 1
+            token_range = (
+                str(token_start)
+                if token_start == token_end
+                else f"{token_start}-{token_end}"
+            )
+            decode_step_lines.append(
+                "    "
+                f"step={step_idx} "
+                f"generated_token={token_range} "
+                f"new_tokens={num_tokens} "
+                f"latency_ms={ms(latency):.3f}"
+            )
+
+        decode_steps = "\n".join(decode_step_lines) or "    no decode steps"
+        logger.info(
+            "Request timing report\n"
+            "  request_id=%s internal_request_id=%s finish_reason=%s\n"
+            "  prompt_tokens=%d cached_tokens=%d generated_tokens=%d "
+            "prefill_output_tokens=%d decode_output_tokens=%d\n"
+            "  ttft_ms=%.3f e2e_ms=%.3f queue_ms=%.3f prefill_ms=%.3f "
+            "decode_total_ms=%.3f inference_ms=%.3f\n"
+            "  ttft_server_overhead_ms=%.3f e2e_server_overhead_ms=%.3f\n"
+            "  decode_summary steps=%d mean_ms=%.3f min_ms=%.3f max_ms=%.3f "
+            "sum_steps_ms=%.3f\n"
+            "  decode_steps:\n%s",
+            req_state.external_req_id,
+            req_state.request_id,
+            finish_reason,
+            req_state.prompt_len,
+            req_state.num_cached_tokens,
+            stats.num_generation_tokens,
+            prefill_output_tokens,
+            decode_token_total,
+            ms(stats.first_token_latency),
+            ms(e2e_latency),
+            ms(queued_time),
+            ms(prefill_time),
+            ms(decode_time),
+            ms(inference_time),
+            ms(ttft_server_overhead),
+            ms(e2e_server_overhead),
+            decode_step_count,
+            ms(decode_mean),
+            ms(decode_min),
+            ms(decode_max),
+            ms(decode_total),
+            decode_steps,
         )

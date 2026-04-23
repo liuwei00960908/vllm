@@ -215,6 +215,10 @@ class RequestStateStats:
     # first token latency
     first_token_latency: float = 0.0
 
+    # Decode step intervals measured in the engine core process.
+    decode_step_latencies: list[float] = field(default_factory=list)
+    decode_step_num_tokens: list[int] = field(default_factory=list)
+
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
 
@@ -380,6 +384,8 @@ class IterationStats:
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts
             self.inter_token_latencies_iter.append(itl)
+            req_stats.decode_step_latencies.append(itl)
+            req_stats.decode_step_num_tokens.append(num_new_generation_tokens)
 
         req_stats.last_token_ts = engine_core_timestamp
 

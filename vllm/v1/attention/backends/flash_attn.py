@@ -363,6 +363,16 @@ class FlashAttentionMetadata:
     sparse_retroinfer_centres_es: torch.Tensor | None = None
     sparse_retroinfer_value_sum_es: torch.Tensor | None = None
     sparse_retroinfer_cluster_size_es: torch.Tensor | None = None
+    # Deferred-gather retroinfer indices.  When the runner returns indices
+    # instead of a pre-gathered exec buffer, ``_forward_retroinfer_exec_buf``
+    # reads the K/V cache itself at FA time — after ``unified_kv_cache_update``
+    # has written the current-step K/V pair, unlike the pre-hook builder.
+    # ``flat_phys`` / ``flat_slots`` / ``kv_token_ids`` are head-major (head h
+    # owns rows ``[cu_k[h], cu_k[h+1])``).
+    sparse_retroinfer_flat_phys: torch.Tensor | None = None
+    sparse_retroinfer_flat_slots: torch.Tensor | None = None
+    sparse_retroinfer_kv_token_ids: torch.Tensor | None = None
+    sparse_retroinfer_cu_k: torch.Tensor | None = None
 
 
 def _get_sliding_window_configs(
@@ -902,10 +912,10 @@ class FlashAttentionImpl(AttentionImpl):
                     attn_metadata = replace(
                         attn_metadata,
                         sparse_retroinfer_exec_buf_k=(
-                            runtime_retroinfer["exec_buf_k"]
+                            runtime_retroinfer.get("exec_buf_k")
                         ),
                         sparse_retroinfer_exec_buf_v=(
-                            runtime_retroinfer["exec_buf_v"]
+                            runtime_retroinfer.get("exec_buf_v")
                         ),
                         sparse_retroinfer_valid_lengths=(
                             runtime_retroinfer["valid_lengths"]
@@ -918,6 +928,18 @@ class FlashAttentionImpl(AttentionImpl):
                         ),
                         sparse_retroinfer_cluster_size_es=(
                             runtime_retroinfer.get("cluster_size_es")
+                        ),
+                        sparse_retroinfer_flat_phys=(
+                            runtime_retroinfer.get("flat_phys")
+                        ),
+                        sparse_retroinfer_flat_slots=(
+                            runtime_retroinfer.get("flat_slots")
+                        ),
+                        sparse_retroinfer_kv_token_ids=(
+                            runtime_retroinfer.get("kv_token_ids")
+                        ),
+                        sparse_retroinfer_cu_k=(
+                            runtime_retroinfer.get("cu_k")
                         ),
                         # Disable the legacy sparse paths for this step –
                         # the exec_buf has already folded in their work.
@@ -1051,6 +1073,8 @@ class FlashAttentionImpl(AttentionImpl):
                         query[:num_actual_tokens],
                         output[:num_actual_tokens],
                         attn_metadata,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
                         q_descale=q_descale,
                         k_descale=k_descale,
                         v_descale=v_descale,
@@ -1570,6 +1594,8 @@ class FlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: "FlashAttentionMetadata",
         *,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         q_descale: torch.Tensor,
         k_descale: torch.Tensor,
         v_descale: torch.Tensor,
@@ -1599,11 +1625,19 @@ class FlashAttentionImpl(AttentionImpl):
         Decode-only fast path: ``query.shape[0] == 1``.  Prefill falls back
         to the legacy gather path via the retroinfer dispatch guard.
         """
-        assert attn_metadata.sparse_retroinfer_exec_buf_k is not None
-        assert attn_metadata.sparse_retroinfer_exec_buf_v is not None
+        # Deferred-gather path: the runner returns index arrays rather than
+        # a pre-gathered exec buffer.  Gathering from ``key_cache`` /
+        # ``value_cache`` here (inside ``impl.forward``) guarantees we read
+        # the CURRENT step's K/V pair — it was just written by
+        # ``unified_kv_cache_update`` right before ``unified_attention_with_output``
+        # dispatched here.  The legacy builder that fills ``exec_buf_k/v``
+        # at Attention pre-hook time misses that write, which corrupts the
+        # ``pending[-1]`` slot on every decode step.
         assert attn_metadata.sparse_retroinfer_valid_lengths is not None
-        exec_buf_k = attn_metadata.sparse_retroinfer_exec_buf_k
-        exec_buf_v = attn_metadata.sparse_retroinfer_exec_buf_v
+        flat_phys = attn_metadata.sparse_retroinfer_flat_phys
+        flat_slots = attn_metadata.sparse_retroinfer_flat_slots
+        kv_token_ids = attn_metadata.sparse_retroinfer_kv_token_ids
+        cu_k_idx = attn_metadata.sparse_retroinfer_cu_k
         valid_lengths = attn_metadata.sparse_retroinfer_valid_lengths
         centres_es = attn_metadata.sparse_retroinfer_centres_es
         value_sum_es = attn_metadata.sparse_retroinfer_value_sum_es
@@ -1615,9 +1649,21 @@ class FlashAttentionImpl(AttentionImpl):
         )
         H = int(query.shape[1])
         D = int(query.shape[2])
-        assert exec_buf_k.shape[0] == H and exec_buf_k.shape[2] == D
-        max_budget = int(exec_buf_k.shape[1])
         device = query.device
+        assert (
+            flat_phys is not None
+            and flat_slots is not None
+            and kv_token_ids is not None
+            and cu_k_idx is not None
+        ), (
+            "retroinfer deferred-gather indices must be populated; the "
+            "pre-gathered exec_buf_k/v path was removed for correctness"
+        )
+        # ``max_budget`` is only used as a benign upper bound for
+        # ``max_seqlen_k`` — any value >= actual max per-head K length
+        # works; the actual per-head length is carried by ``cu_k_idx`` /
+        # ``valid_lengths``.
+        max_budget = int(valid_lengths.max().item()) if int(valid_lengths.numel()) > 0 else 0
 
         use_cuda_timing = _SPARSE_PERF_DEBUG and bool(query.is_cuda)
         if use_cuda_timing:
@@ -1646,35 +1692,15 @@ class FlashAttentionImpl(AttentionImpl):
         q_flat = (
             query.view(1, H, D).transpose(0, 1).contiguous().view(H, 1, D)
         )
-        if _SPARSE_DEBUG_ASSERT:
-            if exec_buf_v.shape != exec_buf_k.shape:
-                raise ValueError(
-                    "retroinfer exec buffers must have identical shape: "
-                    f"k={tuple(exec_buf_k.shape)} v={tuple(exec_buf_v.shape)}"
-                )
-            _sparse_tensor_range(
-                "retroinfer valid_lengths",
-                valid_lengths.to(dtype=torch.int64),
-                max_budget + 1,
-            )
 
-        # Varlen packing: FA's paged-KV contract only supports
-        # block_size % 16 == 0, and with a single block per "batch" it was
-        # also observed to silently corrupt outputs at non-trivial
-        # max_budget values on FA2.  Compact the valid per-head prefixes
-        # of ``exec_buf_k/v`` into a flat ``[sum(valid_lengths), 1, D]``
-        # tensor and hand FA a plain varlen call with ``cu_seqlens_k`` –
-        # the same pattern the legacy ``_forward_per_head_compact_kv_gather``
-        # uses successfully.
+        # Deferred gather: read K/V directly from the live cache using the
+        # flat index arrays produced by the builder.  Same indexing pattern
+        # as the legacy compact-gather path (see
+        # ``_forward_per_head_compact_kv_gather``) — the critical property
+        # is that this gather runs here, AFTER ``unified_kv_cache_update``
+        # has committed the current decode step's K/V pair.
         cu_q = torch.arange(0, H + 1, dtype=torch.int32, device=device)
-        valid_i64 = valid_lengths.to(dtype=torch.int64)
-        cu_k = torch.empty(H + 1, dtype=torch.int32, device=device)
-        cu_k[0] = 0
-        cu_k[1:] = torch.cumsum(valid_i64, dim=0).to(torch.int32)
-        # Build advanced-index gather: for each batch h, copy
-        # exec_buf[h, 0:valid[h]] to rows cu_k[h]:cu_k[h+1] of the flat
-        # output.  ``batch_idx_flat[i]`` = which head row i came from;
-        # ``row_in_batch_flat[i]`` = 0..valid[h]-1 within that head.
+        cu_k = cu_k_idx
         total_k = int(cu_k[-1].item())
         if total_k == 0:
             # Degenerate: no K tokens for any head this step.  Return zero
@@ -1689,21 +1715,15 @@ class FlashAttentionImpl(AttentionImpl):
                 (H,), float("-inf"), dtype=torch.float32, device=device
             )
         else:
-            batch_idx_flat = torch.repeat_interleave(
-                torch.arange(H, dtype=torch.int64, device=device),
-                valid_i64,
-            )  # [total_k]
-            row_in_batch_flat = (
-                torch.arange(total_k, dtype=torch.int64, device=device)
-                - cu_k[batch_idx_flat].to(torch.int64)
-            )
-            # Gather into packed varlen layout [total_k, 1, D].
-            k_packed = exec_buf_k[batch_idx_flat, row_in_batch_flat].view(
+            # Gather into packed varlen layout [total_k, 1, D].  ``flat_phys``
+            # / ``flat_slots`` / ``kv_token_ids`` are already int64; the
+            # builder sized them for direct use in advanced indexing.
+            k_packed = key_cache[flat_phys, flat_slots, kv_token_ids].view(
                 total_k, 1, D
             )
-            v_packed = exec_buf_v[batch_idx_flat, row_in_batch_flat].view(
-                total_k, 1, D
-            )
+            v_packed = value_cache[
+                flat_phys, flat_slots, kv_token_ids
+            ].view(total_k, 1, D)
 
             # Per-batch descale: FA expects ``[batch, num_heads]`` = ``[H, 1]``.
             # Upstream ``q_descale`` etc. are ``[num_reqs=1, num_kv_heads]``;

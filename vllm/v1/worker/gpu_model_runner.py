@@ -8986,17 +8986,23 @@ class GPUModelRunner(
         # reads at ``valid_lengths[h]``, so the unused tail is never
         # touched.  Keeping pad = 0 (instead of a sentinel) makes Phase 8's
         # CUDA-graph capture less picky about buffer aliasing across steps.
-        exec_buf_k = torch.zeros(
-            (H_total, max_budget, head_dim),
-            dtype=cache_dtype, device=device,
-        )
-        exec_buf_v = torch.zeros(
-            (H_total, max_budget, head_dim),
-            dtype=cache_dtype, device=device,
-        )
+        # Deferred-gather contract: the builder NO LONGER pre-reads K/V
+        # from the paged cache here – that was unsafe because the Attention
+        # pre-hook runs BEFORE ``unified_kv_cache_update`` writes the
+        # current decode step's K/V slot, so any read of the last pending
+        # position returned stale bytes.  We build only the per-head flat
+        # index arrays here and let ``_forward_retroinfer_exec_buf`` do the
+        # actual ``k_cache[...]`` read at FA time, after the cache update.
         valid_lengths = torch.zeros(
             H_total, dtype=torch.int32, device=device
         )
+        # Accumulate per-head flat index arrays on CPU first (one Python
+        # list per head) and concat at the end – H_total * one int64
+        # cumulative concat is cheaper than H_total repeated in-place
+        # writes into a pre-sized tensor.
+        per_head_phys: list[torch.Tensor] = []
+        per_head_slots: list[torch.Tensor] = []
+        per_head_kv_token_ids: list[torch.Tensor] = []
 
         # ── Shared steady + pending position vector ───────────────────────
         # Built once per request and re-used for every head to avoid
@@ -9135,51 +9141,16 @@ class GPUModelRunner(
                         int(k_cache.shape[1]),
                     )
 
-                # Paged gather.  Advanced indexing over 4 dims produces
-                # a contiguous ``[total_count, head_dim]`` result in one
-                # CUDA kernel.  Kept per-head to match the exec_buf
-                # row structure.
-                exec_buf_k[h_total, :total_count] = k_cache[
-                    phys_blocks, slots, g, :
-                ]
-                exec_buf_v[h_total, :total_count] = v_cache[
-                    phys_blocks, slots, g, :
-                ]
+                # Record per-head indices for deferred FA-time gather.
+                # ``kv_ids_h`` broadcasts scalar kv-head ``g`` to one entry
+                # per position so downstream ``k_cache[phys, slots, kv_ids]``
+                # can gather in a single advanced-index kernel (same pattern
+                # as the legacy compact gather).
+                kv_ids_h = torch.full_like(phys_blocks, int(g))
+                per_head_phys.append(phys_blocks)
+                per_head_slots.append(slots)
+                per_head_kv_token_ids.append(kv_ids_h)
                 if _SPARSE_DEBUG_ASSERT:
-                    # Cross-check: re-gather via a per-entry kv_head_ids
-                    # tensor (legacy compact-gather pattern at
-                    # ``flash_attn.py:_forward_per_head_compact_kv_gather``
-                    # line 1401) and assert bit-identical results against
-                    # the scalar-``g`` gather above.  If this diverges,
-                    # the scalar + advanced-index mix is producing wrong
-                    # K/V values under the current cache stride/layout,
-                    # and the retroinfer exec_buf is being populated with
-                    # garbage before FA ever sees it.
-                    kv_ids = torch.full_like(phys_blocks, int(g))
-                    k_check = k_cache[phys_blocks, slots, kv_ids, :]
-                    v_check = v_cache[phys_blocks, slots, kv_ids, :]
-                    if not torch.equal(
-                        exec_buf_k[h_total, :total_count], k_check
-                    ):
-                        mism = (
-                            exec_buf_k[h_total, :total_count] != k_check
-                        ).any(dim=-1).sum().item()
-                        raise ValueError(
-                            "[SparseDebug] retroinfer K gather mismatch: "
-                            f"h_total={h_total} g={g} "
-                            f"mismatched_rows={mism}/{total_count}"
-                        )
-                    if not torch.equal(
-                        exec_buf_v[h_total, :total_count], v_check
-                    ):
-                        mism = (
-                            exec_buf_v[h_total, :total_count] != v_check
-                        ).any(dim=-1).sum().item()
-                        raise ValueError(
-                            "[SparseDebug] retroinfer V gather mismatch: "
-                            f"h_total={h_total} g={g} "
-                            f"mismatched_rows={mism}/{total_count}"
-                        )
                     # Sanity: all_positions must be strictly below
                     # current_len; a stale pending range would silently
                     # over-index into uninitialised KV slots.
@@ -9239,10 +9210,34 @@ class GPUModelRunner(
                 (H_total, 0), dtype=torch.float32, device=device,
             )
 
+        # Build flat per-head index arrays for the FA-time gather.  When
+        # every head is empty (e.g. zero retrieval + zero steady + zero
+        # pending, which shouldn't happen in practice but keeps the
+        # downstream kernel launches defensible) we still emit empty
+        # tensors with the right dtype/device so the consumer doesn't
+        # have to special-case ``None``.
+        if per_head_phys:
+            flat_phys = torch.cat(per_head_phys).to(torch.int64)
+            flat_slots = torch.cat(per_head_slots).to(torch.int64)
+            flat_kv_token_ids = torch.cat(per_head_kv_token_ids).to(torch.int64)
+        else:
+            flat_phys = torch.empty(0, dtype=torch.int64, device=device)
+            flat_slots = torch.empty(0, dtype=torch.int64, device=device)
+            flat_kv_token_ids = torch.empty(
+                0, dtype=torch.int64, device=device
+            )
+        cu_k = torch.empty(H_total + 1, dtype=torch.int32, device=device)
+        cu_k[0] = 0
+        cu_k[1:] = torch.cumsum(valid_lengths.to(torch.int64), dim=0).to(
+            torch.int32
+        )
+
         return {
-            "exec_buf_k": exec_buf_k,
-            "exec_buf_v": exec_buf_v,
             "valid_lengths": valid_lengths,
+            "flat_phys": flat_phys,
+            "flat_slots": flat_slots,
+            "kv_token_ids": flat_kv_token_ids,
+            "cu_k": cu_k,
             "centres_es": centres_es,
             "value_sum_es": value_sum_es,
             "cluster_size_es": cluster_size_es,
