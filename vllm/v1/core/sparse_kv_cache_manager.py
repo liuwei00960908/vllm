@@ -84,7 +84,6 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -164,36 +163,181 @@ def _empty_feats() -> np.ndarray:
     return np.empty((0, 0), dtype=np.float32)
 
 
-def _append_row(buf: np.ndarray, row: np.ndarray) -> np.ndarray:
-    """Append one ``[D]`` row to a ``[N, D]`` float32 buffer (or an empty one)."""
-    row_2d = np.asarray(row, dtype=np.float32).reshape(1, -1)
-    if buf.size == 0:
-        return np.ascontiguousarray(row_2d)
-    return np.concatenate([buf, row_2d], axis=0)
+def _grow_feats(buf: np.ndarray, size: int, row: np.ndarray
+                ) -> tuple[np.ndarray, int]:
+    """Append one ``[D]`` row to a ``[capacity, D]`` buffer, growing 2× when full.
+
+    Returns ``(buf, size)`` where ``buf[:size]`` is the valid slice.  Decode
+    rebalance calls this once per step; geometric growth keeps amortised cost
+    O(1) instead of O(N) per append (``np.concatenate``) – the previous
+    implementation re-copied every layer's full ``[N_prompt, D]`` buffer per
+    decode step (~1.4 GB of memcpy per step for 112 KV heads × 24k tokens).
+    """
+    row_2d = np.asarray(row, dtype=np.float32).reshape(-1)
+    d = int(row_2d.shape[0])
+    if buf.ndim != 2 or buf.shape[1] != d:
+        # Reinitialise with a small capacity – only happens if the state was
+        # constructed from an empty placeholder.
+        capacity = 16
+        new_buf = np.empty((capacity, d), dtype=np.float32)
+        new_buf[0] = row_2d
+        return new_buf, 1
+    capacity = buf.shape[0]
+    if size < capacity:
+        buf[size] = row_2d
+        return buf, size + 1
+    new_capacity = max(capacity * 2, size + 1)
+    new_buf = np.empty((new_capacity, d), dtype=np.float32)
+    new_buf[:size] = buf[:size]
+    new_buf[size] = row_2d
+    return new_buf, size + 1
 
 
-@dataclass
+def _grow_b2c(buf: np.ndarray, size: int, value: int
+              ) -> tuple[np.ndarray, int]:
+    """Append a single int to a growable int32 buffer (2× geometric growth)."""
+    capacity = int(buf.shape[0]) if buf.ndim == 1 else 0
+    if size < capacity:
+        buf[size] = np.int32(value)
+        return buf, size + 1
+    new_capacity = max(capacity * 2, size + 1, 16)
+    new_buf = np.empty((new_capacity,), dtype=np.int32)
+    if size > 0:
+        new_buf[:size] = buf[:size]
+    new_buf[size] = np.int32(value)
+    return new_buf, size + 1
+
+
 class _SparseLayerIndexState:
     """Per-(request, attention-layer) clustering and feature buffers.
 
     ``block_to_cluster`` / ``all_block_features`` / ``all_value_features`` are
-    ndarray-backed (not Python lists).  With token-granularity sparse attention
-    on long prompts, storing one ``[D]`` row per token as a Python list of
-    small ``np.ndarray`` objects plus a parallel ``list[int]`` triggered
-    millions of per-element allocations inside ``indexing()`` – ~7-8 s per
-    prompt for N≈24k × 112 KV units.  Consolidating into ``[N, D]`` / ``[N]``
-    arrays collapses that to a single allocation per layer.
+    ndarray-backed with preallocated capacity and ``*_size`` cursors so
+    decode-step appends are amortised O(1).  The old implementation stored
+    one ``[D]`` row per token as a Python list of small ``np.ndarray``
+    objects plus a parallel ``list[int]`` – that triggered millions of
+    per-element allocations inside ``indexing()`` (~7–8 s per prompt for
+    N≈24 k × 112 KV units) and concat-on-append turned decode ``rebalance``
+    into an O(N²) copy loop.  Consolidated ndarray + cursor growth collapses
+    both paths to single large allocations.
+
+    Public attribute surface (``all_block_features``, ``all_value_features``,
+    ``block_to_cluster``) returns a valid-slice view so ``len(...)`` and
+    indexing work identically to the old list-backed layout.
     """
 
-    cluster_centres: np.ndarray
-    cluster_value_sum: np.ndarray
-    cluster_size: np.ndarray
-    block_to_cluster: np.ndarray = field(default_factory=_empty_b2c)
-    all_block_features: np.ndarray = field(default_factory=_empty_feats)
-    all_value_features: np.ndarray = field(default_factory=_empty_feats)
-    mean_key: np.ndarray | None = None
-    decode_block_buffer: list[np.ndarray] = field(default_factory=list)
-    decode_value_buffer: list[np.ndarray] = field(default_factory=list)
+    __slots__ = (
+        "cluster_centres",
+        "cluster_value_sum",
+        "cluster_size",
+        "_b2c_buf",
+        "_b2c_size",
+        "_abf_buf",
+        "_abf_size",
+        "_avf_buf",
+        "_avf_size",
+        "mean_key",
+        "decode_block_buffer",
+        "decode_value_buffer",
+    )
+
+    def __init__(
+        self,
+        cluster_centres: np.ndarray,
+        cluster_value_sum: np.ndarray,
+        cluster_size: np.ndarray,
+        block_to_cluster: np.ndarray | None = None,
+        all_block_features: np.ndarray | None = None,
+        all_value_features: np.ndarray | None = None,
+        mean_key: np.ndarray | None = None,
+    ) -> None:
+        self.cluster_centres = cluster_centres
+        self.cluster_value_sum = cluster_value_sum
+        self.cluster_size = cluster_size
+
+        b2c = _empty_b2c() if block_to_cluster is None else np.asarray(
+            block_to_cluster, dtype=np.int32
+        )
+        self._b2c_buf = b2c
+        self._b2c_size = int(b2c.shape[0]) if b2c.ndim == 1 else 0
+
+        abf = _empty_feats() if all_block_features is None else np.ascontiguousarray(
+            all_block_features, dtype=np.float32
+        )
+        self._abf_buf = abf
+        self._abf_size = int(abf.shape[0]) if abf.ndim == 2 else 0
+
+        avf = _empty_feats() if all_value_features is None else np.ascontiguousarray(
+            all_value_features, dtype=np.float32
+        )
+        self._avf_buf = avf
+        self._avf_size = int(avf.shape[0]) if avf.ndim == 2 else 0
+
+        self.mean_key = mean_key
+        self.decode_block_buffer = []
+        self.decode_value_buffer = []
+
+    # -- block_to_cluster ---------------------------------------------------
+    @property
+    def block_to_cluster(self) -> np.ndarray:
+        return self._b2c_buf[:self._b2c_size]
+
+    @block_to_cluster.setter
+    def block_to_cluster(self, value: np.ndarray) -> None:
+        arr = np.asarray(value, dtype=np.int32)
+        self._b2c_buf = arr
+        self._b2c_size = int(arr.shape[0]) if arr.ndim == 1 else 0
+
+    def append_b2c(self, value: int) -> None:
+        self._b2c_buf, self._b2c_size = _grow_b2c(
+            self._b2c_buf, self._b2c_size, int(value)
+        )
+
+    def write_b2c_range(self, start: int, values: np.ndarray) -> None:
+        """Overwrite ``b2c[start:start+len(values)]``; grow if needed."""
+        values = np.asarray(values, dtype=np.int32).reshape(-1)
+        end = start + int(values.shape[0])
+        if end > int(self._b2c_buf.shape[0]):
+            new_capacity = max(int(self._b2c_buf.shape[0]) * 2, end, 16)
+            new_buf = np.empty((new_capacity,), dtype=np.int32)
+            if self._b2c_size > 0:
+                new_buf[:self._b2c_size] = self._b2c_buf[:self._b2c_size]
+            self._b2c_buf = new_buf
+        self._b2c_buf[start:end] = values
+        if end > self._b2c_size:
+            self._b2c_size = end
+
+    # -- all_block_features -------------------------------------------------
+    @property
+    def all_block_features(self) -> np.ndarray:
+        return self._abf_buf[:self._abf_size]
+
+    @all_block_features.setter
+    def all_block_features(self, value: np.ndarray) -> None:
+        arr = np.ascontiguousarray(value, dtype=np.float32)
+        self._abf_buf = arr
+        self._abf_size = int(arr.shape[0]) if arr.ndim == 2 else 0
+
+    def append_block_feature(self, row: np.ndarray) -> None:
+        self._abf_buf, self._abf_size = _grow_feats(
+            self._abf_buf, self._abf_size, row
+        )
+
+    # -- all_value_features -------------------------------------------------
+    @property
+    def all_value_features(self) -> np.ndarray:
+        return self._avf_buf[:self._avf_size]
+
+    @all_value_features.setter
+    def all_value_features(self, value: np.ndarray) -> None:
+        arr = np.ascontiguousarray(value, dtype=np.float32)
+        self._avf_buf = arr
+        self._avf_size = int(arr.shape[0]) if arr.ndim == 2 else 0
+
+    def append_value_feature(self, row: np.ndarray) -> None:
+        self._avf_buf, self._avf_size = _grow_feats(
+            self._avf_buf, self._avf_size, row
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1244,10 +1388,21 @@ class SparseKVManager(FullAttentionManager):
             n_k = len(centres)
         if block_value_features is not None:
             vfeat = block_value_features.astype(np.float32)
+            # ``np.add.at`` is needed because multiple tokens share a cluster id;
+            # plain ``value_sum[labels_arr] += vfeat`` would only keep the last
+            # write per duplicate index.  When vfeat is all zeros (fallback
+            # path below), the scatter-add reduces to zero-plus-zero, so skip
+            # the scan entirely.
+            value_sum = np.zeros((n_k, d), dtype=np.float32)
+            np.add.at(value_sum, labels_arr, vfeat)
+            all_value = vfeat
         else:
-            vfeat = np.zeros_like(feat)
-        value_sum = np.zeros((n_k, d), dtype=np.float32)
-        np.add.at(value_sum, labels_arr, vfeat)
+            # Skip the ``np.zeros_like(feat)`` allocation + the ``np.add.at``
+            # scan over ``[N_prompt, D]`` zeros.  For token-mode prefill with
+            # N=24640 × D=128 × 112 KV units this was ~1.4 GB of zero-fill +
+            # ~350 M futile scatter-adds per indexing() call (several seconds).
+            value_sum = np.zeros((n_k, d), dtype=np.float32)
+            all_value = _empty_feats()
 
         # Store ndarray-backed fields directly (no per-row .copy(), no
         # .tolist()).  ``labels_arr`` is already int32/int64 from either the
@@ -1260,7 +1415,7 @@ class SparseKVManager(FullAttentionManager):
             cluster_size=sizes,
             block_to_cluster=np.ascontiguousarray(labels_arr, dtype=np.int32),
             all_block_features=feat,
-            all_value_features=vfeat,
+            all_value_features=all_value,
             mean_key=mean_key,
         )
         self._layer_map_for_request(request_id)[layer_name] = state
@@ -1737,11 +1892,13 @@ class SparseKVManager(FullAttentionManager):
             if new_block_value_feature is not None
             else np.zeros_like(feat)
         )
-        # Append one row to the ndarray-backed history buffers.  Decode
-        # rebalance runs once per decode step so the per-call vstack cost is
-        # negligible next to the attention forward.
-        st.all_block_features = _append_row(st.all_block_features, feat)
-        st.all_value_features = _append_row(st.all_value_features, vfeat)
+        # Amortised O(1) append into the preallocated history buffers (see
+        # ``_grow_feats``/``_grow_b2c``).  Previous ``np.concatenate`` per
+        # decode step cost ~1.4 GB/step of memcpy across 112 KV heads ×
+        # ``[N_prompt, D]`` buffers – showed up as +570 ms/step in the
+        # ``sparse_post_decode_rebalance_ms`` trace.
+        st.append_block_feature(feat)
+        st.append_value_feature(vfeat)
         st.decode_block_buffer.append(feat.copy())
         st.decode_value_buffer.append(vfeat.copy())
 
@@ -1753,9 +1910,7 @@ class SparseKVManager(FullAttentionManager):
             nearest = int(np.argmax(centered_feat @ centred_c.T))
         else:
             nearest = 0
-        st.block_to_cluster = np.concatenate(
-            [st.block_to_cluster, np.array([nearest], dtype=np.int32)]
-        )
+        st.append_b2c(nearest)
 
         return len(st.decode_block_buffer)
 
@@ -1827,22 +1982,14 @@ class SparseKVManager(FullAttentionManager):
 
         # labels_new indexes the fresh sub-clusters; remap to the global
         # cluster-id space (after ``n_existing``) and write into block_to_cluster.
+        # ``write_b2c_range`` handles both in-place overwrite and capacity
+        # growth – in the common case (decode ``rebalance`` appends one row
+        # per step so ``len(b2c) == n_total``) all ``m`` positions fall into
+        # the in-place overwrite branch (O(m) scalar write, no memcpy of the
+        # full buffer).
         n_total = len(st.all_block_features)
-        new_slot = (np.asarray(labels_new, dtype=np.int32) + n_existing)
-        b2c = st.block_to_cluster
-        # Overwrite positions [n_total - m, n_total) if they already exist,
-        # otherwise grow b2c to cover them.  In the common case (decode
-        # ``rebalance`` appends one row per step so ``len(b2c) == n_total``)
-        # all ``m`` positions fall into the overwrite branch.
-        start = n_total - m
-        if b2c.shape[0] >= start + m:
-            b2c[start:start + m] = new_slot
-        elif b2c.shape[0] <= start:
-            st.block_to_cluster = np.concatenate([b2c, new_slot])
-        else:
-            tail = b2c.shape[0] - start
-            b2c[start:] = new_slot[:tail]
-            st.block_to_cluster = np.concatenate([b2c, new_slot[tail:]])
+        new_slot = np.asarray(labels_new, dtype=np.int32) + n_existing
+        st.write_b2c_range(n_total - m, new_slot)
 
         st.decode_block_buffer = []
         st.decode_value_buffer = []
