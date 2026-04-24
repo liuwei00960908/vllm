@@ -340,44 +340,53 @@ class _SparseLayerIndexState:
         )
 
     def reserve_capacity(self, extra_rows: int) -> None:
-        """Pre-grow all row-aligned buffers so the next ``extra_rows`` appends
-        don't trigger a grow memcpy.
+        """Pre-grow the ``block_to_cluster`` buffer so the next ``extra_rows``
+        appends don't trigger a grow memcpy.
 
-        Called once after ``indexing()`` to absorb decode-step rebalances into
-        the initial allocation.  Without this, the first rebalance triggers a
-        ``_grow_feats`` N→2N copy across every KV unit (observed +475 ms on
-        the first decode rebalance for N=24640 × 112 KV heads).
+        Only touches ``_b2c_buf`` because that is the single row-aligned
+        buffer whose *content* is read on the hot path (by
+        ``_retrieve_zone_one_layer``).  ``all_block_features`` and
+        ``all_value_features`` store no downstream-readable content – see
+        ``set_prefill_with_capacity`` below for the cheaper lazy path used on
+        those two.
         """
         if extra_rows <= 0:
             return
-        # block_to_cluster
         need_b2c = self._b2c_size + extra_rows
         if int(self._b2c_buf.shape[0]) < need_b2c:
             new_buf = np.empty((need_b2c,), dtype=np.int32)
             if self._b2c_size > 0:
                 new_buf[:self._b2c_size] = self._b2c_buf[:self._b2c_size]
             self._b2c_buf = new_buf
-        # all_block_features
-        if self._abf_buf.ndim == 2 and self._abf_buf.shape[1] > 0:
-            need_abf = self._abf_size + extra_rows
-            if int(self._abf_buf.shape[0]) < need_abf:
-                new_abf = np.empty(
-                    (need_abf, self._abf_buf.shape[1]), dtype=np.float32
-                )
-                if self._abf_size > 0:
-                    new_abf[:self._abf_size] = self._abf_buf[:self._abf_size]
-                self._abf_buf = new_abf
-        # all_value_features (only if it's materialised, i.e. not the empty
-        # placeholder from the "no value features supplied" fast path)
-        if self._avf_buf.ndim == 2 and self._avf_buf.shape[1] > 0:
-            need_avf = self._avf_size + extra_rows
-            if int(self._avf_buf.shape[0]) < need_avf:
-                new_avf = np.empty(
-                    (need_avf, self._avf_buf.shape[1]), dtype=np.float32
-                )
-                if self._avf_size > 0:
-                    new_avf[:self._avf_size] = self._avf_buf[:self._avf_size]
-                self._avf_buf = new_avf
+
+    def set_prefill_block_feature_shape(
+        self, n_rows: int, d: int, extra_rows: int
+    ) -> None:
+        """Allocate the ``all_block_features`` backing buffer without copying
+        prefill content.
+
+        The logical size is set to ``n_rows`` but the first ``n_rows`` rows of
+        the buffer hold uninitialised memory – every caller of
+        ``all_block_features`` in production touches it only via ``len(...)``
+        (``_num_index_units`` / ``_dynamic_update_layer`` / idempotence
+        guard).  This avoids the ~1.4 GB of useless memcpy that
+        ``reserve_capacity`` used to pay while still giving decode rebalances
+        ``extra_rows`` of free appends.
+        """
+        total = int(n_rows) + max(int(extra_rows), 0)
+        # ``np.empty`` leaves pages unmapped; physical RSS stays zero until a
+        # row is actually written, which only happens for decode-appended
+        # rows (positions ``n_rows`` onward).
+        self._abf_buf = np.empty((total, int(d)), dtype=np.float32)
+        self._abf_size = int(n_rows)
+
+    def set_prefill_value_feature_shape(
+        self, n_rows: int, d: int, extra_rows: int
+    ) -> None:
+        """Same as ``set_prefill_block_feature_shape`` but for ``all_value_features``."""
+        total = int(n_rows) + max(int(extra_rows), 0)
+        self._avf_buf = np.empty((total, int(d)), dtype=np.float32)
+        self._avf_size = int(n_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1517,26 +1526,42 @@ class SparseKVManager(FullAttentionManager):
             value_sum = np.zeros((n_k, d), dtype=np.float32)
             all_value = _empty_feats()
 
-        # Store ndarray-backed fields directly (no per-row .copy(), no
-        # .tolist()).  ``labels_arr`` is already int32/int64 from either the
-        # precomputed path or _segment_kmeans; cast to a stable int32 so
-        # downstream vectorisation (``np.isin(b2c, ...)``) doesn't fall into
-        # a mixed-dtype slow path.
+        # ``labels_arr`` is already int32/int64 from either the precomputed
+        # path or _segment_kmeans; cast to a stable int32 so downstream
+        # vectorisation (``np.isin(b2c, ...)``) doesn't fall into a mixed-dtype
+        # slow path.
+        b2c_arr = np.ascontiguousarray(labels_arr, dtype=np.int32)
+
+        # Reserve decode headroom so the first rebalance after prefill doesn't
+        # trigger an N→2N grow memcpy across every KV unit (~1.4 GB / step
+        # across 112 heads for N=24640).  Size is capped so worst-case extra
+        # memory is bounded even for very long prompts.
+        reserve = min(max(num_blocks // 4, 1024), 4096)
+
         state = _SparseLayerIndexState(
             cluster_centres=centres,
             cluster_value_sum=value_sum,
             cluster_size=sizes,
-            block_to_cluster=np.ascontiguousarray(labels_arr, dtype=np.int32),
-            all_block_features=feat,
-            all_value_features=all_value,
+            block_to_cluster=b2c_arr,
+            # DO NOT pass ``all_block_features=feat`` / ``all_value_features=vfeat``
+            # here: copying N_prompt × D × 4 B per KV unit (×112 heads) costs
+            # ~1.4 GB of memcpy during prefill and has no downstream value
+            # since the content of these two ndarrays is never read in
+            # production code (only ``len(...)`` is consumed).  We allocate an
+            # oversized empty buffer below and set the logical size so
+            # ``len(...)`` matches the old behaviour and decode rebalances get
+            # pre-reserved headroom without paying the copy.
             mean_key=mean_key,
         )
-        # Reserve decode headroom so the first rebalance after prefill doesn't
-        # trigger an N→2N grow memcpy across every KV unit (~1.4 GB / step
-        # across 112 heads for N=24640).  Size is capped so the worst-case
-        # extra memory is bounded even for very long prompts.
-        reserve = min(max(num_blocks // 4, 1024), 4096)
         state.reserve_capacity(reserve)
+        state.set_prefill_block_feature_shape(num_blocks, d, reserve)
+        # ``all_value_features`` storage is only meaningful when the caller
+        # passed ``block_value_features``.  In the (common) ``None`` case we
+        # leave it as the empty placeholder so ``append_value_feature`` takes
+        # the reinit branch at its first call — same observable ``len`` growth
+        # as before with zero cost at indexing time.
+        if block_value_features is not None:
+            state.set_prefill_value_feature_shape(num_blocks, d, reserve)
         self._layer_map_for_request(request_id)[layer_name] = state
         return n_k
 
