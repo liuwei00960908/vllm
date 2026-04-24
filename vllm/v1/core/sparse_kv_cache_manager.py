@@ -987,14 +987,24 @@ class SparseKVManager(FullAttentionManager):
         ``(select, query-head)`` with a budget-sized token set (~128-512 items)
         across 784 query heads per decode step – the original ``for g in ...``
         loop dominated ``sparse_update_query_vectors_ms``.
+
+        Fast path: when ``token_indices`` is already a numpy ndarray (the
+        common case from the batched select path), use ``np.asarray`` which
+        is a bulk view / dtype-copy – no per-element Python iteration.
+        ``np.fromiter`` is reserved for list/set inputs where bulk copy is
+        not possible.
         """
         p_count = self._prefill_token_count.get(request_id)
         if p_count is None:
             return []
         bsz = int(self.block_size)
         pb = self._prefill_blocks.get(request_id, [])
-        # Materialise once; accept any iterable.
-        toks = np.fromiter(token_indices, dtype=np.int64)
+        if isinstance(token_indices, np.ndarray):
+            toks = token_indices.astype(np.int64, copy=False)
+        else:
+            # Iterable fallback: np.fromiter goes per-element but this only
+            # fires for list/set/range callers, which are small (<= budget).
+            toks = np.fromiter(token_indices, dtype=np.int64)
         if toks.size == 0:
             return []
         # Equivalent to ``_global_token_to_logical_block`` per element:
@@ -1243,6 +1253,164 @@ class SparseKVManager(FullAttentionManager):
         retr_bl = self._tokens_to_history_logical_blocks(request_id, retr_t_np)
         return sel_bl, retr_bl, combined_t.tolist()
 
+    def _select_kv_head_batched_topk_tokens(
+        self,
+        request_id: str,
+        n_units: int,
+        steady_np: np.ndarray,
+        st: _SparseLayerIndexState,
+        queries: np.ndarray,
+        budget: int,
+    ) -> tuple[list[list[int]], list[list[int]], list[list[int]]]:
+        """Batched equivalent of ``_select_one_layer_topk_tokens`` over G
+        query heads that share the same layer state ``st``.
+
+        ``queries`` is a stacked ``[G, D]`` float32 array.  Batching replaces
+        G independent ``q @ centres.T`` matmuls, G ``argpartition`` calls, and
+        G ``np.isin`` scans with a single matmul, one batched argpartition,
+        and one fancy-index into a ``[G, N]`` mask – same arithmetic, far
+        less Python / numpy dispatch overhead.
+
+        Returns ``(sel_bl_list, retr_bl_list, sel_t_list)``, each length G.
+        """
+        G = int(queries.shape[0])
+        centres = st.cluster_centres
+        b2c = st.block_to_cluster
+
+        # Fallback: no cluster info → every q head shares the same tail window.
+        if len(centres) == 0 or b2c.size == 0:
+            fallback = np.arange(
+                max(0, n_units - budget), n_units, dtype=np.int64
+            )
+            combined_t = np.union1d(fallback, steady_np)[:budget]
+            sel_t_list_one = combined_t.tolist()
+            retr_minus_steady = np.setdiff1d(
+                combined_t, steady_np, assume_unique=True
+            )
+            sel_bl = self._tokens_to_history_logical_blocks(
+                request_id, combined_t
+            )
+            retr_bl = self._tokens_to_history_logical_blocks(
+                request_id, retr_minus_steady
+            )
+            return (
+                [sel_bl] * G,
+                [retr_bl] * G,
+                [sel_t_list_one] * G,
+            )
+
+        d = int(queries.shape[-1])
+        # One matmul for all G heads: [G, D] @ [D, n_k] -> [G, n_k].
+        scores_all = (queries @ centres.T) / np.sqrt(max(d, 1))
+        n_k = int(centres.shape[0])
+        nprobe = min(self._spec.nprobe, n_k)
+
+        # Batched top-nprobe per row.  ``argpartition`` picks the top nprobe
+        # unsorted per-row – we only need membership to build the cluster
+        # mask, so sorted order is irrelevant here.
+        top_ids_all = np.argpartition(
+            scores_all, -nprobe, axis=-1
+        )[:, -nprobe:]  # [G, nprobe]
+
+        # Build [G, n_k] cluster mask via row-scatter.  ``put_along_axis``
+        # writes True at ``top_ids_all`` positions for each row.
+        cluster_mask = np.zeros((G, n_k), dtype=bool)
+        np.put_along_axis(cluster_mask, top_ids_all, True, axis=-1)
+
+        # retrieve_mask_all[g, t] = cluster_mask[g, b2c[t]] – one fancy-index
+        # on the column axis yields the full [G, N] retrieve mask.  Replaces
+        # the per-q ``np.isin(b2c, top_cluster_ids_g)`` scan.
+        retrieve_mask_all = cluster_mask[:, b2c]  # [G, N] bool
+
+        sel_bl_list: list[list[int]] = []
+        retr_bl_list: list[list[int]] = []
+        sel_t_list: list[list[int]] = []
+        steady_size = int(steady_np.size)
+        cap_base = max(0, budget - steady_size)
+
+        # Precompute request-level bookkeeping once (avoids ``self.*.get(...)``
+        # dict lookups inside ``_tokens_to_history_logical_blocks`` × 2 × G =
+        # 14 calls per group, ~1.5k per step).
+        p_count = self._prefill_token_count.get(request_id)
+        bsz = int(self.block_size)
+        n_pb = (int(p_count) + bsz - 1) // bsz if p_count is not None else 0
+        pb = self._prefill_blocks.get(request_id, [])
+        n_hist = len(pb) if pb else None
+
+        def _to_logical(toks: np.ndarray) -> list[int]:
+            """Inline, hoisted-state version of ``_tokens_to_history_logical_blocks``."""
+            if p_count is None or toks.size == 0:
+                return []
+            in_prompt = toks < p_count
+            lb = np.where(
+                in_prompt, toks // bsz, n_pb + (toks - p_count) // bsz
+            )
+            if n_hist is not None:
+                lb = lb[lb < n_hist]
+            if lb.size == 0:
+                return []
+            return np.unique(lb).tolist()
+
+        for g in range(G):
+            retr_np = np.nonzero(retrieve_mask_all[g])[0].astype(
+                np.int64, copy=False
+            )
+            if retr_np.size == 0:
+                combined_t = steady_np
+                retr_t_np = np.empty((0,), dtype=np.int64)
+            else:
+                # Searchsorted-based membership: steady_np is small and sorted
+                # so this is O(R log S) vs ``np.isin``'s sort-based
+                # O((R+S) log (R+S)).  ``retr_np`` is already ascending
+                # (``np.nonzero`` output), so ``non_steady`` stays sorted.
+                if steady_size == 0:
+                    is_steady_in_retr = np.zeros(retr_np.shape, dtype=bool)
+                    overlap = 0
+                else:
+                    idx = np.searchsorted(steady_np, retr_np)
+                    idx_clamped = np.minimum(idx, steady_size - 1)
+                    is_steady_in_retr = steady_np[idx_clamped] == retr_np
+                    overlap = int(is_steady_in_retr.sum())
+                non_steady_mask = ~is_steady_in_retr
+                combined_size = retr_np.size + steady_size - overlap
+
+                if combined_size > budget:
+                    non_steady = retr_np[non_steady_mask]
+                    # Per-block score = score of its cluster under this query.
+                    ns_scores = scores_all[g, b2c[non_steady]].astype(
+                        np.float32, copy=False
+                    )
+                    if cap_base > 0 and non_steady.size > cap_base:
+                        order = np.argsort(
+                            -ns_scores, kind="stable"
+                        )[:cap_base]
+                        top_non_steady = non_steady[order]
+                    else:
+                        top_non_steady = non_steady[:cap_base]
+                    # ``top_non_steady`` is disjoint from ``steady_np`` (the
+                    # non-steady mask guarantees it) so simple concat + sort
+                    # gives the final sorted union; the combined length is at
+                    # most ``budget`` so the sort is cheap.
+                    combined_t = np.sort(
+                        np.concatenate([steady_np, top_non_steady])
+                    )
+                else:
+                    # No cap needed: merge sorted-disjoint ``steady_np`` with
+                    # sorted ``non_steady``.  Sort on concat of two sorted
+                    # disjoint arrays with ``combined_size <= budget`` is
+                    # cheap (bounded by budget).
+                    non_steady = retr_np[non_steady_mask]
+                    combined_t = np.sort(
+                        np.concatenate([steady_np, non_steady])
+                    )
+                # ``retr_t_np = retr_np \ steady_np`` – already sorted.
+                retr_t_np = retr_np[non_steady_mask]
+            sel_bl_list.append(_to_logical(combined_t))
+            retr_bl_list.append(_to_logical(retr_t_np))
+            sel_t_list.append(combined_t.tolist())
+
+        return sel_bl_list, retr_bl_list, sel_t_list
+
     def _per_layer_fresh_topk(
         self,
         request_id: str,
@@ -1309,23 +1477,42 @@ class SparseKVManager(FullAttentionManager):
                 if num_kv == 0:
                     continue
                 num_q = max(qh for qh, _ in qh_list) + 1 if qh_list else 1
+                # Group q_heads by the kv_head they map to – all q_heads in
+                # the same group share the same ``st`` (centres + b2c) so we
+                # can do one batched matmul/mask per group instead of G
+                # independent per-q ops.
+                group_qks: dict[int, list[str]] = {}
+                group_qs: dict[int, list[np.ndarray]] = {}
                 for qh_idx, qk in qh_list:
                     q = query_by_qh.get(qk)
                     if q is None:
                         continue
                     kv_slot = self._qh_to_kv_index(qh_idx, num_q, num_kv)
                     kv_actual = kv_sorted[kv_slot]
+                    group_qks.setdefault(kv_actual, []).append(qk)
+                    group_qs.setdefault(kv_actual, []).append(q)
+                for kv_actual, qks_in_group in group_qks.items():
                     st_key = sparse_kv_unit_key(layer_name, kv_actual)
                     st = ls.get(st_key)
                     if st is None:
                         continue
-                    sel_bl, retr_bl, sel_t = self._select_one_layer_topk_tokens(
-                        request_id, n_units, steady_tokens_np,
-                        steady_tokens, st, q, budget
+                    qs_in_group = group_qs[kv_actual]
+                    Q = np.stack(qs_in_group, axis=0).astype(
+                        np.float32, copy=False
                     )
-                    selected_by_qh[qk] = sel_bl
-                    retrieve_by_qh[qk] = retr_bl
-                    tokens_by_qh[qk] = sel_t
+                    sel_bl_list, retr_bl_list, sel_t_list = (
+                        self._select_kv_head_batched_topk_tokens(
+                            request_id, n_units, steady_tokens_np,
+                            st, Q, budget,
+                        )
+                    )
+                    for qk, sel_bl, retr_bl, sel_t in zip(
+                        qks_in_group, sel_bl_list, retr_bl_list, sel_t_list,
+                        strict=True,
+                    ):
+                        selected_by_qh[qk] = sel_bl
+                        retrieve_by_qh[qk] = retr_bl
+                        tokens_by_qh[qk] = sel_t
             if self._sparse_probe_info_enabled and request_id not in self._first_select_probe_done:
                 qh_items = list(tokens_by_qh.items())
                 n_heads = len(qh_items)
