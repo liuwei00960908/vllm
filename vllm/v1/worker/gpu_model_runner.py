@@ -11665,12 +11665,23 @@ class GPUModelRunner(
                 if num_blocks == 0:
                     continue
 
-                _t_block_ids = time.perf_counter() if perf_enabled else None
                 block_ids_np = block_table.block_table.np[
                     req_idx, :num_blocks
                 ].copy()
-                block_ids_t = torch.from_numpy(block_ids_np).to(self.device)
-                _perf_add("collect:block_ids_to_device", _t_block_ids)
+                block_ids_t: torch.Tensor | None = None
+
+                def _get_block_ids_t() -> torch.Tensor:
+                    nonlocal block_ids_t
+                    if block_ids_t is None:
+                        _t_block_ids = (
+                            time.perf_counter() if perf_enabled else None
+                        )
+                        block_ids_t = torch.from_numpy(block_ids_np).to(
+                            self.device
+                        )
+                        _perf_add("collect:block_ids_to_device", _t_block_ids)
+                    assert block_ids_t is not None
+                    return block_ids_t
 
                 spec = grp.kv_cache_spec
                 token_sparse = isinstance(
@@ -11709,7 +11720,7 @@ class GPUModelRunner(
                             _t_k_cache_read = (
                                 time.perf_counter() if perf_enabled else None
                             )
-                            k_blocks = kv[0][block_ids_t]
+                            k_blocks = kv[0][_get_block_ids_t()]
                             _perf_add("collect:k_cache_read", _t_k_cache_read)
                         return k_blocks
 
@@ -11731,7 +11742,7 @@ class GPUModelRunner(
                                     )
                                     raw_b = prefill_cluster_meta_from_kv_cache_torch(
                                         kv[0],
-                                        block_ids_t,
+                                        _get_block_ids_t(),
                                         valid_len,
                                         num_clusters=spec.num_clusters,
                                         n_segment=spec.n_segment,
@@ -11794,7 +11805,7 @@ class GPUModelRunner(
                                         )
                                         vs_hkd = value_sum_from_kv_cache_torch(
                                             kv[1],
-                                            block_ids_t,
+                                            _get_block_ids_t(),
                                             valid_len,
                                             labels=raw_b[
                                                 "block_to_cluster"
@@ -11824,7 +11835,7 @@ class GPUModelRunner(
                                 else:
                                     k_heads = kmeans_features_from_kv_cache_torch(
                                         kv[0],
-                                        block_ids_t,
+                                        _get_block_ids_t(),
                                         valid_len,
                                         is_centered=False,
                                     )
@@ -11934,7 +11945,7 @@ class GPUModelRunner(
                                 )
                                 raw_b = prefill_cluster_meta_from_kv_cache_torch(
                                     kv[0],
-                                    block_ids_t,
+                                    _get_block_ids_t(),
                                     num_prompt_tokens,
                                     num_clusters=spec.num_clusters,
                                     n_segment=spec.n_segment,
@@ -11954,7 +11965,7 @@ class GPUModelRunner(
                                 )
                                 k_heads = kmeans_features_from_kv_cache_torch(
                                     kv[0],
-                                    block_ids_t,
+                                    _get_block_ids_t(),
                                     num_prompt_tokens,
                                     is_centered=True,
                                 )

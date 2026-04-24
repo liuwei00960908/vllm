@@ -762,6 +762,36 @@ class TestCollectSparseFeatures:
             for kv_h in range(NUM_KV_HEADS):
                 assert nbf["r0"][sparse_kv_unit_key(ln, kv_h)].shape == (HEAD_SIZE,)
 
+    def test_token_compact_decode_emits_only_gpu_update_payload(self):
+        """Token compact decode keeps scheduler payload empty but updates GPU index."""
+        n_blocks = 3
+        runner, sched = _build_mock_runner(
+            req_ids=["r0"],
+            num_prompt_tokens=[n_blocks * BLOCK_SIZE],
+            seq_lens=[n_blocks * BLOCK_SIZE + 1],
+            query_start_locs=[0, 1],
+            num_output_before=[1],
+            num_scheduled={"r0": 1},
+            blocks_per_req=[list(range(n_blocks))],
+        )
+        runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec = make_spec(
+            cluster_granularity="token",
+            use_compact_kv_gather=True,
+        )
+
+        bf, qv, nbf, pcm, nbf_gpu = runner._collect_sparse_features(sched, 1)
+
+        assert bf is None
+        assert qv is None
+        assert nbf is None
+        assert pcm is None
+        assert nbf_gpu is not None
+        layer_names = runner.kv_cache_config.kv_cache_groups[0].layer_names
+        for ln in layer_names:
+            for kv_h in range(NUM_KV_HEADS):
+                unit_key = sparse_kv_unit_key(ln, kv_h)
+                assert nbf_gpu["r0"][unit_key].shape == (HEAD_SIZE,)
+
     def test_decode_new_block_is_last_block_mean_k(self):
         """new_block_features are last-slot K per KV head (last logical block)."""
         n_blocks = 3
