@@ -551,6 +551,8 @@ class KVCacheManager:
         """
         mgr = self.get_sparse_manager()
         if mgr is not None:
+            if mgr.delegates_token_selection_to_runner() is True:
+                return
             mgr.indexing(
                 request_id,
                 block_features,
@@ -579,6 +581,8 @@ class KVCacheManager:
         mgr = self.get_sparse_manager()
         if mgr is None:
             return
+        if mgr.delegates_token_selection_to_runner() is True:
+            return
         for req_id, qv in query_vectors.items():
             if req_id not in mgr.req_to_blocks:
                 continue
@@ -599,6 +603,8 @@ class KVCacheManager:
         mgr = self.get_sparse_manager()
         if mgr is None:
             return False, "no_sparse_mgr"
+        if mgr.delegates_token_selection_to_runner() is True:
+            return False, "runner_selects_tokens"
         # Already selected for this request in this step.
         if mgr._selected_block_indices_by_layer.get(request_id):
             return False, "already_selected"
@@ -644,6 +650,8 @@ class KVCacheManager:
         """
         mgr = self.get_sparse_manager()
         if mgr is None:
+            return
+        if mgr.delegates_token_selection_to_runner() is True:
             return
         vfeat_map = new_value_features or {}
         for req_id, feat in new_block_features.items():

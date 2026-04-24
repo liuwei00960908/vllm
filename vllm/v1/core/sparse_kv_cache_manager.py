@@ -766,7 +766,13 @@ class SparseKVManager(FullAttentionManager):
         # The history list contains original prefill blocks followed by
         # finalized decode blocks in chronological order.
         prefill_blocks = self._prefill_blocks[request_id]
-        selected = self._selected_block_indices.get(request_id, [])
+        if self.delegates_token_selection_to_runner():
+            # Token compact gather selects tokens inside GPUModelRunner.
+            # Keep the scheduler row chronological/full so token_id //
+            # block_size indexes the same way it does for full attention.
+            selected = range(len(prefill_blocks))
+        else:
+            selected = self._selected_block_indices.get(request_id, [])
         physical_selected = [
             prefill_blocks[i]
             for i in selected
@@ -936,6 +942,16 @@ class SparseKVManager(FullAttentionManager):
 
     def _token_mode(self) -> bool:
         return self._spec.cluster_granularity == "token"
+
+    def delegates_token_selection_to_runner(self) -> bool:
+        """Whether decode token selection is owned by the GPU runner.
+
+        In token mode with compact KV gather, the runner builds per-query-head
+        token selections directly from GPU-resident Q vectors and centroids.
+        The scheduler side should therefore avoid a second CPU TopK/steady-zone
+        pass and keep allocation metadata full-attention-like.
+        """
+        return self._token_mode() and bool(self._spec.use_compact_kv_gather)
 
     def _num_index_units(self, request_id: str) -> int:
         """Number of clustered rows (blocks or tokens) for this request."""
@@ -1258,7 +1274,6 @@ class SparseKVManager(FullAttentionManager):
         request_id: str,
         n_units: int,
         steady_np: np.ndarray,
-        steady_mask_tok: np.ndarray,
         st: _SparseLayerIndexState,
         queries: np.ndarray,
         budget: int,
@@ -1323,22 +1338,6 @@ class SparseKVManager(FullAttentionManager):
         # the per-q ``np.isin(b2c, top_cluster_ids_g)`` scan.
         retrieve_mask_all = cluster_mask[:, b2c]  # [G, N] bool
 
-        # non_steady_mask[g, t] = in retrieve zone AND not in steady zone.
-        # ``steady_mask_tok`` is a caller-hoisted ``[N]`` bool (built once per
-        # ``_per_layer_fresh_topk`` invocation) so this is a single [G, N]
-        # broadcast AND – cheaper than per-g ``np.searchsorted`` + set math.
-        N = int(b2c.shape[0])
-        if steady_mask_tok.shape[0] != N:
-            # Size mismatch shouldn't happen, but clip defensively.
-            steady_mask_tok = steady_mask_tok[:N] if steady_mask_tok.shape[0] > N \
-                else np.pad(steady_mask_tok, (0, N - steady_mask_tok.shape[0]))
-        non_steady_mask_all = retrieve_mask_all & ~steady_mask_tok[None, :]  # [G, N]
-
-        # Pre-compute scores per token under each query:
-        # scores_per_tok[g, t] = scores_all[g, b2c[t]].  Built once per group
-        # so the per-g ``scores_all[g, b2c[non_steady]]`` fancy-index disappears.
-        scores_per_tok = scores_all[:, b2c]  # [G, N] float32
-
         sel_bl_list: list[list[int]] = []
         retr_bl_list: list[list[int]] = []
         sel_t_list: list[list[int]] = []
@@ -1369,35 +1368,59 @@ class SparseKVManager(FullAttentionManager):
             return np.unique(lb).tolist()
 
         for g in range(G):
-            ns_mask_g = non_steady_mask_all[g]
-            ns_size = int(ns_mask_g.sum())
-            retr_t_np = np.nonzero(ns_mask_g)[0].astype(np.int64, copy=False)
-            # ``combined_size`` = |steady ∪ retrieve| = steady_size + ns_size
-            # (by construction ns_mask excludes steady, so disjoint).
-            combined_size = steady_size + ns_size
-            if ns_size == 0:
+            retr_np = np.nonzero(retrieve_mask_all[g])[0].astype(
+                np.int64, copy=False
+            )
+            if retr_np.size == 0:
                 combined_t = steady_np
-            elif combined_size > budget:
-                # Cap path: keep top cap_base non-steady by score, union with steady.
-                ns_scores = scores_per_tok[g, retr_t_np]  # [ns_size]
-                if cap_base > 0 and ns_size > cap_base:
-                    order = np.argsort(
-                        -ns_scores, kind="stable"
-                    )[:cap_base]
-                    top_non_steady = retr_t_np[order]
-                else:
-                    top_non_steady = retr_t_np[:cap_base]
-                # ``top_non_steady`` is disjoint from ``steady_np`` (ns_mask
-                # guarantees it) so concat + sort of a ``<= budget``-sized
-                # array gives the final sorted union.
-                combined_t = np.sort(
-                    np.concatenate([steady_np, top_non_steady])
-                )
+                retr_t_np = np.empty((0,), dtype=np.int64)
             else:
-                # No cap: combined = sorted (steady ∪ all non_steady).
-                combined_t = np.sort(
-                    np.concatenate([steady_np, retr_t_np])
-                )
+                # Searchsorted-based membership: steady_np is small and sorted
+                # so this is O(R log S) vs ``np.isin``'s sort-based
+                # O((R+S) log (R+S)).  ``retr_np`` is already ascending
+                # (``np.nonzero`` output), so ``non_steady`` stays sorted.
+                if steady_size == 0:
+                    is_steady_in_retr = np.zeros(retr_np.shape, dtype=bool)
+                    overlap = 0
+                else:
+                    idx = np.searchsorted(steady_np, retr_np)
+                    idx_clamped = np.minimum(idx, steady_size - 1)
+                    is_steady_in_retr = steady_np[idx_clamped] == retr_np
+                    overlap = int(is_steady_in_retr.sum())
+                non_steady_mask = ~is_steady_in_retr
+                combined_size = retr_np.size + steady_size - overlap
+
+                if combined_size > budget:
+                    non_steady = retr_np[non_steady_mask]
+                    # Per-block score = score of its cluster under this query.
+                    ns_scores = scores_all[g, b2c[non_steady]].astype(
+                        np.float32, copy=False
+                    )
+                    if cap_base > 0 and non_steady.size > cap_base:
+                        order = np.argsort(
+                            -ns_scores, kind="stable"
+                        )[:cap_base]
+                        top_non_steady = non_steady[order]
+                    else:
+                        top_non_steady = non_steady[:cap_base]
+                    # ``top_non_steady`` is disjoint from ``steady_np`` (the
+                    # non-steady mask guarantees it) so simple concat + sort
+                    # gives the final sorted union; the combined length is at
+                    # most ``budget`` so the sort is cheap.
+                    combined_t = np.sort(
+                        np.concatenate([steady_np, top_non_steady])
+                    )
+                else:
+                    # No cap needed: merge sorted-disjoint ``steady_np`` with
+                    # sorted ``non_steady``.  Sort on concat of two sorted
+                    # disjoint arrays with ``combined_size <= budget`` is
+                    # cheap (bounded by budget).
+                    non_steady = retr_np[non_steady_mask]
+                    combined_t = np.sort(
+                        np.concatenate([steady_np, non_steady])
+                    )
+                # ``retr_t_np = retr_np \ steady_np`` – already sorted.
+                retr_t_np = retr_np[non_steady_mask]
             sel_bl_list.append(_to_logical(combined_t))
             retr_bl_list.append(_to_logical(retr_t_np))
             sel_t_list.append(combined_t.tolist())
@@ -1448,15 +1471,6 @@ class SparseKVManager(FullAttentionManager):
                 steady_tokens, dtype=np.int64, count=len(steady_tokens)
             )
             steady_tokens_np.sort()
-            # Build a boolean token-space mask of steady tokens once per
-            # select call – every batched helper then uses
-            # ``retrieve_mask & ~steady_mask_tok`` instead of per-g
-            # searchsorted membership, eliminating ~784 small numpy temps
-            # per decode step.
-            steady_mask_tok = np.zeros(n_units, dtype=bool)
-            if steady_tokens_np.size > 0:
-                valid_steady = steady_tokens_np[steady_tokens_np < n_units]
-                steady_mask_tok[valid_steady] = True
             if all(len(st.cluster_centres) == 0 for st in ls.values()):
                 fallback = set(range(max(0, n_units - budget), n_units))
                 sel_t = sorted(fallback | steady_tokens)[:budget]
@@ -1505,7 +1519,7 @@ class SparseKVManager(FullAttentionManager):
                     sel_bl_list, retr_bl_list, sel_t_list = (
                         self._select_kv_head_batched_topk_tokens(
                             request_id, n_units, steady_tokens_np,
-                            steady_mask_tok, st, Q, budget,
+                            st, Q, budget,
                         )
                     )
                     for qk, sel_bl, retr_bl, sel_t in zip(

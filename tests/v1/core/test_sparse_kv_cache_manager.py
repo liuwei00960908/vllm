@@ -212,6 +212,25 @@ class TestTokenGranularitySparse:
         assert len(sel) <= spec.max_blocks_for_sparse()
         assert all(isinstance(x, int) for x in sel)
 
+    def test_token_compact_decode_keeps_chronological_block_row(self):
+        spec = make_spec(
+            cluster_granularity="token",
+            max_selected_tokens=10,
+            use_compact_kv_gather=True,
+        )
+        mgr = make_manager(spec)
+        prefill_blocks = mgr.block_pool.get_new_blocks(4)
+        mgr.req_to_blocks["req0"] = list(prefill_blocks)
+        mgr.num_cached_block["req0"] = 0
+        mgr._selected_block_indices["req0"] = [0, 2]
+
+        new_req_blocks = mgr.allocate_new_blocks(
+            "req0", num_tokens=1, num_tokens_main_model=1
+        )
+
+        assert new_req_blocks[:-1] == list(prefill_blocks)
+        assert mgr.req_to_blocks["req0"][:-1] == list(prefill_blocks)
+
 
 # ---------------------------------------------------------------------------
 # _kmeans_dot

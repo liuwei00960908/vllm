@@ -1108,6 +1108,11 @@ class Scheduler(SchedulerInterface):
         sparse_selected_block_indices_by_layer: dict[str, dict[str, list[int]]] = {}
         sparse_chrono_phys_block_ids: dict[str, list[int]] = {}
         resumed_req_ids = set()
+        sparse_mgr = self.kv_cache_manager.get_sparse_manager()
+        runner_selects_sparse_tokens = (
+            sparse_mgr is not None
+            and sparse_mgr.delegates_token_selection_to_runner() is True
+        )
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1135,15 +1140,31 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            selected = self.kv_cache_manager.get_sparse_selected_block_indices(req_id)
-            retrieve = self.kv_cache_manager.get_sparse_retrieve_block_indices(req_id)
-            by_layer = (
-                self.kv_cache_manager.get_sparse_selected_block_indices_by_layer(req_id)
-            )
-            chrono = self.kv_cache_manager.get_sparse_chrono_phys_block_ids(req_id)
-            has_sparse_mgr = self.kv_cache_manager.get_sparse_manager() is not None
+            if runner_selects_sparse_tokens:
+                selected = None
+                retrieve = None
+                by_layer = None
+                chrono = None
+            else:
+                selected = self.kv_cache_manager.get_sparse_selected_block_indices(
+                    req_id
+                )
+                retrieve = self.kv_cache_manager.get_sparse_retrieve_block_indices(
+                    req_id
+                )
+                by_layer = (
+                    self.kv_cache_manager.get_sparse_selected_block_indices_by_layer(
+                        req_id
+                    )
+                )
+                chrono = self.kv_cache_manager.get_sparse_chrono_phys_block_ids(req_id)
+            has_sparse_mgr = sparse_mgr is not None
             decode_phase = (req.num_output_tokens + req.num_output_placeholders) > 0
-            is_sparse_decode_req = has_sparse_mgr and decode_phase
+            is_sparse_decode_req = (
+                has_sparse_mgr
+                and decode_phase
+                and not runner_selects_sparse_tokens
+            )
             phase_gate_sparse_meta = False
             phase_gate_reason = ""
             if is_sparse_decode_req:
@@ -1241,7 +1262,6 @@ class Scheduler(SchedulerInterface):
                 sparse_chrono_phys_block_ids[req_id] = chrono
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_for_worker = req.num_output_tokens + req.num_output_placeholders
-            sparse_mgr = self.kv_cache_manager.get_sparse_manager()
             token_sparse_async = (
                 self.scheduler_config.async_scheduling
                 and sparse_mgr is not None

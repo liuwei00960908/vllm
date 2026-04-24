@@ -11617,6 +11617,16 @@ class GPUModelRunner(
             _t_q_extract = time.perf_counter() if perf_enabled else None
             q_per_unit: dict[str, np.ndarray] = {}
             for _, grp in sparse_groups:
+                spec_q = grp.kv_cache_spec
+                if (
+                    isinstance(spec_q, SparseAttentionSpec)
+                    and spec_q.cluster_granularity == "token"
+                    and spec_q.use_compact_kv_gather
+                ):
+                    # Token compact gather scores Q against centroids in the
+                    # runner pre-hook.  Emitting CPU Q vectors would only feed
+                    # the scheduler-side selector that this path bypasses.
+                    continue
                 for layer_name in grp.layer_names:
                     q_raw = self._sparse_q_captures.get(layer_name)
                     if q_raw is None or last_tok_idx >= q_raw.shape[0]:
@@ -11872,36 +11882,43 @@ class GPUModelRunner(
                                 )
                             else:
                                 k_row_gpu = _read_k_blocks()[-1][slot].float()
-                            _t_decode_cpu = (
-                                time.perf_counter() if perf_enabled else None
+                            emit_decode_feature_to_scheduler = (
+                                not bool(spec.use_compact_kv_gather)
                             )
-                            k_row_np = k_row_gpu.cpu().numpy()
-                            _perf_add(
-                                "collect:k_decode_cpu_numpy", _t_decode_cpu
-                            )
+                            k_row_np = None
+                            if emit_decode_feature_to_scheduler:
+                                _t_decode_cpu = (
+                                    time.perf_counter() if perf_enabled else None
+                                )
+                                k_row_np = k_row_gpu.cpu().numpy()
+                                _perf_add(
+                                    "collect:k_decode_cpu_numpy", _t_decode_cpu
+                                )
                             for kv_h in range(num_kv):
                                 unit_key = sparse_kv_unit_key(layer_name, kv_h)
                                 if num_kv == 1:
-                                    k_row_one_np = (
-                                        k_row_np[0]
-                                        if k_row_gpu.dim() == 2
-                                        else k_row_np
-                                    )
                                     k_row_one_gpu = (
                                         k_row_gpu[0]
                                         if k_row_gpu.dim() == 2
                                         else k_row_gpu
                                     )
-                                    sparse_new_block_features.setdefault(
-                                        req_id, {}
-                                    )[unit_key] = k_row_one_np
+                                    if k_row_np is not None:
+                                        k_row_one_np = (
+                                            k_row_np[0]
+                                            if k_row_gpu.dim() == 2
+                                            else k_row_np
+                                        )
+                                        sparse_new_block_features.setdefault(
+                                            req_id, {}
+                                        )[unit_key] = k_row_one_np
                                     sparse_new_block_features_gpu.setdefault(
                                         req_id, {}
                                     )[unit_key] = k_row_one_gpu
                                 else:
-                                    sparse_new_block_features.setdefault(
-                                        req_id, {}
-                                    )[unit_key] = k_row_np[kv_h]
+                                    if k_row_np is not None:
+                                        sparse_new_block_features.setdefault(
+                                            req_id, {}
+                                        )[unit_key] = k_row_np[kv_h]
                                     sparse_new_block_features_gpu.setdefault(
                                         req_id, {}
                                     )[unit_key] = k_row_gpu[kv_h]
