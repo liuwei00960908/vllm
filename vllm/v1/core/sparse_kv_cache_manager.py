@@ -339,6 +339,46 @@ class _SparseLayerIndexState:
             self._avf_buf, self._avf_size, row
         )
 
+    def reserve_capacity(self, extra_rows: int) -> None:
+        """Pre-grow all row-aligned buffers so the next ``extra_rows`` appends
+        don't trigger a grow memcpy.
+
+        Called once after ``indexing()`` to absorb decode-step rebalances into
+        the initial allocation.  Without this, the first rebalance triggers a
+        ``_grow_feats`` N→2N copy across every KV unit (observed +475 ms on
+        the first decode rebalance for N=24640 × 112 KV heads).
+        """
+        if extra_rows <= 0:
+            return
+        # block_to_cluster
+        need_b2c = self._b2c_size + extra_rows
+        if int(self._b2c_buf.shape[0]) < need_b2c:
+            new_buf = np.empty((need_b2c,), dtype=np.int32)
+            if self._b2c_size > 0:
+                new_buf[:self._b2c_size] = self._b2c_buf[:self._b2c_size]
+            self._b2c_buf = new_buf
+        # all_block_features
+        if self._abf_buf.ndim == 2 and self._abf_buf.shape[1] > 0:
+            need_abf = self._abf_size + extra_rows
+            if int(self._abf_buf.shape[0]) < need_abf:
+                new_abf = np.empty(
+                    (need_abf, self._abf_buf.shape[1]), dtype=np.float32
+                )
+                if self._abf_size > 0:
+                    new_abf[:self._abf_size] = self._abf_buf[:self._abf_size]
+                self._abf_buf = new_abf
+        # all_value_features (only if it's materialised, i.e. not the empty
+        # placeholder from the "no value features supplied" fast path)
+        if self._avf_buf.ndim == 2 and self._avf_buf.shape[1] > 0:
+            need_avf = self._avf_size + extra_rows
+            if int(self._avf_buf.shape[0]) < need_avf:
+                new_avf = np.empty(
+                    (need_avf, self._avf_buf.shape[1]), dtype=np.float32
+                )
+                if self._avf_size > 0:
+                    new_avf[:self._avf_size] = self._avf_buf[:self._avf_size]
+                self._avf_buf = new_avf
+
 
 # ---------------------------------------------------------------------------
 # CPU K-Means primitives (numpy only, dot-product / attention-score style)
@@ -932,23 +972,38 @@ class SparseKVManager(FullAttentionManager):
     def _tokens_to_history_logical_blocks(
         self, request_id: str, token_indices: Iterable[int]
     ) -> list[int]:
-        """Map global token indices to historical logical block ids (decode slot excluded)."""
+        """Map global token indices to historical logical block ids (decode slot excluded).
+
+        Vectorised to eliminate the per-token Python dispatch: called once per
+        ``(select, query-head)`` with a budget-sized token set (~128-512 items)
+        across 784 query heads per decode step – the original ``for g in ...``
+        loop dominated ``sparse_update_query_vectors_ms``.
+        """
         p_count = self._prefill_token_count.get(request_id)
         if p_count is None:
             return []
-        bsz = self.block_size
+        bsz = int(self.block_size)
         pb = self._prefill_blocks.get(request_id, [])
-        out: set[int] = set()
+        # Materialise once; accept any iterable.
+        toks = np.fromiter(token_indices, dtype=np.int64)
+        if toks.size == 0:
+            return []
+        # Equivalent to ``_global_token_to_logical_block`` per element:
+        #   if g < p_count:  lb = g // bsz
+        #   else:            lb = cdiv(p_count, bsz) + (g - p_count) // bsz
+        n_pb = (p_count + bsz - 1) // bsz  # cdiv
+        in_prompt = toks < p_count
+        lb = np.where(
+            in_prompt,
+            toks // bsz,
+            n_pb + (toks - p_count) // bsz,
+        )
         if pb:
             n_hist = len(pb)
-            for g in token_indices:
-                lb = self._global_token_to_logical_block(int(g), p_count, bsz)
-                if lb < n_hist:
-                    out.add(lb)
-        else:
-            for g in token_indices:
-                out.add(self._global_token_to_logical_block(int(g), p_count, bsz))
-        return sorted(out)
+            lb = lb[lb < n_hist]
+        if lb.size == 0:
+            return []
+        return np.unique(lb).tolist()
 
     def _steady_block_set(self, request_id: str) -> set[int]:
         """Logical history blocks that intersect the steady (sink + local) token zones."""
@@ -1024,33 +1079,39 @@ class SparseKVManager(FullAttentionManager):
         self,
         st: _SparseLayerIndexState,
         q: np.ndarray,
-    ) -> tuple[set[int], dict[int, float]]:
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Select retrieve-zone block indices and their per-block cluster scores.
+
+        Returns ``(retrieve_idx, per_block_scores)``:
+            - ``retrieve_idx``   int64 ndarray of ascending block indices
+              (equivalent to ``sorted(set)`` of the old set return).
+            - ``per_block_scores`` float32 ndarray, same length, each entry is
+              ``scores_c[b2c[bidx]]`` for the corresponding ``bidx``.
+
+        Downstream (``_select_one_layer_topk_*``) consumes these directly as
+        ndarrays – avoiding the old ``set[int]`` / ``dict[int, float]``
+        materialisation that forced per-element Python boxing at ~19 M
+        elements/decode (784 q-heads × 24 k tokens).
+        """
         centres = st.cluster_centres
         b2c = st.block_to_cluster
+        empty_idx = np.empty((0,), dtype=np.int64)
+        empty_scores = np.empty((0,), dtype=np.float32)
         if len(centres) == 0 or b2c.size == 0:
-            return set(), {}
+            return empty_idx, empty_scores
         q = np.asarray(q, dtype=np.float32)
         d = int(q.shape[-1])
         scores_c = (q @ centres.T) / np.sqrt(max(d, 1))
         nprobe = min(self._spec.nprobe, len(centres))
         top_cluster_ids_np = np.argpartition(scores_c, -nprobe)[-nprobe:]
-        # Vectorised retrieve-zone selection: replaces the Python
-        # ``for bidx, cid in enumerate(b2c)`` scan (~24k iterations per
-        # query head × 784 heads = ~19M iters/decode).  ``np.isin`` is
-        # O(N log K) and ``np.nonzero`` gives block indices directly.
         mask = np.isin(b2c, top_cluster_ids_np, assume_unique=False)
-        retrieve_idx = np.nonzero(mask)[0]
+        retrieve_idx = np.nonzero(mask)[0].astype(np.int64, copy=False)
         if retrieve_idx.size == 0:
-            return set(), {}
-        # Per-block score = score of its cluster.  Build in one fancy-index.
+            return empty_idx, empty_scores
         per_block_scores = scores_c[b2c[retrieve_idx]].astype(
             np.float32, copy=False
         )
-        retrieve = set(retrieve_idx.tolist())
-        block_scores = dict(
-            zip(retrieve_idx.tolist(), per_block_scores.tolist(), strict=True)
-        )
-        return retrieve, block_scores
+        return retrieve_idx, per_block_scores
 
     @staticmethod
     def _union_sorted_block_indices(
@@ -1061,6 +1122,7 @@ class SparseKVManager(FullAttentionManager):
     def _select_one_layer_topk_blocks(
         self,
         total_blocks: int,
+        steady_np: np.ndarray,
         steady_set: set[int],
         st: _SparseLayerIndexState,
         q: np.ndarray,
@@ -1069,32 +1131,54 @@ class SparseKVManager(FullAttentionManager):
         """
         Steady zone + retrieve zone for one layer, capped by ``budget`` blocks.
 
+        ``steady_np`` is the caller-hoisted sorted ndarray form of
+        ``steady_set`` (same contents); both are accepted so that per-layer
+        ndarray ops can skip the set→ndarray conversion that would otherwise
+        fire per q-head (784× per decode step).
+
         Returns:
             (sorted full selection, sorted retrieve-only logical block indices).
         """
-        if len(st.cluster_centres) == 0 or st.block_to_cluster.size == 0:
-            fallback = set(range(max(0, total_blocks - budget), total_blocks))
-            combined = fallback | steady_set
-            sel = sorted(combined)[:budget]
-            return sel, sorted(set(sel) - steady_set)
 
-        retr, unit_scores = self._retrieve_zone_one_layer(st, q)
-        combined = steady_set | retr
-        if len(combined) > budget:
-            non_steady = sorted(
-                retr - steady_set,
-                key=lambda b: unit_scores.get(b, float("-inf")),
-                reverse=True,
+        if len(st.cluster_centres) == 0 or st.block_to_cluster.size == 0:
+            fallback = np.arange(
+                max(0, total_blocks - budget), total_blocks, dtype=np.int64
             )
-            cap = max(0, budget - len(steady_set))
-            combined = steady_set | set(non_steady[:cap])
-        sel = sorted(combined)
-        return sel, sorted(retr - steady_set)
+            combined = np.union1d(fallback, steady_np)[:budget]
+            sel_list = combined.tolist()
+            retr_np = np.setdiff1d(combined, steady_np, assume_unique=True)
+            return sel_list, retr_np.tolist()
+
+        retr_np, scores_np = self._retrieve_zone_one_layer(st, q)
+        combined = np.union1d(retr_np, steady_np)
+        if combined.size > budget:
+            # Drop steady members from retrieve, then keep top (budget -
+            # |steady|) retrieve entries by score.  This matches the old
+            # semantics: steady is always included, retrieve members
+            # compete for the remaining slots.
+            is_steady_in_retr = np.isin(retr_np, steady_np, assume_unique=True)
+            non_steady_mask = ~is_steady_in_retr
+            non_steady = retr_np[non_steady_mask]
+            ns_scores = scores_np[non_steady_mask]
+            cap = max(0, budget - int(steady_np.size))
+            if cap > 0 and non_steady.size > cap:
+                # Stable argsort on descending scores: deterministic tie-break
+                # (smaller block index wins on equal score) – a valid refinement
+                # of the original ``sorted(retr - steady, key=score, reverse=True)``
+                # which iterated a Python set (non-deterministic order).
+                order = np.argsort(-ns_scores, kind="stable")[:cap]
+                top_non_steady = non_steady[order]
+            else:
+                top_non_steady = non_steady[:cap]
+            combined = np.union1d(steady_np, top_non_steady)
+        retr_only = np.setdiff1d(retr_np, steady_np, assume_unique=True)
+        return combined.tolist(), retr_only.tolist()
 
     def _select_one_layer_topk_tokens(
         self,
         request_id: str,
         total_tokens: int,
+        steady_np: np.ndarray,
         steady_tokens: set[int],
         st: _SparseLayerIndexState,
         q: np.ndarray,
@@ -1103,34 +1187,52 @@ class SparseKVManager(FullAttentionManager):
         """
         Token-granularity Top-K.
 
+        ``steady_np`` is the caller-hoisted sorted ndarray form of
+        ``steady_tokens`` (same contents); both are accepted to avoid
+        re-building either per q-head iteration.
+
         Returns:
             (selected logical blocks, retrieve-only blocks, sorted global token ids).
         """
-        if len(st.cluster_centres) == 0 or st.block_to_cluster.size == 0:
-            fallback = set(range(max(0, total_tokens - budget), total_tokens))
-            combined_t = fallback | steady_tokens
-            sel_t = sorted(combined_t)[:budget]
-            sel_bl = self._tokens_to_history_logical_blocks(request_id, sel_t)
-            retr_bl = self._tokens_to_history_logical_blocks(
-                request_id, set(sel_t) - steady_tokens
-            )
-            return sel_bl, retr_bl, sel_t
 
-        retr, unit_scores = self._retrieve_zone_one_layer(st, q)
-        combined_t = steady_tokens | retr
-        if len(combined_t) > budget:
-            non_steady = sorted(
-                retr - steady_tokens,
-                key=lambda t: unit_scores.get(t, float("-inf")),
-                reverse=True,
+        if len(st.cluster_centres) == 0 or st.block_to_cluster.size == 0:
+            fallback = np.arange(
+                max(0, total_tokens - budget), total_tokens, dtype=np.int64
             )
-            cap = max(0, budget - len(steady_tokens))
-            combined_t = steady_tokens | set(non_steady[:cap])
-        sel_t = sorted(combined_t)
-        retr_t = sorted(retr - steady_tokens)
-        sel_bl = self._tokens_to_history_logical_blocks(request_id, sel_t)
-        retr_bl = self._tokens_to_history_logical_blocks(request_id, retr_t)
-        return sel_bl, retr_bl, sel_t
+            combined_t = np.union1d(fallback, steady_np)[:budget]
+            sel_t_list = combined_t.tolist()
+            retr_minus_steady = np.setdiff1d(combined_t, steady_np,
+                                             assume_unique=True)
+            sel_bl = self._tokens_to_history_logical_blocks(
+                request_id, combined_t
+            )
+            retr_bl = self._tokens_to_history_logical_blocks(
+                request_id, retr_minus_steady
+            )
+            return sel_bl, retr_bl, sel_t_list
+
+        retr_np, scores_np = self._retrieve_zone_one_layer(st, q)
+        combined_t = np.union1d(retr_np, steady_np)
+        if combined_t.size > budget:
+            is_steady_in_retr = np.isin(retr_np, steady_np, assume_unique=True)
+            non_steady_mask = ~is_steady_in_retr
+            non_steady = retr_np[non_steady_mask]
+            ns_scores = scores_np[non_steady_mask]
+            cap = max(0, budget - int(steady_np.size))
+            if cap > 0 and non_steady.size > cap:
+                # Stable argsort on descending scores: deterministic tie-break
+                # (smaller token index wins on equal score) – a valid refinement
+                # of the original ``sorted(retr - steady, key=score, reverse=True)``
+                # which iterated a Python set (non-deterministic order).
+                order = np.argsort(-ns_scores, kind="stable")[:cap]
+                top_non_steady = non_steady[order]
+            else:
+                top_non_steady = non_steady[:cap]
+            combined_t = np.union1d(steady_np, top_non_steady)
+        retr_t_np = np.setdiff1d(retr_np, steady_np, assume_unique=True)
+        sel_bl = self._tokens_to_history_logical_blocks(request_id, combined_t)
+        retr_bl = self._tokens_to_history_logical_blocks(request_id, retr_t_np)
+        return sel_bl, retr_bl, combined_t.tolist()
 
     def _per_layer_fresh_topk(
         self,
@@ -1170,6 +1272,12 @@ class SparseKVManager(FullAttentionManager):
             steady_tokens.update(
                 range(max(0, n_units - self._spec.static_pattern_end), n_units)
             )
+            # Hoist the set→ndarray conversion out of the per-q_head loop so
+            # all 784 calls into ``_select_one_layer_topk_tokens`` share it.
+            steady_tokens_np = np.fromiter(
+                steady_tokens, dtype=np.int64, count=len(steady_tokens)
+            )
+            steady_tokens_np.sort()
             if all(len(st.cluster_centres) == 0 for st in ls.values()):
                 fallback = set(range(max(0, n_units - budget), n_units))
                 sel_t = sorted(fallback | steady_tokens)[:budget]
@@ -1203,7 +1311,8 @@ class SparseKVManager(FullAttentionManager):
                     if st is None:
                         continue
                     sel_bl, retr_bl, sel_t = self._select_one_layer_topk_tokens(
-                        request_id, n_units, steady_tokens, st, q, budget
+                        request_id, n_units, steady_tokens_np,
+                        steady_tokens, st, q, budget
                     )
                     selected_by_qh[qk] = sel_bl
                     retrieve_by_qh[qk] = retr_bl
@@ -1236,6 +1345,10 @@ class SparseKVManager(FullAttentionManager):
         sink_set = set(range(min(n_sink, n_units)))
         recent_set = set(range(max(0, n_units - n_recent), n_units))
         steady_set = sink_set | recent_set
+        steady_set_np = np.fromiter(
+            steady_set, dtype=np.int64, count=len(steady_set)
+        )
+        steady_set_np.sort()
 
         if all(len(st.cluster_centres) == 0 for st in ls.values()):
             fallback = set(range(max(0, n_units - budget), n_units))
@@ -1266,7 +1379,7 @@ class SparseKVManager(FullAttentionManager):
                 if st is None:
                     continue
                 sel, retr = self._select_one_layer_topk_blocks(
-                    n_units, steady_set, st, q, budget
+                    n_units, steady_set_np, steady_set, st, q, budget
                 )
                 selected_by_qh[qk] = sel
                 retrieve_by_qh[qk] = retr
@@ -1418,6 +1531,12 @@ class SparseKVManager(FullAttentionManager):
             all_value_features=all_value,
             mean_key=mean_key,
         )
+        # Reserve decode headroom so the first rebalance after prefill doesn't
+        # trigger an N→2N grow memcpy across every KV unit (~1.4 GB / step
+        # across 112 heads for N=24640).  Size is capped so the worst-case
+        # extra memory is bounded even for very long prompts.
+        reserve = min(max(num_blocks // 4, 1024), 4096)
+        state.reserve_capacity(reserve)
         self._layer_map_for_request(request_id)[layer_name] = state
         return n_k
 
