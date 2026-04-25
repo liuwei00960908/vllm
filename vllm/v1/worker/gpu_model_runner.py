@@ -10597,6 +10597,8 @@ class GPUModelRunner(
     def _sparse_online_dynamic_update(
         self,
         state: _SparseOnlineLayerState,
+        *,
+        append_buffered_features: bool = False,
     ) -> None:
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
         try:
@@ -10632,7 +10634,17 @@ class GPUModelRunner(
             labels_new = labels_new.to(
                 dtype=torch.int64, device=state.block_to_cluster.device
             )
-            state.block_to_cluster[-m:] = labels_new + n_existing
+            new_slot = labels_new + n_existing
+            if append_buffered_features:
+                state._grow_if_needed(m)
+                start = state._len
+                state._abf_storage[start : start + m].copy_(
+                    feat.to(dtype=state._abf_storage.dtype)
+                )
+                state._b2c_storage[start : start + m].copy_(new_slot)
+                state._len += m
+            else:
+                state.block_to_cluster[-m:] = new_slot
             state.decode_block_buffer.clear()
         finally:
             if _t0 is not None:
@@ -10825,6 +10837,7 @@ class GPUModelRunner(
             pass1_states: list[_SparseOnlineLayerState] = []
             pass1_feats: list[torch.Tensor] = []
             pass1_specs: list[SparseAttentionSpec] = []
+            pass1_defer_append: list[bool] = []
             for req_id, unit_map, is_gpu in iter_src:
                 req_states = self._sparse_online_index.get(req_id)
                 if not req_states:
@@ -10840,9 +10853,13 @@ class GPUModelRunner(
                     state = req_states.get(unit_key)
                     if state is None:
                         continue
+                    defer_append = bool(
+                        self._sparse_legacy_token_topk
+                        and spec.use_compact_kv_gather
+                    )
                     if is_gpu:
                         feat_t = feat
-                        if feat_t.dtype != torch.float32:
+                        if not defer_append and feat_t.dtype != torch.float32:
                             feat_t = feat_t.to(dtype=torch.float32)
                     else:
                         feat_t = torch.as_tensor(
@@ -10851,6 +10868,7 @@ class GPUModelRunner(
                     pass1_states.append(state)
                     pass1_feats.append(feat_t)
                     pass1_specs.append(spec)
+                    pass1_defer_append.append(defer_append)
 
             if _t_sub is not None:
                 self._sparse_perf_record(
@@ -10862,6 +10880,9 @@ class GPUModelRunner(
                 return
 
             device = pass1_feats[0].device
+            immediate_idxs = [
+                i for i, defer in enumerate(pass1_defer_append) if not defer
+            ]
 
             # ------------------------------------------------------------
             # Pass 2 + Pass 3: bucket units by (K, D) and, for each bucket,
@@ -10882,7 +10903,8 @@ class GPUModelRunner(
             buckets: dict[
                 tuple[int, int], list[int]
             ] = {}
-            for i, s in enumerate(pass1_states):
+            for i in immediate_idxs:
+                s = pass1_states[i]
                 k = int(s.cluster_centres.shape[0])
                 d = (
                     int(s.mean_key.shape[0])
@@ -10958,15 +10980,22 @@ class GPUModelRunner(
                 time.perf_counter()
                 if self._sparse_perf_stats_enabled else None
             )
-            for state, feat_t, spec in zip(
-                pass1_states, pass1_feats, pass1_specs, strict=True
+            for i, (state, feat_t, spec) in enumerate(
+                zip(pass1_states, pass1_feats, pass1_specs, strict=True)
             ):
+                # Legacy token compact gather includes generated tokens as
+                # pending tail, so per-step nearest-cluster labels are not
+                # consumed before the periodic dynamic update.  Buffer only
+                # the K tensor and append clustered rows in that update.
                 state.decode_block_buffer.append(feat_t)
                 if (
                     len(state.decode_block_buffer)
                     >= int(spec.update_threshold_tokens)
                 ):
-                    self._sparse_online_dynamic_update(state)
+                    self._sparse_online_dynamic_update(
+                        state,
+                        append_buffered_features=pass1_defer_append[i],
+                    )
             if _t_sub is not None:
                 self._sparse_perf_record(
                     "_update_sparse_online_index:bookkeep",
@@ -11667,7 +11696,7 @@ class GPUModelRunner(
 
                 block_ids_np = block_table.block_table.np[
                     req_idx, :num_blocks
-                ].copy()
+                ]
                 block_ids_t: torch.Tensor | None = None
 
                 def _get_block_ids_t() -> torch.Tensor:
@@ -11880,6 +11909,10 @@ class GPUModelRunner(
                         if is_decode_committed:
                             last_g = seq_len_after - 1
                             slot = int(last_g % block_size)
+                            defer_compact_update = bool(
+                                self._sparse_legacy_token_topk
+                                and spec.use_compact_kv_gather
+                            )
                             if decode_only_token_sparse:
                                 # Direct scalar read: no block_ids_t.to(device)
                                 # needed, no full-gather allocation.
@@ -11887,12 +11920,14 @@ class GPUModelRunner(
                                 _t_k_cache_read = (
                                     time.perf_counter() if perf_enabled else None
                                 )
-                                k_row_gpu = kv[0][last_block_id, slot].float()
+                                k_row_gpu = kv[0][last_block_id, slot]
                                 _perf_add(
                                     "collect:k_cache_read", _t_k_cache_read
                                 )
                             else:
-                                k_row_gpu = _read_k_blocks()[-1][slot].float()
+                                k_row_gpu = _read_k_blocks()[-1][slot]
+                            if not defer_compact_update:
+                                k_row_gpu = k_row_gpu.float()
                             emit_decode_feature_to_scheduler = (
                                 not bool(spec.use_compact_kv_gather)
                             )
