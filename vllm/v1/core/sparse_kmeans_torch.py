@@ -14,9 +14,18 @@ import os
 
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 _PREFILL_CLUSTER_DEVICE = os.environ.get(
     "VLLM_SPARSE_PREFILL_CLUSTER_DEVICE", "auto"
 ).lower()
+_PREFILL_CLUSTER_TRITON = (
+    os.environ.get("VLLM_SPARSE_TRITON_KMEANS", "0").lower()
+    in ("1", "true", "yes", "on")
+)
+_TRITON_KMEANS_HEAD_DIMS = {32, 64, 128}
 
 
 def sparse_prefill_cluster_use_device_kmeans(feat: torch.Tensor) -> bool:
@@ -27,6 +36,25 @@ def sparse_prefill_cluster_use_device_kmeans(feat: torch.Tensor) -> bool:
         return feat.is_cuda
     # auto
     return feat.is_cuda
+
+
+def sparse_prefill_cluster_use_triton_kmeans(feat: torch.Tensor) -> bool:
+    """Whether to use the Triton K-Means kernels for ``feat``.
+
+    This is deliberately opt-in. The Triton path preserves the torch
+    algorithm's mean-centering, seeded initialization, segment split, and
+    no-normalization update semantics, but it still needs Triton-compatible
+    CUDA tensors and common attention head dimensions.
+    """
+    if not _PREFILL_CLUSTER_TRITON:
+        return False
+    if not sparse_prefill_cluster_use_device_kmeans(feat):
+        return False
+    if not feat.is_cuda:
+        return False
+    if feat.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    return int(feat.shape[-1]) in _TRITON_KMEANS_HEAD_DIMS
 
 
 def _kmeans_dot_torch_batched(
@@ -316,6 +344,90 @@ def prefill_cluster_meta_from_features_torch(
     }
 
 
+def prefill_cluster_meta_from_features_triton(
+    feat: torch.Tensor,
+    num_clusters: int,
+    n_segment: int,
+    n_iter: int = 15,
+    seed: int = 42,
+) -> dict[str, torch.Tensor]:
+    """Triton-backed equivalent of ``prefill_cluster_meta_from_features_torch``.
+
+    The wrapper keeps the public contract identical to the torch path and uses
+    Triton only for Lloyd assignment/update iterations on already centered
+    features.
+    """
+    feat, squeeze = _as_batched_features(feat, "feat")
+    h, n_tokens, d = feat.shape
+    if n_tokens == 0:
+        zc = feat.new_zeros((h, 0, d), dtype=torch.float32)
+        zl = torch.zeros(h, 0, dtype=torch.int64, device=feat.device)
+        zs = torch.zeros(h, 0, dtype=torch.int32, device=feat.device)
+        mean_key = feat.new_zeros((h, d), dtype=torch.float32)
+        return {
+            "cluster_centres": _maybe_squeeze(zc, squeeze),
+            "block_to_cluster": _maybe_squeeze(zl, squeeze),
+            "cluster_size": _maybe_squeeze(zs, squeeze),
+            "mean_key": _maybe_squeeze(mean_key, squeeze),
+        }
+
+    from vllm.v1.attention.ops.triton_segment_kmeans import (
+        segment_kmeans_centered_triton,
+    )
+
+    f = feat.to(dtype=torch.float32)
+    mean_key = f.mean(dim=1)
+    centered = f - mean_key.unsqueeze(1)
+    k = min(int(num_clusters), int(n_tokens))
+    n_seg = min(int(n_segment), int(n_tokens))
+    centres_c, labels, sizes = segment_kmeans_centered_triton(
+        centered,
+        n_clusters=k,
+        n_segments=n_seg,
+        n_iter=n_iter,
+        seed=seed,
+    )
+    centres = centres_c + mean_key.unsqueeze(1)
+    return {
+        "cluster_centres": _maybe_squeeze(centres, squeeze),
+        "block_to_cluster": _maybe_squeeze(labels, squeeze),
+        "cluster_size": _maybe_squeeze(sizes, squeeze),
+        "mean_key": _maybe_squeeze(mean_key, squeeze),
+    }
+
+
+def prefill_cluster_meta_from_features_device(
+    feat: torch.Tensor,
+    num_clusters: int,
+    n_segment: int,
+    n_iter: int = 15,
+    seed: int = 42,
+) -> dict[str, torch.Tensor]:
+    """Device K-Means with optional Triton acceleration and torch fallback."""
+    if sparse_prefill_cluster_use_triton_kmeans(feat):
+        try:
+            return prefill_cluster_meta_from_features_triton(
+                feat,
+                num_clusters=num_clusters,
+                n_segment=n_segment,
+                n_iter=n_iter,
+                seed=seed,
+            )
+        except Exception as err:
+            logger.warning_once(
+                "Sparse Triton K-Means failed; falling back to torch "
+                "K-Means. error=%s",
+                err,
+            )
+    return prefill_cluster_meta_from_features_torch(
+        feat,
+        num_clusters=num_clusters,
+        n_segment=n_segment,
+        n_iter=n_iter,
+        seed=seed,
+    )
+
+
 def value_sum_from_kv_cache_torch(
     v_cache: torch.Tensor,
     block_ids: torch.Tensor,
@@ -458,6 +570,66 @@ def prefill_cluster_meta_from_kv_cache_torch(
     )
     raw["features"] = features
     return raw
+
+
+def prefill_cluster_meta_from_kv_cache_device(
+    kv_cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    num_tokens: int,
+    *,
+    num_clusters: int,
+    n_segment: int,
+    is_centered: bool,
+    n_iter: int = 15,
+    seed: int = 42,
+) -> dict[str, torch.Tensor]:
+    """Build prefill K-Means metadata, using Triton when explicitly enabled.
+
+    The returned dict is identical to ``prefill_cluster_meta_from_kv_cache_torch``.
+    Keeping the feature tensor in the payload preserves the current runner and
+    scheduler contracts while the clustering backend is swapped underneath.
+    """
+    if sparse_prefill_cluster_use_triton_kmeans(kv_cache):
+        features = kmeans_features_from_kv_cache_torch(
+            kv_cache,
+            block_ids,
+            num_tokens,
+            is_centered=is_centered,
+        )
+        try:
+            raw = prefill_cluster_meta_from_features_triton(
+                features,
+                num_clusters=num_clusters,
+                n_segment=n_segment,
+                n_iter=n_iter,
+                seed=seed,
+            )
+        except Exception as err:
+            logger.warning_once(
+                "Sparse Triton K-Means from KV cache failed; falling back "
+                "to torch K-Means. error=%s",
+                err,
+            )
+            raw = prefill_cluster_meta_from_features_torch(
+                features,
+                num_clusters=num_clusters,
+                n_segment=n_segment,
+                n_iter=n_iter,
+                seed=seed,
+            )
+        raw["features"] = features
+        return raw
+
+    return prefill_cluster_meta_from_kv_cache_torch(
+        kv_cache,
+        block_ids,
+        num_tokens,
+        num_clusters=num_clusters,
+        n_segment=n_segment,
+        is_centered=is_centered,
+        n_iter=n_iter,
+        seed=seed,
+    )
 
 
 def prefill_cluster_meta_from_features_torch_batched(

@@ -135,8 +135,8 @@ from vllm.v1.attention.ops.triton_sparse_pack import sparse_pack_single_req
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sparse_kmeans_torch import (
     kmeans_features_from_kv_cache_torch,
-    prefill_cluster_meta_from_features_torch,
-    prefill_cluster_meta_from_kv_cache_torch,
+    prefill_cluster_meta_from_features_device,
+    prefill_cluster_meta_from_kv_cache_device,
     sparse_prefill_cluster_use_device_kmeans,
     value_sum_from_kv_cache_torch,
 )
@@ -10612,7 +10612,7 @@ class GPUModelRunner(
             k_new = (k_new // max(1, 32)) * 32
             k_new = max(k_new, 1)
             k_new = min(k_new, m)
-            raw = prefill_cluster_meta_from_features_torch(
+            raw = prefill_cluster_meta_from_features_device(
                 feat, num_clusters=k_new, n_segment=1
             )
             centres_new = raw["cluster_centres"]
@@ -10687,7 +10687,7 @@ class GPUModelRunner(
                         )
                         meta = meta_map.get(unit_key)
                         if meta is None:
-                            raw = prefill_cluster_meta_from_features_torch(
+                            raw = prefill_cluster_meta_from_features_device(
                                 feat_t,
                                 num_clusters=spec.num_clusters,
                                 n_segment=spec.n_segment,
@@ -11282,7 +11282,7 @@ class GPUModelRunner(
         raw = precomputed_meta
         if raw is None and sparse_prefill_cluster_use_device_kmeans(k_feat):
             _t_kmeans = time.perf_counter() if perf_enabled else None
-            raw = prefill_cluster_meta_from_features_torch(
+            raw = prefill_cluster_meta_from_features_device(
                 k_feat,
                 num_clusters=spec.num_clusters,
                 n_segment=spec.n_segment,
@@ -11403,7 +11403,7 @@ class GPUModelRunner(
         raw_b = precomputed_meta
         if raw_b is None and sparse_prefill_cluster_use_device_kmeans(k_heads):
             _t_kmeans = time.perf_counter() if perf_enabled else None
-            raw_b = prefill_cluster_meta_from_features_torch(
+            raw_b = prefill_cluster_meta_from_features_device(
                 k_heads,
                 num_clusters=spec.num_clusters,
                 n_segment=spec.n_segment,
@@ -11769,7 +11769,7 @@ class GPUModelRunner(
                                         if perf_enabled
                                         else None
                                     )
-                                    raw_b = prefill_cluster_meta_from_kv_cache_torch(
+                                    raw_b = prefill_cluster_meta_from_kv_cache_device(
                                         kv[0],
                                         _get_block_ids_t(),
                                         valid_len,
@@ -11978,7 +11978,7 @@ class GPUModelRunner(
                                     if perf_enabled
                                     else None
                                 )
-                                raw_b = prefill_cluster_meta_from_kv_cache_torch(
+                                raw_b = prefill_cluster_meta_from_kv_cache_device(
                                     kv[0],
                                     _get_block_ids_t(),
                                     num_prompt_tokens,
