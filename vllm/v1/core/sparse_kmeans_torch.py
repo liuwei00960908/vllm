@@ -11,6 +11,7 @@ features still live on device, avoiding large CPU matmuls.
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 
@@ -456,14 +457,25 @@ def prefill_cluster_meta_from_features_device(
     skip_reason = _triton_kmeans_skip_reason(feat)
     if skip_reason is None:
         _trace_triton_kmeans("features", feat, use_triton=True)
+        t0 = time.perf_counter() if _PREFILL_CLUSTER_TRITON_DEBUG else None
         try:
-            return prefill_cluster_meta_from_features_triton(
+            raw = prefill_cluster_meta_from_features_triton(
                 feat,
                 num_clusters=num_clusters,
                 n_segment=n_segment,
                 n_iter=n_iter,
                 seed=seed,
             )
+            if t0 is not None:
+                logger.info(
+                    "[SparseTritonKMeans] source=features done=1 "
+                    "elapsed_ms=%.3f shape=%s dtype=%s device=%s",
+                    (time.perf_counter() - t0) * 1000.0,
+                    tuple(feat.shape),
+                    feat.dtype,
+                    feat.device,
+                )
+            return raw
         except Exception as err:
             if _PREFILL_CLUSTER_TRITON_DEBUG:
                 logger.warning_once(
@@ -656,6 +668,7 @@ def prefill_cluster_meta_from_kv_cache_device(
     skip_reason = _triton_kmeans_skip_reason(kv_cache)
     if skip_reason is None:
         _trace_triton_kmeans("kv_cache", kv_cache, use_triton=True)
+        t0 = time.perf_counter() if _PREFILL_CLUSTER_TRITON_DEBUG else None
         features = kmeans_features_from_kv_cache_torch(
             kv_cache,
             block_ids,
@@ -695,6 +708,17 @@ def prefill_cluster_meta_from_kv_cache_device(
                 seed=seed,
             )
         raw["features"] = features
+        if t0 is not None:
+            logger.info(
+                "[SparseTritonKMeans] source=kv_cache done=1 "
+                "elapsed_ms=%.3f kv_shape=%s feature_shape=%s dtype=%s "
+                "device=%s",
+                (time.perf_counter() - t0) * 1000.0,
+                tuple(kv_cache.shape),
+                tuple(features.shape),
+                kv_cache.dtype,
+                kv_cache.device,
+            )
         return raw
 
     _trace_triton_kmeans(
