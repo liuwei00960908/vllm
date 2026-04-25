@@ -25,6 +25,10 @@ _PREFILL_CLUSTER_TRITON = (
     os.environ.get("VLLM_SPARSE_TRITON_KMEANS", "0").lower()
     in ("1", "true", "yes", "on")
 )
+_PREFILL_CLUSTER_TRITON_DEBUG = (
+    os.environ.get("VLLM_SPARSE_TRITON_KMEANS_DEBUG", "0").lower()
+    in ("1", "true", "yes", "on")
+)
 _TRITON_KMEANS_HEAD_DIMS = {32, 64, 128}
 
 
@@ -38,6 +42,59 @@ def sparse_prefill_cluster_use_device_kmeans(feat: torch.Tensor) -> bool:
     return feat.is_cuda
 
 
+def _triton_kmeans_skip_reason(feat: torch.Tensor) -> str | None:
+    if not _PREFILL_CLUSTER_TRITON:
+        return "VLLM_SPARSE_TRITON_KMEANS is not enabled"
+    if not sparse_prefill_cluster_use_device_kmeans(feat):
+        return (
+            f"device clustering disabled or tensor is not on the requested "
+            f"device: VLLM_SPARSE_PREFILL_CLUSTER_DEVICE="
+            f"{_PREFILL_CLUSTER_DEVICE!r}, is_cuda={feat.is_cuda}"
+        )
+    if not feat.is_cuda:
+        return "tensor is not CUDA"
+    if feat.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return f"unsupported dtype {feat.dtype}"
+    head_dim = int(feat.shape[-1]) if feat.dim() > 0 else -1
+    if head_dim not in _TRITON_KMEANS_HEAD_DIMS:
+        return (
+            f"unsupported head_dim {head_dim}; supported="
+            f"{sorted(_TRITON_KMEANS_HEAD_DIMS)}"
+        )
+    return None
+
+
+def _trace_triton_kmeans(
+    source: str,
+    feat: torch.Tensor,
+    *,
+    use_triton: bool,
+    reason: str | None = None,
+) -> None:
+    if not _PREFILL_CLUSTER_TRITON_DEBUG:
+        return
+    shape = tuple(feat.shape)
+    if use_triton:
+        logger.info_once(
+            "[SparseTritonKMeans] source=%s use_triton=1 shape=%s "
+            "dtype=%s device=%s",
+            source,
+            shape,
+            feat.dtype,
+            feat.device,
+        )
+    else:
+        logger.info_once(
+            "[SparseTritonKMeans] source=%s use_triton=0 reason=%s "
+            "shape=%s dtype=%s device=%s",
+            source,
+            reason,
+            shape,
+            feat.dtype,
+            feat.device,
+        )
+
+
 def sparse_prefill_cluster_use_triton_kmeans(feat: torch.Tensor) -> bool:
     """Whether to use the Triton K-Means kernels for ``feat``.
 
@@ -46,15 +103,7 @@ def sparse_prefill_cluster_use_triton_kmeans(feat: torch.Tensor) -> bool:
     no-normalization update semantics, but it still needs Triton-compatible
     CUDA tensors and common attention head dimensions.
     """
-    if not _PREFILL_CLUSTER_TRITON:
-        return False
-    if not sparse_prefill_cluster_use_device_kmeans(feat):
-        return False
-    if not feat.is_cuda:
-        return False
-    if feat.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        return False
-    return int(feat.shape[-1]) in _TRITON_KMEANS_HEAD_DIMS
+    return _triton_kmeans_skip_reason(feat) is None
 
 
 def _kmeans_dot_torch_batched(
@@ -404,7 +453,9 @@ def prefill_cluster_meta_from_features_device(
     seed: int = 42,
 ) -> dict[str, torch.Tensor]:
     """Device K-Means with optional Triton acceleration and torch fallback."""
-    if sparse_prefill_cluster_use_triton_kmeans(feat):
+    skip_reason = _triton_kmeans_skip_reason(feat)
+    if skip_reason is None:
+        _trace_triton_kmeans("features", feat, use_triton=True)
         try:
             return prefill_cluster_meta_from_features_triton(
                 feat,
@@ -414,11 +465,24 @@ def prefill_cluster_meta_from_features_device(
                 seed=seed,
             )
         except Exception as err:
+            if _PREFILL_CLUSTER_TRITON_DEBUG:
+                logger.warning_once(
+                    "[SparseTritonKMeans] source=features fallback=1 "
+                    "shape=%s dtype=%s device=%s error=%s",
+                    tuple(feat.shape),
+                    feat.dtype,
+                    feat.device,
+                    err,
+                )
             logger.warning_once(
                 "Sparse Triton K-Means failed; falling back to torch "
                 "K-Means. error=%s",
                 err,
             )
+    else:
+        _trace_triton_kmeans(
+            "features", feat, use_triton=False, reason=skip_reason
+        )
     return prefill_cluster_meta_from_features_torch(
         feat,
         num_clusters=num_clusters,
@@ -589,7 +653,9 @@ def prefill_cluster_meta_from_kv_cache_device(
     Keeping the feature tensor in the payload preserves the current runner and
     scheduler contracts while the clustering backend is swapped underneath.
     """
-    if sparse_prefill_cluster_use_triton_kmeans(kv_cache):
+    skip_reason = _triton_kmeans_skip_reason(kv_cache)
+    if skip_reason is None:
+        _trace_triton_kmeans("kv_cache", kv_cache, use_triton=True)
         features = kmeans_features_from_kv_cache_torch(
             kv_cache,
             block_ids,
@@ -605,6 +671,17 @@ def prefill_cluster_meta_from_kv_cache_device(
                 seed=seed,
             )
         except Exception as err:
+            if _PREFILL_CLUSTER_TRITON_DEBUG:
+                logger.warning_once(
+                    "[SparseTritonKMeans] source=kv_cache fallback=1 "
+                    "kv_shape=%s feature_shape=%s dtype=%s device=%s "
+                    "error=%s",
+                    tuple(kv_cache.shape),
+                    tuple(features.shape),
+                    kv_cache.dtype,
+                    kv_cache.device,
+                    err,
+                )
             logger.warning_once(
                 "Sparse Triton K-Means from KV cache failed; falling back "
                 "to torch K-Means. error=%s",
@@ -619,6 +696,10 @@ def prefill_cluster_meta_from_kv_cache_device(
             )
         raw["features"] = features
         return raw
+
+    _trace_triton_kmeans(
+        "kv_cache", kv_cache, use_triton=False, reason=skip_reason
+    )
 
     return prefill_cluster_meta_from_kv_cache_torch(
         kv_cache,
