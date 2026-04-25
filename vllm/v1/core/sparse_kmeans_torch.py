@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU (or device) segment K-Means for sparse KV prefill indexing.
 
-Mirrors ``sparse_kv_cache_manager._segment_kmeans`` on centered features:
-Lloyd iterations with dot-product assignment (equivalent to L2 K-Means on
-mean-centered vectors).  Intended to run in the model-runner process while
-features still live on device, avoiding large CPU matmuls.
+The torch path mirrors ``sparse_kv_cache_manager._segment_kmeans`` on centered
+features. The optional Triton path directly calls the paged
+``segment_k_means_paged`` operator on raw K/V cache for token prefill.
 """
 
 from __future__ import annotations
@@ -99,10 +98,8 @@ def _trace_triton_kmeans(
 def sparse_prefill_cluster_use_triton_kmeans(feat: torch.Tensor) -> bool:
     """Whether to use the Triton K-Means kernels for ``feat``.
 
-    This is deliberately opt-in. The Triton path preserves the torch
-    algorithm's mean-centering, seeded initialization, segment split, and
-    no-normalization update semantics, but it still needs Triton-compatible
-    CUDA tensors and common attention head dimensions.
+    This is deliberately opt-in and only gates Triton-compatible CUDA tensors.
+    The active Triton prefill path is the paged ``segment_k_means_paged`` entry.
     """
     return _triton_kmeans_skip_reason(feat) is None
 
@@ -394,58 +391,6 @@ def prefill_cluster_meta_from_features_torch(
     }
 
 
-def prefill_cluster_meta_from_features_triton(
-    feat: torch.Tensor,
-    num_clusters: int,
-    n_segment: int,
-    n_iter: int = 15,
-    seed: int = 42,
-) -> dict[str, torch.Tensor]:
-    """Triton-backed equivalent of ``prefill_cluster_meta_from_features_torch``.
-
-    The wrapper keeps the public contract identical to the torch path and uses
-    Triton only for Lloyd assignment/update iterations on already centered
-    features.
-    """
-    feat, squeeze = _as_batched_features(feat, "feat")
-    h, n_tokens, d = feat.shape
-    if n_tokens == 0:
-        zc = feat.new_zeros((h, 0, d), dtype=torch.float32)
-        zl = torch.zeros(h, 0, dtype=torch.int64, device=feat.device)
-        zs = torch.zeros(h, 0, dtype=torch.int32, device=feat.device)
-        mean_key = feat.new_zeros((h, d), dtype=torch.float32)
-        return {
-            "cluster_centres": _maybe_squeeze(zc, squeeze),
-            "block_to_cluster": _maybe_squeeze(zl, squeeze),
-            "cluster_size": _maybe_squeeze(zs, squeeze),
-            "mean_key": _maybe_squeeze(mean_key, squeeze),
-        }
-
-    from vllm.v1.attention.ops.triton_segment_kmeans import (
-        segment_kmeans_centered_triton,
-    )
-
-    f = feat.to(dtype=torch.float32)
-    mean_key = f.mean(dim=1)
-    centered = f - mean_key.unsqueeze(1)
-    k = min(int(num_clusters), int(n_tokens))
-    n_seg = min(int(n_segment), int(n_tokens))
-    centres_c, labels, sizes = segment_kmeans_centered_triton(
-        centered,
-        n_clusters=k,
-        n_segments=n_seg,
-        n_iter=n_iter,
-        seed=seed,
-    )
-    centres = centres_c + mean_key.unsqueeze(1)
-    return {
-        "cluster_centres": _maybe_squeeze(centres, squeeze),
-        "block_to_cluster": _maybe_squeeze(labels, squeeze),
-        "cluster_size": _maybe_squeeze(sizes, squeeze),
-        "mean_key": _maybe_squeeze(mean_key, squeeze),
-    }
-
-
 def prefill_cluster_meta_from_features_device(
     feat: torch.Tensor,
     num_clusters: int,
@@ -453,48 +398,15 @@ def prefill_cluster_meta_from_features_device(
     n_iter: int = 15,
     seed: int = 42,
 ) -> dict[str, torch.Tensor]:
-    """Device K-Means with optional Triton acceleration and torch fallback."""
-    skip_reason = _triton_kmeans_skip_reason(feat)
-    if skip_reason is None:
-        _trace_triton_kmeans("features", feat, use_triton=True)
-        t0 = time.perf_counter() if _PREFILL_CLUSTER_TRITON_DEBUG else None
-        try:
-            raw = prefill_cluster_meta_from_features_triton(
-                feat,
-                num_clusters=num_clusters,
-                n_segment=n_segment,
-                n_iter=n_iter,
-                seed=seed,
-            )
-            if t0 is not None:
-                logger.info(
-                    "[SparseTritonKMeans] source=features done=1 "
-                    "elapsed_ms=%.3f shape=%s dtype=%s device=%s",
-                    (time.perf_counter() - t0) * 1000.0,
-                    tuple(feat.shape),
-                    feat.dtype,
-                    feat.device,
-                )
-            return raw
-        except Exception as err:
-            if _PREFILL_CLUSTER_TRITON_DEBUG:
-                logger.warning_once(
-                    "[SparseTritonKMeans] source=features fallback=1 "
-                    "shape=%s dtype=%s device=%s error=%s",
-                    tuple(feat.shape),
-                    feat.dtype,
-                    feat.device,
-                    err,
-                )
-            logger.warning_once(
-                "Sparse Triton K-Means failed; falling back to torch "
-                "K-Means. error=%s",
-                err,
-            )
-    else:
-        _trace_triton_kmeans(
-            "features", feat, use_triton=False, reason=skip_reason
-        )
+    """Device K-Means from feature tensors.
+
+    The direct Triton path starts from paged K/V cache, so feature tensors keep
+    using the torch implementation.
+    """
+    skip_reason = _triton_kmeans_skip_reason(feat) or (
+        "segment_k_means_paged requires paged kv_cache/value_cache inputs"
+    )
+    _trace_triton_kmeans("features", feat, use_triton=False, reason=skip_reason)
     return prefill_cluster_meta_from_features_torch(
         feat,
         num_clusters=num_clusters,
@@ -653,77 +565,130 @@ def prefill_cluster_meta_from_kv_cache_device(
     block_ids: torch.Tensor,
     num_tokens: int,
     *,
+    value_cache: torch.Tensor | None = None,
     num_clusters: int,
     n_segment: int,
     is_centered: bool,
     n_iter: int = 15,
     seed: int = 42,
+    return_features: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Build prefill K-Means metadata, using Triton when explicitly enabled.
+    """Build prefill K-Means metadata from raw paged KV cache.
 
-    The returned dict is identical to ``prefill_cluster_meta_from_kv_cache_torch``.
-    Keeping the feature tensor in the payload preserves the current runner and
-    scheduler contracts while the clustering backend is swapped underneath.
+    When Triton is enabled and ``value_cache`` is provided, token-granularity
+    prefill (``is_centered=False``) calls the optimized
+    ``segment_k_means_paged`` entry directly. Centered/block feature callers
+    use the torch fallback.
     """
     skip_reason = _triton_kmeans_skip_reason(kv_cache)
-    if skip_reason is None:
-        _trace_triton_kmeans("kv_cache", kv_cache, use_triton=True)
+    if skip_reason is None and not is_centered and value_cache is not None:
+        _trace_triton_kmeans("kv_cache_paged", kv_cache, use_triton=True)
         t0 = time.perf_counter() if _PREFILL_CLUSTER_TRITON_DEBUG else None
-        features = kmeans_features_from_kv_cache_torch(
-            kv_cache,
-            block_ids,
-            num_tokens,
-            is_centered=is_centered,
-        )
         try:
-            raw = prefill_cluster_meta_from_features_triton(
-                features,
-                num_clusters=num_clusters,
-                n_segment=n_segment,
-                n_iter=n_iter,
-                seed=seed,
+            from vllm.v1.attention.ops.triton_segment_kmeans import (
+                segment_k_means_paged,
             )
+
+            key_cache, _ = _as_batched_kv_cache(kv_cache, "kv_cache")
+            value_cache_b, _ = _as_batched_kv_cache(value_cache, "value_cache")
+            if tuple(value_cache_b.shape) != tuple(key_cache.shape):
+                raise ValueError(
+                    "value_cache shape must match kv_cache shape for "
+                    f"segment_k_means_paged, got {tuple(value_cache_b.shape)} "
+                    f"vs {tuple(key_cache.shape)}"
+                )
+            if block_ids.dim() != 1:
+                raise ValueError(
+                    "block_ids must be [num_selected_blocks], got "
+                    f"{tuple(block_ids.shape)}"
+                )
+
+            (
+                centres,
+                labels,
+                clusters,
+                cluster_size,
+                value_sum,
+            ) = segment_k_means_paged(
+                key_cache,
+                value_cache_b,
+                block_ids,
+                int(num_tokens),
+                int(num_clusters),
+                block_size=int(key_cache.shape[1]),
+                num_iters=int(n_iter),
+                num_segments=int(n_segment),
+            )
+            num_heads = int(key_cache.shape[2])
+            head_dim = int(key_cache.shape[3])
+            if return_features:
+                features = kmeans_features_from_kv_cache_torch(
+                    key_cache,
+                    block_ids,
+                    num_tokens,
+                    is_centered=False,
+                )
+            else:
+                # Token compact legacy TopK only needs the feature tensor's
+                # shape/device to initialize online state storage. The content
+                # is deliberately not copied into that state.
+                features = key_cache.new_empty(
+                    (num_heads, int(num_tokens), head_dim)
+                )
+            raw = {
+                "cluster_centres": centres.to(dtype=torch.float32),
+                "block_to_cluster": labels,
+                "cluster_size": cluster_size.to(dtype=torch.int32),
+                # Direct paged op ignores mean-centering; keep downstream
+                # decode assignment in the same uncentered coordinate system.
+                "mean_key": torch.zeros(
+                    (num_heads, head_dim),
+                    dtype=torch.float32,
+                    device=key_cache.device,
+                ),
+                "features": features,
+                "clusters": clusters,
+                "value_sum": value_sum,
+            }
+            if t0 is not None:
+                logger.info(
+                    "[SparseTritonKMeans] source=kv_cache_paged done=1 "
+                    "elapsed_ms=%.3f kv_shape=%s feature_shape=%s "
+                    "centres_shape=%s labels_shape=%s dtype=%s device=%s",
+                    (time.perf_counter() - t0) * 1000.0,
+                    tuple(key_cache.shape),
+                    tuple(features.shape),
+                    tuple(centres.shape),
+                    tuple(labels.shape),
+                    key_cache.dtype,
+                    key_cache.device,
+                )
+            return raw
         except Exception as err:
             if _PREFILL_CLUSTER_TRITON_DEBUG:
                 logger.warning_once(
-                    "[SparseTritonKMeans] source=kv_cache fallback=1 "
-                    "kv_shape=%s feature_shape=%s dtype=%s device=%s "
-                    "error=%s",
+                    "[SparseTritonKMeans] source=kv_cache_paged fallback=1 "
+                    "kv_shape=%s dtype=%s device=%s error=%s",
                     tuple(kv_cache.shape),
-                    tuple(features.shape),
                     kv_cache.dtype,
                     kv_cache.device,
                     err,
                 )
             logger.warning_once(
-                "Sparse Triton K-Means from KV cache failed; falling back "
+                "Sparse paged Triton K-Means from KV cache failed; falling back "
                 "to torch K-Means. error=%s",
                 err,
             )
-            raw = prefill_cluster_meta_from_features_torch(
-                features,
-                num_clusters=num_clusters,
-                n_segment=n_segment,
-                n_iter=n_iter,
-                seed=seed,
+    else:
+        reason = skip_reason
+        if reason is None:
+            reason = (
+                "segment_k_means_paged requires is_centered=False and "
+                "value_cache"
             )
-        raw["features"] = features
-        if t0 is not None:
-            logger.info(
-                "[SparseTritonKMeans] source=kv_cache done=1 "
-                "elapsed_ms=%.3f kv_shape=%s feature_shape=%s dtype=%s "
-                "device=%s",
-                (time.perf_counter() - t0) * 1000.0,
-                tuple(kv_cache.shape),
-                tuple(features.shape),
-                kv_cache.dtype,
-                kv_cache.device,
-            )
-        return raw
-
-    _trace_triton_kmeans(
-        "kv_cache", kv_cache, use_triton=False, reason=skip_reason
-    )
+        _trace_triton_kmeans(
+            "kv_cache_paged", kv_cache, use_triton=False, reason=reason
+        )
 
     return prefill_cluster_meta_from_kv_cache_torch(
         kv_cache,

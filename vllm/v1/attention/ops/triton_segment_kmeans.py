@@ -133,102 +133,6 @@ def _triton_k_means_train(
     return centroids
 
 
-def segment_kmeans_centered_triton(
-    features_centered: torch.Tensor,
-    n_clusters: int,
-    n_segments: int,
-    n_iter: int = 15,
-    seed: int = 42,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Segment K-Means for already mean-centered features.
-
-    This is the Triton implementation of
-    ``sparse_kmeans_torch.segment_kmeans_centered_torch``. The surrounding
-    algorithm intentionally matches the torch reference: same segment split,
-    same random initialization, dot-product assignment, empty-cluster retention,
-    and no centroid normalization.
-    """
-    if features_centered.dim() != 3:
-        raise ValueError(
-            "features_centered must be [H, N, D], "
-            f"got {tuple(features_centered.shape)}"
-        )
-    if not features_centered.is_cuda:
-        raise ValueError("Triton segment K-Means requires CUDA tensors")
-
-    h, n, d = features_centered.shape
-    if n == 0:
-        zc = features_centered.new_zeros((h, 0, d), dtype=torch.float32)
-        zl = torch.zeros(h, 0, dtype=torch.int64,
-                         device=features_centered.device)
-        zs = torch.zeros(h, 0, dtype=torch.int32,
-                         device=features_centered.device)
-        return zc, zl, zs
-
-    n_seg = min(int(n_segments), int(n))
-    k_per_seg = max(1, int(n_clusters) // n_seg)
-    seg_starts = [i * (n // n_seg) for i in range(n_seg)]
-    seg_ends = seg_starts[1:] + [n]
-
-    fc = features_centered.to(dtype=torch.float32).contiguous()
-    all_centres: list[torch.Tensor] = []
-    labels = torch.zeros(h, n, dtype=torch.int64, device=fc.device)
-    cluster_offset = 0
-
-    for seg_idx, (start, end) in enumerate(
-        zip(seg_starts, seg_ends, strict=False)
-    ):
-        seg_feat = fc[:, start:end, :].contiguous()
-        seg_n = int(seg_feat.shape[1])
-        k = min(k_per_seg, seg_n)
-        if k == 0:
-            continue
-
-        g = torch.Generator(device=fc.device)
-        g.manual_seed(int(seed) + seg_idx)
-        perm = torch.randperm(seg_n, generator=g, device=fc.device)[:k]
-        centres = seg_feat[:, perm, :].contiguous().clone()
-        labels_seg = torch.zeros(h, seg_n, dtype=torch.int32, device=fc.device)
-
-        for it in range(max(int(n_iter), 0)):
-            is_last = it == int(n_iter) - 1
-            if is_last:
-                centres, labels_seg, _ = _triton_k_means_train(
-                    seg_feat,
-                    centres,
-                    max_idx=labels_seg,
-                    normalize_centroids=False,
-                    return_indices=True,
-                    return_counts=True,
-                )
-            else:
-                centres = _triton_k_means_train(
-                    seg_feat,
-                    centres,
-                    max_idx=labels_seg,
-                    normalize_centroids=False,
-                    return_indices=False,
-                )
-
-        all_centres.append(centres)
-        labels[:, start:end] = labels_seg.to(torch.int64) + cluster_offset
-        cluster_offset += k
-
-    if not all_centres:
-        zc = fc.new_zeros((h, 0, d))
-        zs = torch.zeros(h, 0, dtype=torch.int32, device=fc.device)
-        return zc, labels, zs
-
-    all_c = torch.cat(all_centres, dim=1)
-    total_k = int(all_c.shape[1])
-    sizes = torch.zeros(h, total_k, dtype=torch.int32, device=fc.device)
-    for hi in range(h):
-        sizes[hi] = torch.bincount(
-            labels[hi], minlength=total_k
-        ).to(torch.int32)
-    return all_c, labels, sizes
-
-
 @triton.jit
 def _triton_reverse_index_kernel(
     M, I, C,  # max_idx, clusters, cluster_size
@@ -643,7 +547,12 @@ def segment_k_means_paged(
 
     # tokens segmemted
     max_tokens_per_segment = max_blocks_per_segment * block_size
-    tokens_per_segment = torch.full((num_segments,), fill_value=max_tokens_per_segment, device=block_ids.device)
+    tokens_per_segment = torch.full(
+        (num_segments,),
+        fill_value=max_tokens_per_segment,
+        dtype=torch.int32,
+        device=block_ids.device,
+    )
     tokens_per_segment[-1] = num_tokens - (num_segments - 1) * max_tokens_per_segment
 
     # centroids segmented
@@ -666,7 +575,8 @@ def segment_k_means_paged(
     # Final run, cluster each token
     centroids = centroids.view(num_heads, num_segments * centroids_per_segment, head_dim)
     centroids, max_idx, max_cluster_size = _triton_k_means_train_paged(
-        key, block_ids.unsqueeze(0), centroids, torch.tensor([num_tokens], device=block_ids.device), 1,
+        key, block_ids.unsqueeze(0), centroids,
+        torch.tensor([num_tokens], dtype=torch.int32, device=block_ids.device), 1,
         normalize_centroids=False, return_indices=True
     )
 

@@ -136,6 +136,7 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sparse_kmeans_torch import (
     kmeans_features_from_kv_cache_torch,
     prefill_cluster_meta_from_features_device,
+    prefill_cluster_meta_from_features_torch,
     prefill_cluster_meta_from_kv_cache_device,
     sparse_prefill_cluster_use_device_kmeans,
     value_sum_from_kv_cache_torch,
@@ -230,6 +231,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _SPARSE_DEBUG_ASSERT: bool = int(os.getenv("VLLM_SPARSE_DEBUG_ASSERT", "0")) == 1
+_SPARSE_TOKEN_TOPK_TRACE: bool = (
+    int(os.getenv("VLLM_SPARSE_TOKEN_TOPK_TRACE", "0")) == 1
+)
 
 
 def _sparse_debug_range(name: str, tensor: torch.Tensor, upper: int) -> None:
@@ -486,6 +490,7 @@ class _SparseOnlineLayerState:
         value_sum: torch.Tensor | None = None,
         cluster_slots: torch.Tensor | None = None,
         cluster_offsets: torch.Tensor | None = None,
+        copy_all_block_features: bool = True,
     ) -> None:
         self.cluster_centres = cluster_centres
         self.cluster_size = cluster_size
@@ -508,7 +513,7 @@ class _SparseOnlineLayerState:
             dtype=all_block_features.dtype,
             device=all_block_features.device,
         )
-        if n > 0:
+        if n > 0 and copy_all_block_features:
             self._abf_storage[:n].copy_(all_block_features)
         self._b2c_storage = torch.empty(
             cap,
@@ -5894,6 +5899,8 @@ class GPUModelRunner(
                 sparse_new_block_features,
                 sparse_prefill_cluster_meta,
                 sparse_new_block_features_gpu,
+                sparse_prefill_block_features_gpu,
+                sparse_prefill_cluster_meta_gpu,
             ) = self._collect_sparse_features(
                 scheduler_output, self.input_batch.num_reqs
             )
@@ -5902,6 +5909,8 @@ class GPUModelRunner(
                 sparse_prefill_cluster_meta,
                 sparse_new_block_features,
                 sparse_new_block_features_gpu,
+                sparse_prefill_block_features_gpu,
+                sparse_prefill_cluster_meta_gpu,
             )
             if _e2e_sample_marks is not None:
                 _e2e_sample_marks.append(("sparse_features", time.perf_counter()))
@@ -10324,6 +10333,38 @@ class GPUModelRunner(
                         )
                     counts_r = selected_mask.sum(dim=1).to(torch.int64)
 
+                if _SPARSE_TOKEN_TOPK_TRACE:
+                    counts_trace = counts_r.to(torch.float32)
+                    unique_phys = int(torch.unique(phys_r).numel()) \
+                        if phys_r.numel() else 0
+                    logger.info(
+                        "[SparseTokenTopK] layer=%s req_id=%s "
+                        "seq_len=%d prompt_len=%d pending=%d "
+                        "budget=%d select_budget=%d steady=%d "
+                        "heads=%d selected_min=%.0f selected_avg=%.1f "
+                        "selected_max=%.0f selected_total=%.0f "
+                        "unique_phys_blocks=%d pack_triton=%s",
+                        layer_name,
+                        rid,
+                        int(seq_len),
+                        int(prompt_len),
+                        int(pending_count),
+                        int(budget),
+                        int(select_budget),
+                        int(steady_count),
+                        int(counts_r.numel()),
+                        float(counts_trace.min().item())
+                        if counts_trace.numel() else 0.0,
+                        float(counts_trace.mean().item())
+                        if counts_trace.numel() else 0.0,
+                        float(counts_trace.max().item())
+                        if counts_trace.numel() else 0.0,
+                        float(counts_trace.sum().item())
+                        if counts_trace.numel() else 0.0,
+                        unique_phys,
+                        bool(use_triton),
+                    )
+
                 per_req_head_ids.append(head_ids_r)
                 per_req_phys.append(phys_r)
                 per_req_slots.append(slots_r)
@@ -10612,7 +10653,11 @@ class GPUModelRunner(
             k_new = (k_new // max(1, 32)) * 32
             k_new = max(k_new, 1)
             k_new = min(k_new, m)
-            raw = prefill_cluster_meta_from_features_device(
+            # Keep decode-side dynamic refresh on the original torch path.
+            # The Triton K-Means rollout is intentionally limited to prefill
+            # indexing first; dynamic refresh fires on the decode critical
+            # path and should be enabled only after separate latency testing.
+            raw = prefill_cluster_meta_from_features_torch(
                 feat, num_clusters=k_new, n_segment=1
             )
             centres_new = raw["cluster_centres"]
@@ -10659,133 +10704,131 @@ class GPUModelRunner(
         sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]] | None,
         sparse_new_block_features: dict[str, dict[str, np.ndarray]] | None,
         sparse_new_block_features_gpu: dict[str, dict[str, torch.Tensor]] | None = None,
+        sparse_prefill_block_features_gpu: (
+            dict[str, dict[str, torch.Tensor]] | None
+        ) = None,
+        sparse_prefill_cluster_meta_gpu: (
+            dict[str, dict[str, dict[str, torch.Tensor]]] | None
+        ) = None,
     ) -> None:
         _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
         try:
+            def _init_prefill_unit(
+                req_id: str,
+                unit_key: str,
+                feat_t: torch.Tensor,
+                meta: dict[str, Any] | None,
+            ) -> None:
+                parsed = parse_sparse_kv_key(unit_key)
+                if parsed is None:
+                    return
+                layer_name, _ = parsed
+                spec = self._sparse_layer_spec_by_name.get(layer_name)
+                if spec is None or spec.cluster_granularity != "token":
+                    return
+                if feat_t.device != self.device:
+                    feat_t = feat_t.to(device=self.device)
+                if meta is None:
+                    raw = prefill_cluster_meta_from_features_device(
+                        feat_t,
+                        num_clusters=spec.num_clusters,
+                        n_segment=spec.n_segment,
+                    )
+                    centres_t = raw["cluster_centres"].to(
+                        dtype=torch.float32, device=self.device
+                    )
+                    labels_t = raw["block_to_cluster"].to(
+                        dtype=torch.int64, device=self.device
+                    )
+                    sizes_t = raw["cluster_size"].to(
+                        dtype=torch.int32, device=self.device
+                    )
+                    mean_t = raw["mean_key"].to(
+                        dtype=torch.float32, device=self.device
+                    )
+                else:
+                    centres_t = torch.as_tensor(
+                        meta["cluster_centres"],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    labels_t = torch.as_tensor(
+                        meta["block_to_cluster"],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    sizes_t = torch.as_tensor(
+                        meta["cluster_size"],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    mean_t = torch.as_tensor(
+                        meta["mean_key"],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                pending_vs_map = self._sparse_pending_value_sum_gpu.get(req_id)
+                vs_tensor = None
+                if pending_vs_map is not None:
+                    vs_tensor = pending_vs_map.get(unit_key)
+                state_new = _SparseOnlineLayerState(
+                    cluster_centres=centres_t,
+                    cluster_size=sizes_t,
+                    block_to_cluster=labels_t,
+                    all_block_features=feat_t,
+                    mean_key=mean_t,
+                    value_sum=vs_tensor,
+                    copy_all_block_features=False,
+                )
+                n_tokens = int(labels_t.numel())
+                k_clusters = int(centres_t.shape[0]) \
+                    if centres_t.dim() >= 2 else 0
+                head_n = min(int(spec.static_pattern_start), n_tokens)
+                tail_start = max(0, n_tokens - int(spec.static_pattern_end))
+                if head_n < tail_start and k_clusters > 0:
+                    positions = torch.arange(
+                        head_n,
+                        tail_start,
+                        dtype=torch.int32,
+                        device=labels_t.device,
+                    )
+                    state_new.rebuild_cluster_csr_from_labels(
+                        labels=labels_t[head_n:tail_start],
+                        positions=positions,
+                        num_clusters=k_clusters,
+                    )
+                req_states = self._sparse_online_index.setdefault(req_id, {})
+                req_states[unit_key] = state_new
+
             _t_prefill_init = (
                 time.perf_counter()
-                if self._sparse_perf_stats_enabled and sparse_block_features
+                if self._sparse_perf_stats_enabled
+                and (sparse_block_features or sparse_prefill_block_features_gpu)
                 else None
             )
             if sparse_block_features:
                 for req_id, unit_map in sparse_block_features.items():
-                    req_states = self._sparse_online_index.setdefault(req_id, {})
                     meta_map = (
                         {} if sparse_prefill_cluster_meta is None else
                         sparse_prefill_cluster_meta.get(req_id, {})
                     )
                     for unit_key, feat_np in unit_map.items():
-                        parsed = parse_sparse_kv_key(unit_key)
-                        if parsed is None:
-                            continue
-                        layer_name, _ = parsed
-                        spec = self._sparse_layer_spec_by_name.get(layer_name)
-                        if spec is None or spec.cluster_granularity != "token":
-                            continue
                         feat_t = torch.as_tensor(
                             feat_np, dtype=torch.float32, device=self.device
                         )
-                        meta = meta_map.get(unit_key)
-                        if meta is None:
-                            raw = prefill_cluster_meta_from_features_device(
-                                feat_t,
-                                num_clusters=spec.num_clusters,
-                                n_segment=spec.n_segment,
-                            )
-                            centres_t = raw["cluster_centres"].to(
-                                dtype=torch.float32, device=self.device
-                            )
-                            labels_t = raw["block_to_cluster"].to(
-                                dtype=torch.int64, device=self.device
-                            )
-                            sizes_t = raw["cluster_size"].to(
-                                dtype=torch.int32, device=self.device
-                            )
-                            mean_t = raw["mean_key"].to(
-                                dtype=torch.float32, device=self.device
-                            )
-                        else:
-                            centres_t = torch.as_tensor(
-                                meta["cluster_centres"],
-                                dtype=torch.float32,
-                                device=self.device,
-                            )
-                            labels_t = torch.as_tensor(
-                                meta["block_to_cluster"],
-                                dtype=torch.int64,
-                                device=self.device,
-                            )
-                            sizes_t = torch.as_tensor(
-                                meta["cluster_size"],
-                                dtype=torch.int32,
-                                device=self.device,
-                            )
-                            mean_t = torch.as_tensor(
-                                meta["mean_key"],
-                                dtype=torch.float32,
-                                device=self.device,
-                            )
-                        # --- Phase 2b: consume GPU-resident value_sum -----
-                        # Populated by ``_collect_sparse_features`` on the
-                        # device-kmeans path.  Absent on the CPU fallback
-                        # path or when the prompt is entirely steady zone;
-                        # constructor falls back to zeros which is a
-                        # correct (if less selective) estimation prior.
-                        pending_vs_map = (
-                            self._sparse_pending_value_sum_gpu.get(req_id)
+                        _init_prefill_unit(
+                            req_id, unit_key, feat_t, meta_map.get(unit_key)
                         )
-                        vs_tensor = None
-                        if pending_vs_map is not None:
-                            vs_tensor = pending_vs_map.get(unit_key)
-                        state_new = _SparseOnlineLayerState(
-                            cluster_centres=centres_t,
-                            cluster_size=sizes_t,
-                            block_to_cluster=labels_t,
-                            all_block_features=feat_t,
-                            mean_key=mean_t,
-                            value_sum=vs_tensor,
+            if sparse_prefill_block_features_gpu:
+                for req_id, unit_map in sparse_prefill_block_features_gpu.items():
+                    meta_map = (
+                        {} if sparse_prefill_cluster_meta_gpu is None else
+                        sparse_prefill_cluster_meta_gpu.get(req_id, {})
+                    )
+                    for unit_key, feat_t in unit_map.items():
+                        _init_prefill_unit(
+                            req_id, unit_key, feat_t, meta_map.get(unit_key)
                         )
-                        # --- Phase 2a: build cluster→tokens CSR -----------
-                        # Retrieval-zone expand looks up "which logical token
-                        # positions belong to cluster c" in O(|c|) via CSR.
-                        # ``block_to_cluster`` alone is the forward mapping
-                        # (token→cluster); without this inverted index the
-                        # per-step expand would have to scan all N tokens,
-                        # cancelling retroinfer's sparsity win.
-                        #
-                        # Steady zone (``static_pattern_start`` prefix /
-                        # ``static_pattern_end`` suffix) is intentionally
-                        # **excluded** from the CSR.  Those tokens are always
-                        # merged into the executable buffer via a separate
-                        # fixed path; if they were also present in the CSR,
-                        # picking any cluster that contained a steady token
-                        # would double-count it in softmax, breaking the
-                        # (steady ⊔ retrieved) partition invariant.
-                        n_tokens = int(labels_t.numel())
-                        k_clusters = int(centres_t.shape[0]) \
-                            if centres_t.dim() >= 2 else 0
-                        head_n = min(
-                            int(spec.static_pattern_start), n_tokens
-                        )
-                        tail_start = max(
-                            0, n_tokens - int(spec.static_pattern_end)
-                        )
-                        if head_n < tail_start and k_clusters > 0:
-                            positions = torch.arange(
-                                head_n,
-                                tail_start,
-                                dtype=torch.int32,
-                                device=labels_t.device,
-                            )
-                            state_new.rebuild_cluster_csr_from_labels(
-                                labels=labels_t[head_n:tail_start],
-                                positions=positions,
-                                num_clusters=k_clusters,
-                            )
-                        # else: whole prompt is steady (or k=0).  CSR stays
-                        # at its zero-init placeholder; select fallback
-                        # drives a steady-only exec buffer.
-                        req_states[unit_key] = state_new
             if _t_prefill_init is not None:
                 # Isolates the prefill-only state-materialisation block so
                 # we can compare it cleanly against the batched decode path
@@ -11513,6 +11556,8 @@ class GPUModelRunner(
         "dict[str, dict[str, np.ndarray]] | None",
         "dict[str, dict[str, dict[str, np.ndarray]]] | None",
         "dict[str, dict[str, torch.Tensor]] | None",
+        "dict[str, dict[str, torch.Tensor]] | None",
+        "dict[str, dict[str, dict[str, torch.Tensor]]] | None",
     ]:
         """Extract block-level K features and per-request Q vectors.
 
@@ -11542,6 +11587,12 @@ class GPUModelRunner(
             K vector of the last slot per KV head.
         sparse_prefill_cluster_meta
             Optional GPU-computed K-Means metadata per ``layer##kv{i}`` (CPU numpy).
+        sparse_new_block_features_gpu
+            GPU-resident mirror of decode ``sparse_new_block_features`` for the
+            in-process online index update.
+        sparse_prefill_block_features_gpu / sparse_prefill_cluster_meta_gpu
+            GPU-resident prefill handoff for token compact legacy TopK. These
+            are internal to the runner and are not serialized to the scheduler.
         """
         perf_enabled = self._sparse_perf_stats_enabled and self._has_sparse_attn
         perf_local_ms: dict[str, float] = defaultdict(float)
@@ -11552,7 +11603,7 @@ class GPUModelRunner(
             perf_local_ms[name] += (time.perf_counter() - start_t) * 1000.0
 
         if not self._has_sparse_attn:
-            return None, None, None, None, None
+            return None, None, None, None, None, None, None
 
         sparse_groups = [
             (gid, grp)
@@ -11560,12 +11611,16 @@ class GPUModelRunner(
             if isinstance(grp.kv_cache_spec, SparseAttentionSpec)
         ]
         if not sparse_groups:
-            return None, None, None, None, None
+            return None, None, None, None, None, None, None
 
         sparse_block_features: dict[str, dict[str, np.ndarray]] = {}
         sparse_query_vectors: dict[str, dict[str, np.ndarray]] = {}
         sparse_new_block_features: dict[str, dict[str, np.ndarray]] = {}
         sparse_prefill_cluster_meta: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+        sparse_prefill_block_features_gpu: dict[str, dict[str, torch.Tensor]] = {}
+        sparse_prefill_cluster_meta_gpu: (
+            dict[str, dict[str, dict[str, torch.Tensor]]]
+        ) = {}
         # GPU-resident mirror of ``sparse_new_block_features`` for the in-worker
         # ``_update_sparse_online_index`` consumer.  Avoids the GPU→CPU→GPU
         # round-trip that otherwise happens per (req, layer, kv_head) pair on
@@ -11575,6 +11630,45 @@ class GPUModelRunner(
         sparse_new_block_features_gpu: dict[str, dict[str, torch.Tensor]] = {}
         pending_async_feat: list[tuple[str, str, torch.Tensor]] = []
         pending_async_meta: list[tuple[str, str, dict[str, torch.Tensor]]] = []
+
+        def _store_prefill_gpu_handoff(
+            req_id: str,
+            layer_name: str,
+            k_heads: torch.Tensor,
+            raw_b: dict[str, torch.Tensor],
+        ) -> None:
+            if k_heads.dim() != 3:
+                raise ValueError(
+                    "token prefill GPU handoff expects k_heads [H, N, D], "
+                    f"got shape {tuple(k_heads.shape)}"
+                )
+            num_kv_local = int(k_heads.shape[0])
+            feat_map = sparse_prefill_block_features_gpu.setdefault(req_id, {})
+            meta_map = sparse_prefill_cluster_meta_gpu.setdefault(req_id, {})
+            for kv_h in range(num_kv_local):
+                unit_key = sparse_kv_unit_key(layer_name, kv_h)
+                feat_map[unit_key] = k_heads[kv_h]
+                meta_map[unit_key] = {
+                    "cluster_centres": raw_b["cluster_centres"][kv_h],
+                    "block_to_cluster": raw_b["block_to_cluster"][kv_h],
+                    "cluster_size": raw_b["cluster_size"][kv_h],
+                    "mean_key": raw_b["mean_key"][kv_h],
+                }
+            if _SPARSE_TOKEN_TOPK_TRACE:
+                centres = raw_b["cluster_centres"]
+                cluster_count = (
+                    int(centres.shape[1])
+                    if centres.dim() == 3 else int(centres.shape[0])
+                )
+                logger.info(
+                    "[SparseTokenTopK] prefill_gpu_handoff req_id=%s "
+                    "layer=%s kv_heads=%d tokens=%d clusters=%d",
+                    req_id,
+                    layer_name,
+                    num_kv_local,
+                    int(k_heads.shape[1]) if k_heads.dim() >= 2 else 0,
+                    cluster_count,
+                )
 
         # Diagnostic: full per-req body wall-clock (covers q_extract_total,
         # k_extract_total, and the Python bookkeeping between them).  Running
@@ -11763,6 +11857,10 @@ class GPUModelRunner(
                                     time.perf_counter() if perf_enabled else None
                                 )
                                 raw_b = None
+                                prefill_gpu_handoff_allowed = bool(
+                                    self._sparse_legacy_token_topk
+                                    and spec.use_compact_kv_gather
+                                )
                                 if sparse_prefill_cluster_use_device_kmeans(kv[0]):
                                     _t_kmeans = (
                                         time.perf_counter()
@@ -11773,9 +11871,13 @@ class GPUModelRunner(
                                         kv[0],
                                         _get_block_ids_t(),
                                         valid_len,
+                                        value_cache=kv[1],
                                         num_clusters=spec.num_clusters,
                                         n_segment=spec.n_segment,
                                         is_centered=False,
+                                        return_features=not (
+                                            prefill_gpu_handoff_allowed
+                                        ),
                                     )
                                     if _t_kmeans is not None:
                                         self._sparse_perf_record(
@@ -11868,7 +11970,25 @@ class GPUModelRunner(
                                         valid_len,
                                         is_centered=False,
                                     )
-                                if num_kv == 1:
+                                use_gpu_prefill_handoff = (
+                                    prefill_gpu_handoff_allowed
+                                    and raw_b is not None
+                                    and k_heads.is_cuda
+                                )
+                                if use_gpu_prefill_handoff:
+                                    assert raw_b is not None
+                                    _t_handoff = (
+                                        time.perf_counter()
+                                        if perf_enabled else None
+                                    )
+                                    _store_prefill_gpu_handoff(
+                                        req_id, layer_name, k_heads, raw_b
+                                    )
+                                    _perf_add(
+                                        "collect:prefill_gpu_handoff",
+                                        _t_handoff,
+                                    )
+                                elif num_kv == 1:
                                     raw = None if raw_b is None else {
                                         "cluster_centres": raw_b[
                                             "cluster_centres"
@@ -12120,9 +12240,11 @@ class GPUModelRunner(
         if self._sparse_probe_info_enabled:
             logger.info(
                 "[SparseProbe] collect_sparse_features scheduled_reqs=%d "
-                "prefill_feature_reqs=%d query_reqs=%d decode_new_block_reqs=%d",
+                "prefill_feature_reqs=%d prefill_gpu_feature_reqs=%d "
+                "query_reqs=%d decode_new_block_reqs=%d",
                 len(scheduler_output.num_scheduled_tokens),
                 len(sparse_block_features),
+                len(sparse_prefill_block_features_gpu),
                 len(sparse_query_vectors),
                 len(sparse_new_block_features),
             )
@@ -12144,6 +12266,8 @@ class GPUModelRunner(
             sparse_new_block_features or None,
             sparse_prefill_cluster_meta or None,
             sparse_new_block_features_gpu or None,
+            sparse_prefill_block_features_gpu or None,
+            sparse_prefill_cluster_meta_gpu or None,
         )
 
     def _sparse_layer_decode_phys_row(
