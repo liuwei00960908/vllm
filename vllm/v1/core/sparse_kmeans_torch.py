@@ -580,6 +580,18 @@ def prefill_cluster_meta_from_kv_cache_device(
     ``segment_k_means_paged`` entry directly. Centered/block feature callers
     use the torch fallback.
     """
+    def torch_fallback() -> dict[str, torch.Tensor]:
+        return prefill_cluster_meta_from_kv_cache_torch(
+            kv_cache,
+            block_ids,
+            num_tokens,
+            num_clusters=num_clusters,
+            n_segment=n_segment,
+            is_centered=is_centered,
+            n_iter=n_iter,
+            seed=seed,
+        )
+
     skip_reason = _triton_kmeans_skip_reason(kv_cache)
     if skip_reason is None and not is_centered and value_cache is not None:
         _trace_triton_kmeans("kv_cache_paged", kv_cache, use_triton=True)
@@ -635,6 +647,9 @@ def prefill_cluster_meta_from_kv_cache_device(
                 features = key_cache.new_empty(
                     (num_heads, int(num_tokens), head_dim)
                 )
+            # segment_k_means_paged returns labels from its final full-token
+            # pass over all centroids, so these are global cluster ids in
+            # [0, num_clusters), not per-segment warmup ids.
             raw = {
                 "cluster_centres": centres.to(dtype=torch.float32),
                 "block_to_cluster": labels,
@@ -652,7 +667,8 @@ def prefill_cluster_meta_from_kv_cache_device(
             }
             if t0 is not None:
                 logger.info(
-                    "[SparseTritonKMeans] source=kv_cache_paged done=1 "
+                    "[SparseTritonKMeans] source=kv_cache_paged "
+                    "backend=segment_k_means_paged done=1 "
                     "elapsed_ms=%.3f kv_shape=%s feature_shape=%s "
                     "centres_shape=%s labels_shape=%s dtype=%s device=%s",
                     (time.perf_counter() - t0) * 1000.0,
@@ -668,7 +684,8 @@ def prefill_cluster_meta_from_kv_cache_device(
             if _PREFILL_CLUSTER_TRITON_DEBUG:
                 logger.warning_once(
                     "[SparseTritonKMeans] source=kv_cache_paged fallback=1 "
-                    "kv_shape=%s dtype=%s device=%s error=%s",
+                    "backend=segment_k_means_paged kv_shape=%s dtype=%s "
+                    "device=%s error=%s",
                     tuple(kv_cache.shape),
                     kv_cache.dtype,
                     kv_cache.device,
@@ -679,6 +696,7 @@ def prefill_cluster_meta_from_kv_cache_device(
                 "to torch K-Means. error=%s",
                 err,
             )
+            return torch_fallback()
     else:
         reason = skip_reason
         if reason is None:
@@ -689,17 +707,7 @@ def prefill_cluster_meta_from_kv_cache_device(
         _trace_triton_kmeans(
             "kv_cache_paged", kv_cache, use_triton=False, reason=reason
         )
-
-    return prefill_cluster_meta_from_kv_cache_torch(
-        kv_cache,
-        block_ids,
-        num_tokens,
-        num_clusters=num_clusters,
-        n_segment=n_segment,
-        is_centered=is_centered,
-        n_iter=n_iter,
-        seed=seed,
-    )
+        return torch_fallback()
 
 
 def prefill_cluster_meta_from_features_torch_batched(
