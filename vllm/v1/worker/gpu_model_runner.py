@@ -234,6 +234,9 @@ _SPARSE_DEBUG_ASSERT: bool = int(os.getenv("VLLM_SPARSE_DEBUG_ASSERT", "0")) == 
 _SPARSE_TOKEN_TOPK_TRACE: bool = (
     int(os.getenv("VLLM_SPARSE_TOKEN_TOPK_TRACE", "0")) == 1
 )
+_SPARSE_DECODE_STEP_TRACE: bool = (
+    int(os.getenv("VLLM_SPARSE_DECODE_STEP_TRACE", "0")) == 1
+)
 
 
 def _sparse_debug_range(name: str, tensor: torch.Tensor, upper: int) -> None:
@@ -5569,6 +5572,35 @@ class GPUModelRunner(
                 int(has_kv_transfer_group()),
                 cudagraph_mode.name,
             )
+            if _SPARSE_DECODE_STEP_TRACE and self._has_sparse_attn:
+                trace_req_ids = list(req_ids[:_decode_perf_num_reqs])
+                out_tokens_before: list[int] = []
+                sparse_units: list[int] = []
+                for rid in trace_req_ids:
+                    req_state = self.requests.get(rid)
+                    out_tokens_before.append(
+                        0 if req_state is None
+                        else len(req_state.output_token_ids)
+                    )
+                    sparse_units.append(
+                        len(self._sparse_online_index.get(rid, {}))
+                    )
+                logger.info(
+                    "[SparseDecodeStep] req_ids=%s out_tokens_before=%s "
+                    "sparse_units=%s total_ms=%.3f preprocess_ms=%.3f "
+                    "attn_metadata_ms=%.3f forward_ms=%.3f "
+                    "postprocess_ms=%.3f other_ms=%.3f cudagraph=%s",
+                    trace_req_ids,
+                    out_tokens_before,
+                    sparse_units,
+                    total_ms,
+                    _decode_perf_preprocess_ms,
+                    _decode_perf_attn_metadata_ms,
+                    _decode_perf_forward_ms,
+                    _decode_perf_postprocess_ms,
+                    other_ms,
+                    cudagraph_mode.name,
+                )
             if _t_decode_perf_log is not None:
                 # Direct measurement of the per-step ``[DecodePerf]``
                 # logger.info cost.  This lands in the ``sample_tokens_ms``
