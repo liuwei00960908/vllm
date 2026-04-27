@@ -9127,11 +9127,12 @@ class GPUModelRunner(
         """Select prompt tokens by expanding Triton cluster member lists.
 
         This fast path is only used by the legacy TOPK=1 compact-gather mode.
-        It scores clusters directly as ``Q dot centroid`` and expands the
-        selected dense ``clusters`` rows returned by ``segment_k_means_paged``.
-        Within each KV group, expanded token scores are softmaxed per Q head,
-        summed across the group's Q heads, top-k'd once, and broadcast back to
-        all Q heads in the group.
+        It scores clusters directly as ``Q dot centroid``.  Within each KV
+        group, cluster probabilities are summed across the group's Q heads,
+        top-k'd once in centroid space, then the selected cluster members are
+        expanded in stored member order and clipped to the remaining token
+        budget.  The resulting token mask is broadcast back to all Q heads in
+        the group.
         It intentionally does not read ``block_to_cluster`` labels or the CSR
         inverted index.  If the dense member layout is unavailable or stale
         (for example after a dynamic cluster refresh), callers fall back to the
@@ -9285,8 +9286,14 @@ class GPUModelRunner(
             _record_cluster_perf("score_clusters", _t_scores)
 
             _t_cluster_topk = time.perf_counter() if stats_on else None
+            row_max = scores_c.amax(dim=-1, keepdim=True)
+            exp_scores = torch.exp(scores_c - row_max)
+            cluster_probs = exp_scores / exp_scores.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-20)
+            group_cluster_scores = cluster_probs.sum(dim=1)
             top_clusters = torch.topk(
-                scores_c, k=nprobe, dim=-1
+                group_cluster_scores, k=nprobe, dim=-1
             ).indices.to(dtype=torch.int64)
             _record_cluster_perf("topk_clusters", _t_cluster_topk)
 
@@ -9299,72 +9306,57 @@ class GPUModelRunner(
             )
             _record_cluster_perf("stack_members", _t_stack)
 
-            _t_gather = time.perf_counter() if stats_on else None
-            gather_idx = top_clusters.unsqueeze(-1).expand(
-                G, H, nprobe, M0
+            _t_expand = time.perf_counter() if stats_on else None
+            member_rows = members_stack.gather(
+                1, top_clusters.unsqueeze(-1).expand(G, nprobe, M0)
             )
-            member_rows = members_stack.unsqueeze(1).expand(
-                G, H, K0, M0
-            ).gather(2, gather_idx)
-            size_rows = size_stack.unsqueeze(1).expand(
-                G, H, K0
-            ).gather(2, top_clusters).to(dtype=torch.int64)
-            _record_cluster_perf("gather_members", _t_gather)
-
-            _t_valid = time.perf_counter() if stats_on else None
+            size_rows = size_stack.gather(1, top_clusters).to(dtype=torch.int64)
             slot_idx = torch.arange(
                 M0, dtype=torch.int64, device=device
-            ).view(1, 1, 1, M0)
+            ).view(1, 1, M0)
             valid = slot_idx < size_rows.unsqueeze(-1)
             valid &= member_rows >= head_n
             valid &= member_rows < tail_start
             valid &= member_rows < N
-
-            score_rows = scores_c.gather(2, top_clusters)
-            score_flat = score_rows.unsqueeze(-1).expand(
-                -1, -1, -1, M0
-            ).reshape(G, H, -1)
-            valid_flat = valid.reshape(G, H, -1)
-            pos_flat = member_rows.reshape(G, H, -1).to(dtype=torch.int64)
-            sentinel = torch.full_like(pos_flat, N)
-            pos_ext = torch.where(
-                valid_flat,
-                pos_flat.clamp(0, N - 1),
-                sentinel,
-            )
-            _record_cluster_perf("build_candidates", _t_valid)
+            valid_flat = valid.reshape(G, -1)
+            member_flat = member_rows.reshape(G, -1).to(dtype=torch.int64)
+            token_cu = torch.cumsum(valid_flat.to(torch.int32), dim=1)
+            select_flat = valid_flat & (token_cu <= int(cap))
+            _record_cluster_perf("expand_clip_members", _t_expand)
 
             _t_scatter = time.perf_counter() if stats_on else None
-            masked_scores_ext = torch.full(
-                (G, H, N + 1),
-                float("-inf"),
-                dtype=scores_c.dtype,
+            sentinel = torch.full_like(member_flat, N)
+            pos_ext = torch.where(
+                select_flat,
+                member_flat.clamp(0, N - 1),
+                sentinel,
+            )
+            selected_group_ext = torch.zeros(
+                (G, N + 1),
+                dtype=torch.bool,
                 device=device,
             )
-            masked_scores_ext.scatter_(
-                2,
-                pos_ext,
-                score_flat.masked_fill(~valid_flat, float("-inf")),
-            )
-            _record_cluster_perf("scatter_candidates", _t_scatter)
-
-            _t_token_topk = time.perf_counter() if stats_on else None
-            out = GPUModelRunner._sparse_group_shared_topk_mask(
-                masked_scores_ext[:, :, :N],
-                steady_mask,
-                cap,
-            )
-            _record_cluster_perf("topk_tokens", _t_token_topk)
+            selected_group_ext.scatter_(1, pos_ext, select_flat)
+            selected_group = selected_group_ext[:, :N] | steady_mask.view(1, N)
+            out = selected_group.unsqueeze(1).expand(G, H, N).contiguous()
+            _record_cluster_perf("scatter_token_mask", _t_scatter)
 
             if _SPARSE_TOKEN_TOPK_TRACE:
-                valid_counts = valid_flat.sum(dim=2).to(dtype=torch.float32)
+                valid_counts_trace = valid_flat.sum(dim=1).to(
+                    dtype=torch.float32
+                )
+                selected_counts_trace = select_flat.sum(dim=1).to(
+                    dtype=torch.float32
+                )
                 out_counts = out.sum(dim=2).to(dtype=torch.float32)
                 logger.info(
                     "[SparseTokenTopKCluster] hit groups=%d "
                     "q_heads_per_group=%d total_tokens=%d K=%d M=%d "
                     "nprobe=%d budget=%d steady=%d cap=%d "
-                    "candidate_slots=%d score_cells=%d valid_min=%.0f "
-                    "valid_avg=%.1f valid_max=%.0f out_min=%.0f "
+                    "member_slots=%d cluster_score_cells=%d "
+                    "valid_min=%.0f valid_avg=%.1f valid_max=%.0f "
+                    "selected_min=%.0f selected_avg=%.1f selected_max=%.0f "
+                    "out_min=%.0f "
                     "out_avg=%.1f out_max=%.0f",
                     G,
                     H,
@@ -9375,14 +9367,20 @@ class GPUModelRunner(
                     budget,
                     steady_count,
                     cap,
-                    int(G * H * nprobe * M0),
-                    int(G * H * (N + 1)),
-                    float(valid_counts.min().item())
-                    if valid_counts.numel() else 0.0,
-                    float(valid_counts.mean().item())
-                    if valid_counts.numel() else 0.0,
-                    float(valid_counts.max().item())
-                    if valid_counts.numel() else 0.0,
+                    int(G * nprobe * M0),
+                    int(G * K0),
+                    float(valid_counts_trace.min().item())
+                    if valid_counts_trace.numel() else 0.0,
+                    float(valid_counts_trace.mean().item())
+                    if valid_counts_trace.numel() else 0.0,
+                    float(valid_counts_trace.max().item())
+                    if valid_counts_trace.numel() else 0.0,
+                    float(selected_counts_trace.min().item())
+                    if selected_counts_trace.numel() else 0.0,
+                    float(selected_counts_trace.mean().item())
+                    if selected_counts_trace.numel() else 0.0,
+                    float(selected_counts_trace.max().item())
+                    if selected_counts_trace.numel() else 0.0,
                     float(out_counts.min().item())
                     if out_counts.numel() else 0.0,
                     float(out_counts.mean().item())
