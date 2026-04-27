@@ -10252,7 +10252,6 @@ class GPUModelRunner(
                     num_heads_i, dtype=torch.int64, device=query.device
                 )
                 kv_head_ids_int64 = head_ids_int64 // num_queries_per_kv_i
-                kv_head_ids_int32 = kv_head_ids_int64.to(torch.int32)
                 # GQA-regular layout check: when ``num_heads == num_kv *
                 # num_queries_per_kv`` and kv_idx ``k`` owns the contiguous
                 # head range ``[k*npk, (k+1)*npk)``, we can replace the G
@@ -10319,7 +10318,6 @@ class GPUModelRunner(
                     "kv_to_qh_tensor": kv_to_qh_tensor,
                     "head_ids_int64": head_ids_int64,
                     "kv_head_ids_int64": kv_head_ids_int64,
-                    "kv_head_ids_int32": kv_head_ids_int32,
                     "gqa_regular": gqa_regular,
                     "unit_keys_in_kv_order": unit_keys_in_kv_order,
                     "cu_q_flat_nreqs1_int32": cu_q_flat_nreqs1_int32,
@@ -10352,10 +10350,6 @@ class GPUModelRunner(
             if kv_head_ids_int64 is None:
                 kv_head_ids_int64 = head_ids_int64 // num_queries_per_kv
                 ctx["kv_head_ids_int64"] = kv_head_ids_int64
-            kv_head_ids_int32 = ctx.get("kv_head_ids_int32")
-            if kv_head_ids_int32 is None:
-                kv_head_ids_int32 = kv_head_ids_int64.to(torch.int32)
-                ctx["kv_head_ids_int32"] = kv_head_ids_int32
             ctx.setdefault("num_queries_per_kv", num_queries_per_kv)
             # Backfill GQA-layout hints for older ctx dicts.
             if "gqa_regular" not in ctx:
@@ -10635,9 +10629,9 @@ class GPUModelRunner(
                 )
                 if use_group_pack:
                     # Pack K/V once per KV group.  The FA backend still
-                    # expands execution back to one query row per Q head via
-                    # kv_batch_idx, so this only removes duplicated K/V
-                    # gather/packing work.
+                    # expands execution back to one query row per Q head in
+                    # the attention backend, so this only removes duplicated
+                    # K/V gather/packing work.
                     num_kv_heads_g = int(ctx["num_kv_heads"])
                     group_mask = selected_mask.view(
                         num_kv_heads_g,
@@ -10893,10 +10887,6 @@ class GPUModelRunner(
                     :num_kv_heads_g
                 ]
                 group_kv_pair_ids_flat = head_ids_int64[:num_kv_heads_g]
-                group_q_cu_q_flat = ctx["cu_q_flat_nreqs1_int32"]
-                group_q_req_ids_flat = ctx["req_ids_flat_nreqs1_zero"]
-                group_q_kv_pair_ids_flat = kv_head_ids_int64
-                group_kv_batch_idx = kv_head_ids_int32
                 group_q_seqused_k = None
                 if int(group_phys.shape[0]) == num_kv_heads_g * int(max_k_hint):
                     full_budget_key = "q_seqused_k_nreqs1_full_budget_int32"
@@ -10947,10 +10937,6 @@ class GPUModelRunner(
                     "group_cu_q_flat": group_cu_q_flat,
                     "group_req_ids_flat": group_req_ids_flat,
                     "group_kv_pair_ids_flat": group_kv_pair_ids_flat,
-                    "group_q_cu_q_flat": group_q_cu_q_flat,
-                    "group_q_req_ids_flat": group_q_req_ids_flat,
-                    "group_q_kv_pair_ids_flat": group_q_kv_pair_ids_flat,
-                    "group_kv_batch_idx": group_kv_batch_idx,
                     "group_q_seqused_k": group_q_seqused_k,
                     "num_q_groups": num_kv_heads_g,
                     "num_queries_per_kv": num_queries_per_kv,

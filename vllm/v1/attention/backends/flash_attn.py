@@ -26,6 +26,7 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -337,7 +338,7 @@ class FlashAttentionMetadata:
 
     # Group-shared compact gather for GQA token-sparse decode.  When the
     # runner selects one token set per KV group, FA gathers K/V once per KV
-    # group but still launches one query row per Q head via FA3 kv_batch_idx.
+    # group and runs decode attention with one execution row per Q head.
     sparse_q_group_gather_flat_phys: torch.Tensor | None = None
     sparse_q_group_gather_flat_slots: torch.Tensor | None = None
     sparse_q_group_gather_kv_token_ids: torch.Tensor | None = None
@@ -345,10 +346,6 @@ class FlashAttentionMetadata:
     sparse_q_group_gather_cu_q_flat: torch.Tensor | None = None
     sparse_q_group_gather_req_ids_flat: torch.Tensor | None = None
     sparse_q_group_gather_kv_pair_ids_flat: torch.Tensor | None = None
-    sparse_q_group_gather_q_cu_q_flat: torch.Tensor | None = None
-    sparse_q_group_gather_q_req_ids_flat: torch.Tensor | None = None
-    sparse_q_group_gather_q_kv_pair_ids_flat: torch.Tensor | None = None
-    sparse_q_group_gather_kv_batch_idx: torch.Tensor | None = None
     sparse_q_group_gather_q_seqused_k: torch.Tensor | None = None
     sparse_q_group_gather_num_groups: int | None = None
     sparse_q_group_gather_num_queries_per_kv: int | None = None
@@ -972,10 +969,6 @@ class FlashAttentionImpl(AttentionImpl):
                         sparse_q_group_gather_cu_q_flat=None,
                         sparse_q_group_gather_req_ids_flat=None,
                         sparse_q_group_gather_kv_pair_ids_flat=None,
-                        sparse_q_group_gather_q_cu_q_flat=None,
-                        sparse_q_group_gather_q_req_ids_flat=None,
-                        sparse_q_group_gather_q_kv_pair_ids_flat=None,
-                        sparse_q_group_gather_kv_batch_idx=None,
                         sparse_q_group_gather_q_seqused_k=None,
                         sparse_q_group_gather_num_groups=None,
                         sparse_q_group_gather_num_queries_per_kv=None,
@@ -1067,20 +1060,6 @@ class FlashAttentionImpl(AttentionImpl):
                                     "group_kv_pair_ids_flat"
                                 )
                             ),
-                            sparse_q_group_gather_q_cu_q_flat=(
-                                runtime_q_head_gather.get("group_q_cu_q_flat")
-                            ),
-                            sparse_q_group_gather_q_req_ids_flat=(
-                                runtime_q_head_gather.get("group_q_req_ids_flat")
-                            ),
-                            sparse_q_group_gather_q_kv_pair_ids_flat=(
-                                runtime_q_head_gather.get(
-                                    "group_q_kv_pair_ids_flat"
-                                )
-                            ),
-                            sparse_q_group_gather_kv_batch_idx=(
-                                runtime_q_head_gather.get("group_kv_batch_idx")
-                            ),
                             sparse_q_group_gather_q_seqused_k=(
                                 runtime_q_head_gather.get("group_q_seqused_k")
                             ),
@@ -1123,10 +1102,6 @@ class FlashAttentionImpl(AttentionImpl):
                             sparse_q_group_gather_cu_q_flat=None,
                             sparse_q_group_gather_req_ids_flat=None,
                             sparse_q_group_gather_kv_pair_ids_flat=None,
-                            sparse_q_group_gather_q_cu_q_flat=None,
-                            sparse_q_group_gather_q_req_ids_flat=None,
-                            sparse_q_group_gather_q_kv_pair_ids_flat=None,
-                            sparse_q_group_gather_kv_batch_idx=None,
                             sparse_q_group_gather_q_seqused_k=None,
                             sparse_q_group_gather_num_groups=None,
                             sparse_q_group_gather_num_queries_per_kv=None,
@@ -1419,6 +1394,9 @@ class FlashAttentionImpl(AttentionImpl):
         # builder attaches an ``int`` budget via ``sparse_q_head_gather_max_k``;
         # using that avoids the per-call ``.max().item()`` GPU→CPU sync.
         max_k_hint = attn_metadata.sparse_q_head_gather_max_k
+        triton_group_decode_cache = getattr(
+            self, "_sparse_group_decode_triton_cache", None
+        )
         group_phys = attn_metadata.sparse_q_group_gather_flat_phys
         group_slots = attn_metadata.sparse_q_group_gather_flat_slots
         group_kv_token_ids = attn_metadata.sparse_q_group_gather_kv_token_ids
@@ -1428,12 +1406,6 @@ class FlashAttentionImpl(AttentionImpl):
         group_kv_pair_ids = (
             attn_metadata.sparse_q_group_gather_kv_pair_ids_flat
         )
-        group_q_cu_q = attn_metadata.sparse_q_group_gather_q_cu_q_flat
-        group_q_req_ids = attn_metadata.sparse_q_group_gather_q_req_ids_flat
-        group_q_kv_pair_ids = (
-            attn_metadata.sparse_q_group_gather_q_kv_pair_ids_flat
-        )
-        group_kv_batch_idx = attn_metadata.sparse_q_group_gather_kv_batch_idx
         group_q_seqused_k = attn_metadata.sparse_q_group_gather_q_seqused_k
         group_count = attn_metadata.sparse_q_group_gather_num_groups
         group_q_per_kv = (
@@ -1457,12 +1429,7 @@ class FlashAttentionImpl(AttentionImpl):
         )
         have_group_q_expanded = (
             have_group
-            and group_q_cu_q is not None
-            and group_q_req_ids is not None
-            and group_q_kv_pair_ids is not None
-            and group_kv_batch_idx is not None
             and group_q_seqused_k is not None
-            and self.vllm_flash_attn_version == 3
             and int(group_num_reqs) == 1
         )
         if have_group_q_expanded:
@@ -1479,10 +1446,6 @@ class FlashAttentionImpl(AttentionImpl):
             assert group_cu_q is not None
             assert group_req_ids is not None
             assert group_kv_pair_ids is not None
-            assert group_q_cu_q is not None
-            assert group_q_req_ids is not None
-            assert group_q_kv_pair_ids is not None
-            assert group_kv_batch_idx is not None
             assert group_q_seqused_k is not None
             num_reqs = int(group_num_reqs)
             num_groups = int(group_count)
@@ -1508,61 +1471,82 @@ class FlashAttentionImpl(AttentionImpl):
                     assert bool(
                         (group_q_seqused_k == dense_group_k).all().item()
                     ), "group-shared compact K/V must be dense per KV group"
-                k_compact = k_slice.view(
-                    num_groups, dense_group_k, 1, query.shape[-1]
-                )
-                v_compact = v_slice.view(
-                    num_groups, dense_group_k, 1, query.shape[-1]
-                )
+                k_compact = k_slice.view(total_group_k, 1, query.shape[-1])
+                v_compact = v_slice.view(total_group_k, 1, query.shape[-1])
 
                 q_flat = (
                     query.transpose(0, 1)
                     .contiguous()
                     .view(num_q_flat, 1, query.shape[-1])
                 )
-                out_flat = torch.empty_like(q_flat)
-                max_seqlen_k = dense_group_k
-                q_descale_flat = q_descale[
-                    group_q_req_ids, group_q_kv_pair_ids
-                ].view(-1, 1)
-                k_descale_flat = k_descale[
-                    group_q_req_ids, group_q_kv_pair_ids
-                ].view(-1, 1)
-                v_descale_flat = v_descale[
-                    group_q_req_ids, group_q_kv_pair_ids
-                ].view(-1, 1)
+                num_kv_splits = 1 if vllm_is_batch_invariant() else 4
+                cache_key = (
+                    num_q_heads,
+                    num_groups,
+                    dense_group_k,
+                    query.shape[-1],
+                    num_kv_splits,
+                    query.dtype,
+                    query.device,
+                )
+                if (
+                    triton_group_decode_cache is None
+                    or triton_group_decode_cache.get("key") != cache_key
+                ):
+                    group_positions = torch.arange(
+                        total_group_k,
+                        dtype=torch.int32,
+                        device=query.device,
+                    ).view(num_groups, dense_group_k)
+                    req_to_token = group_positions.repeat_interleave(
+                        q_per_kv, dim=0
+                    ).contiguous()
+                    triton_group_decode_cache = {
+                        "key": cache_key,
+                        "req_to_token": req_to_token,
+                        "attn_logits": torch.empty(
+                            (
+                                num_q_heads,
+                                1,
+                                num_kv_splits,
+                                query.shape[-1] + 1,
+                            ),
+                            dtype=torch.float32,
+                            device=query.device,
+                        ),
+                        "out": torch.empty_like(q_flat),
+                        "lse": torch.empty(
+                            (num_q_heads, 1),
+                            dtype=torch.float32,
+                            device=query.device,
+                        ),
+                    }
+                    self._sparse_group_decode_triton_cache = (
+                        triton_group_decode_cache
+                    )
                 if use_cuda_timing:
                     gather_end.record()
                     fa_start.record()
-                flash_attn_varlen_func(
-                    q=q_flat,
-                    k=k_compact,
-                    v=v_compact,
-                    out=out_flat,
-                    cu_seqlens_q=group_q_cu_q,
-                    max_seqlen_q=1,
-                    cu_seqlens_k=None,
-                    seqused_k=group_q_seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=None,
-                    window_size=win,
-                    block_table=None,
-                    kv_batch_idx=group_kv_batch_idx,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=None,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=q_descale_flat,
-                    k_descale=k_descale_flat,
-                    v_descale=v_descale_flat,
-                    num_splits=0,
-                    s_aux=None,
+                decode_attention_fwd(
+                    q_flat,
+                    k_compact,
+                    v_compact,
+                    triton_group_decode_cache["out"],
+                    triton_group_decode_cache["lse"],
+                    triton_group_decode_cache["req_to_token"],
+                    group_q_seqused_k,
+                    triton_group_decode_cache["attn_logits"],
+                    num_kv_splits,
+                    self.scale,
+                    page_size=1,
+                    logit_cap=self.logits_soft_cap,
+                    k_scale=k_descale,
+                    v_scale=v_descale,
                 )
                 output.copy_(
-                    out_flat.view(num_q_heads, num_reqs, query.shape[-1])
-                    .transpose(0, 1)
-                    .contiguous()
+                    triton_group_decode_cache["out"]
+                    .view(num_q_heads, query.shape[-1])
+                    .unsqueeze(0)
                 )
                 if use_cuda_timing:
                     fa_end.record()
@@ -1573,15 +1557,16 @@ class FlashAttentionImpl(AttentionImpl):
                     total_end.synchronize()
                     total_ms = float(total_start.elapsed_time(total_end))
                     logger.info(
-                        "[SparsePerfFA] compact_group_kv_gather_q_expanded "
+                        "[SparsePerfFA] compact_group_kv_gather_triton_decode "
                         "total_ms=%.3f gather_ms=%.3f fa_ms=%.3f "
-                        "groups=%d q_per_kv=%d num_tok=%d",
+                        "groups=%d q_per_kv=%d num_tok=%d splits=%d",
                         total_ms,
                         gather_ms,
                         fa_ms,
                         num_groups,
                         q_per_kv,
                         int(query.shape[0]),
+                        num_kv_splits,
                     )
                 return
             # During very short prompts or ragged retrieval, groups can have
