@@ -9142,7 +9142,29 @@ class GPUModelRunner(
             return []
         if len(q_list) != G:
             return None
-        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        stats_on = bool(
+            self._sparse_perf_stats_enabled and self._has_sparse_attn
+        )
+        _t0 = time.perf_counter() if stats_on else None
+
+        def _record_cluster_perf(name: str, start_t: float | None) -> None:
+            if start_t is None:
+                return
+            self._sparse_perf_record(
+                f"_sparse_online_select_tokens_from_clusters_batched:{name}",
+                time.perf_counter() - start_t,
+            )
+
+        def _trace_cluster_miss(reason: str) -> None:
+            if _SPARSE_TOKEN_TOPK_TRACE:
+                logger.info(
+                    "[SparseTokenTopKCluster] miss reason=%s groups=%d "
+                    "total_tokens=%d",
+                    reason,
+                    G,
+                    total_tokens,
+                )
+
         try:
             q0 = q_list[0]
             if q0.dim() == 1:
@@ -9168,42 +9190,53 @@ class GPUModelRunner(
                 ]
 
             members0 = states[0].cluster_members
-            K0 = (
-                int(states[0].cluster_centres.shape[0])
-                if states[0].cluster_centres.numel() > 0
-                else 0
-            )
             if (
-                K0 == 0
-                or members0 is None
+                members0 is None
                 or members0.dim() != 2
-                or int(members0.shape[0]) != K0
             ):
+                _trace_cluster_miss("missing_or_bad_cluster_members")
+                return None
+            # ``cluster_members`` is the dense reverse index produced at
+            # prefill time.  Decode-side dynamic refresh appends new
+            # clusters to ``cluster_centres`` / ``cluster_size`` but does not
+            # extend this dense member table.  That is fine here: this
+            # selector is called only for prompt tokens (decode tokens are
+            # force-included after selection), so restrict scoring to the
+            # prefill clusters covered by ``cluster_members`` instead of
+            # falling back to the label-based selector after refresh.
+            K0 = int(members0.shape[0])
+            if K0 == 0 or states[0].cluster_centres.numel() == 0:
+                _trace_cluster_miss("empty_clusters")
                 return None
             M0 = int(members0.shape[1])
             if M0 <= 0:
+                _trace_cluster_miss("empty_member_width")
                 return None
 
+            _t_shape = time.perf_counter() if stats_on else None
             q_norm: list[torch.Tensor] = []
             for q in q_list:
                 if q.dim() == 1:
                     q = q.unsqueeze(0)
                 if int(q.shape[0]) != H or int(q.shape[-1]) != D:
+                    _trace_cluster_miss("q_shape_mismatch")
                     return None
                 q_norm.append(q)
             for state in states:
                 members = state.cluster_members
                 if (
                     state.cluster_centres.numel() == 0
-                    or int(state.cluster_centres.shape[0]) != K0
+                    or int(state.cluster_centres.shape[0]) < K0
                     or int(state.cluster_centres.shape[-1]) != D
-                    or int(state.cluster_size.numel()) != K0
+                    or int(state.cluster_size.numel()) < K0
                     or members is None
                     or members.dim() != 2
                     or int(members.shape[0]) != K0
                     or int(members.shape[1]) != M0
                 ):
+                    _trace_cluster_miss("state_shape_mismatch")
                     return None
+            _record_cluster_perf("shape_check", _t_shape)
 
             head_n = min(int(spec.static_pattern_start), N)
             tail_start = max(0, N - int(spec.static_pattern_end))
@@ -9221,73 +9254,143 @@ class GPUModelRunner(
             cap = max(0, budget - steady_count)
             nprobe = min(int(spec.nprobe), K0)
             if nprobe <= 0 or cap <= 0:
+                if _SPARSE_TOKEN_TOPK_TRACE:
+                    logger.info(
+                        "[SparseTokenTopKCluster] steady_only groups=%d "
+                        "q_heads_per_group=%d total_tokens=%d K=%d M=%d "
+                        "nprobe=%d budget=%d steady=%d cap=%d",
+                        G,
+                        H,
+                        N,
+                        K0,
+                        M0,
+                        nprobe,
+                        budget,
+                        steady_count,
+                        cap,
+                    )
                 return [
                     steady_row.expand(H, -1).contiguous()
                     for _ in range(G)
                 ]
 
+            _t_scores = time.perf_counter() if stats_on else None
             q_stack = torch.stack(q_norm, dim=0).to(dtype=torch.float32)
             centres = torch.stack(
-                [state.cluster_centres for state in states], dim=0
+                [state.cluster_centres[:K0] for state in states], dim=0
             )
             scores_c = torch.bmm(
                 q_stack, centres.transpose(1, 2)
             ) / float(max(D, 1)) ** 0.5
+            _record_cluster_perf("score_clusters", _t_scores)
+
+            _t_cluster_topk = time.perf_counter() if stats_on else None
             top_clusters = torch.topk(
                 scores_c, k=nprobe, dim=-1
             ).indices.to(dtype=torch.int64)
+            _record_cluster_perf("topk_clusters", _t_cluster_topk)
 
-            slot_idx = torch.arange(M0, dtype=torch.int64, device=device).view(
-                1, 1, M0
+            _t_stack = time.perf_counter() if stats_on else None
+            members_stack = torch.stack(
+                [state.cluster_members for state in states], dim=0
             )
-            out: list[torch.Tensor] = []
-            for g, state in enumerate(states):
-                cids = top_clusters[g].reshape(-1)
-                members = state.cluster_members
-                assert members is not None
-                member_rows = members.index_select(0, cids).view(
-                    H, nprobe, M0
-                )
-                size_rows = state.cluster_size.index_select(0, cids).view(
-                    H, nprobe
-                ).to(dtype=torch.int64)
+            size_stack = torch.stack(
+                [state.cluster_size[:K0] for state in states], dim=0
+            )
+            _record_cluster_perf("stack_members", _t_stack)
 
-                valid = slot_idx < size_rows.unsqueeze(-1)
-                valid &= member_rows >= head_n
-                valid &= member_rows < tail_start
-                valid &= member_rows < N
+            _t_gather = time.perf_counter() if stats_on else None
+            gather_idx = top_clusters.unsqueeze(-1).expand(
+                G, H, nprobe, M0
+            )
+            member_rows = members_stack.unsqueeze(1).expand(
+                G, H, K0, M0
+            ).gather(2, gather_idx)
+            size_rows = size_stack.unsqueeze(1).expand(
+                G, H, K0
+            ).gather(2, top_clusters).to(dtype=torch.int64)
+            _record_cluster_perf("gather_members", _t_gather)
 
-                score_rows = scores_c[g].gather(1, top_clusters[g])
-                score_flat = score_rows.unsqueeze(-1).expand(
-                    -1, -1, M0
-                ).reshape(H, -1)
-                valid_flat = valid.reshape(H, -1)
-                pos_flat = member_rows.reshape(H, -1).to(dtype=torch.int64)
-                sentinel = torch.full_like(pos_flat, N)
-                pos_ext = torch.where(
-                    valid_flat,
-                    pos_flat.clamp(0, N - 1),
-                    sentinel,
+            _t_valid = time.perf_counter() if stats_on else None
+            slot_idx = torch.arange(
+                M0, dtype=torch.int64, device=device
+            ).view(1, 1, 1, M0)
+            valid = slot_idx < size_rows.unsqueeze(-1)
+            valid &= member_rows >= head_n
+            valid &= member_rows < tail_start
+            valid &= member_rows < N
+
+            score_rows = scores_c.gather(2, top_clusters)
+            score_flat = score_rows.unsqueeze(-1).expand(
+                -1, -1, -1, M0
+            ).reshape(G, H, -1)
+            valid_flat = valid.reshape(G, H, -1)
+            pos_flat = member_rows.reshape(G, H, -1).to(dtype=torch.int64)
+            sentinel = torch.full_like(pos_flat, N)
+            pos_ext = torch.where(
+                valid_flat,
+                pos_flat.clamp(0, N - 1),
+                sentinel,
+            )
+            _record_cluster_perf("build_candidates", _t_valid)
+
+            _t_scatter = time.perf_counter() if stats_on else None
+            masked_scores_ext = torch.full(
+                (G, H, N + 1),
+                float("-inf"),
+                dtype=scores_c.dtype,
+                device=device,
+            )
+            masked_scores_ext.scatter_(
+                2,
+                pos_ext,
+                score_flat.masked_fill(~valid_flat, float("-inf")),
+            )
+            _record_cluster_perf("scatter_candidates", _t_scatter)
+
+            _t_token_topk = time.perf_counter() if stats_on else None
+            out = GPUModelRunner._sparse_group_shared_topk_mask(
+                masked_scores_ext[:, :, :N],
+                steady_mask,
+                cap,
+            )
+            _record_cluster_perf("topk_tokens", _t_token_topk)
+
+            if _SPARSE_TOKEN_TOPK_TRACE:
+                valid_counts = valid_flat.sum(dim=2).to(dtype=torch.float32)
+                out_counts = out.sum(dim=2).to(dtype=torch.float32)
+                logger.info(
+                    "[SparseTokenTopKCluster] hit groups=%d "
+                    "q_heads_per_group=%d total_tokens=%d K=%d M=%d "
+                    "nprobe=%d budget=%d steady=%d cap=%d "
+                    "candidate_slots=%d score_cells=%d valid_min=%.0f "
+                    "valid_avg=%.1f valid_max=%.0f out_min=%.0f "
+                    "out_avg=%.1f out_max=%.0f",
+                    G,
+                    H,
+                    N,
+                    K0,
+                    M0,
+                    nprobe,
+                    budget,
+                    steady_count,
+                    cap,
+                    int(G * H * nprobe * M0),
+                    int(G * H * (N + 1)),
+                    float(valid_counts.min().item())
+                    if valid_counts.numel() else 0.0,
+                    float(valid_counts.mean().item())
+                    if valid_counts.numel() else 0.0,
+                    float(valid_counts.max().item())
+                    if valid_counts.numel() else 0.0,
+                    float(out_counts.min().item())
+                    if out_counts.numel() else 0.0,
+                    float(out_counts.mean().item())
+                    if out_counts.numel() else 0.0,
+                    float(out_counts.max().item())
+                    if out_counts.numel() else 0.0,
                 )
-                masked_scores_ext = torch.full(
-                    (H, N + 1),
-                    float("-inf"),
-                    dtype=scores_c.dtype,
-                    device=device,
-                )
-                masked_scores_ext.scatter_(
-                    1,
-                    pos_ext,
-                    score_flat.masked_fill(~valid_flat, float("-inf")),
-                )
-                out.append(
-                    GPUModelRunner._sparse_group_shared_topk_mask(
-                        masked_scores_ext[:, :N],
-                        steady_mask,
-                        cap,
-                    )
-                )
-            return out
+            return list(out.unbind(0))
         finally:
             if _t0 is not None:
                 self._sparse_perf_record(
@@ -10777,11 +10880,13 @@ class GPUModelRunner(
                     counts_r = selected_mask.sum(dim=1).to(torch.int64)
 
                 if _SPARSE_TOKEN_TOPK_TRACE:
-                    counts_for_trace = (
-                        counts_r
-                        if counts_r is not None
-                        else triton_head_offsets[1:].to(torch.int64)
-                    )
+                    if counts_r is not None:
+                        counts_for_trace = counts_r
+                    else:
+                        counts_for_trace = (
+                            triton_head_offsets[1:]
+                            - triton_head_offsets[:-1]
+                        ).to(torch.int64)
                     counts_trace = counts_for_trace.to(torch.float32)
                     unique_phys = int(torch.unique(phys_r).numel()) \
                         if phys_r.numel() else 0
