@@ -26,9 +26,6 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.attention.ops.triton_sparse_pack import (
-    sparse_gather_cluster_members_to_exec_buf,
-)
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -337,22 +334,6 @@ class FlashAttentionMetadata:
     sparse_q_head_gather_num_q_flat: int | None = None
     sparse_q_head_gather_num_q_heads: int | None = None
     sparse_q_head_gather_num_reqs: int | None = None
-
-    # Cluster-direct q-head gather runtime. The runner computes top clusters
-    # from Q and passes the dense cluster member table through metadata; FA
-    # gathers K/V cache rows directly into compact execution buffers after the
-    # current-step KV update has happened.
-    sparse_q_head_cluster_top_clusters: torch.Tensor | None = None
-    sparse_q_head_cluster_members: torch.Tensor | None = None
-    sparse_q_head_cluster_size: torch.Tensor | None = None
-    sparse_q_head_cluster_block_table: torch.Tensor | None = None
-    sparse_q_head_cluster_head_offsets_scratch: torch.Tensor | None = None
-    sparse_q_head_cluster_seq_len: int | None = None
-    sparse_q_head_cluster_prompt_len: int | None = None
-    sparse_q_head_cluster_head_n: int | None = None
-    sparse_q_head_cluster_tail_start: int | None = None
-    sparse_q_head_cluster_select_budget: int | None = None
-    sparse_q_head_cluster_block_size: int | None = None
 
     # ── Retroinfer-style pre-gathered KV + estimation zone ──────────────────
     # Populated by the runner when running the new cluster-based sparse path
@@ -903,7 +884,6 @@ class FlashAttentionImpl(AttentionImpl):
                     (
                         attn_metadata.sparse_q_head_gather is not None
                         or attn_metadata.sparse_q_head_gather_flat_phys is not None
-                        or attn_metadata.sparse_q_head_cluster_top_clusters is not None
                     )
                     and self.alibi_slopes is None
                     and self.sinks is None
@@ -981,17 +961,17 @@ class FlashAttentionImpl(AttentionImpl):
                         attn_metadata = replace(
                             attn_metadata,
                             sparse_q_head_gather=None,
-                            sparse_q_head_gather_flat_phys=(
-                                runtime_q_head_gather.get("phys")
-                            ),
-                            sparse_q_head_gather_flat_slots=(
-                                runtime_q_head_gather.get("slots")
-                            ),
+                            sparse_q_head_gather_flat_phys=runtime_q_head_gather[
+                                "phys"
+                            ],
+                            sparse_q_head_gather_flat_slots=runtime_q_head_gather[
+                                "slots"
+                            ],
                             sparse_q_head_gather_flat_cu_seqlens_k=(
-                                runtime_q_head_gather.get("cu")
+                                runtime_q_head_gather["cu"]
                             ),
                             sparse_q_head_gather_head_offsets=(
-                                runtime_q_head_gather.get("head_offsets")
+                                runtime_q_head_gather["head_offsets"]
                             ),
                             sparse_q_head_gather_max_k=(
                                 runtime_q_head_gather.get("max_k")
@@ -1029,43 +1009,6 @@ class FlashAttentionImpl(AttentionImpl):
                             sparse_q_head_gather_num_reqs=(
                                 runtime_q_head_gather.get("num_reqs")
                             ),
-                            sparse_q_head_cluster_top_clusters=(
-                                runtime_q_head_gather.get("cluster_top_clusters")
-                            ),
-                            sparse_q_head_cluster_members=(
-                                runtime_q_head_gather.get("cluster_members")
-                            ),
-                            sparse_q_head_cluster_size=(
-                                runtime_q_head_gather.get("cluster_size")
-                            ),
-                            sparse_q_head_cluster_block_table=(
-                                runtime_q_head_gather.get("cluster_block_table")
-                            ),
-                            sparse_q_head_cluster_head_offsets_scratch=(
-                                runtime_q_head_gather.get(
-                                    "cluster_head_offsets_scratch"
-                                )
-                            ),
-                            sparse_q_head_cluster_seq_len=(
-                                runtime_q_head_gather.get("cluster_seq_len")
-                            ),
-                            sparse_q_head_cluster_prompt_len=(
-                                runtime_q_head_gather.get("cluster_prompt_len")
-                            ),
-                            sparse_q_head_cluster_head_n=(
-                                runtime_q_head_gather.get("cluster_head_n")
-                            ),
-                            sparse_q_head_cluster_tail_start=(
-                                runtime_q_head_gather.get("cluster_tail_start")
-                            ),
-                            sparse_q_head_cluster_select_budget=(
-                                runtime_q_head_gather.get(
-                                    "cluster_select_budget"
-                                )
-                            ),
-                            sparse_q_head_cluster_block_size=(
-                                runtime_q_head_gather.get("cluster_block_size")
-                            ),
                             sparse_gather_phys=None,
                             sparse_gather_slots=None,
                             sparse_gather_cu_seqlens_k=None,
@@ -1089,17 +1032,6 @@ class FlashAttentionImpl(AttentionImpl):
                             sparse_q_head_gather_num_q_flat=None,
                             sparse_q_head_gather_num_q_heads=None,
                             sparse_q_head_gather_num_reqs=None,
-                            sparse_q_head_cluster_top_clusters=None,
-                            sparse_q_head_cluster_members=None,
-                            sparse_q_head_cluster_size=None,
-                            sparse_q_head_cluster_block_table=None,
-                            sparse_q_head_cluster_head_offsets_scratch=None,
-                            sparse_q_head_cluster_seq_len=None,
-                            sparse_q_head_cluster_prompt_len=None,
-                            sparse_q_head_cluster_head_n=None,
-                            sparse_q_head_cluster_tail_start=None,
-                            sparse_q_head_cluster_select_budget=None,
-                            sparse_q_head_cluster_block_size=None,
                             sparse_gather_phys=None,
                             sparse_gather_slots=None,
                             sparse_gather_cu_seqlens_k=None,
@@ -1350,21 +1282,16 @@ class FlashAttentionImpl(AttentionImpl):
         assert (
             attn_metadata.sparse_q_head_gather is not None
             or attn_metadata.sparse_q_head_gather_flat_phys is not None
-            or attn_metadata.sparse_q_head_cluster_top_clusters is not None
         )
         flat_phys = attn_metadata.sparse_q_head_gather_flat_phys
         flat_slots = attn_metadata.sparse_q_head_gather_flat_slots
         flat_cu = attn_metadata.sparse_q_head_gather_flat_cu_seqlens_k
         head_offsets = attn_metadata.sparse_q_head_gather_head_offsets
-        cluster_top = attn_metadata.sparse_q_head_cluster_top_clusters
-        if head_offsets is not None:
-            num_q_heads_gather = int(head_offsets.numel() - 1)
-        elif cluster_top is not None:
-            num_q_heads_gather = int(cluster_top.shape[0]) * int(
-                cluster_top.shape[1]
-            )
-        else:
-            num_q_heads_gather = len(attn_metadata.sparse_q_head_gather)
+        num_q_heads_gather = (
+            int(head_offsets.numel() - 1)
+            if head_offsets is not None
+            else len(attn_metadata.sparse_q_head_gather)
+        )
         if _SPARSE_PERF_DEBUG:
             logger.info(
                 "[SparseDebug] _forward_per_head_compact_kv_gather ENTER "
@@ -1390,127 +1317,6 @@ class FlashAttentionImpl(AttentionImpl):
         # builder attaches an ``int`` budget via ``sparse_q_head_gather_max_k``;
         # using that avoids the per-call ``.max().item()`` GPU→CPU sync.
         max_k_hint = attn_metadata.sparse_q_head_gather_max_k
-        if (
-            attn_metadata.sparse_q_head_cluster_top_clusters is not None
-            and attn_metadata.sparse_q_head_cluster_members is not None
-            and attn_metadata.sparse_q_head_cluster_size is not None
-            and attn_metadata.sparse_q_head_cluster_block_table is not None
-            and attn_metadata.sparse_q_head_cluster_seq_len is not None
-            and attn_metadata.sparse_q_head_cluster_prompt_len is not None
-            and attn_metadata.sparse_q_head_cluster_head_n is not None
-            and attn_metadata.sparse_q_head_cluster_tail_start is not None
-            and attn_metadata.sparse_q_head_cluster_select_budget is not None
-            and attn_metadata.sparse_q_head_cluster_block_size is not None
-            and attn_metadata.sparse_q_head_gather_cu_q_flat is not None
-            and attn_metadata.sparse_q_head_gather_req_ids_flat is not None
-            and attn_metadata.sparse_q_head_gather_kv_pair_ids_flat is not None
-            and int(max_seqlen_q) == 1
-            and int(query.shape[0]) == 1
-            and key_cache.dim() == 4
-            and value_cache.dim() == 4
-        ):
-            if use_cuda_timing:
-                gather_start = torch.cuda.Event(enable_timing=True)
-                gather_end = torch.cuda.Event(enable_timing=True)
-                fa_start = torch.cuda.Event(enable_timing=True)
-                fa_end = torch.cuda.Event(enable_timing=True)
-                gather_start.record()
-
-            k_compact, v_compact, cu_k_flat = (
-                sparse_gather_cluster_members_to_exec_buf(
-                    top_clusters=attn_metadata.sparse_q_head_cluster_top_clusters,
-                    cluster_members=attn_metadata.sparse_q_head_cluster_members,
-                    cluster_size=attn_metadata.sparse_q_head_cluster_size,
-                    bt_row_gpu=attn_metadata.sparse_q_head_cluster_block_table,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_size_kv=int(
-                        attn_metadata.sparse_q_head_cluster_block_size
-                    ),
-                    seq_len=int(attn_metadata.sparse_q_head_cluster_seq_len),
-                    prompt_len=int(
-                        attn_metadata.sparse_q_head_cluster_prompt_len
-                    ),
-                    head_n=int(attn_metadata.sparse_q_head_cluster_head_n),
-                    tail_start=int(
-                        attn_metadata.sparse_q_head_cluster_tail_start
-                    ),
-                    select_budget=int(
-                        attn_metadata.sparse_q_head_cluster_select_budget
-                    ),
-                    head_offsets_scratch=(
-                        attn_metadata
-                        .sparse_q_head_cluster_head_offsets_scratch
-                    ),
-                )
-            )
-            num_q_flat = int(cu_k_flat.numel() - 1)
-            cu_q_flat = attn_metadata.sparse_q_head_gather_cu_q_flat
-            req_ids = attn_metadata.sparse_q_head_gather_req_ids_flat
-            kv_pair_ids = attn_metadata.sparse_q_head_gather_kv_pair_ids_flat
-            q_flat = (
-                query.transpose(0, 1)
-                .contiguous()
-                .view(num_q_flat, 1, query.shape[-1])
-            )
-            out_flat = torch.empty_like(q_flat)
-            max_seqlen_k = (
-                int(max_k_hint)
-                if max_k_hint is not None
-                else int((cu_k_flat[1:] - cu_k_flat[:-1]).max().item())
-            )
-            q_descale_flat = q_descale[req_ids, kv_pair_ids].view(-1, 1)
-            k_descale_flat = k_descale[req_ids, kv_pair_ids].view(-1, 1)
-            v_descale_flat = v_descale[req_ids, kv_pair_ids].view(-1, 1)
-            if use_cuda_timing:
-                gather_end.record()
-                fa_start.record()
-            flash_attn_varlen_func(
-                q=q_flat,
-                k=k_compact,
-                v=v_compact,
-                out=out_flat,
-                cu_seqlens_q=cu_q_flat,
-                max_seqlen_q=1,
-                cu_seqlens_k=cu_k_flat,
-                seqused_k=None,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=attn_metadata.causal,
-                alibi_slopes=None,
-                window_size=win,
-                block_table=None,
-                softcap=self.logits_soft_cap,
-                scheduler_metadata=None,
-                fa_version=self.vllm_flash_attn_version,
-                q_descale=q_descale_flat,
-                k_descale=k_descale_flat,
-                v_descale=v_descale_flat,
-                num_splits=0,
-                s_aux=None,
-            )
-            output.copy_(
-                out_flat.view(num_q_flat, 1, query.shape[-1])
-                .transpose(0, 1)
-                .contiguous()
-            )
-            if use_cuda_timing:
-                fa_end.record()
-                fa_end.synchronize()
-                gather_ms += float(gather_start.elapsed_time(gather_end))
-                fa_ms += float(fa_start.elapsed_time(fa_end))
-                total_end.record()
-                total_end.synchronize()
-                total_ms += float(total_start.elapsed_time(total_end))
-                logger.info(
-                    "[SparsePerfFA] compact_kv_gather total_ms=%.3f "
-                    "gather_ms=%.3f fa_ms=%.3f path=clusters_exec",
-                    total_ms,
-                    gather_ms,
-                    fa_ms,
-                )
-            return
-
         if (
             flat_phys is not None
             and flat_slots is not None

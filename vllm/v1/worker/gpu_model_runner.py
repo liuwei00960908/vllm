@@ -131,10 +131,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.triton_sparse_pack import (
-    sparse_pack_cluster_members_single_req,
-    sparse_pack_single_req,
-)
+from vllm.v1.attention.ops.triton_sparse_pack import sparse_pack_single_req
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sparse_kmeans_torch import (
     kmeans_features_from_kv_cache_torch,
@@ -9208,257 +9205,6 @@ class GPUModelRunner(
                     time.perf_counter() - _t0,
                 )
 
-    def _sparse_online_pack_tokens_from_clusters_batched(
-        self,
-        states: "list[_SparseOnlineLayerState]",
-        q_list: "list[torch.Tensor]",
-        *,
-        seq_len: int,
-        prompt_len: int,
-        spec: "SparseAttentionSpec",
-        select_budget: int,
-        bt_row_gpu: torch.Tensor,
-        kv_head_ids: torch.Tensor,
-        head_offsets_scratch: torch.Tensor | None,
-    ) -> (
-        "tuple[torch.Tensor, torch.Tensor, torch.Tensor, "
-        "torch.Tensor | None, torch.Tensor] | None"
-    ):
-        """Cluster-member selector fused with compact-KV pack.
-
-        This is the TOPK=1 hot path that avoids both the label reverse lookup
-        and the dense ``[H, N]`` selected-mask scan.  It is deliberately gated
-        to homogeneous GQA layouts by the caller; any stale/missing dense
-        cluster member tensor returns ``None`` and falls back to the mask path.
-        """
-        G = len(states)
-        if G == 0 or len(q_list) != G:
-            return None
-        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
-        try:
-            q0 = q_list[0]
-            if q0.dim() == 1:
-                q0 = q0.unsqueeze(0)
-            H = int(q0.shape[0])
-            D = int(q0.shape[-1])
-            device = q0.device
-            if int(kv_head_ids.numel()) != G * H:
-                return None
-
-            members0 = states[0].cluster_members
-            K0 = (
-                int(states[0].cluster_centres.shape[0])
-                if states[0].cluster_centres.numel() > 0
-                else 0
-            )
-            if (
-                K0 <= 0
-                or members0 is None
-                or members0.dim() != 2
-                or int(members0.shape[0]) != K0
-            ):
-                return None
-            M0 = int(members0.shape[1])
-            if M0 <= 0:
-                return None
-
-            q_norm: list[torch.Tensor] = []
-            for q in q_list:
-                if q.dim() == 1:
-                    q = q.unsqueeze(0)
-                if int(q.shape[0]) != H or int(q.shape[-1]) != D:
-                    return None
-                q_norm.append(q)
-
-            for state in states:
-                members = state.cluster_members
-                if (
-                    state.cluster_centres.numel() == 0
-                    or int(state.cluster_centres.shape[0]) != K0
-                    or int(state.cluster_centres.shape[-1]) != D
-                    or int(state.cluster_size.numel()) != K0
-                    or members is None
-                    or members.dim() != 2
-                    or int(members.shape[0]) != K0
-                    or int(members.shape[1]) != M0
-                ):
-                    return None
-
-            N = int(prompt_len)
-            head_n = min(int(spec.static_pattern_start), N)
-            tail_start = max(0, N - int(spec.static_pattern_end))
-            all_prompt_steady = head_n >= tail_start
-            steady_count = (
-                N if all_prompt_steady else head_n + (N - tail_start)
-            )
-            cap = max(0, int(select_budget) - steady_count)
-            nprobe = min(int(spec.nprobe), K0)
-
-            if cap > 0 and nprobe > 0 and not all_prompt_steady:
-                q_stack = torch.stack(q_norm, dim=0).to(dtype=torch.float32)
-                centres = torch.stack(
-                    [state.cluster_centres for state in states], dim=0
-                )
-                scores_c = torch.bmm(
-                    q_stack, centres.transpose(1, 2)
-                ) / float(max(D, 1)) ** 0.5
-                top_clusters = torch.topk(
-                    scores_c, k=nprobe, dim=-1
-                ).indices.to(dtype=torch.int64)
-            else:
-                top_clusters = torch.empty(
-                    (G, H, 1), dtype=torch.int64, device=device
-                )
-
-            members_g = torch.stack(
-                [state.cluster_members for state in states], dim=0
-            )
-            sizes_g = torch.stack(
-                [state.cluster_size for state in states], dim=0
-            )
-            return sparse_pack_cluster_members_single_req(
-                top_clusters,
-                members_g,
-                sizes_g,
-                bt_row_gpu,
-                kv_head_ids,
-                int(spec.block_size),
-                seq_len=int(seq_len),
-                prompt_len=int(prompt_len),
-                head_n=int(head_n),
-                tail_start=int(tail_start),
-                select_budget=int(select_budget),
-                head_offsets_scratch=head_offsets_scratch,
-                perf_record=(
-                    self._sparse_perf_record
-                    if self._sparse_perf_stats_enabled and self._has_sparse_attn
-                    else None
-                ),
-            )
-        finally:
-            if _t0 is not None:
-                self._sparse_perf_record(
-                    "_sparse_online_pack_tokens_from_clusters_batched",
-                    time.perf_counter() - _t0,
-                )
-
-    def _sparse_online_cluster_exec_runtime_batched(
-        self,
-        states: "list[_SparseOnlineLayerState]",
-        q_list: "list[torch.Tensor]",
-        *,
-        seq_len: int,
-        prompt_len: int,
-        spec: "SparseAttentionSpec",
-        select_budget: int,
-        bt_row_gpu: torch.Tensor,
-    ) -> "dict[str, Any] | None":
-        """Build cluster-direct runtime for FA-side K/V gather.
-
-        The runner only scores Q against centroids and carries the selected
-        cluster member tables forward.  K/V cache reads happen inside the FA
-        backend after the current-step KV cache update.
-        """
-        G = len(states)
-        if G == 0 or len(q_list) != G:
-            return None
-        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
-        try:
-            q0 = q_list[0]
-            if q0.dim() == 1:
-                q0 = q0.unsqueeze(0)
-            H = int(q0.shape[0])
-            D = int(q0.shape[-1])
-            device = q0.device
-
-            members0 = states[0].cluster_members
-            K0 = (
-                int(states[0].cluster_centres.shape[0])
-                if states[0].cluster_centres.numel() > 0
-                else 0
-            )
-            if (
-                K0 <= 0
-                or members0 is None
-                or members0.dim() != 2
-                or int(members0.shape[0]) != K0
-            ):
-                return None
-            M0 = int(members0.shape[1])
-            if M0 <= 0:
-                return None
-
-            q_norm: list[torch.Tensor] = []
-            for q in q_list:
-                if q.dim() == 1:
-                    q = q.unsqueeze(0)
-                if int(q.shape[0]) != H or int(q.shape[-1]) != D:
-                    return None
-                q_norm.append(q)
-
-            for state in states:
-                members = state.cluster_members
-                if (
-                    state.cluster_centres.numel() == 0
-                    or int(state.cluster_centres.shape[0]) != K0
-                    or int(state.cluster_centres.shape[-1]) != D
-                    or int(state.cluster_size.numel()) != K0
-                    or members is None
-                    or members.dim() != 2
-                    or int(members.shape[0]) != K0
-                    or int(members.shape[1]) != M0
-                ):
-                    return None
-
-            N = int(prompt_len)
-            head_n = min(int(spec.static_pattern_start), N)
-            tail_start = max(0, N - int(spec.static_pattern_end))
-            all_prompt_steady = head_n >= tail_start
-            steady_count = (
-                N if all_prompt_steady else head_n + (N - tail_start)
-            )
-            cap = max(0, int(select_budget) - steady_count)
-            nprobe = min(int(spec.nprobe), K0)
-
-            if cap > 0 and nprobe > 0 and not all_prompt_steady:
-                q_stack = torch.stack(q_norm, dim=0).to(dtype=torch.float32)
-                centres = torch.stack(
-                    [state.cluster_centres for state in states], dim=0
-                )
-                scores_c = torch.bmm(
-                    q_stack, centres.transpose(1, 2)
-                ) / float(max(D, 1)) ** 0.5
-                top_clusters = torch.topk(
-                    scores_c, k=nprobe, dim=-1
-                ).indices.to(dtype=torch.int64)
-            else:
-                top_clusters = torch.empty(
-                    (G, H, 1), dtype=torch.int64, device=device
-                )
-
-            return {
-                "cluster_top_clusters": top_clusters,
-                "cluster_members": torch.stack(
-                    [state.cluster_members for state in states], dim=0
-                ),
-                "cluster_size": torch.stack(
-                    [state.cluster_size for state in states], dim=0
-                ),
-                "cluster_block_table": bt_row_gpu,
-                "cluster_seq_len": int(seq_len),
-                "cluster_prompt_len": int(prompt_len),
-                "cluster_head_n": int(head_n),
-                "cluster_tail_start": int(tail_start),
-                "cluster_select_budget": int(select_budget),
-                "cluster_block_size": int(spec.block_size),
-            }
-        finally:
-            if _t0 is not None:
-                self._sparse_perf_record(
-                    "_sparse_online_cluster_exec_runtime_batched",
-                    time.perf_counter() - _t0,
-                )
-
     def _sparse_online_select_clusters_batched(
         self,
         states: "list[_SparseOnlineLayerState]",
@@ -10627,9 +10373,6 @@ class GPUModelRunner(
                     return None
 
                 q_tok = q_flat[tok_end - 1].to(dtype=torch.float32)
-                # GPU block-table row is needed by both the legacy
-                # selected-mask pack and the direct cluster-member pack.
-                bt_row_gpu = blk_tbl.block_table.gpu[req_idx]
                 _t_select = time.perf_counter() if perf_enabled else None
                 # Collect per-kv_head inputs first so we can hand the whole
                 # layer's kv_heads to the batched selector in one call.  This
@@ -10651,9 +10394,6 @@ class GPUModelRunner(
                 gqa_regular = bool(ctx.get("gqa_regular", False))
                 unit_keys_in_kv_order = ctx.get("unit_keys_in_kv_order", ())
                 select_source = "labels"
-                direct_cluster_runtime = None
-                direct_cluster_pack = None
-                selected_mask: torch.Tensor | None = None
                 if gqa_regular and len(unit_keys_in_kv_order) == int(
                     ctx["num_kv_heads"]
                 ):
@@ -10674,51 +10414,32 @@ class GPUModelRunner(
                         q_tok[k * npk : (k + 1) * npk]
                         for k in range(num_kv_heads)
                     ]
-                    if (
-                        self._sparse_legacy_token_topk
-                        and num_reqs == 1
-                        and not publish_lmcache_rows
-                    ):
-                        direct_cluster_runtime = (
-                            self._sparse_online_cluster_exec_runtime_batched(
-                                states=batched_states,
-                                q_list=q_list_views,
-                                seq_len=seq_len,
-                                prompt_len=prompt_len,
-                                spec=spec,
-                                select_budget=select_budget,
-                                bt_row_gpu=bt_row_gpu,
-                            )
+                    group_masks = (
+                        self._sparse_online_select_tokens_from_clusters_batched(
+                            states=batched_states,
+                            q_list=q_list_views,
+                            total_tokens=prompt_len,
+                            spec=spec,
+                            budget_override=select_budget,
                         )
-                    if direct_cluster_runtime is not None:
-                        select_source = "clusters_exec"
-                    else:
-                        group_masks = (
-                            self._sparse_online_select_tokens_from_clusters_batched(
-                                states=batched_states,
-                                q_list=q_list_views,
-                                total_tokens=prompt_len,
-                                spec=spec,
-                                budget_override=select_budget,
-                            )
-                            if self._sparse_legacy_token_topk
-                            else None
+                        if self._sparse_legacy_token_topk
+                        else None
+                    )
+                    if group_masks is not None:
+                        select_source = "clusters"
+                    if group_masks is None:
+                        group_masks = self._sparse_online_select_tokens_batched(
+                            states=batched_states,
+                            q_list=q_list_views,
+                            total_tokens=prompt_len,
+                            spec=spec,
+                            budget_override=select_budget,
                         )
-                        if group_masks is not None:
-                            select_source = "clusters"
-                        if group_masks is None:
-                            group_masks = self._sparse_online_select_tokens_batched(
-                                states=batched_states,
-                                q_list=q_list_views,
-                                total_tokens=prompt_len,
-                                spec=spec,
-                                budget_override=select_budget,
-                            )
-                        # Concatenation in kv-head order == head-order under
-                        # GQA-regular layout, so this is the final mask with
-                        # no scatter.  ``cat`` guarantees a contiguous tensor
-                        # that downstream ``nonzero`` / indexing expects.
-                        selected_mask = torch.cat(group_masks, dim=0)
+                    # Concatenation in kv-head order == head-order under
+                    # GQA-regular layout, so this is the final mask with
+                    # no scatter.  ``cat`` guarantees a contiguous tensor
+                    # that downstream ``nonzero`` / indexing expects.
+                    selected_mask = torch.cat(group_masks, dim=0)
                 else:
                     selected_mask = torch.zeros(
                         (num_heads, seq_len),
@@ -10766,63 +10487,20 @@ class GPUModelRunner(
                     "_build_sparse_runtime_q_head_gather:select_tokens",
                     _t_select,
                 )
-                if direct_cluster_runtime is not None:
-                    if _SPARSE_TOKEN_TOPK_TRACE:
-                        logger.info(
-                            "[SparseTokenTopK] layer=%s req_id=%s "
-                            "seq_len=%d prompt_len=%d pending=%d "
-                            "budget=%d select_budget=%d steady=%d "
-                            "select_source=%s pack_triton=%s",
-                            layer_name,
-                            rid,
-                            int(seq_len),
-                            int(prompt_len),
-                            int(pending_count),
-                            int(budget),
-                            int(select_budget),
-                            int(steady_count),
-                            select_source,
-                            True,
-                        )
-                    _perf_add(
-                        "_build_sparse_runtime_q_head_gather:per_req_total",
-                        _t_req,
-                    )
-                    direct_cluster_runtime.update(
-                        {
-                            "phys": None,
-                            "slots": None,
-                            "cu": None,
-                            "head_offsets": None,
-                            "max_k": max_k_hint,
-                            "cu_q_flat": ctx["cu_q_flat_nreqs1_int32"],
-                            "req_ids_flat": ctx["req_ids_flat_nreqs1_zero"],
-                            "kv_pair_ids_flat": kv_head_ids_int64,
-                            "num_q_flat": num_heads,
-                            "num_q_heads": num_heads,
-                            "num_reqs": num_reqs,
-                            "cluster_head_offsets_scratch": ctx[
-                                "pack_head_offsets_scratch"
-                            ],
-                        }
-                    )
-                    return direct_cluster_runtime
 
                 # Post-prompt tokens are always included, but they must be
                 # reserved from the sparse budget before prompt retrieval.
                 # Otherwise actual per-head K length can exceed the
                 # ``max_k`` hint passed to FA, which corrupts decode outputs.
-                if direct_cluster_pack is None:
-                    assert selected_mask is not None
-                    if int(selected_mask.shape[1]) != seq_len:
-                        selected_prompt = selected_mask
-                        selected_mask = torch.zeros(
-                            (num_heads, seq_len),
-                            dtype=torch.bool,
-                            device=query.device,
-                        )
-                        selected_mask[:, :prompt_len] = selected_prompt
-                    selected_mask[:, prompt_len:seq_len] = True
+                if int(selected_mask.shape[1]) != seq_len:
+                    selected_prompt = selected_mask
+                    selected_mask = torch.zeros(
+                        (num_heads, seq_len),
+                        dtype=torch.bool,
+                        device=query.device,
+                    )
+                    selected_mask[:, :prompt_len] = selected_prompt
+                selected_mask[:, prompt_len:seq_len] = True
 
                 _t_pack = time.perf_counter() if perf_enabled else None
                 # Skip the per-layer H2D block-table copy: the block-table
@@ -10842,32 +10520,13 @@ class GPUModelRunner(
                 # returned; ``per_req_head_ids`` stores a zero-length
                 # placeholder to keep list lengths consistent for any
                 # multi-layer accounting elsewhere.
-                use_triton = direct_cluster_pack is not None or (
+                use_triton = (
                     self._sparse_triton_pack_enabled
                     and not _SPARSE_DEBUG_ASSERT
                     and num_reqs == 1
-                    and selected_mask is not None
                     and selected_mask.is_cuda
                 )
-                if direct_cluster_pack is not None:
-                    (
-                        phys_r,
-                        slots_r,
-                        triton_kv_token_ids,
-                        counts_r,
-                        triton_head_offsets,
-                    ) = direct_cluster_pack
-                    self._sparse_triton_head_offsets_cache = (
-                        triton_head_offsets
-                    )
-                    self._sparse_triton_kv_token_ids_cache = (
-                        triton_kv_token_ids
-                    )
-                    head_ids_r = torch.empty(
-                        0, dtype=torch.int64, device=query.device
-                    )
-                elif use_triton:
-                    assert selected_mask is not None
+                if use_triton:
                     # Phase-B: Triton emits int64 phys/slots +
                     # per-entry kv_token_ids in one kernel, folding
                     # the three legacy finalize ops (two
@@ -10915,7 +10574,6 @@ class GPUModelRunner(
                         0, dtype=torch.int64, device=query.device
                     )
                 else:
-                    assert selected_mask is not None
                     # Legacy path (num_reqs > 1 or explicit fallback):
                     # ``nonzero`` produces [N, 2] row-major (head first,
                     # token second), matching one implicit GPU sync per
