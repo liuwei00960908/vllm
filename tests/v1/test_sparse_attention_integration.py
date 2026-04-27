@@ -634,6 +634,133 @@ def _build_mock_runner(
     return runner, scheduler_output
 
 
+def _build_token_selector_runner() -> SimpleNamespace:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = SimpleNamespace(_sparse_perf_stats_enabled=False)
+    runner._sparse_online_select_tokens = (
+        GPUModelRunner._sparse_online_select_tokens.__get__(runner)
+    )
+    runner._sparse_online_select_tokens_batched = (
+        GPUModelRunner._sparse_online_select_tokens_batched.__get__(runner)
+    )
+    cluster_member_selector = (
+        GPUModelRunner._sparse_online_select_tokens_from_clusters_batched
+    )
+    runner._sparse_online_select_tokens_from_clusters_batched = (
+        cluster_member_selector.__get__(runner)
+    )
+    return runner
+
+
+def _build_token_selector_state() -> SimpleNamespace:
+    centres = torch.eye(4, dtype=torch.float32)
+    return SimpleNamespace(
+        cluster_centres=centres,
+        block_to_cluster=torch.arange(4, dtype=torch.int64),
+        cluster_members=torch.arange(4, dtype=torch.int32).view(4, 1),
+        cluster_size=torch.ones(4, dtype=torch.int32),
+    )
+
+
+def _build_token_selector_q() -> torch.Tensor:
+    # With identity centroids and D=4, multiplying by sqrt(D)=2 makes the
+    # selector see these per-head token scores:
+    #   h0: [8, 7, 0, 0]
+    #   h1: [0, 7, 6, 0]
+    # Per-head top-2 would differ, but softmax-sum over the group picks
+    # tokens 1 and 0 for both heads.
+    scores = torch.tensor(
+        [[8.0, 7.0, 0.0, 0.0], [0.0, 7.0, 6.0, 0.0]],
+        dtype=torch.float32,
+    )
+    return scores * 2.0
+
+
+class TestTokenSparseGQASelection:
+    """Unit-test GQA group-shared token selection for compact sparse decode."""
+
+    def test_single_kv_group_shares_topk_across_q_heads(self):
+        runner = _build_token_selector_runner()
+        spec = make_spec(
+            cluster_granularity="token",
+            use_compact_kv_gather=True,
+            max_selected_tokens=2,
+            nprobe=4,
+            static_pattern_start=0,
+            static_pattern_end=0,
+        )
+
+        mask = runner._sparse_online_select_tokens(
+            state=_build_token_selector_state(),
+            q=_build_token_selector_q(),
+            total_tokens=4,
+            spec=spec,
+        )
+
+        expected = torch.tensor(
+            [[True, True, False, False], [True, True, False, False]]
+        )
+        assert torch.equal(mask, expected)
+
+    def test_batched_kv_groups_share_topk_across_q_heads(self):
+        runner = _build_token_selector_runner()
+        spec = make_spec(
+            cluster_granularity="token",
+            use_compact_kv_gather=True,
+            max_selected_tokens=2,
+            nprobe=4,
+            static_pattern_start=0,
+            static_pattern_end=0,
+        )
+
+        masks = runner._sparse_online_select_tokens_batched(
+            states=[
+                _build_token_selector_state(),
+                _build_token_selector_state(),
+            ],
+            q_list=[_build_token_selector_q(), _build_token_selector_q()],
+            total_tokens=4,
+            spec=spec,
+        )
+
+        expected = torch.tensor(
+            [[True, True, False, False], [True, True, False, False]]
+        )
+        assert len(masks) == 2
+        for mask in masks:
+            assert torch.equal(mask, expected)
+
+    def test_cluster_member_fast_path_uses_group_shared_topk(self):
+        runner = _build_token_selector_runner()
+        spec = make_spec(
+            cluster_granularity="token",
+            use_compact_kv_gather=True,
+            max_selected_tokens=2,
+            nprobe=4,
+            static_pattern_start=0,
+            static_pattern_end=0,
+        )
+
+        masks = runner._sparse_online_select_tokens_from_clusters_batched(
+            states=[
+                _build_token_selector_state(),
+                _build_token_selector_state(),
+            ],
+            q_list=[_build_token_selector_q(), _build_token_selector_q()],
+            total_tokens=4,
+            spec=spec,
+        )
+
+        expected = torch.tensor(
+            [[True, True, False, False], [True, True, False, False]]
+        )
+        assert masks is not None
+        assert len(masks) == 2
+        for mask in masks:
+            assert torch.equal(mask, expected)
+
+
 class TestCollectSparseFeatures:
     """Unit-test _collect_sparse_features with mocked GPU state."""
 

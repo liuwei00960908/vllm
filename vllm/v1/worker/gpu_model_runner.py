@@ -8726,6 +8726,76 @@ class GPUModelRunner(
         q_per_kv = max(1, num_q // num_kv)
         return min(qh_idx // q_per_kv, num_kv - 1)
 
+    @staticmethod
+    def _sparse_group_shared_topk_mask(
+        masked_scores: torch.Tensor,
+        steady_mask: torch.Tensor,
+        cap: int,
+    ) -> torch.Tensor:
+        """Return a group-shared token mask from per-Q-head scores.
+
+        ``masked_scores`` is ``[H, N]`` for one KV group or ``[G, H, N]``
+        for multiple KV groups.  Non-candidate tokens must be ``-inf``.
+        Selection is done once per KV group:
+
+        * softmax over candidate tokens independently for each Q head;
+        * sum those probabilities across the group-Q dimension;
+        * top-k over tokens using the summed scores;
+        * broadcast the selected token mask back to every Q head.
+
+        The returned shape matches ``masked_scores``.
+        """
+        squeeze_group = masked_scores.dim() == 2
+        if squeeze_group:
+            masked_scores = masked_scores.unsqueeze(0)
+        if masked_scores.dim() != 3:
+            raise ValueError(
+                "masked_scores must be [H, N] or [G, H, N], got "
+                f"{tuple(masked_scores.shape)}"
+            )
+
+        G, H, N = (
+            int(masked_scores.shape[0]),
+            int(masked_scores.shape[1]),
+            int(masked_scores.shape[2]),
+        )
+        steady = steady_mask.to(
+            dtype=torch.bool, device=masked_scores.device
+        ).view(1, 1, N)
+        if cap <= 0 or N == 0:
+            out = steady.expand(G, H, N).contiguous()
+            return out.squeeze(0) if squeeze_group else out
+
+        finite = torch.isfinite(masked_scores)
+        row_max = masked_scores.masked_fill(~finite, float("-inf")).amax(
+            dim=-1, keepdim=True
+        )
+        row_has_candidate = torch.isfinite(row_max)
+        safe_row_max = torch.where(
+            row_has_candidate, row_max, torch.zeros_like(row_max)
+        )
+        exp_scores = torch.exp(masked_scores - safe_row_max)
+        exp_scores = exp_scores.masked_fill(
+            ~finite | ~row_has_candidate, 0.0
+        )
+        probs = exp_scores / exp_scores.sum(dim=-1, keepdim=True).clamp_min(
+            1e-20
+        )
+
+        group_scores = probs.sum(dim=1)
+        group_valid = finite.any(dim=1)
+        group_scores = group_scores.masked_fill(~group_valid, float("-inf"))
+
+        k = min(int(cap), N)
+        top_vals, top_idx = torch.topk(group_scores, k=k, dim=-1)
+        selected_group = torch.zeros(
+            (G, N), dtype=torch.bool, device=masked_scores.device
+        )
+        selected_group.scatter_(1, top_idx, torch.isfinite(top_vals))
+        out = selected_group.unsqueeze(1).expand(G, H, N) | steady
+        out = out.contiguous()
+        return out.squeeze(0) if squeeze_group else out
+
     def _sparse_online_select_tokens(
         self,
         state: _SparseOnlineLayerState,
@@ -8736,8 +8806,13 @@ class GPUModelRunner(
     ) -> torch.Tensor:
         """Return ``[num_q_heads, total_tokens]`` bool selection mask.
 
-        Rewrite notes (behaviour must remain bitwise-equivalent to the legacy
-        implementation):
+        GQA semantics: the Q heads passed in ``q`` belong to one KV group.
+        Candidate token scores are softmaxed per Q head, summed across the
+        group's Q-head dimension, and top-k is taken once for the group.  The
+        resulting token mask is broadcast back to every Q head, so the group
+        attends over the same K/V set while each head still uses its own Q.
+
+        Rewrite notes:
 
         * Removed three GPU→CPU sync points:
 
@@ -8745,13 +8820,11 @@ class GPUModelRunner(
           - the ``steady_mask.sum().item()`` steady count,
           - the ``nonsteady_retr_mask.any().item()`` guard.
 
-          The early-return is equivalent to the top-k path with ``k = cap``:
-          when ``combined_count_h <= budget`` we have ``nonsteady_retr_h <=
-          cap``, and ``torch.topk(masked_scores, k=cap)`` returns all valid
-          non-steady retrieve tokens (the remaining ``-inf`` padding is
-          filtered by ``isfinite``), so ``steady | selected_nonsteady`` equals
-          ``combined_mask`` in that case.  The empty-retrieve guard is
-          similarly subsumed by the ``isfinite`` filter.
+          The early-return is equivalent to the group-shared top-k path with
+          ``k = cap``: when the group has no more than ``cap`` candidate
+          non-steady tokens, the finite-score filter returns all of them.  The
+          empty-retrieve guard is similarly subsumed by the finite-score
+          filter.
 
         * ``steady_count`` is now computed from ``spec`` + ``total_tokens``
           with plain Python int math (no tensor ``.sum()`` involved).
@@ -8795,7 +8868,10 @@ class GPUModelRunner(
                 fallback_start = max(0, N - budget)
                 fallback_mask = torch.zeros(N, dtype=torch.bool, device=device)
                 fallback_mask[fallback_start:N] = True
-                return fallback_mask.unsqueeze(0) | steady_row
+                return (
+                    fallback_mask.unsqueeze(0).expand(H, -1)
+                    | steady_row
+                ).contiguous()
 
             scores_c = torch.matmul(
                 q.to(dtype=torch.float32), state.cluster_centres.transpose(0, 1)
@@ -8840,14 +8916,11 @@ class GPUModelRunner(
             masked_scores = token_scores.masked_fill(
                 ~nonsteady_retr_mask, float("-inf")
             )
-            k = min(cap, N)
-            if k <= 0:
-                return steady_row.expand(H, -1).contiguous()
-            top_vals, top_idx = torch.topk(masked_scores, k=k, dim=1)
-            valid = torch.isfinite(top_vals)
-            selected_nonsteady = torch.zeros_like(nonsteady_retr_mask)
-            selected_nonsteady.scatter_(1, top_idx, valid)
-            return steady_row | selected_nonsteady
+            return GPUModelRunner._sparse_group_shared_topk_mask(
+                masked_scores,
+                steady_mask,
+                cap,
+            )
         finally:
             if _t0 is not None:
                 self._sparse_perf_record(
@@ -9030,13 +9103,11 @@ class GPUModelRunner(
                 ~nonsteady_retr_mask, float("-inf")
             )
 
-            k = min(cap, N)
-            top_vals, top_idx = torch.topk(masked_scores, k=k, dim=-1)
-            valid = torch.isfinite(top_vals)
-            selected_nonsteady = torch.zeros_like(nonsteady_retr_mask)
-            selected_nonsteady.scatter_(2, top_idx, valid)
-
-            out = selected_nonsteady | steady_row  # [G, H, N]
+            out = GPUModelRunner._sparse_group_shared_topk_mask(
+                masked_scores,
+                steady_mask,
+                cap,
+            )  # [G, H, N]
             return list(out.unbind(0))
         finally:
             if _t0 is not None:
@@ -9058,6 +9129,9 @@ class GPUModelRunner(
         This fast path is only used by the legacy TOPK=1 compact-gather mode.
         It scores clusters directly as ``Q dot centroid`` and expands the
         selected dense ``clusters`` rows returned by ``segment_k_means_paged``.
+        Within each KV group, expanded token scores are softmaxed per Q head,
+        summed across the group's Q heads, top-k'd once, and broadcast back to
+        all Q heads in the group.
         It intentionally does not read ``block_to_cluster`` labels or the CSR
         inverted index.  If the dense member layout is unavailable or stale
         (for example after a dynamic cluster refresh), callers fall back to the
@@ -9183,20 +9257,36 @@ class GPUModelRunner(
                 valid &= member_rows < tail_start
                 valid &= member_rows < N
 
+                score_rows = scores_c[g].gather(1, top_clusters[g])
+                score_flat = score_rows.unsqueeze(-1).expand(
+                    -1, -1, M0
+                ).reshape(H, -1)
                 valid_flat = valid.reshape(H, -1)
-                if cap < int(valid_flat.shape[1]):
-                    rank = valid_flat.to(torch.int32).cumsum(dim=1)
-                    valid_flat &= rank <= cap
-                pos_flat = member_rows.reshape(H, -1).clamp(0, N - 1)
-                selected_i = torch.zeros(
-                    (H, N), dtype=torch.int32, device=device
+                pos_flat = member_rows.reshape(H, -1).to(dtype=torch.int64)
+                sentinel = torch.full_like(pos_flat, N)
+                pos_ext = torch.where(
+                    valid_flat,
+                    pos_flat.clamp(0, N - 1),
+                    sentinel,
                 )
-                selected_i.scatter_add_(
+                masked_scores_ext = torch.full(
+                    (H, N + 1),
+                    float("-inf"),
+                    dtype=scores_c.dtype,
+                    device=device,
+                )
+                masked_scores_ext.scatter_(
                     1,
-                    pos_flat.to(dtype=torch.int64),
-                    valid_flat.to(dtype=torch.int32),
+                    pos_ext,
+                    score_flat.masked_fill(~valid_flat, float("-inf")),
                 )
-                out.append((selected_i > 0) | steady_row)
+                out.append(
+                    GPUModelRunner._sparse_group_shared_topk_mask(
+                        masked_scores_ext[:, :N],
+                        steady_mask,
+                        cap,
+                    )
+                )
             return out
         finally:
             if _t0 is not None:
@@ -10335,6 +10425,10 @@ class GPUModelRunner(
             per_req_phys: list[torch.Tensor] = []
             per_req_slots: list[torch.Tensor] = []
             per_req_counts: list[torch.Tensor] = []
+            per_req_group_phys: list[torch.Tensor] = []
+            per_req_group_slots: list[torch.Tensor] = []
+            per_req_group_kv_token_ids: list[torch.Tensor] = []
+            per_req_group_head_offsets: list[torch.Tensor] = []
             max_k_hint = budget
 
             for req_idx in range(num_reqs):
@@ -10520,13 +10614,82 @@ class GPUModelRunner(
                 # returned; ``per_req_head_ids`` stores a zero-length
                 # placeholder to keep list lengths consistent for any
                 # multi-layer accounting elsewhere.
+                use_group_pack = (
+                    num_reqs == 1
+                    and bool(gqa_regular)
+                    and int(num_queries_per_kv) > 1
+                    and int(num_heads)
+                    == int(ctx["num_kv_heads"]) * int(num_queries_per_kv)
+                )
                 use_triton = (
                     self._sparse_triton_pack_enabled
                     and not _SPARSE_DEBUG_ASSERT
                     and num_reqs == 1
                     and selected_mask.is_cuda
                 )
-                if use_triton:
+                if use_group_pack:
+                    num_kv_heads_g = int(ctx["num_kv_heads"])
+                    group_mask = selected_mask.view(
+                        num_kv_heads_g,
+                        int(num_queries_per_kv),
+                        int(seq_len),
+                    )[:, 0, :].contiguous()
+                    group_kv_ids = head_ids_int64[:num_kv_heads_g]
+                    use_group_triton = (
+                        self._sparse_triton_pack_enabled
+                        and not _SPARSE_DEBUG_ASSERT
+                        and group_mask.is_cuda
+                    )
+                    if use_group_triton:
+                        (
+                            phys_r,
+                            slots_r,
+                            triton_kv_token_ids,
+                            counts_r,
+                            triton_head_offsets,
+                        ) = sparse_pack_single_req(
+                            group_mask,
+                            bt_row_gpu,
+                            group_kv_ids,
+                            int(bsz),
+                            head_offsets_scratch=(
+                                ctx["pack_head_offsets_scratch"]
+                            ),
+                            perf_record=(
+                                self._sparse_perf_record
+                                if perf_enabled else None
+                            ),
+                        )
+                    else:
+                        nz = torch.nonzero(group_mask, as_tuple=False)
+                        tok_ids_r = nz[:, 1]
+                        block_idx = tok_ids_r // int(bsz)
+                        slots_r = (
+                            tok_ids_r - block_idx * int(bsz)
+                        ).to(torch.int32)
+                        phys_r = bt_row_gpu.index_select(0, block_idx)
+                        counts_r = group_mask.sum(dim=1).to(torch.int64)
+                        counts_i32 = counts_r.to(torch.int32)
+                        triton_head_offsets = torch.empty(
+                            num_kv_heads_g + 1,
+                            dtype=torch.int32,
+                            device=query.device,
+                        )
+                        triton_head_offsets[0] = 0
+                        torch.cumsum(
+                            counts_i32,
+                            dim=0,
+                            out=triton_head_offsets[1:],
+                        )
+                        triton_kv_token_ids = torch.repeat_interleave(
+                            group_kv_ids, counts_r
+                        )
+                    self._sparse_triton_head_offsets_cache = None
+                    self._sparse_triton_kv_token_ids_cache = None
+                    head_ids_r = torch.empty(
+                        0, dtype=torch.int64, device=query.device
+                    )
+                elif use_triton:
                     # Phase-B: Triton emits int64 phys/slots +
                     # per-entry kv_token_ids in one kernel, folding
                     # the three legacy finalize ops (two
@@ -10648,10 +10811,16 @@ class GPUModelRunner(
                         bool(use_triton),
                     )
 
-                per_req_head_ids.append(head_ids_r)
-                per_req_phys.append(phys_r)
-                per_req_slots.append(slots_r)
-                per_req_counts.append(counts_r)
+                if use_group_pack:
+                    per_req_group_phys.append(phys_r.contiguous())
+                    per_req_group_slots.append(slots_r.contiguous())
+                    per_req_group_kv_token_ids.append(triton_kv_token_ids)
+                    per_req_group_head_offsets.append(triton_head_offsets)
+                else:
+                    per_req_head_ids.append(head_ids_r)
+                    per_req_phys.append(phys_r)
+                    per_req_slots.append(slots_r)
+                    per_req_counts.append(counts_r)
                 _perf_add(
                     "_build_sparse_runtime_q_head_gather:pack_per_req_gpu",
                     _t_pack,
@@ -10670,7 +10839,7 @@ class GPUModelRunner(
                     _t_req,
                 )
 
-            if not per_req_head_ids:
+            if not per_req_head_ids and not per_req_group_phys:
                 return None
 
             _t_finalize = time.perf_counter() if perf_enabled else None
@@ -10691,6 +10860,62 @@ class GPUModelRunner(
             # Bypassing them keeps bitwise-equivalent outputs while saving
             # ~5-8 ms / decode step on the reference model.  The generic
             # path is retained for multi-req prefill-style calls.
+            if num_reqs == 1 and per_req_group_phys:
+                num_kv_heads_g = int(ctx["num_kv_heads"])
+                group_phys = per_req_group_phys[0].contiguous()
+                group_slots = per_req_group_slots[0].contiguous()
+                group_kv_token_ids = per_req_group_kv_token_ids[0]
+                group_head_offsets = per_req_group_head_offsets[0]
+                group_phys_int64 = (
+                    group_phys
+                    if group_phys.dtype == torch.int64
+                    else group_phys.to(torch.int64)
+                )
+                group_slots_int64 = (
+                    group_slots
+                    if group_slots.dtype == torch.int64
+                    else group_slots.to(torch.int64)
+                )
+                group_cu_q_flat = ctx["cu_q_flat_nreqs1_int32"][
+                    : num_kv_heads_g + 1
+                ]
+                group_req_ids_flat = ctx["req_ids_flat_nreqs1_zero"][
+                    :num_kv_heads_g
+                ]
+                group_kv_pair_ids_flat = head_ids_int64[:num_kv_heads_g]
+                _perf_add(
+                    "_build_sparse_runtime_q_head_gather:finalize_cat",
+                    _t_finalize,
+                )
+                if perf_enabled and perf_local_ms:
+                    if (
+                        self._sparse_perf_total_steps
+                        >= self._sparse_perf_warmup_skip
+                    ):
+                        for k, ms in perf_local_ms.items():
+                            self._sparse_perf_accum_ms[k] += ms
+                            self._sparse_perf_accum_calls[k] += 1
+                if publish_lmcache_rows and lmcache_rows_by_req:
+                    by_req = forward_additional_kwargs.setdefault(
+                        "lmcache_per_head_token_indices_by_layer_by_req_id",
+                        {},
+                    )
+                    for rid, rows in lmcache_rows_by_req.items():
+                        by_layer = by_req.setdefault(rid, {})
+                        by_layer[layer_name] = rows
+                return {
+                    "max_k": max_k_hint,
+                    "group_phys": group_phys_int64,
+                    "group_slots": group_slots_int64,
+                    "group_kv_token_ids": group_kv_token_ids,
+                    "group_cu_k_flat": group_head_offsets,
+                    "group_cu_q_flat": group_cu_q_flat,
+                    "group_req_ids_flat": group_req_ids_flat,
+                    "group_kv_pair_ids_flat": group_kv_pair_ids_flat,
+                    "num_q_groups": num_kv_heads_g,
+                    "num_queries_per_kv": num_queries_per_kv,
+                    "num_reqs": num_reqs,
+                }
             if num_reqs == 1:
                 head_ids_r = per_req_head_ids[0]
                 flat_phys = per_req_phys[0].contiguous()
