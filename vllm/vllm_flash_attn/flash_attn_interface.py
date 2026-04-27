@@ -194,6 +194,7 @@ def flash_attn_varlen_func(
     block_table=None,
     return_softmax_lse=False,
     out=None,
+    kv_batch_idx=None,
     # FA3 Only
     scheduler_metadata=None,
     q_descale=None,
@@ -248,6 +249,8 @@ def flash_attn_varlen_func(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        kv_batch_idx: (batch_size,), dtype torch.int32. FA3-only mapping
+            from each query batch row to the K/V batch row it should attend.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
@@ -297,6 +300,8 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
+        if kv_batch_idx is not None:
+            raise NotImplementedError("FA2 does not support kv_batch_idx")
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q,
             k,
@@ -341,7 +346,7 @@ def flash_attn_varlen_func(
             max_seqlen_q,
             max_seqlen_k,
             block_table,
-            None,  # kv_batch_idx
+            kv_batch_idx,
             None,  # leftpad_k
             None,
             None,
@@ -366,6 +371,8 @@ def flash_attn_varlen_func(
         )
     elif fa_version == 4:
         assert alibi_slopes is None, "Alibi is not supported in FA4"
+        if kv_batch_idx is not None:
+            raise NotImplementedError("FA4 does not support kv_batch_idx")
         # FA4 on SM90 doesn't support paged KV; SM100+ does
         from vllm.platforms import current_platform
 

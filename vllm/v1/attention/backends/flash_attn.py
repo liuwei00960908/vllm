@@ -337,7 +337,7 @@ class FlashAttentionMetadata:
 
     # Group-shared compact gather for GQA token-sparse decode.  When the
     # runner selects one token set per KV group, FA gathers K/V once per KV
-    # group and runs varlen attention with multiple Q heads over one KV head.
+    # group but still launches one query row per Q head via FA3 kv_batch_idx.
     sparse_q_group_gather_flat_phys: torch.Tensor | None = None
     sparse_q_group_gather_flat_slots: torch.Tensor | None = None
     sparse_q_group_gather_kv_token_ids: torch.Tensor | None = None
@@ -345,6 +345,11 @@ class FlashAttentionMetadata:
     sparse_q_group_gather_cu_q_flat: torch.Tensor | None = None
     sparse_q_group_gather_req_ids_flat: torch.Tensor | None = None
     sparse_q_group_gather_kv_pair_ids_flat: torch.Tensor | None = None
+    sparse_q_group_gather_q_cu_q_flat: torch.Tensor | None = None
+    sparse_q_group_gather_q_req_ids_flat: torch.Tensor | None = None
+    sparse_q_group_gather_q_kv_pair_ids_flat: torch.Tensor | None = None
+    sparse_q_group_gather_kv_batch_idx: torch.Tensor | None = None
+    sparse_q_group_gather_q_seqused_k: torch.Tensor | None = None
     sparse_q_group_gather_num_groups: int | None = None
     sparse_q_group_gather_num_queries_per_kv: int | None = None
     sparse_q_group_gather_num_reqs: int | None = None
@@ -967,6 +972,11 @@ class FlashAttentionImpl(AttentionImpl):
                         sparse_q_group_gather_cu_q_flat=None,
                         sparse_q_group_gather_req_ids_flat=None,
                         sparse_q_group_gather_kv_pair_ids_flat=None,
+                        sparse_q_group_gather_q_cu_q_flat=None,
+                        sparse_q_group_gather_q_req_ids_flat=None,
+                        sparse_q_group_gather_q_kv_pair_ids_flat=None,
+                        sparse_q_group_gather_kv_batch_idx=None,
+                        sparse_q_group_gather_q_seqused_k=None,
                         sparse_q_group_gather_num_groups=None,
                         sparse_q_group_gather_num_queries_per_kv=None,
                         sparse_q_group_gather_num_reqs=None,
@@ -1057,6 +1067,23 @@ class FlashAttentionImpl(AttentionImpl):
                                     "group_kv_pair_ids_flat"
                                 )
                             ),
+                            sparse_q_group_gather_q_cu_q_flat=(
+                                runtime_q_head_gather.get("group_q_cu_q_flat")
+                            ),
+                            sparse_q_group_gather_q_req_ids_flat=(
+                                runtime_q_head_gather.get("group_q_req_ids_flat")
+                            ),
+                            sparse_q_group_gather_q_kv_pair_ids_flat=(
+                                runtime_q_head_gather.get(
+                                    "group_q_kv_pair_ids_flat"
+                                )
+                            ),
+                            sparse_q_group_gather_kv_batch_idx=(
+                                runtime_q_head_gather.get("group_kv_batch_idx")
+                            ),
+                            sparse_q_group_gather_q_seqused_k=(
+                                runtime_q_head_gather.get("group_q_seqused_k")
+                            ),
                             sparse_q_group_gather_num_groups=(
                                 runtime_q_head_gather.get("num_q_groups")
                             ),
@@ -1096,6 +1123,11 @@ class FlashAttentionImpl(AttentionImpl):
                             sparse_q_group_gather_cu_q_flat=None,
                             sparse_q_group_gather_req_ids_flat=None,
                             sparse_q_group_gather_kv_pair_ids_flat=None,
+                            sparse_q_group_gather_q_cu_q_flat=None,
+                            sparse_q_group_gather_q_req_ids_flat=None,
+                            sparse_q_group_gather_q_kv_pair_ids_flat=None,
+                            sparse_q_group_gather_kv_batch_idx=None,
+                            sparse_q_group_gather_q_seqused_k=None,
                             sparse_q_group_gather_num_groups=None,
                             sparse_q_group_gather_num_queries_per_kv=None,
                             sparse_q_group_gather_num_reqs=None,
@@ -1346,7 +1378,7 @@ class FlashAttentionImpl(AttentionImpl):
         k_descale: torch.Tensor,
         v_descale: torch.Tensor,
         ) -> None:
-        """One compact-KV varlen FA call per query head (token-sparse)."""
+        """Compact-KV sparse FA path with per-Q-head execution."""
         assert (
             attn_metadata.sparse_q_head_gather is not None
             or attn_metadata.sparse_q_head_gather_flat_phys is not None
@@ -1396,6 +1428,13 @@ class FlashAttentionImpl(AttentionImpl):
         group_kv_pair_ids = (
             attn_metadata.sparse_q_group_gather_kv_pair_ids_flat
         )
+        group_q_cu_q = attn_metadata.sparse_q_group_gather_q_cu_q_flat
+        group_q_req_ids = attn_metadata.sparse_q_group_gather_q_req_ids_flat
+        group_q_kv_pair_ids = (
+            attn_metadata.sparse_q_group_gather_q_kv_pair_ids_flat
+        )
+        group_kv_batch_idx = attn_metadata.sparse_q_group_gather_kv_batch_idx
+        group_q_seqused_k = attn_metadata.sparse_q_group_gather_q_seqused_k
         group_count = attn_metadata.sparse_q_group_gather_num_groups
         group_q_per_kv = (
             attn_metadata.sparse_q_group_gather_num_queries_per_kv
@@ -1416,6 +1455,138 @@ class FlashAttentionImpl(AttentionImpl):
             and int(query.shape[0]) == int(group_num_reqs)
             and int(query.shape[1]) == int(group_count) * int(group_q_per_kv)
         )
+        have_group_q_expanded = (
+            have_group
+            and group_q_cu_q is not None
+            and group_q_req_ids is not None
+            and group_q_kv_pair_ids is not None
+            and group_kv_batch_idx is not None
+            and group_q_seqused_k is not None
+            and self.vllm_flash_attn_version == 3
+            and int(group_num_reqs) == 1
+        )
+        if have_group_q_expanded:
+            if use_cuda_timing:
+                gather_start = torch.cuda.Event(enable_timing=True)
+                gather_end = torch.cuda.Event(enable_timing=True)
+                fa_start = torch.cuda.Event(enable_timing=True)
+                fa_end = torch.cuda.Event(enable_timing=True)
+                gather_start.record()
+            assert group_phys is not None
+            assert group_slots is not None
+            assert group_kv_token_ids is not None
+            assert group_cu_k is not None
+            assert group_cu_q is not None
+            assert group_req_ids is not None
+            assert group_kv_pair_ids is not None
+            assert group_q_cu_q is not None
+            assert group_q_req_ids is not None
+            assert group_q_kv_pair_ids is not None
+            assert group_kv_batch_idx is not None
+            assert group_q_seqused_k is not None
+            num_reqs = int(group_num_reqs)
+            num_groups = int(group_count)
+            q_per_kv = int(group_q_per_kv)
+            num_q_heads = num_groups * q_per_kv
+            num_group_flat = num_groups * num_reqs
+            num_q_flat = num_q_heads * num_reqs
+            if _SPARSE_DEBUG_ASSERT:
+                _sparse_assert_compact_gather_inputs(
+                    phys=group_phys,
+                    slots=group_slots,
+                    kv_heads=group_kv_token_ids,
+                    cu_k=group_cu_k,
+                    key_cache=key_cache,
+                    num_q_flat=num_group_flat,
+                )
+            k_slice = key_cache[group_phys, group_slots, group_kv_token_ids]
+            v_slice = value_cache[group_phys, group_slots, group_kv_token_ids]
+            total_group_k = int(k_slice.shape[0])
+            dense_group_k = int(max_k_hint) if max_k_hint is not None else 0
+            if dense_group_k > 0 and total_group_k == num_groups * dense_group_k:
+                if _SPARSE_DEBUG_ASSERT:
+                    assert bool(
+                        (group_q_seqused_k == dense_group_k).all().item()
+                    ), "group-shared compact K/V must be dense per KV group"
+                k_compact = k_slice.view(
+                    num_groups, dense_group_k, 1, query.shape[-1]
+                )
+                v_compact = v_slice.view(
+                    num_groups, dense_group_k, 1, query.shape[-1]
+                )
+
+                q_flat = (
+                    query.transpose(0, 1)
+                    .contiguous()
+                    .view(num_q_flat, 1, query.shape[-1])
+                )
+                out_flat = torch.empty_like(q_flat)
+                max_seqlen_k = dense_group_k
+                q_descale_flat = q_descale[
+                    group_q_req_ids, group_q_kv_pair_ids
+                ].view(-1, 1)
+                k_descale_flat = k_descale[
+                    group_q_req_ids, group_q_kv_pair_ids
+                ].view(-1, 1)
+                v_descale_flat = v_descale[
+                    group_q_req_ids, group_q_kv_pair_ids
+                ].view(-1, 1)
+                if use_cuda_timing:
+                    gather_end.record()
+                    fa_start.record()
+                flash_attn_varlen_func(
+                    q=q_flat,
+                    k=k_compact,
+                    v=v_compact,
+                    out=out_flat,
+                    cu_seqlens_q=group_q_cu_q,
+                    max_seqlen_q=1,
+                    cu_seqlens_k=None,
+                    seqused_k=group_q_seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=None,
+                    window_size=win,
+                    block_table=None,
+                    kv_batch_idx=group_kv_batch_idx,
+                    softcap=self.logits_soft_cap,
+                    scheduler_metadata=None,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale_flat,
+                    k_descale=k_descale_flat,
+                    v_descale=v_descale_flat,
+                    num_splits=0,
+                    s_aux=None,
+                )
+                output.copy_(
+                    out_flat.view(num_q_heads, num_reqs, query.shape[-1])
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+                if use_cuda_timing:
+                    fa_end.record()
+                    fa_end.synchronize()
+                    gather_ms += float(gather_start.elapsed_time(gather_end))
+                    fa_ms += float(fa_start.elapsed_time(fa_end))
+                    total_end.record()
+                    total_end.synchronize()
+                    total_ms = float(total_start.elapsed_time(total_end))
+                    logger.info(
+                        "[SparsePerfFA] compact_group_kv_gather_q_expanded "
+                        "total_ms=%.3f gather_ms=%.3f fa_ms=%.3f "
+                        "groups=%d q_per_kv=%d num_tok=%d",
+                        total_ms,
+                        gather_ms,
+                        fa_ms,
+                        num_groups,
+                        q_per_kv,
+                        int(query.shape[0]),
+                    )
+                return
+            # During very short prompts or ragged retrieval, groups can have
+            # fewer than the steady-state budget.  Fall through to the varlen
+            # GQA branch instead of viewing a ragged buffer as dense.
         if have_group:
             if use_cuda_timing:
                 gather_start = torch.cuda.Event(enable_timing=True)
