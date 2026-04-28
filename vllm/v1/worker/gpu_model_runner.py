@@ -9341,6 +9341,10 @@ class GPUModelRunner(
             out = selected_group.unsqueeze(1).expand(G, H, N).contiguous()
             _record_cluster_perf("scatter_token_mask", _t_scatter)
 
+            _t_trace = (
+                time.perf_counter()
+                if stats_on and _SPARSE_TOKEN_TOPK_TRACE else None
+            )
             if _SPARSE_TOKEN_TOPK_TRACE:
                 valid_counts_trace = valid_flat.sum(dim=1).to(
                     dtype=torch.float32
@@ -9348,7 +9352,7 @@ class GPUModelRunner(
                 selected_counts_trace = select_flat.sum(dim=1).to(
                     dtype=torch.float32
                 )
-                out_counts = out.sum(dim=2).to(dtype=torch.float32)
+                out_counts = selected_group.sum(dim=1).to(dtype=torch.float32)
                 logger.info(
                     "[SparseTokenTopKCluster] hit groups=%d "
                     "q_heads_per_group=%d total_tokens=%d K=%d M=%d "
@@ -9388,6 +9392,7 @@ class GPUModelRunner(
                     float(out_counts.max().item())
                     if out_counts.numel() else 0.0,
                 )
+            _record_cluster_perf("trace_log", _t_trace)
             return list(out.unbind(0))
         finally:
             if _t0 is not None:
@@ -10877,6 +10882,10 @@ class GPUModelRunner(
                         )
                     counts_r = selected_mask.sum(dim=1).to(torch.int64)
 
+                _t_trace = (
+                    time.perf_counter()
+                    if perf_enabled and _SPARSE_TOKEN_TOPK_TRACE else None
+                )
                 if _SPARSE_TOKEN_TOPK_TRACE:
                     if counts_r is not None:
                         counts_for_trace = counts_r
@@ -10917,6 +10926,10 @@ class GPUModelRunner(
                         select_source,
                         bool(use_triton),
                     )
+                _perf_add(
+                    "_build_sparse_runtime_q_head_gather:trace_log",
+                    _t_trace,
+                )
 
                 if use_group_pack:
                     per_req_group_phys.append(phys_r.contiguous())
