@@ -113,7 +113,7 @@ def _kmeans_dot_torch_batched(
     """Lloyd K-Means on **mean-centered** features, batched over leading dim.
 
     Args:
-        features: ``[H, N, D]`` float -one independent K-Means per row ``h``.
+        features: ``[H, N, D]`` float – one independent K-Means per row ``h``.
 
     Returns:
         centres: ``[H, k, D]``, labels: ``[H, N]`` int64.
@@ -404,7 +404,7 @@ def prefill_cluster_meta_from_features_device(
     using the torch implementation.
     """
     skip_reason = _triton_kmeans_skip_reason(feat) or (
-        "segment_k_means_paged requires paged kv_cache inputs"
+        "segment_k_means_paged requires paged kv_cache/value_cache inputs"
     )
     _trace_triton_kmeans("features", feat, use_triton=False, reason=skip_reason)
     return prefill_cluster_meta_from_features_torch(
@@ -414,6 +414,115 @@ def prefill_cluster_meta_from_features_device(
         n_iter=n_iter,
         seed=seed,
     )
+
+
+def value_sum_from_kv_cache_torch(
+    v_cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    num_tokens: int,
+    labels: torch.Tensor,
+    num_clusters: int,
+    *,
+    middle_start: int = 0,
+    middle_end: int | None = None,
+) -> torch.Tensor:
+    """Bucket-sum V rows by cluster directly from a paged V cache.
+
+    Mirrors retroinfer's ``value_sum`` accumulator: for each K-Means cluster
+    ``c``, the sum over all clustered-token V vectors that landed in ``c``.
+    Used by the retroinfer-style "estimation zone" to approximate the softmax
+    contribution of clusters not selected into the retrieval zone, via the
+    identity ``softmax_like_score(c) ≈ Q · (value_sum[c] / cluster_size[c])``
+    weighted by ``log(cluster_size[c])``.
+
+    The read path intentionally mirrors ``kmeans_features_from_kv_cache_torch``
+    so that reuse of ``block_ids`` stays one ``kv_cache[block_ids]`` gather –
+    the V-side computation adds O(N·D) FLOPs beyond the K-side but does not
+    introduce any extra block-table indirection.  Computation is kept in
+    fp32 to keep the accumulator numerically stable across arbitrarily long
+    prompts (retroinfer does the same via CUTLASS fp32 epilogue).
+
+    Args:
+        v_cache: V cache, ``[num_blocks, block_size, num_heads, head_dim]``.
+            Legacy 3D ``[num_blocks, block_size, head_dim]`` is accepted as
+            one KV head.
+        block_ids: Physical block ids for this request.
+        num_tokens: Number of valid request tokens covered by ``block_ids``.
+        labels: Cluster label per request token, ``[H, N]`` or ``[N]`` int.
+        num_clusters: ``K`` – output leading size.
+        middle_start: First token index to include.  Tokens in
+            ``[0, middle_start)`` are treated as the retroinfer "steady head
+            zone" and excluded from the value_sum accumulation (they are
+            always merged into the executable buffer, so letting them
+            contribute to an estimated cluster score would double-count).
+        middle_end: Exclusive upper bound; defaults to ``num_tokens``.
+            ``[middle_end, num_tokens)`` is the steady tail zone.
+
+    Returns:
+        ``[H, K, head_dim]`` fp32 value_sum tensor (squeezed to ``[K, D]``
+        when ``labels`` was 1D).
+    """
+    v_cache, kv_squeezed = _as_batched_kv_cache(v_cache, "v_cache")
+    if block_ids.dim() != 1:
+        raise ValueError(
+            f"block_ids must be [num_selected_blocks], got {tuple(block_ids.shape)}"
+        )
+
+    num_blocks = int(block_ids.numel())
+    block_size = int(v_cache.shape[1])
+    num_heads = int(v_cache.shape[2])
+    head_dim = int(v_cache.shape[3])
+    max_tokens = num_blocks * block_size
+    valid_tokens = max(0, min(int(num_tokens), max_tokens))
+
+    lo = max(0, int(middle_start))
+    hi = valid_tokens if middle_end is None else min(int(middle_end), valid_tokens)
+    lo = min(lo, hi)
+    m = hi - lo
+
+    labels, lbl_squeezed = _as_batched_features(
+        labels.unsqueeze(-1), "labels"
+    )
+    # labels is now [H, N, 1]; drop trailing dim.
+    labels = labels.squeeze(-1)
+    h_labels = int(labels.shape[0])
+
+    if h_labels != num_heads:
+        raise ValueError(
+            f"labels head dim ({h_labels}) must match v_cache num_heads "
+            f"({num_heads})"
+        )
+
+    out = v_cache.new_zeros(
+        (num_heads, int(num_clusters), head_dim), dtype=torch.float32
+    )
+    if m <= 0 or num_blocks == 0 or num_heads == 0 or num_clusters == 0:
+        return _maybe_squeeze(out, lbl_squeezed and kv_squeezed)
+
+    # Gather the V rows covering [lo, hi) once – **in cache dtype** so
+    # we don't carry a transient ``[M, H, D]`` fp32 copy of the whole
+    # V-cache slice through the rest of prefill (observed: 770 MiB OOM
+    # at long prompts on a 24 GiB card).  The fp32 upcast is deferred to
+    # the per-head slice inside the scatter loop so peak is ``[M, D]``
+    # fp32 instead of ``[M, H, D]``.  ``index_add_`` on a non-contiguous
+    # (strided) fp32 source is well-supported by PyTorch's CUDA
+    # implementation – no need for the pre-loop ``transpose+contiguous``.
+    v_blocks = v_cache[block_ids]
+    v_flat = v_blocks.reshape(num_blocks * block_size, num_heads, head_dim)[
+        lo:hi
+    ]  # [M, H, D]  (cache dtype)
+    lab_slice = labels[:, lo:hi].to(torch.int64)  # [H, M]
+
+    # Per-head scatter-add: one bincount-style accumulation per head.
+    # The fp32 cast happens on the per-head slice so only ``[M, D]``
+    # fp32 is live at any time (~M*D*4 bytes, vs the prior
+    # ``[M, H, D]`` fp32 = M*H*D*4).
+    for h in range(num_heads):
+        out[h].index_add_(
+            0, lab_slice[h], v_flat[:, h, :].to(dtype=torch.float32)
+        )
+
+    return _maybe_squeeze(out, lbl_squeezed and kv_squeezed)
 
 
 def prefill_cluster_meta_from_kv_cache_torch(
@@ -456,6 +565,7 @@ def prefill_cluster_meta_from_kv_cache_device(
     block_ids: torch.Tensor,
     num_tokens: int,
     *,
+    value_cache: torch.Tensor | None = None,
     num_clusters: int,
     n_segment: int,
     is_centered: bool,
@@ -465,8 +575,8 @@ def prefill_cluster_meta_from_kv_cache_device(
 ) -> dict[str, torch.Tensor]:
     """Build prefill K-Means metadata from raw paged KV cache.
 
-    When Triton is enabled, token-granularity prefill (``is_centered=False``)
-    calls the optimized
+    When Triton is enabled and ``value_cache`` is provided, token-granularity
+    prefill (``is_centered=False``) calls the optimized
     ``segment_k_means_paged`` entry directly. Centered/block feature callers
     use the torch fallback.
     """
@@ -483,7 +593,7 @@ def prefill_cluster_meta_from_kv_cache_device(
         )
 
     skip_reason = _triton_kmeans_skip_reason(kv_cache)
-    if skip_reason is None and not is_centered:
+    if skip_reason is None and not is_centered and value_cache is not None:
         _trace_triton_kmeans("kv_cache_paged", kv_cache, use_triton=True)
         t0 = time.perf_counter() if _PREFILL_CLUSTER_TRITON_DEBUG else None
         try:
@@ -492,6 +602,13 @@ def prefill_cluster_meta_from_kv_cache_device(
             )
 
             key_cache, _ = _as_batched_kv_cache(kv_cache, "kv_cache")
+            value_cache_b, _ = _as_batched_kv_cache(value_cache, "value_cache")
+            if tuple(value_cache_b.shape) != tuple(key_cache.shape):
+                raise ValueError(
+                    "value_cache shape must match kv_cache shape for "
+                    f"segment_k_means_paged, got {tuple(value_cache_b.shape)} "
+                    f"vs {tuple(key_cache.shape)}"
+                )
             if block_ids.dim() != 1:
                 raise ValueError(
                     "block_ids must be [num_selected_blocks], got "
@@ -503,8 +620,10 @@ def prefill_cluster_meta_from_kv_cache_device(
                 labels,
                 clusters,
                 cluster_size,
+                value_sum,
             ) = segment_k_means_paged(
                 key_cache,
+                value_cache_b,
                 block_ids,
                 int(num_tokens),
                 int(num_clusters),
@@ -544,6 +663,7 @@ def prefill_cluster_meta_from_kv_cache_device(
                 ),
                 "features": features,
                 "clusters": clusters,
+                "value_sum": value_sum,
             }
             if t0 is not None:
                 logger.info(
@@ -580,7 +700,10 @@ def prefill_cluster_meta_from_kv_cache_device(
     else:
         reason = skip_reason
         if reason is None:
-            reason = "segment_k_means_paged requires is_centered=False"
+            reason = (
+                "segment_k_means_paged requires is_centered=False and "
+                "value_cache"
+            )
         _trace_triton_kmeans(
             "kv_cache_paged", kv_cache, use_triton=False, reason=reason
         )

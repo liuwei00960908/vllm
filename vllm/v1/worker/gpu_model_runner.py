@@ -139,6 +139,7 @@ from vllm.v1.core.sparse_kmeans_torch import (
     prefill_cluster_meta_from_features_torch,
     prefill_cluster_meta_from_kv_cache_device,
     sparse_prefill_cluster_use_device_kmeans,
+    value_sum_from_kv_cache_torch,
 )
 from vllm.v1.core.sparse_kv_cache_manager import (
     SparseKVManager,
@@ -455,6 +456,32 @@ class _SparseOnlineLayerState:
         "_abf_storage",
         "_b2c_storage",
         "_len",
+        # Retroinfer-style cluster-retrieval additions.
+        #
+        # ``value_sum``: per-cluster accumulated V rows, float32
+        # ``[K, D]``.  Written once at prefill (and extended at each dynamic
+        # k-means refresh, mirroring retroinfer's ``torch.cat`` pattern); used
+        # by the estimation zone to approximate the non-retrieved clusters'
+        # softmax-attention contribution.  Lives alongside ``cluster_centres``
+        # / ``cluster_size`` and is kept consistent with them.
+        #
+        # ``_cs_storage`` / ``_cs_len``: CSR data array for the
+        # cluster→token inverted index.  Stores **logical token positions**
+        # within the request (int32), sorted by cluster id.  Resolution to
+        # paged physical slots happens inside the gather kernel, so we avoid
+        # holding a second copy of the vLLM block_table.
+        #
+        # ``cluster_offsets``: CSR row-pointer int32 ``[K+1]``.  Cluster ``c``
+        # occupies ``cluster_slots[cluster_offsets[c]:cluster_offsets[c+1]]``.
+        #
+        # Note: tokens in the steady zone
+        # (``static_pattern_start``/``static_pattern_end``) are intentionally
+        # **excluded** from the CSR at prefill-time so the expand kernel does
+        # not have to deduplicate against an always-on steady region.
+        "value_sum",
+        "_cs_storage",
+        "_cs_len",
+        "cluster_offsets",
     )
 
     def __init__(
@@ -464,7 +491,10 @@ class _SparseOnlineLayerState:
         block_to_cluster: torch.Tensor,
         all_block_features: torch.Tensor,
         mean_key: torch.Tensor,
+        value_sum: torch.Tensor | None = None,
         cluster_members: torch.Tensor | None = None,
+        cluster_slots: torch.Tensor | None = None,
+        cluster_offsets: torch.Tensor | None = None,
         copy_all_block_features: bool = True,
     ) -> None:
         self.cluster_centres = cluster_centres
@@ -474,7 +504,7 @@ class _SparseOnlineLayerState:
 
         n = int(all_block_features.shape[0])
         head_size = int(all_block_features.shape[1]) if all_block_features.dim() >= 2 else 0
-        # Init with exact capacity -prefill features can span the full prompt
+        # Init with exact capacity – prefill features can span the full prompt
         # length (thousands of tokens) and we are holding one buffer per
         # (layer, kv_head, req).  Over-allocating here would double the
         # persistent sparse-state footprint right when the prefill K-Means
@@ -499,6 +529,13 @@ class _SparseOnlineLayerState:
             self._b2c_storage[:n].copy_(block_to_cluster)
         self._len = n
 
+        # --- retroinfer-style CSR + value_sum init ---
+        k_clusters = int(cluster_centres.shape[0]) if cluster_centres.dim() >= 2 else 0
+        d_head = (
+            int(cluster_centres.shape[1])
+            if cluster_centres.dim() >= 2 and k_clusters > 0
+            else head_size
+        )
         dev = cluster_centres.device
 
         if cluster_members is not None:
@@ -510,6 +547,45 @@ class _SparseOnlineLayerState:
             self.cluster_members = members
         else:
             self.cluster_members = None
+
+        if value_sum is not None:
+            # Caller supplied a pre-built accumulator – trust shape/dtype.
+            self.value_sum = value_sum
+        else:
+            # Empty placeholder; Phase 2 prefill path fills this in.
+            self.value_sum = torch.zeros(
+                (k_clusters, d_head), dtype=torch.float32, device=dev
+            )
+
+        if cluster_slots is not None:
+            cs_n = int(cluster_slots.numel())
+            cs_cap = max(cs_n, 1)
+            self._cs_storage = torch.empty(
+                cs_cap, dtype=torch.int32, device=dev
+            )
+            if cs_n > 0:
+                src = cluster_slots
+                if src.dtype != torch.int32:
+                    src = src.to(dtype=torch.int32)
+                self._cs_storage[:cs_n].copy_(src)
+            self._cs_len = cs_n
+        else:
+            # Placeholder; Phase 2 prefill will rebuild via
+            # ``rebuild_cluster_csr_from_labels``.
+            self._cs_storage = torch.empty(1, dtype=torch.int32, device=dev)
+            self._cs_len = 0
+
+        if cluster_offsets is not None:
+            off = cluster_offsets
+            if off.dtype != torch.int32:
+                off = off.to(dtype=torch.int32)
+            self.cluster_offsets = off
+        else:
+            # Placeholder with a valid ``[0]`` sentinel so consumers can
+            # always dereference ``cluster_offsets[0]`` without a shape check.
+            self.cluster_offsets = torch.zeros(
+                max(k_clusters + 1, 1), dtype=torch.int32, device=dev
+            )
 
     @property
     def block_to_cluster(self) -> torch.Tensor:
@@ -560,6 +636,115 @@ class _SparseOnlineLayerState:
             )
         self._abf_storage[:n].copy_(value)
         self._len = n
+
+    # --- retroinfer-style CSR helpers ----------------------------------
+
+    @property
+    def cluster_slots(self) -> torch.Tensor:
+        """Read-side view of the current CSR data array.
+
+        Shape ``[cluster_offsets[-1]]`` int32, i.e. the number of clustered
+        (non-steady) tokens registered into the inverted index so far.
+        """
+        return self._cs_storage[: self._cs_len]
+
+    def rebuild_cluster_csr_from_labels(
+        self,
+        labels: torch.Tensor,
+        positions: torch.Tensor,
+        num_clusters: int,
+    ) -> None:
+        """Rebuild the CSR (``cluster_slots`` / ``cluster_offsets``) in-place.
+
+        Args:
+            labels: ``[M]`` int (any int dtype); cluster id per entry.
+            positions: ``[M]`` int; the logical-token position to store.
+            num_clusters: total cluster count ``K`` (including empty clusters).
+
+        Runs on ``labels.device``.  Uses ``argsort`` on the cluster ids so the
+        CSR data is laid out grouped-by-cluster, with ``torch.bincount`` +
+        ``cumsum`` producing the offsets – this mirrors retroinfer's offline
+        index layout but stays fully on-device and avoids any per-cluster
+        Python loop.
+        """
+        m = int(labels.numel())
+        dev = labels.device
+        if m == 0:
+            self._cs_storage = torch.empty(1, dtype=torch.int32, device=dev)
+            self._cs_len = 0
+            self.cluster_offsets = torch.zeros(
+                max(int(num_clusters) + 1, 1), dtype=torch.int32, device=dev
+            )
+            return
+
+        # Stable sort by cluster id so slot order within a cluster is
+        # deterministic (helps reproducibility of downstream debug traces
+        # and keeps ``exec_buf`` ordering predictable across runs).
+        lab64 = labels if labels.dtype == torch.int64 else labels.to(torch.int64)
+        order = torch.argsort(lab64, stable=True)
+        sorted_positions = positions.to(dtype=torch.int32)[order].contiguous()
+
+        # Grow storage if needed; reuse the existing allocator-friendly
+        # ``*2`` doubling so repeated dynamic refreshes converge on a stable
+        # capacity.
+        cap = int(self._cs_storage.shape[0])
+        if m > cap:
+            new_cap = cap if cap > 0 else 128
+            while new_cap < m:
+                new_cap *= 2
+            self._cs_storage = torch.empty(
+                new_cap, dtype=torch.int32, device=dev
+            )
+        self._cs_storage[:m].copy_(sorted_positions)
+        self._cs_len = m
+
+        # CSR offsets: bincount of labels + cumsum, prepended with 0.
+        # ``torch.cumsum`` on int32 is not supported on all backends, so we
+        # go through int64 scratch and cast back to int32 – the ``K`` axis
+        # here is tiny (hundreds to low thousands) so the conversion cost is
+        # noise compared to the attention passes downstream.
+        counts64 = torch.bincount(lab64, minlength=int(num_clusters))
+        offs = torch.empty(
+            int(num_clusters) + 1, dtype=torch.int32, device=dev
+        )
+        offs[0] = 0
+        offs[1:].copy_(torch.cumsum(counts64, dim=0).to(torch.int32))
+        self.cluster_offsets = offs
+
+    def accumulate_value_sum(
+        self,
+        values: torch.Tensor,
+        labels: torch.Tensor,
+        num_clusters: int,
+    ) -> None:
+        """Scatter-add ``values`` into ``self.value_sum`` bucketed by ``labels``.
+
+        Args:
+            values: ``[M, D]`` float (any float dtype); V rows to aggregate.
+            labels: ``[M]`` int; cluster id per row.
+            num_clusters: target cluster count ``K``.
+
+        Always stores accumulation in float32 for stability (mirrors
+        retroinfer which materialises ``value_sum`` in the model dtype only
+        lazily; we keep it fp32 to tolerate K-Means refreshes).
+        """
+        if values.numel() == 0:
+            d = int(self.value_sum.shape[-1]) if self.value_sum.dim() == 2 else 0
+            self.value_sum = torch.zeros(
+                (int(num_clusters), d),
+                dtype=torch.float32,
+                device=values.device,
+            )
+            return
+        d = int(values.shape[-1])
+        vs = torch.zeros(
+            (int(num_clusters), d),
+            dtype=torch.float32,
+            device=values.device,
+        )
+        lab64 = labels if labels.dtype == torch.int64 else labels.to(torch.int64)
+        vs.index_add_(0, lab64, values.to(dtype=torch.float32))
+        self.value_sum = vs
 
     def _grow_if_needed(self, extra: int) -> None:
         needed = self._len + extra
@@ -800,7 +985,7 @@ class GPUModelRunner(
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
 
-        # Sparse KV attention state.
+        # ── Sparse KV attention state (RetroInfer-style) ──────────────────────
         # Set to True once a SparseAttentionSpec KV-cache group is detected.
         self._has_sparse_attn: bool = False
         # Captured query tensors from the current forward pass, keyed by layer
@@ -822,7 +1007,7 @@ class GPUModelRunner(
         # index_select + sum chain, but cuts the per-layer kernel launch
         # count from ~5 down to 2 (count + pack).  Measured steady-state
         # (VLLM_SPARSE_PERF_WARMUP_SKIP=20 on a 20-sparse-layer Qwen-
-        # style decode): forward_ms 54.59 ->52.07 (-2.52 ms/step), with
+        # style decode): forward_ms 54.59 → 52.07 (-2.52 ms/step), with
         # the bulk of the win coming from the num_reqs==1 finalize
         # reusing the Triton-produced int32 ``head_offsets`` (skipping
         # a redundant ``empty + zero + cumsum`` chain).  Defaults to
@@ -831,9 +1016,31 @@ class GPUModelRunner(
         self._sparse_triton_pack_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_TRITON_PACK", "1")) == 1
         )
-        # Current token-compact sparse path.
+        # ── Retroinfer-style cluster retrieval (Phase 5) ────────────────
+        # The new path replaces the per-token top-k selector with a
+        # cluster-level selector (``_sparse_online_select_clusters_batched``)
+        # + pre-gathered per-head exec buffers
+        # (``_sparse_retroinfer_expand_and_gather_single_req``).  FA consumes
+        # these via the ``_forward_retroinfer_exec_buf`` dispatch.  Two
+        # env vars govern rollout so we can bisect regressions without a
+        # code-level revert:
+        #
+        # * ``VLLM_SPARSE_LEGACY_TOKEN_TOPK=1`` — force the old per-token
+        #   topk + compact-kv gather path for every sparse layer.  Useful
+        #   for regression bisection during Phase 5 rollout.  Defaults off.
+        #
+        # * ``VLLM_SPARSE_ESTIMATION_BUDGET=K`` — how many additional
+        #   clusters to allocate to the estimation zone (on top of
+        #   ``spec.nprobe`` for the retrieval zone).  ``K=0`` degenerates
+        #   to a retrieval-only path (matches the legacy semantic up to
+        #   cluster-vs-token granularity).  Defaults to 0 so an initial
+        #   rollout step can be validated against the previous reference
+        #   before enabling the estimation zone.
         self._sparse_legacy_token_topk: bool = (
             int(os.getenv("VLLM_SPARSE_LEGACY_TOKEN_TOPK", "0")) == 1
+        )
+        self._sparse_estimation_budget: int = max(
+            0, int(os.getenv("VLLM_SPARSE_ESTIMATION_BUDGET", "0"))
         )
         # Per-layer scratch: when the Triton pack fast path runs in the
         # per-req loop, it already computes the int32 exclusive-prefix
@@ -868,7 +1075,7 @@ class GPUModelRunner(
         self._sparse_perf_log_interval: int = max(
             1, int(os.getenv("VLLM_SPARSE_PERF_LOG_INTERVAL", "50"))
         )
-        # Post-warmup step counter -used for ``window_steps`` modulo
+        # Post-warmup step counter — used for ``window_steps`` modulo
         # logging.  Only ticks once the warmup-skip gate below has
         # cleared.
         self._sparse_perf_steps: int = 0
@@ -907,13 +1114,25 @@ class GPUModelRunner(
         self._sparse_decode_trace_qhead_ms: float = 0.0
         self._sparse_decode_trace_qhead_calls: int = 0
         self._sparse_decode_trace_qhead_none: int = 0
+        self._sparse_decode_trace_retro_ms: float = 0.0
+        self._sparse_decode_trace_retro_calls: int = 0
         self._sparse_online_index: dict[str, dict[str, _SparseOnlineLayerState]] = {}
+        # GPU-resident handoff: per-(req, unit_key) precomputed ``value_sum``
+        # ``[K, D]`` fp32 tensors written during ``_collect_sparse_features``
+        # (next to the K-Means call, while V rows are still hot in the paged
+        # cache's L2) and consumed one line later in
+        # ``_update_sparse_online_index`` to avoid a redundant D2H→numpy→H2D
+        # roundtrip.  Intentionally not a function parameter: the two callers
+        # are adjacent in ``sample_tokens`` and bouncing it through a tuple
+        # would bloat the already-wide return signature of
+        # ``_collect_sparse_features``.  Cleared at the end of each update.
+        self._sparse_pending_value_sum_gpu: dict[str, dict[str, torch.Tensor]] = {}
         # Snapshot of per-request output length BEFORE this step appends sampled
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
         self._sparse_output_tokens_before_step: dict[str, int] = {}
         # Prefill-features-emitted guard: ``is_prefill_done`` can re-fire on
-        # subsequent steps (async placeholder / first-decode boundary -see
+        # subsequent steps (async placeholder / first-decode boundary – see
         # comment near ``_collect_sparse_features``).  Re-sending the full
         # ``[N_prompt_tokens, D]`` feature dict forces the scheduler to redo
         # ``SparseKVManager.indexing()`` which rebuilds per-token Python state
@@ -2563,6 +2782,20 @@ class GPUModelRunner(
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
 
+        # NOTE: _override_sparse_slot_mapping is intentionally DISABLED.
+        # compute_slot_mapping above uses the *original* (non-sparse)
+        # block_table, which already maps each decode token to the correct
+        # physical slot.  The sparse block-table rewrite
+        # (_build_sparse_layer_block_table_tensor) only produces a separate
+        # tensor for the attention kernel and never mutates
+        # input_batch.block_table.  The old override mis-computed
+        # fill_offset = num_output_tokens % block_size instead of the
+        # correct (prompt_len + num_output_tokens - 1) % block_size,
+        # corrupting newly-written KV cache entries and causing garbled
+        # output.
+        # if self._has_sparse_attn:
+        #     self._override_sparse_slot_mapping(num_reqs, cu_num_tokens)
+
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
@@ -2814,6 +3047,9 @@ class GPUModelRunner(
             *,
             skip_block_table_cache: bool = False,
             layer_names_override: list[str] | None = None,
+            sparse_per_head_block_table: torch.Tensor | None = None,
+            sparse_per_head_seq_lens: torch.Tensor | None = None,
+            disable_token_sparse_boundary: bool = False,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
@@ -2871,6 +3107,17 @@ class GPUModelRunner(
                     time.perf_counter() - _t_builder,
                 )
 
+            if (
+                sparse_per_head_block_table is not None
+                and sparse_per_head_seq_lens is not None
+                and isinstance(attn_metadata_i, FlashAttentionMetadata)
+            ):
+                attn_metadata_i = replace(
+                    attn_metadata_i,
+                    sparse_per_head_block_table=sparse_per_head_block_table,
+                    sparse_per_head_seq_lens=sparse_per_head_seq_lens,
+                )
+
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
@@ -2906,7 +3153,76 @@ class GPUModelRunner(
                     time.perf_counter() - _t_enc,
                 )
 
-            cm_union = cm
+            is_sparse_group = isinstance(
+                kv_cache_group.kv_cache_spec, SparseAttentionSpec
+            )
+            boundary_disable_sparse = False
+            boundary_req_ids: list[str] = []
+            if is_sparse_group:
+                _t_boundary = time.perf_counter() if perf_sparse_enabled else None
+                for req_idx in range(num_reqs):
+                    rid = self.input_batch.req_ids[req_idx]
+                    seq_i = int(cm._seq_lens_cpu[req_idx].item())
+                    p_i = int(self.input_batch.num_prompt_tokens[req_idx])
+                    rs = self.requests.get(rid)
+                    out_n = 0 if rs is None else len(rs.output_token_ids)
+                    # Async placeholder boundary: first decode forward can have
+                    # seq_len == prompt_len + 1 while no output token is yet
+                    # committed on worker side. Treat this as boundary as well
+                    # so token-sparse patching is disabled for that transition
+                    # step and cannot affect the first sampled token.
+                    if out_n == 0 and seq_i <= (p_i + 1):
+                        boundary_req_ids.append(rid)
+                boundary_disable_sparse = len(boundary_req_ids) > 0
+                if boundary_disable_sparse and (
+                    self._sparse_probe_info_enabled
+                    or self._sparse_debug_decode_tokens
+                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
+                ):
+                    logger.info(
+                        "[SparseRC] boundary_disable_sparse gid=%d reqs=%d "
+                        "req_id_head=%s",
+                        kv_cache_gid,
+                        len(boundary_req_ids),
+                        boundary_req_ids[:2],
+                    )
+                if _t_boundary is not None:
+                    self._sparse_perf_record(
+                        "_build_attention_metadata:sparse_boundary_scan",
+                        time.perf_counter() - _t_boundary,
+                    )
+            # Token-level compact gather uses sparse_q_head_gather metadata
+            # (phys, slot, cu_seqlens_k) to index KV directly with
+            # block_table=None.  The underlying block_table and seq_lens
+            # must therefore stay *unmodified* so that when compact gather
+            # is unavailable (e.g. first decode step) FA falls back to
+            # standard paged attention with the full, correct metadata.
+            # Skipping _override_sparse_seq_lens here also eliminates the
+            # async-scheduling state drift that caused repeated-token output.
+            _group_is_tok_compact = (
+                is_sparse_group
+                and isinstance(kv_cache_group.kv_cache_spec, SparseAttentionSpec)
+                and kv_cache_group.kv_cache_spec.cluster_granularity == "token"
+                and kv_cache_group.kv_cache_spec.use_compact_kv_gather
+            )
+            if is_sparse_group and not boundary_disable_sparse and not _group_is_tok_compact:
+                _t0_sparse_seq = (
+                    time.perf_counter() if self._sparse_perf_stats_enabled else None
+                )
+                cm_union = self._override_sparse_seq_lens(
+                    cm,
+                    kv_cache_gid,
+                    num_reqs,
+                    num_reqs_padded,
+                    kv_cache_group.kv_cache_spec.block_size,
+                )
+                if _t0_sparse_seq is not None:
+                    self._sparse_perf_record(
+                        "_override_sparse_seq_lens",
+                        time.perf_counter() - _t0_sparse_seq,
+                    )
+            else:
+                cm_union = cm
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):
@@ -2916,7 +3232,175 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata = cm_union
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
-                if ubatch_slices is not None:
+                attn_group_i = self.attn_groups[kv_cache_gid][attn_gid]
+                if is_sparse_group:
+                    spec_sp = kv_cache_group.kv_cache_spec
+                    assert isinstance(spec_sp, SparseAttentionSpec)
+                    is_tok_compact = (
+                        spec_sp.cluster_granularity == "token"
+                        and spec_sp.use_compact_kv_gather
+                    )
+                    for layer_name in attn_group_i.layer_names:
+                        attn_mod_sh = (
+                            self.compilation_config.static_forward_context.get(
+                                layer_name
+                            )
+                        )
+                        n_heads_sh = (
+                            int(attn_mod_sh.num_heads)
+                            if attn_mod_sh is not None
+                            else 1
+                        )
+                        bsz = spec_sp.block_size
+                        sp_bt: torch.Tensor | None = None
+                        sp_sl: torch.Tensor | None = None
+                        decode_override: np.ndarray | None = None
+                        if boundary_disable_sparse:
+                            cm_layer = copy(cm_union)
+                            cm_layer.block_table_tensor = (
+                                cm_union.block_table_tensor.clone()
+                            )
+                        elif is_tok_compact:
+                            # Token-level compact gather uses
+                            # sparse_q_head_gather metadata (phys, slot,
+                            # cu_seqlens_k) to index KV directly – it
+                            # passes block_table=None to FA.  Therefore
+                            # the block_table and seq_lens in
+                            # CommonAttentionMetadata must remain
+                            # *unmodified* so that when compact gather is
+                            # unavailable (e.g. first decode step) FA
+                            # falls back to standard paged attention with
+                            # the full, correct block_table.
+                            cm_layer = copy(cm_union)
+                            cm_layer.block_table_tensor = (
+                                cm_union.block_table_tensor.clone()
+                            )
+                        else:
+                            _t_per_head = (
+                                time.perf_counter() if perf_sparse_enabled else None
+                            )
+                            per_bt, per_sl = (
+                                self._build_sparse_per_head_block_table_and_lens(
+                                    cm_union.block_table_tensor,
+                                    cm_union,
+                                    kv_cache_gid,
+                                    layer_name,
+                                    n_heads_sh,
+                                    num_reqs,
+                                    num_reqs_padded,
+                                    bsz,
+                                )
+                            )
+                            if _t_per_head is not None:
+                                self._sparse_perf_record(
+                                    "_build_attention_metadata:per_head_block_table",
+                                    time.perf_counter() - _t_per_head,
+                                )
+                            if per_bt is not None and per_sl is not None:
+                                cm_layer = copy(cm)
+                                cm_layer.block_table_tensor = per_bt[0]
+                                cm_layer.seq_lens = per_sl[0]
+                                cm_layer._seq_lens_cpu = torch.tensor(
+                                    per_sl[0].cpu().numpy(), dtype=torch.int32
+                                )
+                                if num_reqs > 0:
+                                    cm_layer.max_seq_len = int(
+                                        per_sl[0, :num_reqs].max().item()
+                                    )
+                                sp_bt, sp_sl = per_bt, per_sl
+                            else:
+                                cm_layer = copy(cm)
+                                cm_layer.block_table_tensor = (
+                                    cm_union.block_table_tensor.clone()
+                                )
+                                _t0_sparse_seq = (
+                                    time.perf_counter()
+                                    if self._sparse_perf_stats_enabled
+                                    else None
+                                )
+                                cm_layer = self._override_sparse_seq_lens(
+                                    cm_layer,
+                                    kv_cache_gid,
+                                    num_reqs,
+                                    num_reqs_padded,
+                                    bsz,
+                                    decode_num_blocks_override=None,
+                                )
+                                if _t0_sparse_seq is not None:
+                                    self._sparse_perf_record(
+                                        "_override_sparse_seq_lens",
+                                        time.perf_counter() - _t0_sparse_seq,
+                                    )
+                        if (
+                            (self._sparse_probe_info_enabled
+                             or self._sparse_debug_decode_tokens)
+                            and num_reqs > 0
+                        ):
+                            req0 = self.input_batch.req_ids[0]
+                            blk0 = int(
+                                self.input_batch.block_table[
+                                    kv_cache_gid
+                                ].num_blocks_per_row[0]
+                            )
+                            seq0 = int(cm_layer._seq_lens_cpu[0].item())
+                            ov0 = (
+                                -1
+                                if decode_override is None
+                                else int(decode_override[0])
+                            )
+                            logger.info(
+                                "[SparseProbe] seq_lens_bridge req_id=%s "
+                                "layer=%s is_tok_compact=%s "
+                                "decode_num_blocks_override=%d "
+                                "num_blocks_per_row=%d seq_len_cpu=%d block_size=%d",
+                                req0,
+                                layer_name,
+                                is_tok_compact,
+                                ov0,
+                                blk0,
+                                seq0,
+                                int(bsz),
+                            )
+                            logger.info(
+                                "[SparseRC] layer_bridge req_id=%s layer=%s gid=%d "
+                                "union_seq_len=%d layer_seq_len=%d "
+                                "union_blocks=%d layer_override_blocks=%d",
+                                req0,
+                                layer_name,
+                                kv_cache_gid,
+                                int(cm_union._seq_lens_cpu[0].item()),
+                                seq0,
+                                blk0,
+                                ov0,
+                            )
+                        if ubatch_slices is not None:
+                            for ubid, _cm in enumerate(
+                                split_attn_metadata(ubatch_slices, cm_layer)
+                            ):
+                                _build_attn_group_metadata(
+                                    kv_cache_gid,
+                                    attn_gid,
+                                    _cm,
+                                    ubid,
+                                    skip_block_table_cache=True,
+                                    layer_names_override=[layer_name],
+                                    sparse_per_head_block_table=sp_bt,
+                                    sparse_per_head_seq_lens=sp_sl,
+                                    disable_token_sparse_boundary=boundary_disable_sparse,
+                                )
+                        else:
+                            _build_attn_group_metadata(
+                                kv_cache_gid,
+                                attn_gid,
+                                cm_layer,
+                                None,
+                                skip_block_table_cache=True,
+                                layer_names_override=[layer_name],
+                                sparse_per_head_block_table=sp_bt,
+                                sparse_per_head_seq_lens=sp_sl,
+                                disable_token_sparse_boundary=boundary_disable_sparse,
+                            )
+                elif ubatch_slices is not None:
                     for ubid, _cm in enumerate(
                         split_attn_metadata(ubatch_slices, cm_union)
                     ):
@@ -2925,6 +3409,7 @@ class GPUModelRunner(
                             attn_gid,
                             _cm,
                             ubid,
+                            disable_token_sparse_boundary=boundary_disable_sparse,
                         )
 
                 else:
@@ -2932,6 +3417,7 @@ class GPUModelRunner(
                         kv_cache_gid,
                         attn_gid,
                         cm_union,
+                        disable_token_sparse_boundary=boundary_disable_sparse,
                     )
 
         if self.is_mm_prefix_lm:
@@ -4540,6 +5026,8 @@ class GPUModelRunner(
             self._sparse_decode_trace_qhead_ms = 0.0
             self._sparse_decode_trace_qhead_calls = 0
             self._sparse_decode_trace_qhead_none = 0
+            self._sparse_decode_trace_retro_ms = 0.0
+            self._sparse_decode_trace_retro_calls = 0
         _decode_perf_preprocess_ms = 0.0
         _decode_perf_update_states_ms = 0.0
         _decode_perf_prepare_inputs_ms = 0.0
@@ -5053,7 +5541,7 @@ class GPUModelRunner(
         if self._decode_perf_stats_enabled and not _decode_perf_decode_only:
             # Non-decode-only step (e.g. prefill / mixed).  We do not want
             # ``[DecodePerfE2E]`` to fire from ``sample_tokens`` in that case
-            # -drop the step-level window so the next call is a fresh
+            # – drop the step-level window so the next call is a fresh
             # start.
             self._decode_perf_step_t0 = None
             self._decode_perf_step_exec_ms = 0.0
@@ -5126,7 +5614,7 @@ class GPUModelRunner(
                     "attn_metadata_ms=%.3f forward_ms=%.3f "
                     "postprocess_ms=%.3f other_ms=%.3f "
                     "qhead_ms=%.3f qhead_calls=%d qhead_none=%d "
-                    "cudagraph=%s",
+                    "retro_ms=%.3f retro_calls=%d cudagraph=%s",
                     trace_req_ids,
                     out_tokens_before,
                     sparse_units,
@@ -5139,6 +5627,8 @@ class GPUModelRunner(
                     self._sparse_decode_trace_qhead_ms,
                     self._sparse_decode_trace_qhead_calls,
                     self._sparse_decode_trace_qhead_none,
+                    self._sparse_decode_trace_retro_ms,
+                    self._sparse_decode_trace_retro_calls,
                     cudagraph_mode.name,
                 )
             if _t_decode_perf_log is not None:
@@ -5154,7 +5644,7 @@ class GPUModelRunner(
                     time.perf_counter() - _t_decode_perf_log,
                 )
         # Stamp exit time AFTER the log so ``sample_tokens`` can isolate the
-        # engine-side gap (apply_grammar_bitmask, PP, IPC, ...) -this
+        # engine-side gap (apply_grammar_bitmask, PP, IPC, ...) – this
         # quantity is normally 0 for single-process TP=1, and any non-trivial
         # value is a red flag for instrumentation overhead leaking in.
         if self._decode_perf_stats_enabled and _decode_perf_decode_only:
@@ -5412,10 +5902,10 @@ class GPUModelRunner(
         if _e2e_sample_marks is not None:
             _e2e_sample_marks.append(("bookkeeping_sync", time.perf_counter()))
         if _t_bookkeep is not None:
-            # ``_bookkeeping_sync`` is the major GPU-> CPU sync point (pulls
+            # ``_bookkeeping_sync`` is the major GPU→CPU sync point (pulls
             # sampled token ids, logprobs, num_nans, etc.).  If the forward
             # pipeline still has pending attention-kernel work, this is where
-            # the CPU blocks -that's why it's the prime suspect for the
+            # the CPU blocks – that's why it's the prime suspect for the
             # sparse/full ``sample_tokens_ms`` gap.
             self._sparse_perf_record(
                 "sample_tokens:bookkeeping_sync",
@@ -5454,13 +5944,14 @@ class GPUModelRunner(
             if _t_post_bookkeep is not None:
                 # Window covers propose_drafts_after_bookkeeping +
                 # finalize_kv_connector + eplb_step + RoutedExperts capture
-                # -i.e. everything that happens on the CPU path between
+                # – i.e. everything that happens on the CPU path between
                 # the bookkeeping sync and the sparse feature collection.
                 self._sparse_perf_record(
                     "sample_tokens:post_bookkeep_pre_sparse",
                     time.perf_counter() - _t_post_bookkeep,
                 )
 
+            # ── Sparse KV attention features ──────────────────────────────
             _t0_sparse_collect = (
                 time.perf_counter() if self._sparse_perf_stats_enabled else None
             )
@@ -5503,7 +5994,7 @@ class GPUModelRunner(
             self._sparse_perf_flush_if_needed()
             if _t0_perf_flush is not None:
                 # Window logger.info cost at VLLM_SPARSE_PERF_LOG_INTERVAL=1
-                # dominates sample_tokens runtime -isolate it so it does not
+                # dominates sample_tokens runtime – isolate it so it does not
                 # get attributed to genuine sparse work.  Note the timer only
                 # fires on steps where the window actually flushes; at larger
                 # intervals it is near-zero on the non-flush steps.
@@ -5511,6 +6002,7 @@ class GPUModelRunner(
                     "sample_tokens:perf_log_flush",
                     time.perf_counter() - _t0_perf_flush,
                 )
+            # ──────────────────────────────────────────────────────────────
 
             _t_tail = time.perf_counter() if _sp_perf_enabled else None
             output = ModelRunnerOutput(
@@ -5531,7 +6023,7 @@ class GPUModelRunner(
                 sparse_prefill_cluster_meta=sparse_prefill_cluster_meta,
             )
             if _t_tail is not None:
-                # ModelRunnerOutput construction -should be near-zero even
+                # ModelRunnerOutput construction – should be near-zero even
                 # when sparse_* dict payloads are attached (they are already
                 # realised tensors/dicts by this point).  Non-trivial values
                 # here point at hidden cost in dataclass __post_init__ or
@@ -6999,7 +7491,7 @@ class GPUModelRunner(
 
                 if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
                     if not mm_budget.mm_max_toks_per_item:
-                        # All modality limits are 0 -embedding-only mode.
+                        # All modality limits are 0 — embedding-only mode.
                         # Budget is non-zero for embedding storage, but
                         # there's no encoder to profile.
                         logger.info(
@@ -7190,7 +7682,7 @@ class GPUModelRunner(
 
                 logger.debug(
                     "Estimated %s CUDA graph memory: "
-                    "%.2f MiB first-capture + (%d-1) x %.2f MiB per-graph",
+                    "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
                     mode.name,
                     first_capture / (1 << 20),
                     len(descs),
@@ -8060,6 +8552,7 @@ class GPUModelRunner(
                 return gid
         return 0
 
+    # ── Sparse KV attention helpers ───────────────────────────────────────────
 
     def _setup_sparse_attention(self) -> None:
         """Register forward pre-hooks on sparse attention layers to capture Q.
@@ -8068,7 +8561,7 @@ class GPUModelRunner(
         layer that belongs to a ``SparseAttentionSpec`` KV-cache group, a
         ``register_forward_pre_hook`` is attached.  The hook stores the raw
         query tensor so that ``_collect_sparse_features`` can later read it
-        without an extra GPU-> CPU copy.
+        without an extra GPU→CPU copy.
 
         The hooks write into ``self._sparse_q_captures`` unconditionally on
         every forward pass.  This means the writes are captured by CUDA graphs
@@ -8115,6 +8608,11 @@ class GPUModelRunner(
                                     "_vllm_sparse_runtime_q_head_gather",
                                     None,
                                 )
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_retroinfer",
+                                    None,
+                                )
                                 return
                             try:
                                 if q.is_cuda and torch.cuda.is_current_stream_capturing():
@@ -8123,35 +8621,85 @@ class GPUModelRunner(
                                         "_vllm_sparse_runtime_q_head_gather",
                                         None,
                                     )
+                                    setattr(
+                                        module,
+                                        "_vllm_sparse_runtime_retroinfer",
+                                        None,
+                                    )
                                     return
                             except Exception:
                                 pass
-                            # Current sparse experiment path: token compact
-                            # gather via legacy cluster top-k.
-                            _t_qh = (
-                                time.perf_counter()
-                                if _SPARSE_DECODE_STEP_TRACE
-                                else None
-                            )
-                            q_head_gather = (
-                                self._build_sparse_runtime_q_head_gather(
+                            # Retroinfer fast path is the default under
+                            # ``cluster_granularity == "token"`` once the
+                            # Phase 1–6 code is in.  ``VLLM_SPARSE_LEGACY_TOKEN_TOPK=1``
+                            # forces the legacy per-token topk + compact
+                            # gather path for regression bisection.  The
+                            # retroinfer builder returns ``None`` when its
+                            # own fast-path checks don't hold (num_reqs!=1,
+                            # non-GQA-regular layout, prefill step, etc.),
+                            # in which case we cleanly fall back to the
+                            # legacy builder without running retroinfer.
+                            retro: dict | None = None
+                            if not self._sparse_legacy_token_topk:
+                                _t_retro = (
+                                    time.perf_counter()
+                                    if _SPARSE_DECODE_STEP_TRACE
+                                    else None
+                                )
+                                retro = self._build_sparse_runtime_retroinfer(
                                     layer_name=name,
                                     query=q,
                                     spec=spec,
                                 )
-                            )
-                            if _t_qh is not None:
-                                self._sparse_decode_trace_qhead_ms += (
-                                    time.perf_counter() - _t_qh
-                                ) * 1000.0
-                                self._sparse_decode_trace_qhead_calls += 1
-                                if q_head_gather is None:
-                                    self._sparse_decode_trace_qhead_none += 1
-                            setattr(
-                                module,
-                                "_vllm_sparse_runtime_q_head_gather",
-                                q_head_gather,
-                            )
+                                if _t_retro is not None:
+                                    self._sparse_decode_trace_retro_ms += (
+                                        time.perf_counter() - _t_retro
+                                    ) * 1000.0
+                                    self._sparse_decode_trace_retro_calls += 1
+                            if retro is not None:
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_retroinfer",
+                                    retro,
+                                )
+                                # Suppress the legacy runtime handle for
+                                # this step so FA's dispatch selects the
+                                # retroinfer exec_buf path unambiguously.
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_q_head_gather",
+                                    None,
+                                )
+                            else:
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_retroinfer",
+                                    None,
+                                )
+                                _t_qh = (
+                                    time.perf_counter()
+                                    if _SPARSE_DECODE_STEP_TRACE
+                                    else None
+                                )
+                                q_head_gather = (
+                                    self._build_sparse_runtime_q_head_gather(
+                                        layer_name=name,
+                                        query=q,
+                                        spec=spec,
+                                    )
+                                )
+                                if _t_qh is not None:
+                                    self._sparse_decode_trace_qhead_ms += (
+                                        time.perf_counter() - _t_qh
+                                    ) * 1000.0
+                                    self._sparse_decode_trace_qhead_calls += 1
+                                    if q_head_gather is None:
+                                        self._sparse_decode_trace_qhead_none += 1
+                                setattr(
+                                    module,
+                                    "_vllm_sparse_runtime_q_head_gather",
+                                    q_head_gather,
+                                )
 
                     return _hook
 
@@ -8248,6 +8796,326 @@ class GPUModelRunner(
         out = out.contiguous()
         return out.squeeze(0) if squeeze_group else out
 
+    def _sparse_online_select_tokens(
+        self,
+        state: _SparseOnlineLayerState,
+        q: torch.Tensor,
+        total_tokens: int,
+        spec: SparseAttentionSpec,
+        budget_override: int | None = None,
+    ) -> torch.Tensor:
+        """Return ``[num_q_heads, total_tokens]`` bool selection mask.
+
+        GQA semantics: the Q heads passed in ``q`` belong to one KV group.
+        Candidate token scores are softmaxed per Q head, summed across the
+        group's Q-head dimension, and top-k is taken once for the group.  The
+        resulting token mask is broadcast back to every Q head, so the group
+        attends over the same K/V set while each head still uses its own Q.
+
+        Rewrite notes:
+
+        * Removed three GPU→CPU sync points:
+
+          - the ``(combined_counts <= budget).all().item()`` early-return,
+          - the ``steady_mask.sum().item()`` steady count,
+          - the ``nonsteady_retr_mask.any().item()`` guard.
+
+          The early-return is equivalent to the group-shared top-k path with
+          ``k = cap``: when the group has no more than ``cap`` candidate
+          non-steady tokens, the finite-score filter returns all of them.  The
+          empty-retrieve guard is similarly subsumed by the finite-score
+          filter.
+
+        * ``steady_count`` is now computed from ``spec`` + ``total_tokens``
+          with plain Python int math (no tensor ``.sum()`` involved).
+
+        * ``labels`` is taken as a direct view of ``state.block_to_cluster``
+          (already int64 on the correct device) instead of an extra ``.to()``.
+        """
+        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        try:
+            if q.dim() == 1:
+                q = q.unsqueeze(0)
+            device = q.device
+            H = int(q.shape[0])
+            N = int(total_tokens)
+            budget = (
+                int(spec.sparse_selection_budget())
+                if budget_override is None
+                else int(budget_override)
+            )
+            if budget <= 0:
+                return torch.zeros((H, N), dtype=torch.bool, device=device)
+
+            head_n = min(int(spec.static_pattern_start), N)
+            tail_start = max(0, N - int(spec.static_pattern_end))
+            if head_n >= tail_start:
+                # Head and tail overlap: every token in [0, N) is steady.
+                steady_count = N
+            else:
+                steady_count = head_n + (N - tail_start)
+            steady_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            if head_n > 0:
+                steady_mask[:head_n] = True
+            if tail_start < N:
+                steady_mask[tail_start:] = True
+            steady_row = steady_mask.unsqueeze(0)
+
+            indexed_tokens = min(N, int(state.block_to_cluster.shape[0]))
+
+            if (state.cluster_centres.numel() == 0
+                    or state.block_to_cluster.numel() == 0):
+                fallback_start = max(0, N - budget)
+                fallback_mask = torch.zeros(N, dtype=torch.bool, device=device)
+                fallback_mask[fallback_start:N] = True
+                return (
+                    fallback_mask.unsqueeze(0).expand(H, -1)
+                    | steady_row
+                ).contiguous()
+
+            scores_c = torch.matmul(
+                q.to(dtype=torch.float32), state.cluster_centres.transpose(0, 1)
+            ) / float(max(int(q.shape[-1]), 1)) ** 0.5
+            nprobe = min(int(spec.nprobe), int(state.cluster_centres.shape[0]))
+            if nprobe <= 0:
+                return steady_row.expand(H, -1).contiguous()
+            top_clusters = torch.topk(scores_c, k=nprobe, dim=-1).indices.to(
+                dtype=torch.int64
+            )
+            labels = state.block_to_cluster[:indexed_tokens]
+            if labels.dtype != torch.int64:
+                labels = labels.to(dtype=torch.int64)
+            if labels.numel() == 0 or indexed_tokens <= 0:
+                return steady_row.expand(H, -1).contiguous()
+            cluster_mask = torch.zeros(
+                (H, int(state.cluster_centres.shape[0])),
+                dtype=torch.bool,
+                device=device,
+            )
+            cluster_mask.scatter_(1, top_clusters, True)
+            retr_mask_indexed = cluster_mask[:, labels]  # [H, indexed_tokens]
+            retr_mask = torch.zeros((H, N), dtype=torch.bool, device=device)
+            retr_mask[:, :indexed_tokens] = retr_mask_indexed
+
+            cap = max(0, budget - steady_count)
+            if cap <= 0:
+                return steady_row.expand(H, -1).contiguous()
+
+            nonsteady_retr_mask = retr_mask & ~steady_row
+
+            token_scores_indexed = scores_c.gather(
+                1, labels.unsqueeze(0).expand(H, indexed_tokens)
+            )
+            token_scores = torch.full(
+                (H, N),
+                float("-inf"),
+                dtype=token_scores_indexed.dtype,
+                device=device,
+            )
+            token_scores[:, :indexed_tokens] = token_scores_indexed
+            masked_scores = token_scores.masked_fill(
+                ~nonsteady_retr_mask, float("-inf")
+            )
+            return GPUModelRunner._sparse_group_shared_topk_mask(
+                masked_scores,
+                steady_mask,
+                cap,
+            )
+        finally:
+            if _t0 is not None:
+                self._sparse_perf_record(
+                    "_sparse_online_select_tokens",
+                    time.perf_counter() - _t0,
+                )
+
+    def _sparse_online_select_tokens_batched(
+        self,
+        states: "list[_SparseOnlineLayerState]",
+        q_list: "list[torch.Tensor]",
+        total_tokens: int,
+        spec: "SparseAttentionSpec",
+        budget_override: int | None = None,
+    ) -> "list[torch.Tensor]":
+        """Batched variant of ``_sparse_online_select_tokens``.
+
+        All ``(state, q)`` pairs must share the same request (``total_tokens``)
+        and ``spec``.  The implementation stacks them along a new batch
+        dimension to replace ``G`` copies of the kernel soup with a single
+        set of 3D kernels, cutting launch overhead by ~G×.
+
+        Pre-conditions for the fast path (validated inside):
+
+        * ``len(states) == len(q_list)`` and ``G >= 1``.
+        * All ``q`` tensors are 2-D with identical ``(H, D)``.
+        * All ``state.cluster_centres`` are non-empty with identical ``(K, D)``.
+        * All ``state.block_to_cluster`` are non-empty with identical length.
+
+        On pre-condition miss we fall back to the per-state method so behaviour
+        stays bitwise-equivalent.  The fast path produces results that match
+        ``_sparse_online_select_tokens`` within floating-point rounding on
+        ``scores_c`` (same ``matmul`` math, just batched as ``bmm``).
+
+        Returns a list of ``[H, total_tokens]`` bool masks in input order.
+        """
+        G = len(states)
+        if G == 0:
+            return []
+        if G == 1:
+            return [
+                self._sparse_online_select_tokens(
+                    state=states[0],
+                    q=q_list[0],
+                    total_tokens=total_tokens,
+                    spec=spec,
+                    budget_override=budget_override,
+                )
+            ]
+
+        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        try:
+            # Normalise q to 2-D and check homogeneity; bail on any mismatch.
+            q0 = q_list[0]
+            if q0.dim() == 1:
+                q0 = q0.unsqueeze(0)
+            H = int(q0.shape[0])
+            D = int(q0.shape[-1])
+            device = q0.device
+            N = int(total_tokens)
+            budget = (
+                int(spec.sparse_selection_budget())
+                if budget_override is None
+                else int(budget_override)
+            )
+
+            def _fallback() -> "list[torch.Tensor]":
+                return [
+                    self._sparse_online_select_tokens(
+                        state=s,
+                        q=q,
+                        total_tokens=N,
+                        spec=spec,
+                        budget_override=budget,
+                    )
+                    for s, q in zip(states, q_list, strict=True)
+                ]
+
+            if budget <= 0:
+                return [
+                    torch.zeros((H, N), dtype=torch.bool, device=device)
+                    for _ in range(G)
+                ]
+
+            q_norm: list[torch.Tensor] = []
+            for q in q_list:
+                if q.dim() == 1:
+                    q = q.unsqueeze(0)
+                if int(q.shape[0]) != H or int(q.shape[-1]) != D:
+                    return _fallback()
+                q_norm.append(q)
+
+            K0 = int(states[0].cluster_centres.shape[0]) \
+                if states[0].cluster_centres.numel() > 0 else 0
+            N_idx0 = int(states[0].block_to_cluster.shape[0]) \
+                if states[0].block_to_cluster.numel() > 0 else 0
+            if K0 == 0 or N_idx0 == 0:
+                return _fallback()
+            for s in states[1:]:
+                if (
+                    s.cluster_centres.numel() == 0
+                    or s.block_to_cluster.numel() == 0
+                    or int(s.cluster_centres.shape[0]) != K0
+                    or int(s.block_to_cluster.shape[0]) != N_idx0
+                    or int(s.cluster_centres.shape[-1]) != D
+                ):
+                    return _fallback()
+
+            indexed_tokens = min(N, N_idx0)
+            if indexed_tokens <= 0:
+                return _fallback()
+
+            # ── Steady mask (shared across all G) ─────────────────────────
+            head_n = min(int(spec.static_pattern_start), N)
+            tail_start = max(0, N - int(spec.static_pattern_end))
+            if head_n >= tail_start:
+                steady_count = N
+            else:
+                steady_count = head_n + (N - tail_start)
+            steady_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            if head_n > 0:
+                steady_mask[:head_n] = True
+            if tail_start < N:
+                steady_mask[tail_start:] = True
+            steady_row = steady_mask.view(1, 1, N)  # [1,1,N] broadcastable
+
+            cap = max(0, budget - steady_count)
+            nprobe = min(int(spec.nprobe), K0)
+            if nprobe <= 0 or cap <= 0:
+                full_steady = steady_row.expand(G, H, N).contiguous()
+                return list(full_steady.unbind(0))
+
+            # ── Stacked inputs ────────────────────────────────────────────
+            q_stack = torch.stack(q_norm, dim=0).to(dtype=torch.float32)
+            # [G, H, D]
+            centres = torch.stack(
+                [s.cluster_centres for s in states], dim=0
+            )  # [G, K, D]
+            labels = torch.stack(
+                [s.block_to_cluster[:indexed_tokens] for s in states], dim=0
+            )  # [G, N_idx]
+            if labels.dtype != torch.int64:
+                labels = labels.to(dtype=torch.int64)
+
+            # ── Cluster scores & top-nprobe ───────────────────────────────
+            scores_c = torch.bmm(
+                q_stack, centres.transpose(1, 2)
+            ) / float(max(D, 1)) ** 0.5  # [G, H, K]
+            top_clusters = torch.topk(
+                scores_c, k=nprobe, dim=-1
+            ).indices.to(dtype=torch.int64)  # [G, H, nprobe]
+
+            cluster_mask = torch.zeros(
+                (G, H, K0), dtype=torch.bool, device=device
+            )
+            cluster_mask.scatter_(2, top_clusters, True)
+
+            # retr_mask[g, h, n] = cluster_mask[g, h, labels[g, n]] for n<idx
+            labels_exp = labels.unsqueeze(1).expand(G, H, indexed_tokens)
+            retr_mask_indexed = cluster_mask.gather(2, labels_exp)
+
+            retr_mask = torch.zeros(
+                (G, H, N), dtype=torch.bool, device=device
+            )
+            retr_mask[:, :, :indexed_tokens] = retr_mask_indexed
+
+            nonsteady_retr_mask = retr_mask & ~steady_row
+
+            # Per-token retrieval scores (only defined for n<indexed_tokens)
+            token_scores_indexed = scores_c.gather(2, labels_exp)
+            # [G, H, N_idx]
+            token_scores = torch.full(
+                (G, H, N),
+                float("-inf"),
+                dtype=token_scores_indexed.dtype,
+                device=device,
+            )
+            token_scores[:, :, :indexed_tokens] = token_scores_indexed
+            masked_scores = token_scores.masked_fill(
+                ~nonsteady_retr_mask, float("-inf")
+            )
+
+            out = GPUModelRunner._sparse_group_shared_topk_mask(
+                masked_scores,
+                steady_mask,
+                cap,
+            )  # [G, H, N]
+            return list(out.unbind(0))
+        finally:
+            if _t0 is not None:
+                self._sparse_perf_record(
+                    "_sparse_online_select_tokens_batched",
+                    time.perf_counter() - _t0,
+                )
+
     def _sparse_online_select_tokens_from_clusters_batched(
         self,
         states: "list[_SparseOnlineLayerState]",
@@ -8266,7 +9134,9 @@ class GPUModelRunner(
         budget.  The resulting token mask is broadcast back to all Q heads in
         the group.
         It intentionally does not read ``block_to_cluster`` labels or the CSR
-        inverted index.
+        inverted index.  If the dense member layout is unavailable or stale
+        (for example after a dynamic cluster refresh), callers fall back to the
+        label-based selector.
         """
         G = len(states)
         if G == 0:
@@ -8333,7 +9203,8 @@ class GPUModelRunner(
             # extend this dense member table.  That is fine here: this
             # selector is called only for prompt tokens (decode tokens are
             # force-included after selection), so restrict scoring to the
-            # prefill clusters covered by ``cluster_members`` after refresh.
+            # prefill clusters covered by ``cluster_members`` instead of
+            # falling back to the label-based selector after refresh.
             K0 = int(members0.shape[0])
             if K0 == 0 or states[0].cluster_centres.numel() == 0:
                 _trace_cluster_miss("empty_clusters")
@@ -8530,6 +9401,887 @@ class GPUModelRunner(
                     time.perf_counter() - _t0,
                 )
 
+    def _sparse_online_select_clusters_batched(
+        self,
+        states: "list[_SparseOnlineLayerState]",
+        q_list: "list[torch.Tensor]",
+        spec: "SparseAttentionSpec",
+        *,
+        estimation_budget: int = 0,
+    ) -> "tuple[torch.Tensor, torch.Tensor] | None":
+        """Retroinfer-style cluster-level top-k selector.
+
+        Scores ``Q`` against cluster **centroids only** (never per-token), then
+        partitions the top ranks into a retrieval zone (exact FA over the
+        expanded tokens) and an estimation zone (approximate FA over centroid
+        summaries).  This replaces the legacy
+        ``_sparse_online_select_tokens[_batched]`` which produced an
+        ``[H, N]`` boolean token mask – under retroinfer we never build a
+        per-token mask, so the whole mask → nonzero → pack → gather chain
+        downstream collapses to "cluster id → CSR expand → paged gather"
+        (Phase 4 consumers).
+
+        Args:
+            states: per-kv-head online states for one request, length ``G``.
+            q_list: matching per-kv-head Q projections ``[H_per_kv, D]``.
+            spec: shared sparse-attention spec (we read ``nprobe`` and the
+                centroid dim from here).
+            estimation_budget: number of clusters to reserve for the
+                estimation zone, ranked immediately below the retrieval
+                zone.  ``0`` = estimation disabled (Phase 6 wires the
+                real default; Phase 9 plumbs it through config).
+
+        Returns:
+            ``(retrieval_cids, estimation_cids)`` int32 tensors of shape
+            ``[G, H, nprobe_eff]`` and ``[G, H, es_eff]`` respectively, or
+            ``None`` if the fast path's homogeneity checks fail (caller
+            should fall back to the legacy per-token selector).  The two
+            returned ranges are disjoint by construction (``topk`` slice
+            at ``[:nprobe]`` vs ``[nprobe:nprobe+es]``).
+
+        Notes:
+            * All cluster ids stay on ``q_list[0].device``.
+            * Cluster ids are int32 – typical ``K`` is well below 2³¹.
+            * Returns empty trailing dim (still int32, shape ``[G, H, 0]``)
+              when ``nprobe_eff`` or ``es_eff`` clips to zero, so downstream
+              callers do not need to special-case ``None`` vs empty.
+        """
+        G = len(states)
+        if G == 0:
+            return None
+        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        try:
+            q0 = q_list[0]
+            if q0.dim() == 1:
+                q0 = q0.unsqueeze(0)
+            H = int(q0.shape[0])
+            D = int(q0.shape[-1])
+            device = q0.device
+
+            # Homogeneity checks – mirror _sparse_online_select_tokens_batched.
+            # If any pair mismatches we bail with ``None`` and let the
+            # caller route to the legacy token-level selector.  This keeps
+            # the cluster path a strict fast path; we never silently cross
+            # into slower heterogeneous territory.
+            K0 = (
+                int(states[0].cluster_centres.shape[0])
+                if states[0].cluster_centres.numel() > 0
+                else 0
+            )
+            if K0 == 0:
+                return None
+            for s in states[1:]:
+                if (
+                    s.cluster_centres.numel() == 0
+                    or int(s.cluster_centres.shape[0]) != K0
+                    or int(s.cluster_centres.shape[-1]) != D
+                ):
+                    return None
+            q_norm: list[torch.Tensor] = []
+            for q in q_list:
+                if q.dim() == 1:
+                    q = q.unsqueeze(0)
+                if int(q.shape[0]) != H or int(q.shape[-1]) != D:
+                    return None
+                q_norm.append(q)
+
+            nprobe_eff = max(0, min(int(spec.nprobe), K0))
+            es_eff = max(0, min(int(estimation_budget), K0 - nprobe_eff))
+            total_k = nprobe_eff + es_eff
+            if total_k == 0:
+                # Degenerate – caller can synthesise empty outputs itself.
+                empty = torch.empty(
+                    (G, H, 0), dtype=torch.int32, device=device
+                )
+                return empty, empty
+
+            # Stacked scoring path.  Using ``bmm`` (one kernel) instead of
+            # a per-state ``matmul`` loop collapses G launches to 1 and is
+            # a significant win at num_kv_heads=8~32.
+            q_stack = torch.stack(q_norm, dim=0).to(dtype=torch.float32)
+            # [G, H, D]
+            centres = torch.stack(
+                [s.cluster_centres for s in states], dim=0
+            )  # [G, K, D]
+            scores_c = torch.bmm(
+                q_stack, centres.transpose(1, 2)
+            ) / float(max(D, 1)) ** 0.5  # [G, H, K]
+
+            # Single top-(nprobe+es) call – retrieval vs estimation split
+            # is just an index slice on the result; topk's own partial
+            # sort within the top-k values guarantees retrieval gets the
+            # strictly-higher scores.
+            top_idx = torch.topk(
+                scores_c, k=total_k, dim=-1
+            ).indices.to(dtype=torch.int32)  # [G, H, total_k]
+
+            retrieval_cids = top_idx[..., :nprobe_eff].contiguous()
+            estimation_cids = (
+                top_idx[..., nprobe_eff:total_k].contiguous()
+                if es_eff > 0
+                else torch.empty(
+                    (G, H, 0), dtype=torch.int32, device=device
+                )
+            )
+            return retrieval_cids, estimation_cids
+        finally:
+            if _t0 is not None:
+                self._sparse_perf_record(
+                    "_sparse_online_select_clusters_batched",
+                    time.perf_counter() - _t0,
+                )
+
+    def _sparse_retroinfer_expand_and_gather_single_req(
+        self,
+        *,
+        states: "list[_SparseOnlineLayerState]",
+        retrieval_cids: torch.Tensor,
+        estimation_cids: torch.Tensor,
+        block_table_row: torch.Tensor,
+        kv_cache: "torch.Tensor | tuple[torch.Tensor, torch.Tensor]",
+        block_size: int,
+        prefill_len: int,
+        current_len: int,
+        static_pattern_start: int,
+        static_pattern_end: int,
+        max_budget: int,
+    ) -> "dict[str, torch.Tensor]":
+        """Phase 4a — retroinfer-style cluster-expand + paged-KV gather.
+
+        Produces the fixed-shape ``exec_buf_k/v`` / ``valid_lengths`` inputs
+        that Phase 5's FA pass will consume in place of the legacy
+        ``phys``/``slots``/``head_offsets`` per-head compact gather, **plus**
+        the estimation-zone centroid / value_sum / cluster_size tensors that
+        Phase 6's second FA pass + LSE merge will consume.
+
+        This is the unfused pytorch baseline.  Correctness here matters more
+        than speed: it is the reference the Phase 4b Triton
+        ``cluster_expand_and_gather`` kernel will be diffed against.  All of
+        the slow parts (per-head Python loop, per-cluster ``torch.cat``)
+        collapse to a single fused kernel in 4b.
+
+        Assumptions / scope:
+
+        * Single request (``num_reqs == 1``).  The select-clusters fast path
+          already gates on GQA-regular + uniform K, so per-group states
+          share ``K``, ``D``, and ``cluster_offsets``/``cluster_slots``
+          layout shapes (though the contents differ per kv head).
+        * GQA-regular layout – q heads within a kv group are contiguous.
+          ``retrieval_cids``/``estimation_cids`` are laid out
+          ``[G = num_kv_heads, H_per_kv, ...]`` matching Phase 3's output.
+        * Paged KV cache shape ``[num_blocks, block_size, num_kv_heads, D]``
+          (the dominant vLLM layout).  A 3D fallback is accepted and
+          treated as ``num_kv_heads == 1``.
+        * ``max_budget`` is the caller-sized capacity of the output buffer.
+          It must cover the worst-case retrieval expansion plus steady +
+          pending zones (Phase 8 CUDA-Graph wiring derives it from
+          ``nprobe * max_cluster_size + static + pending_cap`` so the shape
+          is replay-stable).  Excess retrieval tokens are truncated; FA
+          never reads past ``valid_lengths[h]`` regardless.
+
+        Output layout:
+
+        * ``exec_buf_k`` / ``exec_buf_v``: ``[H_total, max_budget, D]`` in
+          the KV cache's native dtype.  ``H_total = G * H_per_kv`` in q-head
+          index order so downstream FA's ``[num_heads, seqlen, D]`` path is
+          drop-in.
+        * ``valid_lengths``: ``[H_total]`` int32 – FA's ``cache_seqlens`` /
+          ``seqused_k`` argument.
+        * ``centres_es`` / ``value_sum_es`` / ``cluster_size_es``:
+          per-head gathered estimation-zone tensors.  ``cluster_size_es``
+          is fp32 so Phase 6 can apply the ``log(cluster_size)`` reweight
+          with a single ``torch.log`` op instead of a cast + log chain.
+
+        Position composition (what ends up in ``exec_buf_*[h, :valid_lengths[h]]``):
+
+          1. **Retrieval positions** (cluster-expanded) – ``sum_k sizes[h,k]``
+             entries from ``cluster_slots`` via the ``cids → CSR`` lookup.
+          2. **Steady zone** – prefill prefix ``[0, static_pattern_start)``
+             and suffix ``[N_prefill - static_pattern_end, N_prefill)``.
+             Always included; excluded from CSR by Phase 2a so no dup.
+          3. **Pending zone** – decoded-so-far tokens
+             ``[N_prefill, current_len)``.  Not yet re-clustered (Phase 7
+             handles the refresh); always included as a linear tail.
+
+        The ordering mirrors retroinfer so FA's attention weights match
+        their reference – retrieval first, steady / pending appended.
+        """
+        device = retrieval_cids.device
+        if retrieval_cids.dim() != 3:
+            raise ValueError(
+                "retrieval_cids must be [G, H_per_kv, nprobe], got "
+                f"{tuple(retrieval_cids.shape)}"
+            )
+        G, H_per_kv, nprobe = (
+            int(retrieval_cids.shape[0]),
+            int(retrieval_cids.shape[1]),
+            int(retrieval_cids.shape[2]),
+        )
+        es = int(estimation_cids.shape[-1]) if estimation_cids.numel() else 0
+        H_total = G * H_per_kv
+
+        if isinstance(kv_cache, tuple):
+            k_cache, v_cache = kv_cache
+        else:
+            # Legacy stacked ``[2, num_blocks, block_size, H, D]``.
+            k_cache = kv_cache[0]
+            v_cache = kv_cache[1]
+        if k_cache.dim() == 3:
+            # Squeezed ``[num_blocks, block_size, D]`` → treat as one kv head.
+            k_cache = k_cache.unsqueeze(2)
+            v_cache = v_cache.unsqueeze(2)
+        head_dim = int(k_cache.shape[-1])
+        cache_dtype = k_cache.dtype
+
+        # ── Fixed-shape output buffers ────────────────────────────────────
+        # Zero init is safe padding: FA's ``cache_seqlens`` mechanism caps
+        # reads at ``valid_lengths[h]``, so the unused tail is never
+        # touched.  Keeping pad = 0 (instead of a sentinel) makes Phase 8's
+        # CUDA-graph capture less picky about buffer aliasing across steps.
+        # Deferred-gather contract: the builder NO LONGER pre-reads K/V
+        # from the paged cache here – that was unsafe because the Attention
+        # pre-hook runs BEFORE ``unified_kv_cache_update`` writes the
+        # current decode step's K/V slot, so any read of the last pending
+        # position returned stale bytes.  We build only the per-head flat
+        # index arrays here and let ``_forward_retroinfer_exec_buf`` do the
+        # actual ``k_cache[...]`` read at FA time, after the cache update.
+        valid_lengths = torch.zeros(
+            H_total, dtype=torch.int32, device=device
+        )
+        # Accumulate per-head flat index arrays on CPU first (one Python
+        # list per head) and concat at the end – H_total * one int64
+        # cumulative concat is cheaper than H_total repeated in-place
+        # writes into a pre-sized tensor.
+        per_head_phys: list[torch.Tensor] = []
+        per_head_slots: list[torch.Tensor] = []
+        per_head_kv_token_ids: list[torch.Tensor] = []
+
+        # ── Shared steady + pending position vector ───────────────────────
+        # Built once per request and re-used for every head to avoid
+        # ``3 * H_total`` tiny ``arange`` launches.  ``torch.cat`` of up to
+        # 3 pieces keeps the result contiguous so the downstream gather can
+        # do a single ``index_select`` per head.
+        head_n = min(int(static_pattern_start), int(prefill_len))
+        tail_start = max(
+            0, int(prefill_len) - int(static_pattern_end)
+        )
+        # Order: pending first, then tail, then head.  If the caller-supplied
+        # ``max_budget`` ever turns out to be too small, the ``[:max_budget]``
+        # truncation below drops from the end; this order preserves the
+        # newest output tokens (pending) and the local window (tail) first,
+        # and only sacrifices the attention sink (head) on extreme overflow.
+        parts: list[torch.Tensor] = []
+        if current_len > prefill_len:
+            parts.append(torch.arange(
+                prefill_len, current_len,
+                dtype=torch.int32, device=device,
+            ))
+        if tail_start < prefill_len:
+            parts.append(torch.arange(
+                tail_start, prefill_len,
+                dtype=torch.int32, device=device,
+            ))
+        if head_n > 0:
+            parts.append(torch.arange(
+                0, head_n, dtype=torch.int32, device=device
+            ))
+        steady_pending = (
+            torch.cat(parts) if parts
+            else torch.empty(0, dtype=torch.int32, device=device)
+        )
+        steady_pending_cnt = int(steady_pending.numel())
+
+        # ── Per-head retrieval expansion (Python loop – Phase 4b fuses) ──
+        # We do one ``cluster_offsets.index_select`` at the G scope to
+        # amortise the K→H_per_kv broadcast, but the inner per-cluster
+        # ``cluster_slots[s:e]`` slicing still forces a
+        # ``.item()`` per (head, cluster) pair.  For num_kv_heads=8 and
+        # nprobe=32 that is 256 syncs per layer which is unacceptable
+        # long-term; 4b replaces this with a single fused kernel.
+        for g in range(G):
+            state = states[g]
+            offsets_g = state.cluster_offsets.to(torch.int64)
+            slots_g = state.cluster_slots
+
+            # [H_per_kv * nprobe] → starts/ends in one gather.
+            cids_flat = retrieval_cids[g].reshape(-1).to(torch.int64)
+            starts_flat = offsets_g.index_select(0, cids_flat)
+            ends_flat = offsets_g.index_select(0, cids_flat + 1)
+            sizes_flat = (ends_flat - starts_flat)
+            starts_hn = starts_flat.view(H_per_kv, nprobe)
+            sizes_hn = sizes_flat.view(H_per_kv, nprobe)
+
+            # One D2H sync per kv group rather than per (head, cluster).
+            # ``sizes_cpu`` / ``starts_cpu`` drive the subsequent Python
+            # slice plan without any further GPU roundtrip.
+            starts_cpu = starts_hn.to(
+                device="cpu", dtype=torch.int64
+            ).numpy()
+            sizes_cpu = sizes_hn.to(
+                device="cpu", dtype=torch.int64
+            ).numpy()
+
+            for h in range(H_per_kv):
+                h_total = g * H_per_kv + h
+                retr_slices: list[torch.Tensor] = []
+                retr_cnt = 0
+                # Truncate if retrieval alone would overrun the budget
+                # minus steady/pending reserve – steady/pending must
+                # always fit (they are always-on).
+                retr_budget = max(0, max_budget - steady_pending_cnt)
+                for k_idx in range(nprobe):
+                    n = int(sizes_cpu[h, k_idx])
+                    if n <= 0:
+                        continue
+                    if retr_cnt + n > retr_budget:
+                        n = retr_budget - retr_cnt
+                        if n <= 0:
+                            break
+                    s = int(starts_cpu[h, k_idx])
+                    retr_slices.append(slots_g[s : s + n])
+                    retr_cnt += n
+                if retr_slices:
+                    retr_positions = torch.cat(retr_slices)
+                else:
+                    retr_positions = slots_g.new_empty(0)
+
+                # Final position list: retrieval ⊕ steady ⊕ pending.
+                if steady_pending_cnt > 0 and retr_cnt > 0:
+                    all_positions = torch.cat(
+                        [retr_positions, steady_pending]
+                    )
+                elif steady_pending_cnt > 0:
+                    all_positions = steady_pending
+                else:
+                    all_positions = retr_positions
+                total_count = int(all_positions.numel())
+                if total_count > max_budget:
+                    all_positions = all_positions[:max_budget]
+                    total_count = max_budget
+                valid_lengths[h_total] = total_count
+                if total_count == 0:
+                    continue
+
+                # Logical position → physical (block, slot).
+                # block_table_row holds int32 phys_block ids; we cast
+                # to int64 once to match the advanced-indexing expected
+                # dtype and keep the gather on the fast path.
+                all64 = all_positions.to(torch.int64)
+                if _SPARSE_DEBUG_ASSERT:
+                    _sparse_debug_range(
+                        "retroinfer logical positions",
+                        all64,
+                        int(current_len),
+                    )
+                    _sparse_debug_range(
+                        "retroinfer block_idx",
+                        all64 // int(block_size),
+                        int(block_table_row.numel()),
+                    )
+                phys_blocks = block_table_row.to(torch.int64) \
+                    .index_select(0, all64 // int(block_size))
+                slots = all64 % int(block_size)
+                if _SPARSE_DEBUG_ASSERT:
+                    _sparse_debug_range(
+                        "retroinfer physical block ids",
+                        phys_blocks,
+                        int(k_cache.shape[0]),
+                    )
+                    _sparse_debug_range(
+                        "retroinfer slots",
+                        slots,
+                        int(k_cache.shape[1]),
+                    )
+
+                # Record per-head indices for deferred FA-time gather.
+                # ``kv_ids_h`` broadcasts scalar kv-head ``g`` to one entry
+                # per position so downstream ``k_cache[phys, slots, kv_ids]``
+                # can gather in a single advanced-index kernel (same pattern
+                # as the legacy compact gather).
+                kv_ids_h = torch.full_like(phys_blocks, int(g))
+                per_head_phys.append(phys_blocks)
+                per_head_slots.append(slots)
+                per_head_kv_token_ids.append(kv_ids_h)
+                if _SPARSE_DEBUG_ASSERT:
+                    # Sanity: all_positions must be strictly below
+                    # current_len; a stale pending range would silently
+                    # over-index into uninitialised KV slots.
+                    max_pos = int(all_positions.max().item())
+                    if max_pos >= int(current_len):
+                        raise ValueError(
+                            "[SparseDebug] retroinfer position overflow: "
+                            f"max={max_pos} current_len={int(current_len)} "
+                            f"h_total={h_total}"
+                        )
+
+        # ── Estimation zone gather (cheap: K × D per head) ───────────────
+        if es > 0:
+            centres_es = torch.empty(
+                (H_total, es, head_dim),
+                dtype=torch.float32, device=device,
+            )
+            value_sum_es = torch.empty(
+                (H_total, es, head_dim),
+                dtype=torch.float32, device=device,
+            )
+            cluster_size_es = torch.empty(
+                (H_total, es), dtype=torch.float32, device=device,
+            )
+            for g in range(G):
+                state = states[g]
+                est_g = estimation_cids[g].to(torch.int64)  # [H_per_kv, es]
+                flat_idx = est_g.reshape(-1)
+                # state.cluster_centres: [K, D] fp32
+                # state.value_sum: [K, D] fp32
+                # state.cluster_size: [K] int32
+                c_flat = state.cluster_centres.to(torch.float32) \
+                    .index_select(0, flat_idx)
+                vs_flat = state.value_sum.to(torch.float32) \
+                    .index_select(0, flat_idx)
+                sz_flat = state.cluster_size.to(torch.float32) \
+                    .index_select(0, flat_idx)
+                centres_es[
+                    g * H_per_kv : (g + 1) * H_per_kv
+                ] = c_flat.view(H_per_kv, es, head_dim)
+                value_sum_es[
+                    g * H_per_kv : (g + 1) * H_per_kv
+                ] = vs_flat.view(H_per_kv, es, head_dim)
+                cluster_size_es[
+                    g * H_per_kv : (g + 1) * H_per_kv
+                ] = sz_flat.view(H_per_kv, es)
+        else:
+            centres_es = torch.empty(
+                (H_total, 0, head_dim),
+                dtype=torch.float32, device=device,
+            )
+            value_sum_es = torch.empty(
+                (H_total, 0, head_dim),
+                dtype=torch.float32, device=device,
+            )
+            cluster_size_es = torch.empty(
+                (H_total, 0), dtype=torch.float32, device=device,
+            )
+
+        # Build flat per-head index arrays for the FA-time gather.  When
+        # every head is empty (e.g. zero retrieval + zero steady + zero
+        # pending, which shouldn't happen in practice but keeps the
+        # downstream kernel launches defensible) we still emit empty
+        # tensors with the right dtype/device so the consumer doesn't
+        # have to special-case ``None``.
+        if per_head_phys:
+            flat_phys = torch.cat(per_head_phys).to(torch.int64)
+            flat_slots = torch.cat(per_head_slots).to(torch.int64)
+            flat_kv_token_ids = torch.cat(per_head_kv_token_ids).to(torch.int64)
+        else:
+            flat_phys = torch.empty(0, dtype=torch.int64, device=device)
+            flat_slots = torch.empty(0, dtype=torch.int64, device=device)
+            flat_kv_token_ids = torch.empty(
+                0, dtype=torch.int64, device=device
+            )
+        cu_k = torch.empty(H_total + 1, dtype=torch.int32, device=device)
+        cu_k[0] = 0
+        cu_k[1:] = torch.cumsum(valid_lengths.to(torch.int64), dim=0).to(
+            torch.int32
+        )
+
+        return {
+            "valid_lengths": valid_lengths,
+            "flat_phys": flat_phys,
+            "flat_slots": flat_slots,
+            "kv_token_ids": flat_kv_token_ids,
+            "cu_k": cu_k,
+            "centres_es": centres_es,
+            "value_sum_es": value_sum_es,
+            "cluster_size_es": cluster_size_es,
+        }
+
+    @staticmethod
+    def _sparse_retroinfer_estimation_attn(
+        q: torch.Tensor,
+        centres_es: torch.Tensor,
+        value_sum_es: torch.Tensor,
+        cluster_size_es: torch.Tensor,
+        scale: float,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Phase 6 — estimation-zone softmax attention, closed-form.
+
+        Approximates the softmax contribution of the **non-retrieved**
+        clusters by treating each cluster as a single super-token with:
+
+        * logit = ``Q · centroid / sqrt(D)``      (one dot-product per cluster)
+        * unnormalised value = ``value_sum[c]``   (sum of V across the
+          cluster, precomputed at prefill / dynamic refresh)
+        * occupancy weight   = ``cluster_size[c]`` (how many real tokens
+          this super-token stands in for)
+
+        The closed-form softmax aggregate is then::
+
+            numerator   = Σ_c  exp(logit_c) · value_sum[c]
+            denominator = Σ_c  exp(logit_c) · cluster_size[c]
+            out = numerator / denominator
+            lse = logsumexp(logit_c + log(cluster_size[c]))
+
+        Mirrors retroinfer's fused estimation kernel (their
+        ``batch_gemm_softmax`` + estimation epilogue) but as plain torch
+        ops – fine for Phase 4a's baseline; Phase 4b fuses this with the
+        cluster-expand kernel so the ``Q @ centres`` GEMM stays on-chip.
+
+        ``lse`` is returned in the **same absolute reference frame** as
+        FA's own ``softmax_lse`` output (log of the unshifted softmax
+        denominator), so the caller's
+        :meth:`_sparse_retroinfer_lse_merge` can combine it with the
+        retrieval zone's LSE without per-zone re-normalisation.
+
+        Args:
+            q: ``[H, D]`` float query vectors (one per query head).
+            centres_es: ``[H, es, D]`` per-head estimation-zone centroids.
+            value_sum_es: ``[H, es, D]`` matching ``value_sum`` gather.
+            cluster_size_es: ``[H, es]`` float cluster occupancies.
+            scale: ``1 / sqrt(D)`` multiplier applied to the logits.
+
+        Returns:
+            ``(out_est [H, D] fp32, lse_est [H] fp32)``.  Shape carries
+            H_total so the caller can feed it straight into the LSE merge
+            alongside FA's per-head output.
+        """
+        if centres_es.shape[1] == 0:
+            # No estimation clusters allocated – caller's LSE merge
+            # treats ``lse = -inf`` as a zero-weight branch, so the
+            # retrieval-only path falls through unchanged.
+            H = int(q.shape[0])
+            D = int(q.shape[-1])
+            device, dtype = q.device, torch.float32
+            return (
+                torch.zeros((H, D), dtype=dtype, device=device),
+                torch.full(
+                    (H,), float("-inf"), dtype=dtype, device=device
+                ),
+            )
+        q_f = q.to(dtype=torch.float32)
+        c_f = centres_es.to(dtype=torch.float32)
+        vs_f = value_sum_es.to(dtype=torch.float32)
+        sz_f = cluster_size_es.to(dtype=torch.float32).clamp_min(1.0)
+
+        # Logits ``[H, es]``.  ``einsum`` here is a single GEMM per head
+        # (batched via the leading H dim); ``bmm`` would work too but
+        # einsum keeps the index semantics self-documenting.
+        logits = torch.einsum("hd,hed->he", q_f, c_f) * float(scale)
+        log_sizes = torch.log(sz_f)
+
+        # Stable closed-form softmax aggregate:
+        # Subtract a shared scalar max so ``exp`` doesn't overflow.  We
+        # use the ``logit`` max (not ``logit + log_size``) because the
+        # numerator exponent is pure ``logit`` – matching max keeps
+        # ``w_c = exp(logit - max)`` in ``(0, 1]`` with full precision on
+        # the dominant cluster.
+        logits_max = logits.max(dim=-1, keepdim=True).values  # [H, 1]
+        w = torch.exp(logits - logits_max)  # [H, es]
+        num = torch.einsum("he,hed->hd", w, vs_f)  # [H, D]
+        den = (w * sz_f).sum(dim=-1, keepdim=True)  # [H, 1]
+        out = num / den.clamp_min(1e-12)  # [H, D]
+
+        # ``lse`` in absolute units: logsumexp(logit + log_size)
+        #   = max_shift + log( Σ_c exp(logit - max_shift) · size_c )
+        #   = logits_max + log(den)
+        # which is exactly the form FA reports.
+        lse = (
+            logits_max.squeeze(-1)
+            + torch.log(den.squeeze(-1).clamp_min(1e-12))
+        )
+        return out, lse
+
+    @staticmethod
+    def _sparse_retroinfer_lse_merge(
+        out_a: torch.Tensor,
+        lse_a: torch.Tensor,
+        out_b: torch.Tensor,
+        lse_b: torch.Tensor,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Merge two softmax zones via their outputs + per-row LSE.
+
+        Both branches are assumed to report LSE in the **same absolute
+        reference frame** (FA's convention – log of unshifted softmax
+        denominator).  The merged output is the softmax-weighted average::
+
+            w_a = exp(lse_a - m),  w_b = exp(lse_b - m),  m = max(lse_a, lse_b)
+            out = (w_a · out_a + w_b · out_b) / (w_a + w_b)
+            lse = m + log(w_a + w_b)
+
+        Treats ``lse = -inf`` as a zero-weight branch (e.g. empty
+        estimation zone), in which case ``out`` falls through to the
+        non-inf side and ``lse`` equals that side's LSE.  No NaNs even
+        when both branches are ``-inf`` (an all-steady-empty-est
+        pathological case) – caller should not reach this with a
+        populated retrieval zone.
+
+        Args:
+            out_a, out_b: ``[H, D]`` per-row softmax outputs.
+            lse_a, lse_b: ``[H]`` matching log-sum-exp.
+
+        Returns:
+            ``(out [H, D], lse [H])`` in the same dtype as ``out_a``.
+        """
+        out_a_f = out_a.to(dtype=torch.float32)
+        out_b_f = out_b.to(dtype=torch.float32)
+        la = lse_a.to(dtype=torch.float32)
+        lb = lse_b.to(dtype=torch.float32)
+        m = torch.maximum(la, lb)
+        # ``exp(-inf - m) = 0`` so zero-branch contributions drop cleanly.
+        w_a = torch.exp(la - m)
+        w_b = torch.exp(lb - m)
+        w_sum = w_a + w_b
+        out = (
+            (w_a.unsqueeze(-1) * out_a_f
+             + w_b.unsqueeze(-1) * out_b_f)
+            / w_sum.unsqueeze(-1).clamp_min(1e-12)
+        )
+        lse = m + torch.log(w_sum.clamp_min(1e-12))
+        return out.to(dtype=out_a.dtype), lse
+
+    def _build_sparse_runtime_retroinfer(
+        self,
+        *,
+        layer_name: str,
+        query: torch.Tensor,
+        spec: "SparseAttentionSpec",
+    ) -> "dict[str, torch.Tensor] | None":
+        """Phase 5 — retroinfer-style runtime builder for FA.
+
+        Composes the Phase 3 cluster-level selector with the Phase 4a
+        cluster-expand + paged-KV gather to produce the dict consumed by
+        :meth:`FlashAttentionImpl._forward_retroinfer_exec_buf`:
+
+            {"exec_buf_k":  [H, max_budget, D]  (cache dtype),
+             "exec_buf_v":  [H, max_budget, D]  (cache dtype),
+             "valid_lengths": [H]               int32,
+             "centres_es":    [H, es, D]        fp32,
+             "value_sum_es":  [H, es, D]        fp32,
+             "cluster_size_es":[H, es]          fp32}
+
+        Returns ``None`` when the retroinfer fast path can't run for this
+        layer/step – in that case the caller falls back to the legacy
+        ``_build_sparse_runtime_q_head_gather`` path (guarded by the
+        ``VLLM_SPARSE_LEGACY_TOKEN_TOPK`` bisection switch at the
+        hook-level dispatcher).  Reasons we bail:
+
+        * ``num_reqs != 1`` – Phase 5 is the decode fast path only.  The
+          per-request for-loop variant lives in Phase 8 (CUDA graph wiring),
+          which also wants a single-req shape contract.
+        * ``spec`` isn't GQA-regular (exotic head-group layouts) – the
+          shared layer ctx cache flags this; the legacy builder already
+          handles the slow path correctly.
+        * Prefill / mixed prefill-decode – the retroinfer path needs a
+          populated ``value_sum`` + CSR (Phase 2b prefill) and a tok_end
+          of 1; prefill falls through to dense FA via the usual mechanism.
+        * ``cluster_centres`` / ``value_sum`` haven't been materialised yet
+          (pre-first-decode warmup window, or spec reconfigured mid-run).
+
+        All ``None`` returns are benign: the hook leaves
+        ``_vllm_sparse_runtime_retroinfer`` unset and FA dispatches through
+        the legacy path with identical (slower) semantics.
+        """
+        _t0 = time.perf_counter() if self._sparse_perf_stats_enabled else None
+        # One-shot bail diagnostics: count which gate trips each layer/step
+        # and log once per unique (gate, layer) pair so we can tell whether
+        # the retroinfer path is silently falling back to the legacy
+        # builder (e.g. under async scheduling).  Guarded on the debug env
+        # var so production runs pay nothing.
+        def _bail(gate: str) -> None:
+            if not _SPARSE_DEBUG_ASSERT:
+                return
+            key = (layer_name, gate)
+            if not hasattr(self, "_retroinfer_bail_seen"):
+                self._retroinfer_bail_seen: set = set()
+                self._retroinfer_bail_count: dict = {}
+            self._retroinfer_bail_count[gate] = (
+                self._retroinfer_bail_count.get(gate, 0) + 1
+            )
+            if key not in self._retroinfer_bail_seen:
+                self._retroinfer_bail_seen.add(key)
+                logger.info(
+                    "[SparseDebug] retroinfer bail gate=%s layer=%s "
+                    "cumulative_count_for_gate=%d",
+                    gate,
+                    layer_name,
+                    self._retroinfer_bail_count[gate],
+                )
+
+        try:
+            kv_cache_gid = self._sparse_layer_gid_by_name.get(layer_name)
+            if kv_cache_gid is None:
+                _bail("kv_cache_gid_none")
+                return None
+            num_reqs = int(self.input_batch.num_reqs)
+            if num_reqs != 1:
+                _bail(f"num_reqs={num_reqs}")
+                return None
+            # Decode fast path requires exactly 1 query token for the
+            # sole active request.  ``query_start_loc`` encodes the
+            # cumulative token offsets so the delta is the per-req query
+            # token count.
+            tok_end = int(self.query_start_loc.np[1])
+            if tok_end != 1:
+                _bail(f"tok_end={tok_end}")
+                return None
+
+            rid = self.input_batch.req_ids[0]
+            req_states = self._sparse_online_index.get(rid)
+            if not req_states:
+                _bail("req_states_empty")
+                return None
+            req_state = self.requests.get(rid)
+            if req_state is None:
+                _bail("req_state_none")
+                return None
+            seq_len = int(self.seq_lens.np[0])
+            p_count = int(self.input_batch.num_prompt_tokens[0])
+            if seq_len <= p_count:
+                _bail(f"seq_len<=p_count seq_len={seq_len} p_count={p_count}")
+                return None
+            out_before_step = self._sparse_output_tokens_before_step.get(
+                rid, len(req_state.output_token_ids)
+            )
+            if out_before_step <= 0:
+                _bail(f"out_before_step={out_before_step}")
+                return None
+
+            ctx = self._sparse_layer_ctx.get(layer_name)
+            if ctx is None:
+                # Ctx gets warmed by the legacy builder on its first call
+                # for a given layer.  Returning ``None`` here lets the
+                # hook dispatcher fall back to the legacy path for a
+                # single step; subsequent steps hit the retroinfer path
+                # once ctx is cached.  Self-healing and one-shot only.
+                _bail("ctx_none")
+                return None
+            if not bool(ctx.get("gqa_regular", False)):
+                _bail("not_gqa_regular")
+                return None
+            num_heads = int(ctx["num_heads"])
+            head_size = int(ctx["head_size"])
+            num_kv_heads = int(ctx["num_kv_heads"])
+            if num_kv_heads <= 0:
+                _bail(f"num_kv_heads={num_kv_heads}")
+                return None
+            npk = max(1, num_heads // num_kv_heads)
+            unit_keys_in_kv_order = ctx.get("unit_keys_in_kv_order", ())
+            if len(unit_keys_in_kv_order) != num_kv_heads:
+                _bail(
+                    "unit_keys_mismatch "
+                    f"len={len(unit_keys_in_kv_order)} "
+                    f"num_kv_heads={num_kv_heads}"
+                )
+                return None
+
+            # Zero-kernel q split (GQA-regular layout).  Same pattern as
+            # ``_build_sparse_runtime_q_head_gather``'s fast path so that
+            # the two builders share layout invariants and the cluster
+            # selector sees an identical q slice.
+            q_flat = (
+                query.view(-1, num_heads, head_size)
+                if query.dim() != 3 else query
+            )
+            q_tok = q_flat[tok_end - 1].to(dtype=torch.float32)
+            q_list_views = [
+                q_tok[k * npk : (k + 1) * npk]
+                for k in range(num_kv_heads)
+            ]
+
+            batched_states: list[_SparseOnlineLayerState] = []
+            for uk in unit_keys_in_kv_order:
+                st = req_states.get(uk)
+                if st is None:
+                    _bail(f"state_missing_unit_key={uk}")
+                    return None
+                # Retroinfer requires both the centroid table *and* the
+                # per-cluster value_sum.  Empty centroids indicate the
+                # online state hasn't clustered yet (rare – only at the
+                # very first decode step after a reconfigure).  Missing
+                # ``value_sum`` is a harder failure: Phase 2b fills it
+                # during prefill collection, so a non-zero centroid
+                # table with a zero-numel ``value_sum`` signals an
+                # out-of-sync state and we must bail.
+                if st.cluster_centres.numel() == 0:
+                    _bail(f"cluster_centres_empty unit_key={uk}")
+                    return None
+                if st.value_sum.numel() == 0:
+                    _bail(f"value_sum_empty unit_key={uk}")
+                    return None
+                batched_states.append(st)
+
+            sel = self._sparse_online_select_clusters_batched(
+                states=batched_states,
+                q_list=q_list_views,
+                spec=spec,
+                estimation_budget=self._sparse_estimation_budget,
+            )
+            if sel is None:
+                _bail("cluster_selector_returned_none")
+                return None
+            retrieval_cids, estimation_cids = sel
+
+            # ``kv_caches`` is a per-group list keyed by layer group id;
+            # the sparse layer context already resolved ``kv_cache_gid``
+            # above so this lookup is a direct slot access.
+            kv_cache = self.kv_caches[kv_cache_gid]
+            blk_tbl = self.input_batch.block_table[kv_cache_gid]
+            bt_row_gpu = blk_tbl.block_table.gpu[0]
+            # ``sparse_selection_budget`` is the legacy per-head retrieval
+            # cap.  The retroinfer exec buffer also has to hold the always-on
+            # steady zone (head + tail) and the pending zone (output tokens
+            # generated so far); when ``static_pattern_start +
+            # static_pattern_end`` already exceeds the retrieval cap those
+            # positions would otherwise fall off the end of ``steady_pending``
+            # inside the gather and silently corrupt decode.  Mirror the
+            # legacy ``max_k_hint = max(budget, steady + pending)`` invariant.
+            head_n = min(int(spec.static_pattern_start), int(p_count))
+            tail_start = max(
+                0, int(p_count) - int(spec.static_pattern_end)
+            )
+            steady_count = (
+                int(p_count) if head_n >= tail_start
+                else head_n + (int(p_count) - tail_start)
+            )
+            pending_count = max(0, int(seq_len) - int(p_count))
+            max_budget = max(
+                int(spec.sparse_selection_budget()),
+                steady_count + pending_count,
+            )
+
+            out = self._sparse_retroinfer_expand_and_gather_single_req(
+                states=batched_states,
+                retrieval_cids=retrieval_cids,
+                estimation_cids=estimation_cids,
+                block_table_row=bt_row_gpu,
+                kv_cache=kv_cache,
+                block_size=int(spec.block_size),
+                prefill_len=p_count,
+                current_len=seq_len,
+                static_pattern_start=int(spec.static_pattern_start),
+                static_pattern_end=int(spec.static_pattern_end),
+                max_budget=max_budget,
+            )
+            if _SPARSE_DEBUG_ASSERT:
+                if not hasattr(self, "_retroinfer_success_seen"):
+                    self._retroinfer_success_seen: set = set()
+                    self._retroinfer_success_count: int = 0
+                self._retroinfer_success_count += 1
+                if layer_name not in self._retroinfer_success_seen:
+                    self._retroinfer_success_seen.add(layer_name)
+                    logger.info(
+                        "[SparseDebug] retroinfer SUCCESS layer=%s "
+                        "cumulative_global_success=%d",
+                        layer_name,
+                        self._retroinfer_success_count,
+                    )
+            return out
+        finally:
+            if _t0 is not None:
+                self._sparse_perf_record(
+                    "_build_sparse_runtime_retroinfer",
+                    time.perf_counter() - _t0,
+                )
+
     def _build_sparse_runtime_q_head_gather(
         self,
         *,
@@ -8550,7 +10302,7 @@ class GPUModelRunner(
           ``.cpu().numpy()``), so total sync count is unchanged.
 
         * Per-head static mapping (``kv_to_qh_tensor`` etc.) is cached on
-          ``self._sparse_layer_ctx`` -it is fully determined by
+          ``self._sparse_layer_ctx`` – it is fully determined by
           ``num_heads`` / ``num_kv_heads`` and does not change across steps.
 
         * Adds ``max_k`` to the returned dict (= ``spec.sparse_selection_budget()``),
@@ -8657,7 +10409,7 @@ class GPUModelRunner(
                 # calls only touch ``[1:]`` (count kernel writes, then
                 # in-place cumsum).  Eliminates 2 tiny kernel launches
                 # per sparse layer (``[0] = 0`` scalar write and the
-                # ``.to(int32)`` cast), ~70 碌s saved per pack call
+                # ``.to(int32)`` cast), ~70 µs saved per pack call
                 # (~2 ms/decode step at 28 sparse layers).
                 pack_head_offsets_scratch = torch.zeros(
                     num_heads_i + 1,
@@ -8824,9 +10576,10 @@ class GPUModelRunner(
                 _t_select = time.perf_counter() if perf_enabled else None
                 # Collect per-kv_head inputs first so we can hand the whole
                 # layer's kv_heads to the batched selector in one call.  This
-                # replaces G x (cluster-score, topk, scatter, gather, topk)
+                # replaces G × (cluster-score, topk, scatter, gather, topk)
                 # micro-kernels with 3-D variants, shaving the bulk of the
-                # launch overhead on decode.
+                # launch overhead that ``_sparse_online_select_tokens``
+                # otherwise accumulates on decode.
                 #
                 # Fast path (GQA-regular layout): ``q_tok`` already lays out
                 # q-heads in kv-head-major order, so each kv-group's q slice
@@ -8836,37 +10589,100 @@ class GPUModelRunner(
                 # ``torch.cat`` that *is* the final mask, dropping the
                 # initial ``zeros`` allocation.  Saves ~8 kernels / layer
                 # (G index_selects + G scatters + zeros alloc).  The
-                # Non-GQA layouts return ``None`` in this trimmed path.
+                # fallback path below is retained for exotic layouts where
+                # kv-heads own non-contiguous q-head ranges.
                 gqa_regular = bool(ctx.get("gqa_regular", False))
                 unit_keys_in_kv_order = ctx.get("unit_keys_in_kv_order", ())
-                if not (
-                    gqa_regular
-                    and len(unit_keys_in_kv_order) == int(ctx["num_kv_heads"])
-                    and self._sparse_legacy_token_topk
+                select_source = "labels"
+                if gqa_regular and len(unit_keys_in_kv_order) == int(
+                    ctx["num_kv_heads"]
                 ):
-                    return None
-                num_kv_heads = int(ctx["num_kv_heads"])
-                npk = num_queries_per_kv
-                batched_states = []
-                for unit_key in unit_keys_in_kv_order:
-                    state = req_states.get(unit_key)
-                    if state is None:
+                    num_kv_heads = int(ctx["num_kv_heads"])
+                    npk = num_queries_per_kv
+                    batched_states = []
+                    missing_state = False
+                    for unit_key in unit_keys_in_kv_order:
+                        state = req_states.get(unit_key)
+                        if state is None:
+                            missing_state = True
+                            break
+                        batched_states.append(state)
+                    if missing_state:
                         return None
-                    batched_states.append(state)
-                q_list_views = [
-                    q_tok[k * npk : (k + 1) * npk]
-                    for k in range(num_kv_heads)
-                ]
-                group_masks = self._sparse_online_select_tokens_from_clusters_batched(
-                    states=batched_states,
-                    q_list=q_list_views,
-                    total_tokens=prompt_len,
-                    spec=spec,
-                    budget_override=select_budget,
-                )
-                if group_masks is None:
-                    return None
-                selected_mask = torch.cat(group_masks, dim=0)
+                    # Zero-kernel q split: slices share q_tok's storage.
+                    q_list_views = [
+                        q_tok[k * npk : (k + 1) * npk]
+                        for k in range(num_kv_heads)
+                    ]
+                    group_masks = (
+                        self._sparse_online_select_tokens_from_clusters_batched(
+                            states=batched_states,
+                            q_list=q_list_views,
+                            total_tokens=prompt_len,
+                            spec=spec,
+                            budget_override=select_budget,
+                        )
+                        if self._sparse_legacy_token_topk
+                        else None
+                    )
+                    if group_masks is not None:
+                        select_source = "clusters"
+                    if group_masks is None:
+                        group_masks = self._sparse_online_select_tokens_batched(
+                            states=batched_states,
+                            q_list=q_list_views,
+                            total_tokens=prompt_len,
+                            spec=spec,
+                            budget_override=select_budget,
+                        )
+                    # Concatenation in kv-head order == head-order under
+                    # GQA-regular layout, so this is the final mask with
+                    # no scatter.  ``cat`` guarantees a contiguous tensor
+                    # that downstream ``nonzero`` / indexing expects.
+                    selected_mask = torch.cat(group_masks, dim=0)
+                else:
+                    selected_mask = torch.zeros(
+                        (num_heads, seq_len),
+                        dtype=torch.bool,
+                        device=query.device,
+                    )
+                    batched_states = []
+                    batched_q: list[torch.Tensor] = []
+                    batched_qh_indices: list[torch.Tensor] = []
+                    for kv_idx, qh_indices_t in kv_to_qh_tensor.items():
+                        unit_key = sparse_kv_unit_key(layer_name, kv_idx)
+                        state = req_states.get(unit_key)
+                        if state is None:
+                            return None
+                        q_group = q_tok.index_select(0, qh_indices_t)
+                        batched_states.append(state)
+                        batched_q.append(q_group)
+                        batched_qh_indices.append(qh_indices_t)
+                    group_masks = (
+                        self._sparse_online_select_tokens_from_clusters_batched(
+                            states=batched_states,
+                            q_list=batched_q,
+                            total_tokens=prompt_len,
+                            spec=spec,
+                            budget_override=select_budget,
+                        )
+                        if self._sparse_legacy_token_topk
+                        else None
+                    )
+                    if group_masks is not None:
+                        select_source = "clusters"
+                    if group_masks is None:
+                        group_masks = self._sparse_online_select_tokens_batched(
+                            states=batched_states,
+                            q_list=batched_q,
+                            total_tokens=prompt_len,
+                            spec=spec,
+                            budget_override=select_budget,
+                        )
+                    for qh_indices_t, group_mask in zip(
+                        batched_qh_indices, group_masks, strict=True
+                    ):
+                        selected_mask[qh_indices_t] = group_mask
                 _perf_add(
                     "_build_sparse_runtime_q_head_gather:select_tokens",
                     _t_select,
@@ -8896,7 +10712,7 @@ class GPUModelRunner(
                 # Phase-A fused pack: for the decode-dominant
                 # ``num_reqs == 1`` case, a single Triton kernel pair
                 # replaces ``nonzero`` + ``//`` + ``-*`` +
-                # ``index_select`` + ``sum(dim=1)`` (5 ops ->2 ops).
+                # ``index_select`` + ``sum(dim=1)`` (5 ops → 2 ops).
                 # Bitwise-equivalent, same implicit sync count (the
                 # total-count sync matches ``nonzero``'s size sync).
                 # ``head_ids_r`` is never consumed in the
@@ -9087,7 +10903,8 @@ class GPUModelRunner(
                         "budget=%d select_budget=%d steady=%d "
                         "heads=%d selected_min=%.0f selected_avg=%.1f "
                         "selected_max=%.0f selected_total=%.0f "
-                        "unique_phys_blocks=%d pack_triton=%s",
+                        "unique_phys_blocks=%d select_source=%s "
+                        "pack_triton=%s",
                         layer_name,
                         rid,
                         int(seq_len),
@@ -9106,6 +10923,7 @@ class GPUModelRunner(
                         float(counts_trace.sum().item())
                         if counts_trace.numel() else 0.0,
                         unique_phys,
+                        select_source,
                         bool(use_triton),
                     )
                 _perf_add(
@@ -9290,7 +11108,7 @@ class GPUModelRunner(
                 # CPU input).
                 #
                 # Phase-C: when the Triton path runs, ``counts_r`` is
-                # returned as ``None`` (not built separately -only
+                # returned as ``None`` (not built separately — only
                 # ``head_offsets[1:]`` is produced).  ``total_per_head``
                 # is therefore materialized lazily inside the fallback
                 # branch from the int32 view, which is the only place
@@ -9626,12 +11444,17 @@ class GPUModelRunner(
                             dtype=torch.int32,
                             device=self.device,
                         )
+                pending_vs_map = self._sparse_pending_value_sum_gpu.get(req_id)
+                vs_tensor = None
+                if pending_vs_map is not None:
+                    vs_tensor = pending_vs_map.get(unit_key)
                 state_new = _SparseOnlineLayerState(
                     cluster_centres=centres_t,
                     cluster_size=sizes_t,
                     block_to_cluster=labels_t,
                     all_block_features=feat_t,
                     mean_key=mean_t,
+                    value_sum=vs_tensor,
                     cluster_members=clusters_t,
                     copy_all_block_features=False,
                 )
@@ -9640,6 +11463,22 @@ class GPUModelRunner(
                     if centres_t.dim() >= 2 else 0
                 head_n = min(int(spec.static_pattern_start), n_tokens)
                 tail_start = max(0, n_tokens - int(spec.static_pattern_end))
+                if (
+                    not compact_legacy
+                    and head_n < tail_start
+                    and k_clusters > 0
+                ):
+                    positions = torch.arange(
+                        head_n,
+                        tail_start,
+                        dtype=torch.int32,
+                        device=labels_t.device,
+                    )
+                    state_new.rebuild_cluster_csr_from_labels(
+                        labels=labels_t[head_n:tail_start],
+                        positions=positions,
+                        num_clusters=k_clusters,
+                    )
                 req_states = self._sparse_online_index.setdefault(req_id, {})
                 req_states[unit_key] = state_new
 
@@ -9713,7 +11552,7 @@ class GPUModelRunner(
             # Pass 1: gather every (state, feat_t, spec) unit for this step.
             # Collecting once lets Pass 2 / Pass 3 batch across all
             # (layer, kv_head) pairs instead of launching small kernels in a
-            # Python loop (which used to dominate the decode critical path -
+            # Python loop (which used to dominate the decode critical path –
             # 28 layers x 4 kv_heads x ~3 kernels / unit ~= 300 launches).
             # ------------------------------------------------------------
             _t_sub = (
@@ -9814,7 +11653,7 @@ class GPUModelRunner(
                 g = feats_g.shape[0]
 
                 if k == 0 or d == 0:
-                    # Degenerate state -``nearest`` is forced to 0 (matching
+                    # Degenerate state – ``nearest`` is forced to 0 (matching
                     # the legacy scalar ``torch.zeros(())`` path) and we skip
                     # the bmm entirely.
                     nearest_g = torch.zeros(
@@ -9857,7 +11696,7 @@ class GPUModelRunner(
 
             # ------------------------------------------------------------
             # Pass 4: per-state bookkeeping that stays in Python (it's
-            # trivially cheap -only list ``append`` and an ``int`` compare,
+            # trivially cheap – only list ``append`` and an ``int`` compare,
             # no GPU work).  Dynamic K-Means updates are rare (fire every
             # ``update_threshold_tokens`` decode steps) so we keep the
             # existing path intact instead of trying to batch them.
@@ -9888,6 +11727,13 @@ class GPUModelRunner(
                     time.perf_counter() - _t_sub,
                 )
         finally:
+            # Phase 2b: release the GPU-resident value_sum handoff so the
+            # prefill V tensors (``[H, K, D]`` per req) stop pinning memory
+            # after they've been stitched into their ``_SparseOnlineLayerState``
+            # counterparts.  Safe to clear unconditionally even when the
+            # dict was never populated this step.
+            if self._sparse_pending_value_sum_gpu:
+                self._sparse_pending_value_sum_gpu.clear()
             if _t0 is not None:
                 self._sparse_perf_record(
                     "_update_sparse_online_index",
@@ -9900,7 +11746,7 @@ class GPUModelRunner(
         Covers both ``execute_model`` and ``sample_tokens`` halves of the
         decode RPC, so callers can diff against ``[DecodePerf] total_ms``
         (which only covers ``execute_model``) to isolate work that happens
-        between the two halves -notably the sparse feature collect and
+        between the two halves – notably the sparse feature collect and
         online index update executed inside ``sample_tokens``.
         """
         if (
@@ -9917,7 +11763,7 @@ class GPUModelRunner(
         # via step_exec_ms.  If ``sample_body_ms`` is materially smaller than
         # ``sample_tokens_ms`` (the historical field), something between the
         # execute_model exec_ms stamp and sample_tokens entry is being
-        # silently absorbed into the e2e sample_ms -that is our 70-0 ms
+        # silently absorbed into the e2e sample_ms – that is our 70–80 ms
         # mystery gap.
         sample_body_ms = (
             (now_s - st_t0) * 1000.0 if st_t0 is not None else -1.0
@@ -10402,7 +12248,7 @@ class GPUModelRunner(
 
         Feature convention
         ------------------
-        * ``feature_dim = head_size`` -one vector per KV head / query head
+        * ``feature_dim = head_size`` – one vector per KV head / query head
           (no averaging across heads).
         * Keys use ``layer##kv{i}`` for K/V block features (clustering) and
           ``layer##qh{j}`` for query vectors and TopK selection.  ``SparseKVManager``
@@ -10413,13 +12259,13 @@ class GPUModelRunner(
         Returns
         -------
         sparse_block_features
-            ``req_id ->layer##kv{i} ->[num_blocks, head_size]`` CPU float32;
+            ``req_id → layer##kv{i} → [num_blocks, head_size]`` CPU float32;
             emitted only when prefill completes this step.
         sparse_query_vectors
-            ``req_id ->layer##qh{j} ->[head_size]`` CPU float32; every scheduled
+            ``req_id → layer##qh{j} → [head_size]`` CPU float32; every scheduled
             request (prefill completion or decode).
         sparse_new_block_features
-            ``req_id ->layer##kv{i} ->[head_size]`` CPU float32; decode steps -
+            ``req_id → layer##kv{i} → [head_size]`` CPU float32; decode steps –
             K vector of the last slot per KV head.
         sparse_prefill_cluster_meta
             Optional GPU-computed K-Means metadata per ``layer##kv{i}`` (CPU numpy).
@@ -10458,7 +12304,7 @@ class GPUModelRunner(
             dict[str, dict[str, dict[str, torch.Tensor]]]
         ) = {}
         # GPU-resident mirror of ``sparse_new_block_features`` for the in-worker
-        # ``_update_sparse_online_index`` consumer.  Avoids the GPU-> CPU-> GPU
+        # ``_update_sparse_online_index`` consumer.  Avoids the GPU→CPU→GPU
         # round-trip that otherwise happens per (req, layer, kv_head) pair on
         # every decode step.  The numpy dict above is still produced because
         # it is serialized into ``ModelRunnerOutput`` and consumed by the
@@ -10568,7 +12414,7 @@ class GPUModelRunner(
             is_decode = is_decode_committed or is_first_decode_boundary
 
             if not is_prefill_done and not is_decode:
-                # Mid-prefill chunk -nothing to emit yet.
+                # Mid-prefill chunk – nothing to emit yet.
                 continue
 
             # Token index range for this request in the flat batch tensor.
@@ -10576,6 +12422,7 @@ class GPUModelRunner(
             tok_end = int(self.query_start_loc.np[req_idx + 1])
             last_tok_idx = tok_end - 1  # last token of this request
 
+            # ── Q vectors: one row per query head (layer##qh{j})
             _t_q_extract = time.perf_counter() if perf_enabled else None
             q_per_unit: dict[str, np.ndarray] = {}
             for _, grp in sparse_groups:
@@ -10619,6 +12466,7 @@ class GPUModelRunner(
             if q_per_unit:
                 sparse_query_vectors[req_id] = q_per_unit
 
+            # ── K block features from KV cache (per layer, no cross-layer mean)
             _t_k_extract = time.perf_counter() if perf_enabled else None
             for gid, grp in sparse_groups:
                 block_table = self.input_batch.block_table[gid]
@@ -10709,6 +12557,7 @@ class GPUModelRunner(
                                         kv[0],
                                         _get_block_ids_t(),
                                         valid_len,
+                                        value_cache=kv[1],
                                         num_clusters=spec.num_clusters,
                                         n_segment=spec.n_segment,
                                         is_centered=False,
@@ -10722,6 +12571,84 @@ class GPUModelRunner(
                                             time.perf_counter() - _t_kmeans,
                                         )
                                     k_heads = raw_b["features"]
+                                    # --- Phase 2b: per-cluster V accumulator ---
+                                    # Compute ``value_sum`` on the same stream
+                                    # while K-Means output ``block_to_cluster``
+                                    # is still hot.  Uses ``kv[1]`` (V side of
+                                    # the paged cache) with the same block_ids
+                                    # gather; no extra D2H.  Only fires on the
+                                    # device-kmeans path – CPU fallback leaves
+                                    # ``value_sum`` as zeros (estimation zone
+                                    # degrades to uniform, retrieval zone is
+                                    # unaffected).
+                                    #
+                                    # Gate on the estimation budget: when the
+                                    # runtime has no estimation zone configured
+                                    # (``VLLM_SPARSE_ESTIMATION_BUDGET=0`` – the
+                                    # default), the retroinfer path never reads
+                                    # ``value_sum``, and computing it here
+                                    # triggered a large transient FP32 upcast of
+                                    # the V-cache slice in prefill (observed:
+                                    # 770 MiB OOM in a 23.7 GiB card at long
+                                    # prompts).  Skipping it keeps the prefill
+                                    # peak memory equivalent to the
+                                    # pre-Phase 2b path; the state constructor
+                                    # still allocates a tiny ``[K, D]`` zeros
+                                    # placeholder so FA's fallback path is
+                                    # type-stable.
+                                    head_n_cv = min(
+                                        int(spec.static_pattern_start),
+                                        valid_len,
+                                    )
+                                    tail_start_cv = max(
+                                        0,
+                                        valid_len
+                                        - int(spec.static_pattern_end),
+                                    )
+                                    need_value_sum = (
+                                        head_n_cv < tail_start_cv
+                                        and int(
+                                            self._sparse_estimation_budget
+                                        ) > 0
+                                    )
+                                    if need_value_sum:
+                                        _t_vs = (
+                                            time.perf_counter()
+                                            if perf_enabled
+                                            else None
+                                        )
+                                        actual_k = int(
+                                            raw_b["cluster_centres"].shape[1]
+                                        )
+                                        vs_hkd = value_sum_from_kv_cache_torch(
+                                            kv[1],
+                                            _get_block_ids_t(),
+                                            valid_len,
+                                            labels=raw_b[
+                                                "block_to_cluster"
+                                            ],
+                                            num_clusters=actual_k,
+                                            middle_start=head_n_cv,
+                                            middle_end=tail_start_cv,
+                                        )
+                                        if vs_hkd.dim() == 2:
+                                            vs_hkd = vs_hkd.unsqueeze(0)
+                                        req_vs_map = (
+                                            self
+                                            ._sparse_pending_value_sum_gpu
+                                            .setdefault(req_id, {})
+                                        )
+                                        for kv_h in range(num_kv):
+                                            req_vs_map[
+                                                sparse_kv_unit_key(
+                                                    layer_name, kv_h
+                                                )
+                                            ] = vs_hkd[kv_h]
+                                        if _t_vs is not None:
+                                            self._sparse_perf_record(
+                                                "collect:prefill_value_sum",
+                                                time.perf_counter() - _t_vs,
+                                            )
                                 else:
                                     k_heads = kmeans_features_from_kv_cache_torch(
                                         kv[0],
@@ -10847,6 +12774,118 @@ class GPUModelRunner(
                                     sparse_new_block_features_gpu.setdefault(
                                         req_id, {}
                                     )[unit_key] = k_row_gpu[kv_h]
+                    else:
+                        k_blk: torch.Tensor | None = None
+                        raw_b = None
+                        if is_prefill_done:
+                            if sparse_prefill_cluster_use_device_kmeans(kv[0]):
+                                _t_kmeans = (
+                                    time.perf_counter()
+                                    if perf_enabled
+                                    else None
+                                )
+                                raw_b = prefill_cluster_meta_from_kv_cache_device(
+                                    kv[0],
+                                    _get_block_ids_t(),
+                                    num_prompt_tokens,
+                                    num_clusters=spec.num_clusters,
+                                    n_segment=spec.n_segment,
+                                    is_centered=True,
+                                )
+                                if _t_kmeans is not None:
+                                    self._sparse_perf_record(
+                                        "collect:prefill_device_kmeans",
+                                        time.perf_counter() - _t_kmeans,
+                                    )
+                                k_heads = raw_b["features"]
+                            else:
+                                _t_block_mean = (
+                                    time.perf_counter()
+                                    if perf_enabled
+                                    else None
+                                )
+                                k_heads = kmeans_features_from_kv_cache_torch(
+                                    kv[0],
+                                    _get_block_ids_t(),
+                                    num_prompt_tokens,
+                                    is_centered=True,
+                                )
+                                _perf_add("collect:k_block_mean", _t_block_mean)
+                            k_blk = (
+                                k_heads[0]
+                                if num_kv == 1
+                                else k_heads.transpose(0, 1).contiguous()
+                            )
+                        elif is_decode_committed:
+                            _t_block_mean = (
+                                time.perf_counter() if perf_enabled else None
+                            )
+                            k_blk = _read_k_blocks().mean(dim=1).float()
+                            _perf_add("collect:k_block_mean", _t_block_mean)
+                        if is_prefill_done:
+                            _t_prefill_store = (
+                                time.perf_counter() if perf_enabled else None
+                            )
+                            assert k_blk is not None
+                            if num_kv == 1:
+                                assert num_kv == 1, (
+                                    "KV cache layout: expected num_kv_heads==1 "
+                                    "when block mean has rank 2"
+                                )
+                                raw = None if raw_b is None else {
+                                    "cluster_centres": raw_b["cluster_centres"][0],
+                                    "block_to_cluster": raw_b["block_to_cluster"][0],
+                                    "cluster_size": raw_b["cluster_size"][0],
+                                    "mean_key": raw_b["mean_key"][0],
+                                }
+                                self._sparse_store_prefill_block_features(
+                                    req_id,
+                                    sparse_kv_unit_key(layer_name, 0),
+                                    k_blk,
+                                    spec,
+                                    sparse_block_features,
+                                    sparse_prefill_cluster_meta,
+                                    pending_async_feat,
+                                    pending_async_meta,
+                                    precomputed_meta=raw,
+                                )
+                            else:
+                                self._sparse_store_prefill_kv_heads_block_features(
+                                    req_id,
+                                    layer_name,
+                                    k_heads,
+                                    spec,
+                                    sparse_block_features,
+                                    sparse_prefill_cluster_meta,
+                                    pending_async_feat,
+                                    pending_async_meta,
+                                    precomputed_meta=raw_b,
+                                )
+                            _perf_add(
+                                "collect:prefill_store_features",
+                                _t_prefill_store,
+                            )
+                        if is_decode_committed:
+                            assert k_blk is not None
+                            if k_blk.dim() == 2:
+                                assert num_kv == 1
+                                _t_decode_cpu = (
+                                    time.perf_counter() if perf_enabled else None
+                                )
+                                sparse_new_block_features.setdefault(req_id, {})[
+                                    sparse_kv_unit_key(layer_name, 0)
+                                ] = k_blk[-1].cpu().numpy()
+                                _perf_add("collect:k_decode_cpu_numpy", _t_decode_cpu)
+                            else:
+                                _t_decode_cpu = (
+                                    time.perf_counter() if perf_enabled else None
+                                )
+                                k_last_np = k_blk[-1].cpu().numpy()
+                                _perf_add("collect:k_decode_cpu_numpy", _t_decode_cpu)
+                                for kv_h in range(num_kv):
+                                    sparse_new_block_features.setdefault(req_id, {})[
+                                        sparse_kv_unit_key(layer_name, kv_h)
+                                    ] = k_last_np[kv_h]
             _perf_add("collect:k_extract_total", _t_k_extract)
             if is_prefill_done:
                 # Latch so a repeat boundary fire on the next step cannot
@@ -10916,6 +12955,283 @@ class GPUModelRunner(
             sparse_prefill_block_features_gpu or None,
             sparse_prefill_cluster_meta_gpu or None,
         )
+
+    def _sparse_layer_decode_phys_row(
+        self,
+        req_id: str,
+        kv_cache_gid: int,
+        sparse_row_key: str,
+    ) -> list[int] | None:
+        """Physical KV block ids (history then decode slot) for one sparse row.
+
+        ``sparse_row_key`` is ``layer##qh{j}`` (per query head).  When absent
+        from the per-head map, falls back to merged union order (legacy).
+
+        Uses the block_table (logical-index → physical-block-id mapping) to
+        resolve physical addresses rather than zipping with bid_row, which
+        can differ in length from the logical selection list.
+        """
+        rs = self.requests.get(req_id)
+        if rs is None or len(rs.output_token_ids) == 0:
+            return None
+        merged = self._sparse_merged_logical.get(req_id)
+        if not merged:
+            return None
+        bid_row = rs.block_ids[kv_cache_gid]
+        if len(bid_row) < 2:
+            return None
+        decode_id = int(bid_row[-1])
+
+        req_idx = self.input_batch.req_id_to_index.get(req_id)
+        if req_idx is None:
+            return None
+        blk_table = self.input_batch.block_table[kv_cache_gid]
+        bt_np = blk_table.block_table.np[req_idx]
+        num_blocks = int(blk_table.num_blocks_per_row[req_idx])
+
+        logical_to_phys: dict[int, int] = {}
+        for log_idx in merged:
+            li = int(log_idx)
+            if 0 <= li < num_blocks:
+                logical_to_phys[li] = int(bt_np[li])
+
+        by_l = self._sparse_by_layer_logical.get(req_id)
+        if by_l and sparse_row_key in by_l:
+            logical_order = [int(x) for x in by_l[sparse_row_key]]
+        else:
+            logical_order = [int(x) for x in merged]
+        row: list[int] = []
+        for lg in logical_order:
+            p = logical_to_phys.get(lg)
+            if p is not None:
+                row.append(p)
+        row.append(decode_id)
+        return row
+
+    def _sparse_decode_num_blocks_np(
+        self,
+        kv_cache_gid: int,
+        sparse_row_key: str,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> np.ndarray:
+        """Per-request sparse table width (in blocks) for one sparse row key."""
+        out = np.full(num_reqs_padded, -1, dtype=np.int32)
+        for req_idx in range(num_reqs):
+            req_id = self.input_batch.req_ids[req_idx]
+            row = self._sparse_layer_decode_phys_row(
+                req_id, kv_cache_gid, sparse_row_key
+            )
+            if row is not None:
+                out[req_idx] = int(len(row))
+        return out
+
+    def _build_sparse_layer_block_table_tensor(
+        self,
+        union_bt: torch.Tensor,
+        kv_cache_gid: int,
+        sparse_row_key: str,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> torch.Tensor:
+        """Shrink each sparse-decode row for ``sparse_row_key`` (``layer##qh{j}``)."""
+        out = union_bt.clone()
+        pad_id = -1
+        for req_idx in range(num_reqs):
+            req_id = self.input_batch.req_ids[req_idx]
+            row = self._sparse_layer_decode_phys_row(
+                req_id, kv_cache_gid, sparse_row_key
+            )
+            if row is None:
+                continue
+            out[req_idx].fill_(pad_id)
+            row_t = torch.tensor(row, dtype=torch.int32, device=out.device)
+            out[req_idx, : row_t.shape[0]] = row_t
+        out[num_reqs:num_reqs_padded].fill_(pad_id)
+        return out
+
+    def _build_sparse_per_head_block_table_and_lens(
+        self,
+        union_bt: torch.Tensor,
+        cm: "CommonAttentionMetadata",
+        kv_cache_gid: int,
+        layer_name: str,
+        num_heads: int,
+        num_reqs: int,
+        num_reqs_padded: int,
+        block_size: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Stack per-query-head sparse block tables ``[H, S, max_blocks]`` and seq lens."""
+        _, max_blocks = union_bt.shape
+        device = union_bt.device
+        stacked = torch.full(
+            (num_heads, num_reqs_padded, max_blocks),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        row_lens = np.full((num_heads, num_reqs_padded), -1, dtype=np.int32)
+        any_sparse = False
+        for qh in range(num_heads):
+            sk = sparse_qh_unit_key(layer_name, qh)
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                row = self._sparse_layer_decode_phys_row(req_id, kv_cache_gid, sk)
+                if row is None:
+                    stacked[qh, req_idx] = union_bt[req_idx]
+                else:
+                    any_sparse = True
+                    row_len = len(row)
+                    row_lens[qh, req_idx] = row_len
+                    stacked[qh, req_idx, :row_len] = torch.as_tensor(
+                        row, dtype=torch.int32, device=device
+                    )
+        if not any_sparse:
+            return None, None
+        seq_lens_np = cm._seq_lens_cpu.numpy().copy()
+        per_head_lens = np.zeros((num_heads, num_reqs_padded), dtype=np.int32)
+        blk_table = self.input_batch.block_table[kv_cache_gid]
+        for qh in range(num_heads):
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    per_head_lens[qh, req_idx] = int(seq_lens_np[req_idx])
+                    continue
+                if len(req_state.output_token_ids) == 0:
+                    per_head_lens[qh, req_idx] = int(seq_lens_np[req_idx])
+                    continue
+                old_seq_len = int(seq_lens_np[req_idx])
+                num_blocks = int(blk_table.num_blocks_per_row[req_idx])
+                ob = int(row_lens[qh, req_idx])
+                if ob >= 0:
+                    num_blocks = ob
+                sparse_cap = num_blocks * block_size
+                per_head_lens[qh, req_idx] = min(old_seq_len, sparse_cap)
+        seq_t = torch.tensor(per_head_lens, dtype=torch.int32, device=device)
+        return stacked, seq_t
+
+    def _override_sparse_seq_lens(
+        self,
+        cm: "CommonAttentionMetadata",
+        kv_cache_gid: int,
+        num_reqs: int,
+        num_reqs_padded: int,
+        block_size: int,
+        decode_num_blocks_override: np.ndarray | None = None,
+    ) -> "CommonAttentionMetadata":
+        """Bug 2 fix: replace seq_lens with sparse block-table length.
+
+        For sparse decode requests the block table only contains the selected
+        history blocks plus the single decode block.  The standard
+        ``seq_lens`` value (full context length) would make the attention
+        kernel attempt to read KV from blocks that don't exist in the sparse
+        table, producing garbage outputs.
+
+        This helper builds a corrected ``seq_lens`` GPU tensor where each
+        decode request's length is capped to
+        ``num_blocks_in_sparse_table * block_size``.
+        Prefill requests are left unchanged (their block tables still cover
+        the full prompt).
+        """
+        blk_table = self.input_batch.block_table[kv_cache_gid]
+        seq_lens_np = cm._seq_lens_cpu.numpy().copy()
+
+        for req_idx in range(num_reqs):
+            req_id = self.input_batch.req_ids[req_idx]
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            num_output_tokens = len(req_state.output_token_ids)
+            if num_output_tokens == 0:
+                continue  # prefill – leave seq_len as-is
+            old_seq_len = int(seq_lens_np[req_idx])
+            # Decode: cap to actual number of sparse blocks * block_size.
+            num_blocks = int(blk_table.num_blocks_per_row[req_idx])
+            if decode_num_blocks_override is not None and req_idx < len(
+                decode_num_blocks_override
+            ):
+                ob = int(decode_num_blocks_override[req_idx])
+                if ob >= 0:
+                    num_blocks = ob
+            sparse_cap_seq_len = num_blocks * block_size
+            # Keep seq_len within sparse-table capacity, but never expose
+            # unwritten decode-block tail beyond the currently materialized
+            # sequence length.
+            new_seq_len = min(old_seq_len, sparse_cap_seq_len)
+            seq_lens_np[req_idx] = new_seq_len
+            if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
+                override_blocks = -1
+                if decode_num_blocks_override is not None and req_idx < len(
+                    decode_num_blocks_override
+                ):
+                    override_blocks = int(decode_num_blocks_override[req_idx])
+                logger.info(
+                    "[SparseRC] seq_lens req_id=%s gid=%d req_idx=%d "
+                    "old_seq_len=%d new_seq_len=%d sparse_cap_seq_len=%d "
+                    "num_blocks=%d block_size=%d decode_override=%d "
+                    "num_output_tokens=%d",
+                    req_id,
+                    kv_cache_gid,
+                    req_idx,
+                    old_seq_len,
+                    new_seq_len,
+                    sparse_cap_seq_len,
+                    num_blocks,
+                    block_size,
+                    override_blocks,
+                    num_output_tokens,
+                )
+            # Diagnostic: sparse capacity can be larger than materialized
+            # tokens while the decode block is not yet full. This is expected
+            # as long as we keep applied seq_len equal to old_seq_len.
+            tail_slack = sparse_cap_seq_len - old_seq_len
+            if 0 < tail_slack < block_size:
+                if new_seq_len != old_seq_len:
+                    logger.warning_once(
+                        "Sparse decode tail exposure detected: req_id=%s gid=%d "
+                        "old_seq_len=%d sparse_cap_seq_len=%d applied_seq_len=%d "
+                        "block_size=%d num_blocks=%d num_output_tokens=%d",
+                        req_id,
+                        kv_cache_gid,
+                        old_seq_len,
+                        sparse_cap_seq_len,
+                        new_seq_len,
+                        block_size,
+                        num_blocks,
+                        num_output_tokens,
+                    )
+                else:
+                    logger.debug_once(
+                        "Sparse decode tail slack observed and safely hidden "
+                        "(applied_seq_len == old_seq_len)."
+                    )
+            self._debug_log_sparse_decode_tokens(
+                req_id=req_id,
+                req_idx=req_idx,
+                seq_len=new_seq_len,
+            )
+            self._debug_log_sparse_forward_kv_tokens(
+                req_id=req_id,
+                req_idx=req_idx,
+                seq_len=new_seq_len,
+                kv_cache_gid=kv_cache_gid,
+                block_size=block_size,
+            )
+
+        sparse_seq_lens_gpu = torch.tensor(
+            seq_lens_np[:num_reqs_padded],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        new_cm = copy(cm)
+        new_cm.seq_lens = sparse_seq_lens_gpu
+        new_cm._seq_lens_cpu = torch.tensor(
+            seq_lens_np[:num_reqs_padded], dtype=torch.int32
+        )
+        if num_reqs > 0:
+            new_cm.max_seq_len = int(seq_lens_np[:num_reqs].max())
+        return new_cm
 
     def _debug_log_sparse_decode_tokens(
         self, req_id: str, req_idx: int, seq_len: int
@@ -11351,6 +13667,7 @@ class GPUModelRunner(
                         tok_end,
                     )
 
+    # ── End sparse KV attention helpers ──────────────────────────────────────
 
     def init_routed_experts_capturer(self):
         logger.info(

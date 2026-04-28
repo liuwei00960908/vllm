@@ -541,10 +541,11 @@ class KVCacheManager:
 
         Args:
             request_id:           The request ID.
-            block_features:       Per-layer token feature dict or legacy
-                                  ``[num_rows, D]`` token feature matrix.
+            block_features:       Per-layer dict or legacy ``[num_rows, D]`` –
+                                  mean K per block or per prompt token (see
+                                  ``SparseAttentionSpec.cluster_granularity``).
             block_value_features: Same keys / leading dimension as features
-                                  (unused in the compact token path).
+                                  (optional; for Estimation Zone).
             prefill_cluster_meta: Optional per-layer K-Means outputs (centroids,
                                   labels, sizes, mean_key) to skip CPU clustering.
         """
@@ -572,10 +573,10 @@ class KVCacheManager:
           1. Store the query via ``update_query_vector()``.
           2. Immediately run ``select()`` with ``sparse_selection_budget()`` so
              that ``_selected_block_indices`` is ready for the upcoming
-             ``schedule()`` ->``allocate_slots()`` call.
+             ``schedule()`` → ``allocate_slots()`` call.
 
         Args:
-            query_vectors: req_id ->``[feature_dim]`` float32 numpy array.
+            query_vectors: req_id → ``[feature_dim]`` float32 numpy array.
         """
         mgr = self.get_sparse_manager()
         if mgr is None:
@@ -641,10 +642,11 @@ class KVCacheManager:
         Update the clustering structure after a decode step writes new KV data.
 
         Args:
-            new_block_features: req_id ->``[D]`` float32 -mean K of the
+            new_block_features: req_id → ``[D]`` float32 – mean K of the
                                 newly written decode block.
-            new_value_features: req_id -> ``[D]`` float32, unused in the
-                                compact token path.
+            new_value_features: req_id → ``[D]`` float32 – mean V of the
+                                newly written decode block (optional; stored
+                                for the Estimation Zone TODO).
         """
         mgr = self.get_sparse_manager()
         if mgr is None:

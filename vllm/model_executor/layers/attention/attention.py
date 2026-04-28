@@ -520,19 +520,17 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
 
+        # Bug 4 fix: if sparse_attention is configured in CacheConfig,
+        # return a SparseAttentionSpec for every decoder attention layer.
+        # Sliding-window layers are left as-is (sparse + sliding-window is
+        # not yet supported).
         sparse_cfg = getattr(vllm_config.cache_config, "sparse_attention", None)
         if sparse_cfg is not None and self.sliding_window is None:
-            _cg = str(sparse_cfg.get("cluster_granularity", "token"))
-            if _cg != "token":
+            _cg = str(sparse_cfg.get("cluster_granularity", "block"))
+            if _cg not in ("block", "token"):
                 raise ValueError(
                     "cache_config.sparse_attention['cluster_granularity'] must be "
-                    f"'token', got {_cg!r}"
-                )
-            _use_compact = bool(sparse_cfg.get("use_compact_kv_gather", True))
-            if not _use_compact:
-                raise ValueError(
-                    "cache_config.sparse_attention['use_compact_kv_gather'] "
-                    "must be True."
+                    f"'block' or 'token', got {_cg!r}"
                 )
             return SparseAttentionSpec(
                 block_size=block_size,
@@ -570,7 +568,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 update_threshold_tokens=int(
                     sparse_cfg.get("update_threshold_tokens", 1024)
                 ),
-                use_compact_kv_gather=_use_compact,
+                use_compact_kv_gather=bool(
+                    sparse_cfg.get("use_compact_kv_gather", True)
+                ),
             )
 
         if self.sliding_window is not None:

@@ -151,14 +151,40 @@ class CacheConfig:
     KV offloading is only activated when kv_offloading_size is set."""
 
     sparse_attention: dict | None = None
-    """Configuration dict for token-granularity dynamic sparse attention.
+    """Configuration dict for RetroInfer-style dynamic sparse attention.
     When set, ``Attention.get_kv_cache_spec()`` returns a
     ``SparseAttentionSpec`` for every decoder attention layer instead of the
     default ``FullAttentionSpec``.
 
-    Supported keys mirror ``SparseAttentionSpec``. The active path requires
-    ``cluster_granularity="token"`` and ``use_compact_kv_gather=True``.
-    Selected token indices are gathered into compact KV tensors for decode.
+    Supported keys (all optional; defaults mirror ``SparseAttentionSpec``):
+
+    * ``num_clusters`` (int, default 32) – total K-Means centroids.
+    * ``n_segment`` (int, default 8) – position segments for segment K-Means.
+    * ``nprobe`` (int, default 16) – retrieve-zone cluster count.
+    * ``static_pattern_start`` (int, default 0) – attention-sink tokens.
+    * ``static_pattern_end`` (int, default 0) – local-window tokens.
+    * ``prefill_topk_query_window`` (int, default 8) – when
+      ``refresh_topk_each_decode`` is false, warms a one-shot prefill TopK
+      cache (0 = skip that warmup).
+    * ``refresh_topk_each_decode`` (bool, default True) – if true, every
+      decode step re-runs TopK with the latest query; steady-zone tokens
+      (``static_pattern_start`` / ``static_pattern_end``) stay included.
+    * ``update_threshold_blocks`` (int, default 64) – decode blocks to buffer
+      before refreshing the segment K-Means index.
+    * ``max_selected_blocks`` (int, default 64) – hard cap on total selected
+      blocks per decode step (block-granularity mode).
+    * ``cluster_granularity`` (str, ``"block"`` or ``"token"``) – cluster
+      and Top-K over mean-K per block vs per token; token mode uses
+      ``max_selected_tokens`` (or ``max_selected_blocks * block_size``) as the
+      per-layer token budget.
+    * ``max_selected_tokens`` (int, optional) – token-budget override when
+      ``cluster_granularity`` is ``"token"``.
+    * ``update_threshold_tokens`` (int, default 1024) – buffered decode-token
+      features before a dynamic K-Means refresh in token mode.
+    * ``use_compact_kv_gather`` (bool, default True) – in token mode with
+      FlashAttention, gather selected KV into a compact tensor and run varlen
+      attention instead of paged block-table reads (disabled for fp8 KV,
+      ALiBi, sink, sliding window, or CUDA graph capture).
 
     Example::
 
@@ -169,7 +195,7 @@ class CacheConfig:
                 "nprobe": 32,
                 "static_pattern_start": 64,
                 "static_pattern_end": 64,
-                "max_selected_tokens": 2048,
+                "max_selected_blocks": 128,
             }
         )
     """
