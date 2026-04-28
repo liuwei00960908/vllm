@@ -182,180 +182,6 @@ def triton_reverse_index(
 
 
 @triton.jit
-def _triton_index_add_kernel(
-    V, S, M,  # data, sum, max_idx
-    stride_vz, stride_vn, stride_vd,
-    stride_sz, stride_sk, stride_sd,
-    stride_mz, stride_mn,
-    num_tokens,
-    BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    start_n = tl.program_id(0) * BLOCK_N
-    batch_idx = tl.program_id(1)
-
-    if start_n >= num_tokens:
-        return
-
-    offs_n = start_n + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_D)
-    n_mask = offs_n < num_tokens
-
-    v_ptrs = V + batch_idx * stride_vz + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-    s_ptrs = S + batch_idx * stride_sz + offs_d[None, :] * stride_sd
-    m_ptrs = M + batch_idx * stride_mz + offs_n * stride_mn
-
-    v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.)
-    max_idx = tl.load(m_ptrs, mask=n_mask, other=0)
-
-    tl.atomic_add(s_ptrs + max_idx[:, None] * stride_sk, v.to(S.type.element_ty), mask=n_mask[:, None], sem='relaxed')
-
-
-def triton_index_add(
-    value: torch.Tensor,    # [batch_size, num_tokens, head_dim]
-    max_idx: torch.Tensor,  # [batch_size, num_tokens]
-    num_centroids: int,
-):
-    batch_size, num_tokens, dim = value.shape
-    value_sum = torch.zeros((batch_size, num_centroids, dim), dtype=torch.float32, device=value.device)
-    block_N = 128
-    _triton_index_add_kernel[(triton.cdiv(num_tokens, block_N), batch_size, 1)](
-        value, value_sum, max_idx,
-        value.stride(0), value.stride(1), value.stride(2),
-        value_sum.stride(0), value_sum.stride(1), value_sum.stride(2),
-        max_idx.stride(0), max_idx.stride(1),
-        num_tokens,
-        BLOCK_N=block_N, BLOCK_D=dim,
-    )
-    return value_sum.to(value.dtype)
-
-
-def segment_k_means(
-    key: torch.Tensor,    # [batch_size(=1)*num_heads, num_tokens, head_dim]
-    value: torch.Tensor,  # [batch_size(=1)*num_heads, num_tokens, head_dim]
-    num_centroids: int,
-    num_iters: int = 10,
-    num_segments: int = 1
-):
-    num_groups, num_tokens, head_dim = key.shape
-
-    # initialize centroids uniformly
-    centroid_indices = torch.arange(num_centroids, dtype=torch.float32, device=key.device) * (num_tokens / num_centroids)
-    centroid_indices += num_tokens / num_centroids / 2
-    centroid_indices = centroid_indices.to(torch.int64)
-    # Clamp to valid token range to avoid out-of-bounds access.
-    if num_tokens > 0:
-        centroid_indices = torch.clamp(centroid_indices, max=num_tokens - 1)
-    centroids = torch.index_select(key, dim=1, index=centroid_indices)
-
-    assert num_centroids % num_segments == 0
-    num_tokens_per_segment = num_tokens // num_segments
-    num_centroids_per_segment = num_centroids // num_segments
-    data = key[:, :num_tokens_per_segment * num_segments].reshape((-1, num_tokens_per_segment, head_dim))
-    centroids = centroids.reshape((-1, num_centroids_per_segment, head_dim))
-    max_idx = torch.empty((data.shape[0], data.shape[1]), dtype=torch.int32, device=data.device)
-    for _ in range(num_iters - 1):
-        centroids = _triton_k_means_train(data, centroids, max_idx=max_idx, normalize_centroids=True, return_indices=False)
-
-    data = key.reshape((-1, num_tokens, head_dim))
-    centroids = centroids.reshape((-1, num_centroids, head_dim))
-    centroids, max_idx, max_cluster_size = _triton_k_means_train(data, centroids, normalize_centroids=False, return_indices=True)
-
-    value_sum = triton_index_add(value.reshape((-1, num_tokens, head_dim)), max_idx, num_centroids)
-    clusters, cluster_size = triton_reverse_index(max_idx, num_centroids, max_cluster_size)
-
-    return centroids, max_idx, clusters, cluster_size, value_sum
-
-
-@triton.jit
-def _triton_index_add_kernel_paged(
-    V,                      # V: [block_num, block_size, num_heads, head_dim]
-    B, S, M,                # S: output sum [num_heads, num_centroids, head_dim]
-    stride_vp, stride_vb, stride_vh, stride_vd,
-    stride_bid,
-    stride_sz, stride_sk, stride_sd,
-    stride_mz, stride_mn,
-    num_tokens,
-    BLOCK_S: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    start_n = tl.program_id(0) * BLOCK_N
-    head_idx = tl.program_id(1)   # head 索引
-
-    if start_n >= num_tokens:
-        return
-
-    offs_n = start_n + tl.arange(0, BLOCK_N)
-    n_mask = offs_n < num_tokens
-    safe_offs_n = tl.where(n_mask, offs_n, 0)
-
-    logical_block = safe_offs_n // BLOCK_S
-    offset_in_block = safe_offs_n % BLOCK_S
-
-    bid_ptrs = B + logical_block * stride_bid
-    physical_block = tl.load(bid_ptrs, mask=n_mask)   # [BLOCK_N]
-
-    offs_d = tl.arange(0, BLOCK_D)
-    v_ptrs = (V + physical_block[:, None] * stride_vp +
-              offset_in_block[:, None] * stride_vb +
-              head_idx * stride_vh +
-              offs_d[None, :] * stride_vd)
-    v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.)   # [BLOCK_N, BLOCK_D]
-
-    m_ptrs = M + head_idx * stride_mz + offs_n * stride_mn
-    max_idx = tl.load(m_ptrs, mask=n_mask, other=0)       # [BLOCK_N]
-
-    s_ptrs = S + head_idx * stride_sz + offs_d[None, :] * stride_sd
-    tl.atomic_add(s_ptrs + max_idx[:, None] * stride_sk, v.to(S.type.element_ty), mask=n_mask[:, None], sem='relaxed')
-
-
-def triton_index_add_paged(
-    value_physical: torch.Tensor,  # [block_num, block_size, num_heads, head_dim]
-    block_ids: torch.Tensor,       # [num_logical_blocks]
-    max_idx: torch.Tensor,         # [num_heads, num_tokens]
-    num_centroids: int,
-    block_size: int = 16,
-) -> torch.Tensor:
-    """
-    Accumulation on paged value per cluster
-    
-    Args:
-        value_physical: [P, B, H, D]
-        block_ids: L = num_logical_blocks
-        max_idx: [H, L*B]
-        num_centroids: number of clusters
-        block_size: vllm block size 16
-    
-    Returns:
-        value_sum: [H, num_centroids, D]
-    """
-    block_num, B, num_heads, head_dim = value_physical.shape
-    assert B == block_size
-    num_tokens = max_idx.shape[1]
-
-    value_sum = torch.zeros((num_heads, num_centroids, head_dim), dtype=torch.float32, device=value_physical.device)
-
-    block_N = 128
-    grid = (triton.cdiv(num_tokens, block_N), num_heads)
-
-    _triton_index_add_kernel_paged[grid](
-        value_physical, block_ids, value_sum, max_idx,
-        value_physical.stride(0), value_physical.stride(1),
-        value_physical.stride(2), value_physical.stride(3),
-        block_ids.stride(0),
-        value_sum.stride(0), value_sum.stride(1), value_sum.stride(2),
-        max_idx.stride(0), max_idx.stride(1),
-        num_tokens,
-        BLOCK_S=block_size,
-        BLOCK_N=block_N,
-        BLOCK_D=head_dim,
-        num_warps=4,
-        num_stages=2,
-    )
-    return value_sum.to(value_physical.dtype)
-
-
-@triton.jit
 def _triton_assign_kernel_paged(
     K, block_ids,           # K: [block_num, block_size, num_heads, head_dim]
     X, S, C, M, N,          # centroids, data_sum, data_cnt, max_idx, num_tokens
@@ -490,7 +316,6 @@ def _triton_k_means_train_paged(
 
 def segment_k_means_paged(
     key: torch.Tensor,          # [block_num, block_size, num_heads, head_dim]
-    value: torch.Tensor,          # [block_num, block_size, num_heads, head_dim]
     block_ids: torch.Tensor,    # [num_logical_blocks]
     num_tokens: int,
     num_centroids: int,
@@ -501,14 +326,12 @@ def segment_k_means_paged(
     """
     Args:
         key:        full contiguous key block pool of vllm
-        value:      full contiguous value block pool of vllm
         block_ids:  indices of the selected blocks
     Returns:
         centroids:      [num_heads, num_centroids, head_dim] centroid of each cluster
         max_idx:        [num_heads, num_tokens] centroid each token belongs to
         clusters:       [num_heads, num_centroids, max_cluster_size] tokens each cluster contains
         cluster_size:   [num_heads, num_centroids] num tokens of each cluster
-        value_sum:      [num_heads, num_centroids, head_dim] sum of value of each cluster and head
     """
 
     block_num, block_size_phy, num_heads, head_dim = key.shape
@@ -582,6 +405,4 @@ def segment_k_means_paged(
 
     clusters, cluster_size = triton_reverse_index(max_idx, num_centroids, max_cluster_size)
 
-    value_sum = triton_index_add_paged(value, block_ids, max_idx, num_centroids, block_size)
-
-    return centroids, max_idx, clusters, cluster_size, value_sum
+    return centroids, max_idx, clusters, cluster_size

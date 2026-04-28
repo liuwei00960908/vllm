@@ -278,10 +278,7 @@ class ModelRunnerOutput:
     sparse_new_block_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
     # req_id -> layer_name -> np.ndarray[feature_dim]
-    # Mean V feature of the block written during this decode step.
-    # TODO(estimation-zone): Used for value_sum accumulation.
-    # When the Estimation Zone is enabled, the model runner should also
-    # populate this field alongside sparse_new_block_features.
+    # Reserved value feature payload; unused by the compact token path.
     sparse_new_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
     # req_id -> (layer##kv{i}) -> K-Means metadata dict (CPU numpy), optional.
@@ -293,9 +290,7 @@ class ModelRunnerOutput:
     ) = None
 
     # req_id -> layer_name -> np.ndarray[num_blocks, feature_dim]
-    # Mean V feature per block; emitted after prefill alongside
-    # sparse_block_features.
-    # TODO(estimation-zone): populate from model runner for Estimation Zone.
+    # Reserved value feature payload; unused by the compact token path.
     sparse_block_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
 

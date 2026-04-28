@@ -1,83 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-SparseKVManager – RetroInfer-style dynamic sparse attention (block or token units).
+Token-granularity sparse KV manager for the compact gather path.
 
-When ``SparseAttentionSpec.cluster_granularity == "token"``, clustering and
-Top-K run on **per-token** key features; selected tokens are mapped to the
-minimal set of logical KV blocks for paging.  FlashAttention still reads all
-slots inside each loaded block (no per-token mask in the kernel yet), so FLOPs
-per loaded block are unchanged; only **which** blocks are resident changes.
-
-Algorithm (block-granularity default; token mode uses the same pipeline on rows)
---------------------------------------------------------------------------------
-
-Prefill
-  1. Model runner extracts **block-level key features** per attention layer
-     (same ``SparseAttentionSpec`` group): ``layer → [num_blocks, D]`` mean K
-     per block (tokens and KV-heads averaged within the layer).  Query vectors
-     are likewise **per layer** (mean Q per layer).  A legacy path still accepts
-     a single ``[num_blocks, D]`` / ``[D]`` array (treated as one synthetic
-     layer ``__flat__``).
-
-  2. ``indexing(req_id, block_features, mean_value_features)``
-     - For **each layer** independently: mean-center that layer's block
-       features, run **Segment K-Means**, restore centroids, accumulate value
-       sums.  Cluster ids and centroids are not shared across layers.
-
-  3. ``select(req_id, query_vec, ...)`` runs TopK **independently per layer**:
-     each layer gets ``steady_zone ∪ retrieve_zone`` capped by
-     ``max_selected_blocks`` using **that layer's** cluster scores only.
-     The **union** of all per-layer logical indices is stored for
-     ``allocate_new_blocks`` so every layer's chosen history blocks are
-     resident in GPU memory; the model runner builds a **per-layer** sparse
-     block table so each forward only attends within that layer's subset.
-
-Decode
-  - When ``SparseAttentionSpec.refresh_topk_each_decode`` is True (default),
-    each step's query vector re-runs TopK against the current cluster index
-    (same as prefill), always merging the steady zone
-    (``static_pattern_start`` / ``static_pattern_end``).
-  - When ``refresh_topk_each_decode`` is False, the cached prefill TopK
-    selection can be reused until a dynamic index update invalidates it.
-  - ``rebalance(req_id, new_block_feature, new_block_value_feature)`` tracks
-    newly written decode blocks.  After ``update_threshold_blocks`` new blocks
-    accumulate, a fresh Segment K-Means is run on them and new centroids are
-    appended (mirroring RetroInfer's ``_update_kv_cache``).  The prefill TopK
-    cache is then invalidated and re-computed.
-
-Block allocation (per decode step)
-  - ``remove_skipped_blocks`` – no-op (deferred to allocate_new_blocks).
-  - ``get_num_blocks_to_allocate`` – returns ``max(|selected|+1 − |old|, 0)``.
-  - ``allocate_new_blocks`` – frees all old blocks, allocates ``|selected|+1``
-    fresh GPU slots (the +1 is for the current decode token).
-
-Steady Zone
-  - First ``n_sink_blocks`` blocks (attention sinks) and last ``n_recent_blocks``
-    blocks (local window) are **always** included in the selection regardless
-    of cluster scores.
-
-TODO(estimation-zone)
----------------------
-The Estimation Zone from RetroInfer is NOT implemented yet.  The required
-pieces are already stored:
-
-  ``_cluster_value_sum[req_id]``  → ``[n_clusters, D]``
-      sum of block mean-V vectors for each cluster.
-  ``_cluster_size[req_id]``       → ``[n_clusters]`` int
-      number of blocks in each cluster.
-
-To enable the Estimation Zone:
-  1. In ``select()``: after choosing the top-nprobe retrieve clusters, pick
-     the next ``estimation_zone_size`` clusters as the estimation set.
-     Return their centroid and value_sum to the model runner via
-     ``ModelRunnerOutput.sparse_estimation_zone``.
-  2. In the attention kernel: compute
-       ``est_output = softmax(q · C_est^T / sqrt(d)) × (V_sum_est / size_est)``
-     using only the centroid as K-representative and the mean V.
-  3. Merge with retrieve zone flash-attention output via log-sum-exp (lse).
-  4. Add ``estimation_zone_size: int`` to ``SparseAttentionSpec`` and wire
-     ``max_compute_cluster_num = nprobe + estimation_zone_size``.
+The active sparse path clusters per-token key features, selects token indices
+per query-head group, maps those tokens back to logical KV blocks for
+allocation, and lets the model runner build the compact q-head gather used by
+FlashAttention.
 """
 
 from __future__ import annotations
@@ -165,18 +94,18 @@ def _empty_feats() -> np.ndarray:
 
 def _grow_feats(buf: np.ndarray, size: int, row: np.ndarray
                 ) -> tuple[np.ndarray, int]:
-    """Append one ``[D]`` row to a ``[capacity, D]`` buffer, growing 2× when full.
+    """Append one ``[D]`` row to a ``[capacity, D]`` buffer, growing 2x when full.
 
     Returns ``(buf, size)`` where ``buf[:size]`` is the valid slice.  Decode
     rebalance calls this once per step; geometric growth keeps amortised cost
-    O(1) instead of O(N) per append (``np.concatenate``) – the previous
+    O(1) instead of O(N) per append (``np.concatenate``) -the previous
     implementation re-copied every layer's full ``[N_prompt, D]`` buffer per
-    decode step (~1.4 GB of memcpy per step for 112 KV heads × 24k tokens).
+    decode step (~1.4 GB of memcpy per step for 112 KV heads x 24k tokens).
     """
     row_2d = np.asarray(row, dtype=np.float32).reshape(-1)
     d = int(row_2d.shape[0])
     if buf.ndim != 2 or buf.shape[1] != d:
-        # Reinitialise with a small capacity – only happens if the state was
+        # Reinitialise with a small capacity -only happens if the state was
         # constructed from an empty placeholder.
         capacity = 16
         new_buf = np.empty((capacity, d), dtype=np.float32)
@@ -195,7 +124,7 @@ def _grow_feats(buf: np.ndarray, size: int, row: np.ndarray
 
 def _grow_b2c(buf: np.ndarray, size: int, value: int
               ) -> tuple[np.ndarray, int]:
-    """Append a single int to a growable int32 buffer (2× geometric growth)."""
+    """Append a single int to a growable int32 buffer (2x geometric growth)."""
     capacity = int(buf.shape[0]) if buf.ndim == 1 else 0
     if size < capacity:
         buf[size] = np.int32(value)
@@ -215,10 +144,10 @@ class _SparseLayerIndexState:
     ndarray-backed with preallocated capacity and ``*_size`` cursors so
     decode-step appends are amortised O(1).  The old implementation stored
     one ``[D]`` row per token as a Python list of small ``np.ndarray``
-    objects plus a parallel ``list[int]`` – that triggered millions of
-    per-element allocations inside ``indexing()`` (~7–8 s per prompt for
-    N≈24 k × 112 KV units) and concat-on-append turned decode ``rebalance``
-    into an O(N²) copy loop.  Consolidated ndarray + cursor growth collapses
+    objects plus a parallel ``list[int]`` -that triggered millions of
+    per-element allocations inside ``indexing()`` (~7- s per prompt for
+    N~4 k x 112 KV units) and concat-on-append turned decode ``rebalance``
+    into an O(N^2) copy loop.  Consolidated ndarray + cursor growth collapses
     both paths to single large allocations.
 
     Public attribute surface (``all_block_features``, ``all_value_features``,
@@ -228,7 +157,6 @@ class _SparseLayerIndexState:
 
     __slots__ = (
         "cluster_centres",
-        "cluster_value_sum",
         "cluster_size",
         "_b2c_buf",
         "_b2c_size",
@@ -244,7 +172,6 @@ class _SparseLayerIndexState:
     def __init__(
         self,
         cluster_centres: np.ndarray,
-        cluster_value_sum: np.ndarray,
         cluster_size: np.ndarray,
         block_to_cluster: np.ndarray | None = None,
         all_block_features: np.ndarray | None = None,
@@ -252,7 +179,6 @@ class _SparseLayerIndexState:
         mean_key: np.ndarray | None = None,
     ) -> None:
         self.cluster_centres = cluster_centres
-        self.cluster_value_sum = cluster_value_sum
         self.cluster_size = cluster_size
 
         b2c = _empty_b2c() if block_to_cluster is None else np.asarray(
@@ -346,7 +272,7 @@ class _SparseLayerIndexState:
         Only touches ``_b2c_buf`` because that is the single row-aligned
         buffer whose *content* is read on the hot path (by
         ``_retrieve_zone_one_layer``).  ``all_block_features`` and
-        ``all_value_features`` store no downstream-readable content – see
+        ``all_value_features`` store no downstream-readable content -see
         ``set_prefill_with_capacity`` below for the cheaper lazy path used on
         those two.
         """
@@ -366,7 +292,7 @@ class _SparseLayerIndexState:
         prefill content.
 
         The logical size is set to ``n_rows`` but the first ``n_rows`` rows of
-        the buffer hold uninitialised memory – every caller of
+        the buffer hold uninitialised memory -every caller of
         ``all_block_features`` in production touches it only via ``len(...)``
         (``_num_index_units`` / ``_dynamic_update_layer`` / idempotence
         guard).  This avoids the ~1.4 GB of useless memcpy that
@@ -404,7 +330,7 @@ def _kmeans_dot(
 
     Dot product on centered data is equivalent to minimising the sum of
     squared distances (L2-KMeans), which is the correct distance for
-    attention-score cluster selection (RetroInfer §3).
+    attention-score cluster selection.
 
     Args:
         features: ``[N, D]`` float32, **already mean-centered**.
@@ -414,7 +340,7 @@ def _kmeans_dot(
 
     Returns:
         centres: ``[k, D]`` float32.
-        labels:  ``[N]`` int32 – cluster assignment per point.
+        labels:  ``[N]`` int32 -cluster assignment per point.
     """
     N, D = features.shape
     k = min(k, N)
@@ -427,7 +353,7 @@ def _kmeans_dot(
 
     labels = np.zeros(N, dtype=np.int32)
     for _ in range(n_iter):
-        # Maximise dot product ↔ assign to nearest centre after centering.
+        # Maximise dot product ->assign to nearest centre after centering.
         sims = feat @ centres.T          # [N, k]
         labels = np.argmax(sims, axis=1).astype(np.int32)
 
@@ -461,17 +387,17 @@ def _segment_kmeans(
     centroids are returned in the centered space.
 
     Args:
-        features:   ``[N, D]`` float32 – mean-centered block key features.
+        features:   ``[N, D]`` float32 -mean-centered block key features.
         n_clusters: Target total centroids (distributed as evenly as possible).
         n_segments: Number of position segments.
         n_iter:     K-Means iterations per segment.
         seed:       Base RNG seed (each segment gets ``seed + seg``).
 
     Returns:
-        centres:  ``[total_k, D]`` float32 – all segment centroids stacked.
-        labels:   ``[N]`` int32 – global cluster id per block (0-indexed,
+        centres:  ``[total_k, D]`` float32 -all segment centroids stacked.
+        labels:   ``[N]`` int32 -global cluster id per block (0-indexed,
                   contiguous across segments).
-        sizes:    ``[total_k]`` int32 – number of blocks per cluster.
+        sizes:    ``[total_k]`` int32 -number of blocks per cluster.
     """
     N, D = features.shape
     if N == 0:
@@ -525,22 +451,19 @@ def _segment_kmeans(
 
 class SparseKVManager(FullAttentionManager):
     """
-    ``SingleTypeKVCacheManager`` implementing RetroInfer-style sparse attention
-    adapted for vLLM's paged block layout.
-
-    See module docstring for the full algorithm description.
+    Sparse cache manager for token-granularity compact gather.
 
     Per-request CPU state
     ---------------------
-    ``_layer_states``         ``layer_name → _SparseLayerIndexState`` – per-layer
+    ``_layer_states``         ``layer_name ->_SparseLayerIndexState`` -per-layer
                               centroids, ``block_to_cluster``, feature lists,
                               and decode buffers for dynamic K-Means updates.
-    ``_pending_query``        ``layer_name → [D]`` – last Q vectors per layer.
-    ``_selected_block_indices`` list[int] – **union** of per-layer logical blocks
+    ``_pending_query``        ``layer_name ->[D]`` -last Q vectors per layer.
+    ``_selected_block_indices`` list[int] -**union** of per-layer logical blocks
                               for the next decode step (for physical allocation).
-    ``_selected_block_indices_by_layer`` ``layer → list[int]`` – per-layer
+    ``_selected_block_indices_by_layer`` ``layer ->list[int]`` -per-layer
                               capped selection used by the model runner.
-    ``_prefill_topk_ready``   bool – whether per-layer prefill TopK cache is valid.
+    ``_prefill_topk_ready``   bool -whether per-layer prefill TopK cache is valid.
     ``_prefill_selected``     cached **union** selection (compat / allocation).
     ``_prefill_selected_by_layer`` cached per-layer selection after prefill.
     """
@@ -563,13 +486,18 @@ class SparseKVManager(FullAttentionManager):
             pcp_world_size,
         )
         assert isinstance(kv_cache_spec, SparseAttentionSpec)
+        if (
+            kv_cache_spec.cluster_granularity != "token"
+            or not kv_cache_spec.use_compact_kv_gather
+        ):
+            raise ValueError(
+                "SparseKVManager currently supports only "
+                "cluster_granularity='token' with use_compact_kv_gather=True."
+            )
         self._spec: SparseAttentionSpec = kv_cache_spec
 
-        # ── per-request, per-attention-layer clustering (CPU state; prefill
-        #    K-Means may run on GPU in the model runner) ───────────────────
         self._layer_states: dict[str, dict[str, _SparseLayerIndexState]] = {}
 
-        # ── selection state ───────────────────────────────────────────────
         self._pending_query: dict[str, dict[str, np.ndarray]] = {}
         self._selected_block_indices: dict[str, list[int]] = {}
         self._selected_block_indices_by_layer: dict[str, dict[str, list[int]]] = {}
@@ -604,7 +532,6 @@ class SparseKVManager(FullAttentionManager):
         # One-shot sparse probe per request to avoid log spam.
         self._first_select_probe_done: set[str] = set()
 
-        # ── physical block tracking (Bug 1 fix) ──────────────────────────
         # _prefill_blocks[req_id]: permanent list of all physical blocks
         # allocated during prefill (indexed by logical block index 0..N-1).
         # Never freed until the request is fully freed.
@@ -752,7 +679,6 @@ class SparseKVManager(FullAttentionManager):
                 request_id, num_tokens, num_tokens_main_model
             )
 
-        # ── Decode ────────────────────────────────────────────────────────
         # Key principle (Bug 1 fix): we NEVER free historical blocks during
         # decode so their KV data stays selectable. This includes prefill
         # blocks and finalized decode blocks from previous steps.
@@ -762,7 +688,7 @@ class SparseKVManager(FullAttentionManager):
         if request_id not in self._prefill_blocks:
             self._prefill_blocks[request_id] = list(req_blocks)
 
-        # Map selected logical indices → physical historical blocks.
+        # Map selected logical indices ->physical historical blocks.
         # The history list contains original prefill blocks followed by
         # finalized decode blocks in chronological order.
         prefill_blocks = self._prefill_blocks[request_id]
@@ -941,29 +867,18 @@ class SparseKVManager(FullAttentionManager):
         return self._layer_states.setdefault(request_id, {})
 
     def _token_mode(self) -> bool:
-        return self._spec.cluster_granularity == "token"
+        return True
 
     def delegates_token_selection_to_runner(self) -> bool:
-        """Whether decode token selection is owned by the GPU runner.
-
-        In token mode with compact KV gather, the runner builds per-query-head
-        token selections directly from GPU-resident Q vectors and centroids.
-        The scheduler side should therefore avoid a second CPU TopK/steady-zone
-        pass and keep allocation metadata full-attention-like.
-        """
-        return self._token_mode() and bool(self._spec.use_compact_kv_gather)
+        """GPUModelRunner owns token TopK and compact q-head gather."""
+        return True
 
     def _num_index_units(self, request_id: str) -> int:
-        """Number of clustered rows (blocks or tokens) for this request."""
+        """Number of token rows for this request."""
         ls = self._layer_states.get(request_id, {})
         if not ls:
             return 0
         base_units = len(next(iter(ls.values())).all_block_features)
-        if not self._token_mode():
-            return base_units
-        # Token mode must expose decode history tokens too (not only prefill
-        # indexed rows), otherwise tail/static windows miss the newest decode
-        # tokens and selection lags behind by recent tokens.
         p_count = int(self._prefill_token_count.get(request_id, base_units))
         bsz = int(self.block_size)
         prefill_blocks = self._prefill_blocks.get(request_id, [])
@@ -1001,12 +916,12 @@ class SparseKVManager(FullAttentionManager):
 
         Vectorised to eliminate the per-token Python dispatch: called once per
         ``(select, query-head)`` with a budget-sized token set (~128-512 items)
-        across 784 query heads per decode step – the original ``for g in ...``
+        across 784 query heads per decode step -the original ``for g in ...``
         loop dominated ``sparse_update_query_vectors_ms``.
 
         Fast path: when ``token_indices`` is already a numpy ndarray (the
         common case from the batched select path), use ``np.asarray`` which
-        is a bulk view / dtype-copy – no per-element Python iteration.
+        is a bulk view / dtype-copy -no per-element Python iteration.
         ``np.fromiter`` is reserved for list/set inputs where bulk copy is
         not possible.
         """
@@ -1124,9 +1039,9 @@ class SparseKVManager(FullAttentionManager):
               ``scores_c[b2c[bidx]]`` for the corresponding ``bidx``.
 
         Downstream (``_select_one_layer_topk_*``) consumes these directly as
-        ndarrays – avoiding the old ``set[int]`` / ``dict[int, float]``
+        ndarrays -avoiding the old ``set[int]`` / ``dict[int, float]``
         materialisation that forced per-element Python boxing at ~19 M
-        elements/decode (784 q-heads × 24 k tokens).
+        elements/decode (784 q-heads x 24 k tokens).
         """
         centres = st.cluster_centres
         b2c = st.block_to_cluster
@@ -1168,8 +1083,8 @@ class SparseKVManager(FullAttentionManager):
 
         ``steady_np`` is the caller-hoisted sorted ndarray form of
         ``steady_set`` (same contents); both are accepted so that per-layer
-        ndarray ops can skip the set→ndarray conversion that would otherwise
-        fire per q-head (784× per decode step).
+        ndarray ops can skip the set-> ndarray conversion that would otherwise
+        fire per q-head (784x per decode step).
 
         Returns:
             (sorted full selection, sorted retrieve-only logical block indices).
@@ -1198,7 +1113,7 @@ class SparseKVManager(FullAttentionManager):
             cap = max(0, budget - int(steady_np.size))
             if cap > 0 and non_steady.size > cap:
                 # Stable argsort on descending scores: deterministic tie-break
-                # (smaller block index wins on equal score) – a valid refinement
+                # (smaller block index wins on equal score) -a valid refinement
                 # of the original ``sorted(retr - steady, key=score, reverse=True)``
                 # which iterated a Python set (non-deterministic order).
                 order = np.argsort(-ns_scores, kind="stable")[:cap]
@@ -1256,7 +1171,7 @@ class SparseKVManager(FullAttentionManager):
             cap = max(0, budget - int(steady_np.size))
             if cap > 0 and non_steady.size > cap:
                 # Stable argsort on descending scores: deterministic tie-break
-                # (smaller token index wins on equal score) – a valid refinement
+                # (smaller token index wins on equal score) -a valid refinement
                 # of the original ``sorted(retr - steady, key=score, reverse=True)``
                 # which iterated a Python set (non-deterministic order).
                 order = np.argsort(-ns_scores, kind="stable")[:cap]
@@ -1284,7 +1199,7 @@ class SparseKVManager(FullAttentionManager):
         ``queries`` is a stacked ``[G, D]`` float32 array.  Batching replaces
         G independent ``q @ centres.T`` matmuls, G ``argpartition`` calls, and
         G ``np.isin`` scans with a single matmul, one batched argpartition,
-        and one fancy-index into a ``[G, N]`` mask – same arithmetic, far
+        and one fancy-index into a ``[G, N]`` mask -same arithmetic, far
         less Python / numpy dispatch overhead.
 
         Returns ``(sel_bl_list, retr_bl_list, sel_t_list)``, each length G.
@@ -1293,7 +1208,7 @@ class SparseKVManager(FullAttentionManager):
         centres = st.cluster_centres
         b2c = st.block_to_cluster
 
-        # Fallback: no cluster info → every q head shares the same tail window.
+        # Fallback: no cluster info ->every q head shares the same tail window.
         if len(centres) == 0 or b2c.size == 0:
             fallback = np.arange(
                 max(0, n_units - budget), n_units, dtype=np.int64
@@ -1322,7 +1237,7 @@ class SparseKVManager(FullAttentionManager):
         nprobe = min(self._spec.nprobe, n_k)
 
         # Batched top-nprobe per row.  ``argpartition`` picks the top nprobe
-        # unsorted per-row – we only need membership to build the cluster
+        # unsorted per-row -we only need membership to build the cluster
         # mask, so sorted order is irrelevant here.
         top_ids_all = np.argpartition(
             scores_all, -nprobe, axis=-1
@@ -1333,7 +1248,7 @@ class SparseKVManager(FullAttentionManager):
         cluster_mask = np.zeros((G, n_k), dtype=bool)
         np.put_along_axis(cluster_mask, top_ids_all, True, axis=-1)
 
-        # retrieve_mask_all[g, t] = cluster_mask[g, b2c[t]] – one fancy-index
+        # retrieve_mask_all[g, t] = cluster_mask[g, b2c[t]] -one fancy-index
         # on the column axis yields the full [G, N] retrieve mask.  Replaces
         # the per-q ``np.isin(b2c, top_cluster_ids_g)`` scan.
         retrieve_mask_all = cluster_mask[:, b2c]  # [G, N] bool
@@ -1345,7 +1260,7 @@ class SparseKVManager(FullAttentionManager):
         cap_base = max(0, budget - steady_size)
 
         # Precompute request-level bookkeeping once (avoids ``self.*.get(...)``
-        # dict lookups inside ``_tokens_to_history_logical_blocks`` × 2 × G =
+        # dict lookups inside ``_tokens_to_history_logical_blocks`` x 2 x G =
         # 14 calls per group, ~1.5k per step).
         p_count = self._prefill_token_count.get(request_id)
         bsz = int(self.block_size)
@@ -1419,7 +1334,7 @@ class SparseKVManager(FullAttentionManager):
                     combined_t = np.sort(
                         np.concatenate([steady_np, non_steady])
                     )
-                # ``retr_t_np = retr_np \ steady_np`` – already sorted.
+                # ``retr_t_np = retr_np \ steady_np`` -already sorted.
                 retr_t_np = retr_np[non_steady_mask]
             sel_bl_list.append(_to_logical(combined_t))
             retr_bl_list.append(_to_logical(retr_t_np))
@@ -1465,7 +1380,7 @@ class SparseKVManager(FullAttentionManager):
             steady_tokens.update(
                 range(max(0, n_units - self._spec.static_pattern_end), n_units)
             )
-            # Hoist the set→ndarray conversion out of the per-q_head loop so
+            # Hoist the set-> ndarray conversion out of the per-q_head loop so
             # all 784 calls into ``_select_one_layer_topk_tokens`` share it.
             steady_tokens_np = np.fromiter(
                 steady_tokens, dtype=np.int64, count=len(steady_tokens)
@@ -1493,7 +1408,7 @@ class SparseKVManager(FullAttentionManager):
                 if num_kv == 0:
                     continue
                 num_q = max(qh for qh, _ in qh_list) + 1 if qh_list else 1
-                # Group q_heads by the kv_head they map to – all q_heads in
+                # Group q_heads by the kv_head they map to -all q_heads in
                 # the same group share the same ``st`` (centres + b2c) so we
                 # can do one batched matmul/mask per group instead of G
                 # independent per-q ops.
@@ -1711,24 +1626,6 @@ class SparseKVManager(FullAttentionManager):
             )
             centres = centres + mean_key
             n_k = len(centres)
-        if block_value_features is not None:
-            vfeat = block_value_features.astype(np.float32)
-            # ``np.add.at`` is needed because multiple tokens share a cluster id;
-            # plain ``value_sum[labels_arr] += vfeat`` would only keep the last
-            # write per duplicate index.  When vfeat is all zeros (fallback
-            # path below), the scatter-add reduces to zero-plus-zero, so skip
-            # the scan entirely.
-            value_sum = np.zeros((n_k, d), dtype=np.float32)
-            np.add.at(value_sum, labels_arr, vfeat)
-            all_value = vfeat
-        else:
-            # Skip the ``np.zeros_like(feat)`` allocation + the ``np.add.at``
-            # scan over ``[N_prompt, D]`` zeros.  For token-mode prefill with
-            # N=24640 × D=128 × 112 KV units this was ~1.4 GB of zero-fill +
-            # ~350 M futile scatter-adds per indexing() call (several seconds).
-            value_sum = np.zeros((n_k, d), dtype=np.float32)
-            all_value = _empty_feats()
-
         # ``labels_arr`` is already int32/int64 from either the precomputed
         # path or _segment_kmeans; cast to a stable int32 so downstream
         # vectorisation (``np.isin(b2c, ...)``) doesn't fall into a mixed-dtype
@@ -1736,18 +1633,17 @@ class SparseKVManager(FullAttentionManager):
         b2c_arr = np.ascontiguousarray(labels_arr, dtype=np.int32)
 
         # Reserve decode headroom so the first rebalance after prefill doesn't
-        # trigger an N→2N grow memcpy across every KV unit (~1.4 GB / step
+        # trigger an N->N grow memcpy across every KV unit (~1.4 GB / step
         # across 112 heads for N=24640).  Size is capped so worst-case extra
         # memory is bounded even for very long prompts.
         reserve = min(max(num_blocks // 4, 1024), 4096)
 
         state = _SparseLayerIndexState(
             cluster_centres=centres,
-            cluster_value_sum=value_sum,
             cluster_size=sizes,
             block_to_cluster=b2c_arr,
             # DO NOT pass ``all_block_features=feat`` / ``all_value_features=vfeat``
-            # here: copying N_prompt × D × 4 B per KV unit (×112 heads) costs
+            # here: copying N_prompt x D x 4 B per KV unit (x112 heads) costs
             # ~1.4 GB of memcpy during prefill and has no downstream value
             # since the content of these two ndarrays is never read in
             # production code (only ``len(...)`` is consumed).  We allocate an
@@ -1758,11 +1654,6 @@ class SparseKVManager(FullAttentionManager):
         )
         state.reserve_capacity(reserve)
         state.set_prefill_block_feature_shape(num_blocks, d, reserve)
-        # ``all_value_features`` storage is only meaningful when the caller
-        # passed ``block_value_features``.  In the (common) ``None`` case we
-        # leave it as the empty placeholder so ``append_value_feature`` takes
-        # the reinit branch at its first call — same observable ``len`` growth
-        # as before with zero cost at indexing time.
         if block_value_features is not None:
             state.set_prefill_value_feature_shape(num_blocks, d, reserve)
         self._layer_map_for_request(request_id)[layer_name] = state
@@ -1779,9 +1670,8 @@ class SparseKVManager(FullAttentionManager):
         """
         Build per-layer cluster indices from prefill features.
 
-        ``block_features`` may be a single matrix (legacy) or per-layer dict.
-        Row count is ``num_blocks`` when ``cluster_granularity == "block"``, or
-        ``num_prompt_tokens`` when ``cluster_granularity == "token"``.
+        ``block_features`` may be a single token-feature matrix or a per-layer
+        token-feature dict.
 
         If ``prefill_cluster_meta`` provides per-layer centroids and labels
         (e.g. from GPU K-Means in the model runner), CPU K-Means is skipped
@@ -1800,7 +1690,7 @@ class SparseKVManager(FullAttentionManager):
             )
         num_blocks = next(iter(n_per_layer.values()))
         if num_blocks == 0:
-            logger.debug("sparse indexing: req %s has 0 blocks – skipped", request_id)
+            logger.debug("sparse indexing: req %s has 0 blocks -skipped", request_id)
             return
 
         # Idempotence guard: if the request was already indexed with the same
@@ -1808,7 +1698,7 @@ class SparseKVManager(FullAttentionManager):
         # the worker accidentally re-emits ``sparse_block_features`` (see
         # ``_sparse_prefill_emitted`` guard in gpu_model_runner).  Rebuilding
         # from scratch costs O(num_blocks * num_layers) Python allocations
-        # (~7s for a 24k-token prompt × 112 KV units).
+        # (~7s for a 24k-token prompt x 112 KV units).
         existing_ls = self._layer_states.get(request_id)
         if existing_ls:
             any_state = next(iter(existing_ls.values()), None)
@@ -1820,7 +1710,7 @@ class SparseKVManager(FullAttentionManager):
                 and len(any_state.all_block_features) == num_blocks
             ):
                 logger.debug(
-                    "sparse indexing: req %s already indexed at %d units – "
+                    "sparse indexing: req %s already indexed at %d units -"
                     "skipping idempotent rebuild",
                     request_id,
                     num_blocks,
@@ -1856,7 +1746,7 @@ class SparseKVManager(FullAttentionManager):
         )
 
         logger.debug(
-            "sparse indexing: req %s – %d blocks × %d layers → %d total clusters "
+            "sparse indexing: req %s -%d blocks x %d layers ->%d total clusters "
             "(%d segments/layer)",
             request_id,
             num_blocks,
@@ -1886,8 +1776,7 @@ class SparseKVManager(FullAttentionManager):
         """
         Choose logical block indices for the next decode step.
 
-        ``num_blocks`` is the per-layer selection budget: logical **blocks** in
-        block mode, **tokens** when ``cluster_granularity == "token"``.
+        ``num_blocks`` is the per-layer token selection budget.
 
         When ``ignore_prefill_topk_cache`` is True, any valid prefill TopK
         cache is skipped and selection uses ``query_vector`` (decode path
@@ -2123,7 +2012,7 @@ class SparseKVManager(FullAttentionManager):
         Store per-layer query vectors for the next ``select()`` call.
 
         ``query_vec`` may be a single ``[D]`` vector (broadcast to all indexed
-        layers) or ``layer_name → [D]``.
+        layers) or ``layer_name ->[D]``.
         """
         q_by_qh = self._coerce_query_by_qh(request_id, query_vec)
         self._pending_query[request_id] = q_by_qh
@@ -2159,7 +2048,7 @@ class SparseKVManager(FullAttentionManager):
         """
         Absorb a new decode block into **each** layer's sparse index.
 
-        Pass a dict ``layer_name → [D]`` for layer-specific mean-K (and V), or
+        Pass a dict ``layer_name ->[D]`` for layer-specific mean-K (and V), or
         a single vector to broadcast to every indexed layer (legacy).
         """
         ls = self._layer_states.get(request_id, {})
@@ -2241,8 +2130,8 @@ class SparseKVManager(FullAttentionManager):
         )
         # Amortised O(1) append into the preallocated history buffers (see
         # ``_grow_feats``/``_grow_b2c``).  Previous ``np.concatenate`` per
-        # decode step cost ~1.4 GB/step of memcpy across 112 KV heads ×
-        # ``[N_prompt, D]`` buffers – showed up as +570 ms/step in the
+        # decode step cost ~1.4 GB/step of memcpy across 112 KV heads x
+        # ``[N_prompt, D]`` buffers -showed up as +570 ms/step in the
         # ``sparse_post_decode_rebalance_ms`` trace.
         st.append_block_feature(feat)
         st.append_value_feature(vfeat)
@@ -2284,7 +2173,7 @@ class SparseKVManager(FullAttentionManager):
             prefill_topk_ready=self._prefill_topk_ready.get(request_id),
         )
         logger.debug(
-            "sparse prefill TopK: req %s – cached %d layers, %d union blocks",
+            "sparse prefill TopK: req %s -cached %d layers, %d union blocks",
             request_id,
             len(sel_bl),
             len(union_sel),
@@ -2319,18 +2208,15 @@ class SparseKVManager(FullAttentionManager):
         centres_new = centres_new + mean_key_new
 
         n_k_new = len(centres_new)
-        vsum_new = np.zeros((n_k_new, d), dtype=np.float32)
-        np.add.at(vsum_new, labels_new, vfeat)
 
         n_existing = len(st.cluster_centres)
         st.cluster_centres = np.vstack([st.cluster_centres, centres_new])
-        st.cluster_value_sum = np.vstack([st.cluster_value_sum, vsum_new])
         st.cluster_size = np.concatenate([st.cluster_size, sizes_new])
 
         # labels_new indexes the fresh sub-clusters; remap to the global
         # cluster-id space (after ``n_existing``) and write into block_to_cluster.
         # ``write_b2c_range`` handles both in-place overwrite and capacity
-        # growth – in the common case (decode ``rebalance`` appends one row
+        # growth -in the common case (decode ``rebalance`` appends one row
         # per step so ``len(b2c) == n_total``) all ``m`` positions fall into
         # the in-place overwrite branch (O(m) scalar write, no memcpy of the
         # full buffer).
@@ -2356,7 +2242,7 @@ class SparseKVManager(FullAttentionManager):
         )
 
         logger.debug(
-            "sparse dynamic update: req %s layer=%s – added %d clusters "
+            "sparse dynamic update: req %s layer=%s -added %d clusters "
             "(total %d for layer), prefill TopK invalidated",
             request_id,
             layer_name,
