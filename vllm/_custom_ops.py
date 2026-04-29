@@ -3489,3 +3489,36 @@ if hasattr(torch.ops._C, "hadacore_transform"):
     @register_fake("_C::hadacore_transform")
     def _hadacore_transform_fake(x: torch.Tensor, inplace: bool) -> torch.Tensor:
         return torch.empty_like(x) if not inplace else x
+
+
+def build_sparse_block_table(
+    top_clusters: torch.Tensor,
+    cluster_block_ids: torch.Tensor,
+    cluster_sizes: torch.Tensor,
+    block_storage: torch.Tensor,
+    free_block_ids: torch.Tensor,
+    max_bt_len: int,
+):
+    return torch.ops._C.build_sparse_block_table(
+        top_clusters, cluster_block_ids, cluster_sizes,
+        block_storage, free_block_ids, max_bt_len,
+    )
+
+def append_kv_to_clusters(
+    block_storage: torch.Tensor,
+    cluster_block_ids: torch.Tensor,
+    cluster_sizes: torch.Tensor,
+    free_block_ids: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    label: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.append_kv_to_clusters(
+        block_storage,
+        cluster_block_ids,
+        cluster_sizes,
+        free_block_ids,
+        key,
+        value,
+        label,
+    )

@@ -88,6 +88,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
+import torch
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -96,6 +97,7 @@ from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import KVCacheSpec, SparseAttentionSpec
 from vllm.v1.request import Request
+from vllm.v1.core.sparse_kv_utils import kvprof_start, kvprof_end
 
 if TYPE_CHECKING:
     pass
@@ -416,7 +418,9 @@ class SparseKVManager(FullAttentionManager):
         num_required_blocks = cdiv(max(0, num_new_token - self._spec.num_kv_heads * self._spec.num_clusters), 
                                    cluster_block_size) + self._spec.num_kv_heads * self._spec.num_clusters
         num_required_blocks = num_required_blocks * self._spec.num_layer
-        num_required_blocks += self._spec.num_clusters
+
+        # free blocks for forward
+        num_required_blocks += self._spec.num_layer * self._spec.num_kv_heads * self._spec.num_clusters
 
         unused_blocks_id_list = self._req_to_unused_cluster_blocks_id.setdefault(req_id, [])
         num_required_blocks -= len(unused_blocks_id_list)
@@ -435,9 +439,9 @@ class SparseKVManager(FullAttentionManager):
     def generate_cluster_block_info(self, req_id, num_new_token):
         info = dict()
 
-        info["allocated_block_ids"] = self._req_to_unused_cluster_blocks_id.setdefault(req_id, [])
+        info["allocated_block_ids"] = torch.tensor(self._req_to_unused_cluster_blocks_id.setdefault(req_id, []), dtype=torch.int32)
+        info["used_count"] = torch.zeros(size=(1,), dtype=torch.int32)
         info["cluster_block_size"] = self._get_cluster_block_size()
-        info["used_count"] = 0
         info["num_cluster"] = self._spec.num_clusters
         info["num_segment"] = self._spec.n_segment
         info["nprobe"] = self._spec.nprobe
@@ -649,6 +653,11 @@ class SparseKVManager(FullAttentionManager):
         )
 
     def free(self, request_id: str) -> None:
+        if request_id in self._req_to_cluster_blocks:
+            self.block_pool.free_blocks(self._req_to_cluster_blocks[request_id])
+            self._req_to_cluster_blocks.pop(request_id)
+            self._req_to_unused_cluster_blocks_id.pop(request_id)
+
         # Free non-selected prefill blocks that are no longer referenced by
         # req_to_blocks (they were "held" to preserve KV data but not picked
         # by the latest selection round).

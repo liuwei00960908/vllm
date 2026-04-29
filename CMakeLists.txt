@@ -303,7 +303,11 @@ set(VLLM_EXT_SRC
   "csrc/quantization/activation_kernels.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
-  "csrc/torch_bindings.cpp")
+  "csrc/torch_bindings.cpp"
+  "csrc/sparse_attention/sparse_block_table_kernel.cu"
+  "csrc/sparse_attention/sparse_block_table_ops.cpp"
+  "csrc/sparse_attention/sparse_cluster_kernel.cu"
+  "csrc/sparse_attention/sparse_cluster_ops.cpp")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")

@@ -23,7 +23,7 @@ def main():
                 "cluster_granularity": "token",
                 "num_clusters": 16,
                 "n_segment": 1,
-                "nprobe": 64,
+                "nprobe": 16,
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,
@@ -39,7 +39,7 @@ def main():
             block_size=16, 
             enforce_eager=True,
             gpu_memory_utilization=0.5,
-            async_scheduling=True,
+            async_scheduling=False,
         )
 
     # ====================== 2. 初始化引擎（server启动时做的事） ======================

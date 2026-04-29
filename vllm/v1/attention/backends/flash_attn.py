@@ -27,7 +27,8 @@ from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 from vllm.v1.core.sparse_kmeans_torch import prefill_cluster_meta_from_features_torch_batched
-from vllm.v1.core.sparse_kv_utils import BlockContainer, Clusters
+from vllm.v1.core.sparse_kv_utils import SparseManagerMetadata, kvprof_start, kvprof_end
+from vllm._custom_ops import build_sparse_block_table, append_kv_to_clusters
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -251,10 +252,10 @@ class FlashAttentionMetadata:
 
     # All layers share the same cluster_allocated_block_info
     cluster_allocated_block_info: list[dict[str, object]] | None = None
-    # Each layer has its own cluster_base_vector_info
-    # req_index -> head -> Clusters
-    cluster_base_info: list[list[Clusters]] | None = None
-    extra_cluster_info: dict[str, object] = field(default_factory=dict)
+    # Each layer has its own sparse_manager_metadata
+    # req_index -> SparseManagerMetadata
+    sparse_manager_metadata: list[SparseManagerMetadata] | None = None
+    extra_sparse_manager_info: dict[str, object] = field(default_factory=dict)
 
 
 def _get_sliding_window_configs(
@@ -765,90 +766,105 @@ class FlashAttentionImpl(AttentionImpl):
                     else None
                 )
                 use_sparse_cluster = (
-                    len(attn_metadata.cluster_base_info[0]) != 0 and
-                    query.shape[0] == 1
+                    attn_metadata.sparse_manager_metadata[0].mean is not None
                 )
                 if use_sparse_cluster:
+                    # TODO: there may be several request concurrently
                     cluster_storage = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4])
                     req_index = 0
-
+                    smm = attn_metadata.sparse_manager_metadata[0]
                     cluster_allocated_block_info = attn_metadata.cluster_allocated_block_info[req_index][0]
-                    num_head = len(attn_metadata.cluster_base_info[req_index])
-                    cluster_block_size = cluster_storage.shape[2]
-                    head_group_size = query.shape[1] // num_head
-                    for h in range(num_head):
-                        cluster_base_info = attn_metadata.cluster_base_info[req_index][h]
-                        q_centered = query[:num_actual_tokens, h*head_group_size:(h+1)*head_group_size, :] - cluster_base_info.mean
-                        scores_c = torch.matmul(
-                            q_centered.to(dtype=torch.float32), cluster_base_info.cluster_centers.transpose(0, 1)
+                
+                    is_prefill = smm.in_cluster_token_count == query.shape[0]
+                    if is_prefill:
+                        flash_attn_varlen_func(
+                            q=query[:num_actual_tokens],
+                            k=key,
+                            v=value,
+                            out=output[:num_actual_tokens],
+                            cu_seqlens_q=cu_seqlens_q,
+                            max_seqlen_q=max_seqlen_q,
+                            cu_seqlens_k=cu_seqlens_q,
+                            max_seqlen_k=max_seqlen_k,
+                            softmax_scale=self.scale,
+                            causal=attn_metadata.causal,
+                            alibi_slopes=self.alibi_slopes,
+                            window_size=sliding_window_size,
+                            block_table=None,
+                            softcap=self.logits_soft_cap,
+                            scheduler_metadata=scheduler_metadata,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=q_descale,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                            num_splits=attn_metadata.max_num_splits,
+                            s_aux=self.sinks,
                         )
-                        nprobe = min(attn_metadata.extra_cluster_info["nprobe"], 
-                                        attn_metadata.cluster_base_info[req_index][h].cluster_centers.shape[0])
-                        top_clusters = torch.topk(scores_c, k=nprobe, dim=-1).indices.to(dtype=torch.int)
+                        return output
+                    
+                    Hkv = smm.mean.shape[0]
+                    cluster_block_size = cluster_storage.shape[2]
+                    Nq = num_actual_tokens
+                    Hq = query.shape[1]
+                    head_group_size = Hq // Hkv
+                    maxB = 128
+                    nprobe = attn_metadata.extra_sparse_manager_info["nprobe"]
+                    dim = query.shape[-1]
 
-                        for i in range(top_clusters.shape[0]):
-                            for j in range(top_clusters.shape[1]):
-                                temp_block = -1
-                                temp_block_usage = cluster_block_size
-                                temp_block_count = 0
+                    if smm.in_cluster_token_count < smm.cluster_centers_T.shape[2]:
+                        cluster_centers_T = smm.cluster_centers_T[:, :, :smm.in_cluster_token_count]
+                    else:
+                        cluster_centers_T = smm.cluster_centers_T
+                    nprobe = min(nprobe, cluster_centers_T.shape[2])
+                    query_centered = query.reshape(Nq, Hkv, head_group_size, dim) - smm.mean[None, :, None]
+                    score = torch.matmul(query_centered, cluster_centers_T[None])
+                    score = score.reshape(Nq, Hq, -1)
+                    top_clusters = torch.topk(score, k=nprobe, dim=-1).indices.to(dtype=torch.int32)
+                    cluster_block_ids = smm.cluster_block_ids
+                    cluster_sizes = smm.cluster_sizes
+                    free_block_ids = cluster_allocated_block_info["allocated_block_ids_gpu"]
+                    used_count = cluster_allocated_block_info["used_count_gpu"]
+                    free_block_ids = free_block_ids[used_count:]
+                    
+                    block_table, valid_block_size, seqused_k, free_block_used = build_sparse_block_table(
+                        top_clusters, cluster_block_ids,
+                        cluster_sizes, cluster_storage, 
+                        free_block_ids, maxB
+                    )
 
-                                block_ids = []
-                                total_token_size = 0
-                                for k in range(top_clusters.shape[2]):
-                                    cluster_id = top_clusters[i, j, k].item()
-                                    cluster_blocks = cluster_base_info.cluster_blocks[cluster_id]
-                                    
-                                    size = cluster_blocks.size
-                                    total_token_size += size
-                                    if size % cluster_block_size == 0:
-                                        block_ids.extend(cluster_blocks.block_ids)
-                                    else:
-                                        block_ids.extend(cluster_blocks.block_ids[:-1])
-
-                                        remain = size - cluster_block_size * (len(cluster_blocks.block_ids) - 1)
-                                        target_block = cluster_blocks.block_ids[-1]
-                                        while remain > 0:
-                                            if temp_block_usage == cluster_block_size:
-                                                if temp_block != -1:
-                                                    block_ids.append(temp_block)
-                                                
-                                                temp_block = self._get_one_allocated_cluster_block(cluster_allocated_block_info)
-                                                temp_block_usage = 0
-                                                temp_block_count += 1
-                                            
-                                            take = min(cluster_block_size - temp_block_usage, remain)
-                                            cluster_storage[:, temp_block, temp_block_usage:temp_block_usage+take, :] = \
-                                                cluster_storage[:, target_block, 0:take, :]
-                                            temp_block_usage += take
-                                            remain -= take
-                                if temp_block != -1:
-                                    block_ids.append(temp_block)
-
-                                flash_attn_varlen_func(
-                                    q=query[i, h*head_group_size+j][None, None, :],
-                                    k=cluster_storage[0, :, :, None, :],
-                                    v=cluster_storage[1, :, :, None, :],
-                                    out=output[i, h*head_group_size+j][None, None, :],
-                                    cu_seqlens_q=torch.tensor([0, 1], device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype),
-                                    max_seqlen_q=1,
-                                    seqused_k=torch.tensor([total_token_size], device=seqused_k.device, dtype=seqused_k.dtype),
-                                    max_seqlen_k=total_token_size,
-                                    softmax_scale=self.scale,
-                                    causal=attn_metadata.causal,
-                                    alibi_slopes=self.alibi_slopes,
-                                    window_size=sliding_window_size,
-                                    block_table=torch.tensor(block_ids, device=block_table.device, dtype=block_table.dtype)[None, :],
-                                    softcap=self.logits_soft_cap,
-                                    scheduler_metadata=None,
-                                    fa_version=self.vllm_flash_attn_version,
-                                    q_descale=q_descale,
-                                    k_descale=k_descale,
-                                    v_descale=v_descale,
-                                    num_splits=attn_metadata.max_num_splits,
-                                    s_aux=self.sinks,
-                                )
-
-                                self._free_temp_cluster_block(cluster_allocated_block_info, temp_block_count)
+                    N = Nq * Hq
+                    device = query.device
+                    q_flat = query.reshape(N, 1, -1)
+                    out_flat = output.reshape(N, 1, -1)
+                    seqused_k_flat = seqused_k.reshape(N)
+                    block_table_flat = block_table.reshape(N, -1)
+                    cu_seqlens_q_batch = torch.arange(
+                        N + 1, device=device, dtype=cu_seqlens_q.dtype,
+                    )
+                    
+                    flash_attn_varlen_func(
+                        q=q_flat,
+                        k=cluster_storage[0, :, :, None, :],
+                        v=cluster_storage[1, :, :, None, :],
+                        out=out_flat,
+                        cu_seqlens_q=cu_seqlens_q_batch,
+                        max_seqlen_q=1,
+                        seqused_k=seqused_k_flat,
+                        max_seqlen_k=maxB * cluster_block_size,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=block_table_flat,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=None,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
 
                     return output
 
@@ -1234,16 +1250,6 @@ class FlashAttentionImpl(AttentionImpl):
     def clear_attn_metadata_for_update(self) -> None:
         self.attn_metadata_for_update = None
 
-    def _get_one_allocated_cluster_block(self, cluster_allocated_block_info):
-        used_count = cluster_allocated_block_info["used_count"]
-        block_id = cluster_allocated_block_info["allocated_block_ids"][used_count]
-        cluster_allocated_block_info["used_count"] = used_count + 1
-        return block_id
-    
-    def _free_temp_cluster_block(self, cluster_allocated_block_info, temp_block_count):
-        cluster_allocated_block_info["used_count"] -= temp_block_count
-        return None
-
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -1262,81 +1268,64 @@ class FlashAttentionImpl(AttentionImpl):
             # TODO: there may exist several kv_manager
             assert(len(attn_metadata.cluster_allocated_block_info[req_index]) == 1)
             # TODO: there may exist several segment
-            assert(attn_metadata.extra_cluster_info["num_segment"] == 1)
+            assert(attn_metadata.extra_sparse_manager_info["num_segment"] == 1)
             use_sparse_cluster = (
                 attn_metadata.cluster_allocated_block_info[req_index][0] is not None
             )
         
         if use_sparse_cluster:
-            def append_to_cluster(block_container: BlockContainer, token_ids: torch.Tensor, head: int):
-                cluster_storage = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4])
-                cluster_allocated_block_info = attn_metadata.cluster_allocated_block_info[req_index][0]
-                cluster_block_size = cluster_allocated_block_info["cluster_block_size"]
-                
-                if block_container.size % cluster_block_size == 0:
-                    start = cluster_block_size
-                else:
-                    start = block_container.size % cluster_block_size
-                remain = token_ids.shape[0]
-                total = token_ids.shape[0]
-                while remain > 0: 
-                    if start == cluster_block_size:
-                        target_block_id = self._get_one_allocated_cluster_block(cluster_allocated_block_info)
-                        
-                        block_container.block_ids.append(target_block_id)
-                        start = 0
-                    else:
-                        target_block_id = block_container.block_ids[-1]
-                    take = min(cluster_block_size - start, remain)
-
-                    this_time_take_token_ids = token_ids[total - remain: total - remain + take] 
-                    cluster_storage[0, target_block_id, start:start+take, :] = key[this_time_take_token_ids, head, :]
-                    cluster_storage[1, target_block_id, start:start+take, :] = value[this_time_take_token_ids, head, :]
-                    
-                    block_container.size += take
-                    start += take
-                    remain -= take
-
-            is_prefill = len(attn_metadata.cluster_base_info[req_index]) == 0
-            cluster_base_info = attn_metadata.cluster_base_info[req_index]
-            num_head = key.shape[1]
+            free_blocks_info = attn_metadata.cluster_allocated_block_info[req_index][0]
+            smm = attn_metadata.sparse_manager_metadata[req_index]
+            is_prefill = smm.mean is None
+            Hkv = key.shape[1]
+            C = attn_metadata.extra_sparse_manager_info["num_cluster"]
+            dim = key.shape[-1]
+            cluster_storage = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4])
             if is_prefill:
+                device = key.device
+                smm.cluster_centers_T = torch.zeros(size=(Hkv, dim, C), dtype=key.dtype, device=device)
+                smm.mean = torch.zeros(size=(Hkv, dim), dtype=key.dtype, device=device)
+                smm.cluster_block_ids = torch.full(fill_value=-1, size=(Hkv, C, SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT),
+                                                   dtype=torch.int32, device=device)
+                smm.cluster_sizes = torch.zeros(size=(Hkv, C),
+                                                dtype=torch.int32, device=device)
+                smm.in_cluster_token_count = 0
+                
                 res = prefill_cluster_meta_from_features_torch_batched(
                     key.transpose(0, 1),
-                    attn_metadata.extra_cluster_info["num_cluster"],
-                    attn_metadata.extra_cluster_info["num_segment"],
+                    C,
+                    attn_metadata.extra_sparse_manager_info["num_segment"],
                     granularity = "token"
                 )
-                for h in range(num_head):
-                    cluster_centers = res["cluster_centres"][h]
-                    mean_key = res["mean_key"][h]
-                    block_container_list = [BlockContainer(block_ids=[], size=0) 
-                                            for _ in range(attn_metadata.extra_cluster_info["num_cluster"])]
-                    cluster_base_info.append(Clusters(cluster_blocks=block_container_list,
-                        cluster_centers=cluster_centers, mean=mean_key))
-                    block_container_list = cluster_base_info[h].cluster_blocks
-                    token_to_cluster = res["token_to_cluster"][h]
-                    for cluster_id in range(attn_metadata.extra_cluster_info["num_cluster"]):
-                        token_ids = torch.where(token_to_cluster==cluster_id)[0]
-                        append_to_cluster(block_container_list[cluster_id], token_ids, h)
+                labels = res["token_to_cluster"].transpose_(-1, -2).to(dtype=torch.int32).contiguous()
+
+                valid_len = res["cluster_centres"].shape[1]
+                smm.cluster_centers_T[:, :, :valid_len] = res["cluster_centres"].transpose(1, 2)
+                smm.mean = res["mean_key"].to(dtype=key.dtype)
             else:
                 # For decode, we assume there is only one new token
                 assert(key.shape[0] == 1)
-                for h in range(num_head):
-                    if cluster_base_info[h].cluster_centers.shape[0] < attn_metadata.extra_cluster_info["num_cluster"]:
-                        cluster_base_info[h].cluster_centers = torch.cat([cluster_base_info[h].cluster_centers, key[0, h:h+1, :]], dim=0)
-                        cluster_id = cluster_base_info[h].cluster_centers.shape[0] - 1
-                    else:
-                        mean = cluster_base_info[h].mean
-                        key_centered = key[0, h, :] - mean
-                        cluster_id = torch.argmax(
-                            torch.matmul(cluster_base_info[h].cluster_centers, key_centered)
-                        ).item()
-                    append_to_cluster(cluster_base_info[h].cluster_blocks[cluster_id], torch.tensor([0], dtype=torch.int, device=key.device), h)
-            
-            # Currently, we reuse the conservational path to calculate attention output
-            # when prefill. This can be removed later.
-            # return
+                smm = attn_metadata.sparse_manager_metadata[req_index]
+                if smm.in_cluster_token_count < smm.cluster_sizes.shape[-1]:
+                    labels = torch.full(fill_value=smm.in_cluster_token_count, size=key.shape[:2], dtype=torch.int32, device=key.device)
+                    smm.cluster_centers_T[:, :, smm.in_cluster_token_count] = key[0]
+                else:
+                    score = torch.matmul((key - smm.mean[None])[:, :, None], smm.cluster_centers_T[None])
+                    labels = score.argmax(dim=-1).to(dtype=torch.int32)[:, :, 0]
+
+            used_free_blocks = append_kv_to_clusters(
+                cluster_storage,
+                smm.cluster_block_ids,
+                smm.cluster_sizes,
+                free_blocks_info["allocated_block_ids_gpu"][free_blocks_info["used_count_gpu"]:],
+                key.contiguous(),
+                value.contiguous(),
+                labels
+            )
+            free_blocks_info["used_count_gpu"].add_(used_free_blocks)
+            smm.in_cluster_token_count += key.shape[0]
+
+            return
 
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,

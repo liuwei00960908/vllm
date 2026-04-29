@@ -142,7 +142,7 @@ from vllm.v1.core.sparse_kv_cache_manager import (
     sparse_kv_unit_key,
     sparse_qh_unit_key,
 )
-from vllm.v1.core.sparse_kv_utils import Clusters
+from vllm.v1.core.sparse_kv_utils import SparseManagerMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -994,14 +994,9 @@ class GPUModelRunner(
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
 
-        # head_id -> Clusters
-        HeadItem: TypeAlias = list[Clusters]
-        # layer_name -> HeadItem
-        LayerItem: TypeAlias = dict[str, HeadItem]
-        # req_id -> LayerItem
-        SparseClusterInfo: TypeAlias = dict[str, LayerItem]
-
-        self._sparse_cluster_info: SparseClusterInfo = {}
+        # req_id -> layer_name -> SparseManagerMetadata
+        SparseManagerInfo: TypeAlias = dict[str, dict[str, SparseManagerMetadata]]
+        self._sparse_cluster_info: SparseManagerInfo = {}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -2941,36 +2936,41 @@ class GPUModelRunner(
             nprobe = None
             for ri in range(num_reqs):
                 rid = self.input_batch.req_ids[ri]
+                assert(len(cluster_info[rid]) == 1)
                 if cluster_info[rid][0] is None:
                     continue
+                this_cluster_info = cluster_info[rid][0]
+
+                if num_cluster is None:
+                    num_cluster = this_cluster_info["num_cluster"]
+                    num_segment = this_cluster_info["num_segment"]
+                    nprobe = this_cluster_info["nprobe"]
+                else:
+                    assert num_cluster == this_cluster_info["num_cluster"]
+                    assert num_segment == this_cluster_info["num_segment"]
+                    assert nprobe == this_cluster_info["nprobe"]
+                
+                this_cluster_info["allocated_block_ids_gpu"] = this_cluster_info["allocated_block_ids"].to(device=self.device)
+                this_cluster_info["used_count_gpu"] = this_cluster_info["used_count"].to(self.device)
 
                 cluster_info_list.append(cluster_info[rid])
-                assert(len(cluster_info[rid]) == 1)
-                if num_cluster is None:
-                    num_cluster = cluster_info[rid][0]["num_cluster"]
-                    num_segment = cluster_info[rid][0]["num_segment"]
-                    nprobe = cluster_info[rid][0]["nprobe"]
-                else:
-                    assert num_cluster == cluster_info[rid][0]["num_cluster"]
-                    assert num_segment == cluster_info[rid][0]["num_segment"]
-                    assert nprobe == cluster_info[rid][0]["nprobe"]
-            
+
             for layer_name, layer_attn in attn_metadata.items():
                 if not isinstance(layer_attn, FlashAttentionMetadata):
                     continue
 
-                layer_attn.extra_cluster_info["req_id_list"] = self.input_batch.req_ids
-                layer_attn.extra_cluster_info["layer_name"] = layer_name
-                layer_attn.extra_cluster_info["num_cluster"] = num_cluster
-                layer_attn.extra_cluster_info["num_segment"] = num_segment
-                layer_attn.extra_cluster_info["nprobe"] = nprobe    
+                layer_attn.extra_sparse_manager_info["req_id_list"] = self.input_batch.req_ids
+                layer_attn.extra_sparse_manager_info["layer_name"] = layer_name
+                layer_attn.extra_sparse_manager_info["num_cluster"] = num_cluster
+                layer_attn.extra_sparse_manager_info["num_segment"] = num_segment
+                layer_attn.extra_sparse_manager_info["nprobe"] = nprobe    
                 layer_attn.cluster_allocated_block_info = cluster_info_list
-                layer_attn.cluster_base_info = []
+                layer_attn.sparse_manager_metadata = []
                 for ri in range(num_reqs):
                     rid = self.input_batch.req_ids[ri]
 
-                    cluster_base_info = self._sparse_cluster_info.setdefault(rid, {}).setdefault(layer_name, [])
-                    layer_attn.cluster_base_info.append(cluster_base_info)
+                    sparse_manager_metadata = self._sparse_cluster_info.setdefault(rid, {}).setdefault(layer_name, SparseManagerMetadata())
+                    layer_attn.sparse_manager_metadata.append(sparse_manager_metadata)
 
         return attn_metadata, spec_decode_common_attn_metadata
 
@@ -4968,6 +4968,7 @@ class GPUModelRunner(
                     logger.error("RoutedExpertsCapturer not initialized.")
 
             # ── Sparse KV attention features ──────────────────────────────
+            '''
             _t0_sparse_collect = (
                 time.perf_counter() if self._sparse_perf_stats_enabled else None
             )
@@ -4991,8 +4992,12 @@ class GPUModelRunner(
                 )
             # Clear per-step Q captures to free GPU memory references.
             self._sparse_q_captures.clear()
-            self._sparse_perf_flush_if_needed()
-
+            self._sparse_perf_flush_if_needed()'''
+            sparse_block_features = None
+            sparse_query_vectors = None
+            sparse_new_block_features = None
+            sparse_prefill_cluster_meta = None
+            
             cluster_info = self._collect_sparse_cluster_info(scheduler_output)
             # ──────────────────────────────────────────────────────────────
 
@@ -9001,7 +9006,7 @@ class GPUModelRunner(
                     cluster_info_dst.append(None)
                 else:
                     cluster_info_dst.append({
-                    "used_count": cluster_info_src[i]["used_count"]
+                    "used_count": cluster_info_src[i]["used_count_gpu"].cpu().item()
                 })
         return res
 
