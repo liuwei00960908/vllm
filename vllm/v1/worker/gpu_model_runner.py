@@ -7363,7 +7363,7 @@ class GPUModelRunner(
         """
 
         if not self._has_sparse_attn:
-            return None, None
+            return None
 
         sparse_groups = [
             (gid, grp)
@@ -7371,7 +7371,7 @@ class GPUModelRunner(
             if isinstance(grp.kv_cache_spec, SparseAttentionSpec)
         ]
         if not sparse_groups:
-            return None, None
+            return None
 
         sparse_prefill_cluster_meta_gpu: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
 
