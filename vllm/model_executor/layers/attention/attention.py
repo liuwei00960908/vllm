@@ -525,7 +525,8 @@ class Attention(nn.Module, AttentionLayerBase):
         # Sliding-window layers are left as-is (sparse + sliding-window is
         # not yet supported).
         sparse_cfg = getattr(vllm_config.cache_config, "sparse_attention", None)
-        if sparse_cfg is not None and self.sliding_window is None:
+        # Hardcode off: keep sparse_attention dict on CacheConfig but use FullAttentionSpec.
+        if False and sparse_cfg is not None and self.sliding_window is None:
             _cg = str(sparse_cfg.get("cluster_granularity", "block"))
             if _cg not in ("block", "token"):
                 raise ValueError(

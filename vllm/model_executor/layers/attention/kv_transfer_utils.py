@@ -41,13 +41,19 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
         layer_name: str = args[layer_name_index]
 
         # Extract attention context (metadata, layer, kv_cache, layer_slot_mapping)
-        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
+        attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+        runtime_q_head_gather = getattr(
+            self, "_vllm_sparse_runtime_q_head_gather", None
+        )
+        selected_tokens = None
+        if runtime_q_head_gather:
+            selected_tokens = runtime_q_head_gather["per_req_selected_ids"]
         connector = get_kv_transfer_group()
         if attn_metadata is None or not connector.has_connector_metadata():
             return func(*args, **kwargs)
 
         # Wait for KV layer on entry
-        connector.wait_for_layer_load(layer_name)
+        connector.wait_for_layer_load(layer_name, selected_tokens)
 
         # Execute the function
         result = func(*args, **kwargs)

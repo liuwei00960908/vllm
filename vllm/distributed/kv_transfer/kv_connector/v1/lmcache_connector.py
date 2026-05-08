@@ -150,7 +150,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
-    def wait_for_layer_load(self, layer_name: str) -> None:
+    def wait_for_layer_load(self, layer_name: str, selected_tokens: list[torch.Tensor]) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
         paged buffer. This is called from within attention layer to ensure
@@ -161,7 +161,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
-        self._lmcache_engine.wait_for_layer_load(layer_name)
+        self._lmcache_engine.wait_for_layer_load(layer_name, selected_tokens)
 
     def save_kv_layer(
         self,
