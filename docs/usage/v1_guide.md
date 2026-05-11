@@ -76,6 +76,11 @@ For each item, its support in vLLM V1 falls into one of the following states:
     prefix caching, and speculative decoding without a strict separation between prefill
     and decode phases.
 
+For a contributor-oriented walkthrough of how **LMCache (`KVConnectorV1`)**, **layerwise KV
+transfer**, **token-granularity sparse attention**, and **`--enforce-eager`** flow through the
+scheduler and GPU model runner, see
+[V1：LMCache / token 稀疏 / eager 下的 Prefill 与 Decode 流程](../design/v1_prefill_decode_lmcache_sparse_eager.md).
+
 The V1 scheduler supports multiple scheduling policies, including First-Come,
 First-Served (FCFS) and priority-based scheduling (where requests are processed
 based on assigned priority, with FCFS as a tie-breaker), configurable via the

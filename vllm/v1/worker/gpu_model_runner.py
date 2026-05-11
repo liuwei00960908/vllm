@@ -7303,11 +7303,16 @@ class GPUModelRunner(
                 spec=spec,
                 budget_override=select_budget,
             )
+            if pending_count > 0:
+                dec = torch.arange(
+                    prompt_len, prompt_len + pending_count,
+                    device=selected_ids.device, dtype=torch.int64,
+                ).unsqueeze(0).expand(selected_ids.size(0), -1)
+                selected_ids = torch.cat([selected_ids, dec], dim=1)
+                actual_kv_len += pending_count
             per_req_selected_ids.append(selected_ids)
             per_req_actual_kv_len.append(actual_kv_len)
 
-            # TODO: construct static zone by appending all decode tokens
-            # pending_count = int(seq_len) - int(p_count)
             # TODO: construct estimation zone by appending all unselected clusters' centroids
         logger.info(f"[_build_sparse_runtime_q_head_gather] Layer {layer_name}: select top-k for {num_reqs} requests costs {(time.perf_counter() - start_t) * 1000}ms")
 
