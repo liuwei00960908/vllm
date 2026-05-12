@@ -1,3 +1,6 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 import vllm
 print(vllm.__file__)
 
@@ -6,6 +9,8 @@ import torch
 
 def main():
     USE_SPARSE_ATTENTION = True
+    context_length = 200
+    block_size = 16
 
     # ====================== 1. 引擎配置（和server端完全一致） ======================
     if USE_SPARSE_ATTENTION:
@@ -14,8 +19,8 @@ def main():
             model="Qwen/Qwen2-0.5B-Instruct",
             tensor_parallel_size=1,
             dtype="bfloat16",
-            max_model_len=2048,
-            block_size=16, 
+            max_model_len=context_length,
+            block_size=block_size, 
             enforce_eager=True,
             gpu_memory_utilization=0.5,
             async_scheduling=False,
@@ -35,8 +40,8 @@ def main():
             model="Qwen/Qwen2-0.5B-Instruct",
             tensor_parallel_size=1,
             dtype="bfloat16",
-            max_model_len=2048,
-            block_size=16, 
+            max_model_len=context_length,
+            block_size=block_size, 
             enforce_eager=True,
             gpu_memory_utilization=0.5,
             async_scheduling=False,
@@ -49,9 +54,9 @@ def main():
 
     # ====================== 3. 硬编码请求（模拟server收到HTTP请求） ======================
     request_id = "debug_req_001"  # 字符串类型，和你之前问的一致
-    prompt = "你好，请介绍一下vLLM是什么？"
+    prompt = "说一下世界形式，能说多长说多长，不要少于2万字"
     sampling_params = SamplingParams(
-        max_tokens=200,  # 生成20个token，足够看完整流程
+        max_tokens=context_length,  # 生成20个token，足够看完整流程
         temperature=0.0,  # 固定输出，方便调试
         top_p=1.0,
     )

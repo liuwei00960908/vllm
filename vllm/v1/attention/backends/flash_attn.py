@@ -766,6 +766,7 @@ class FlashAttentionImpl(AttentionImpl):
                     else None
                 )
                 use_sparse_cluster = (
+                    len(attn_metadata.sparse_manager_metadata) > 0 and
                     attn_metadata.sparse_manager_metadata[0].mean is not None
                 )
                 if use_sparse_cluster:
@@ -807,7 +808,7 @@ class FlashAttentionImpl(AttentionImpl):
                     Nq = num_actual_tokens
                     Hq = query.shape[1]
                     head_group_size = Hq // Hkv
-                    maxB = 128
+                    maxB = block_table.shape[-1]
                     nprobe = attn_metadata.extra_sparse_manager_info["nprobe"]
                     dim = query.shape[-1]
 
@@ -820,17 +821,13 @@ class FlashAttentionImpl(AttentionImpl):
                     score = torch.matmul(query_centered, cluster_centers_T[None])
                     score = score.reshape(Nq, Hq, -1)
                     top_clusters = torch.topk(score, k=nprobe, dim=-1).indices.to(dtype=torch.int32)
-                    cluster_block_ids = smm.cluster_block_ids
-                    cluster_sizes = smm.cluster_sizes
                     free_block_ids = cluster_allocated_block_info["allocated_block_ids_gpu"]
                     used_count = cluster_allocated_block_info["used_count_gpu"]
                     free_block_ids = free_block_ids[used_count:]
-                    
+
                     block_table, valid_block_size, seqused_k, free_block_used = build_sparse_block_table(
-                        top_clusters, cluster_block_ids,
-                        cluster_sizes, cluster_storage, 
-                        free_block_ids, maxB
-                    )
+                        top_clusters, smm.cluster_compact_block_ids, smm.cluster_temp_kv_pos, 
+                        smm.cluster_total_kv_counts, smm.temp_block_ids, cluster_storage, free_block_ids, maxB)
 
                     N = Nq * Hq
                     device = query.device
@@ -866,6 +863,32 @@ class FlashAttentionImpl(AttentionImpl):
                         s_aux=self.sinks,
                     )
 
+                    return output
+
+                else:
+                    flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
                     return output
 
                 use_q_head_gather = (
@@ -1281,13 +1304,15 @@ class FlashAttentionImpl(AttentionImpl):
             C = attn_metadata.extra_sparse_manager_info["num_cluster"]
             dim = key.shape[-1]
             cluster_storage = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4])
+            cluster_block_size = cluster_storage.shape[-2]
             if is_prefill:
                 device = key.device
                 smm.cluster_centers_T = torch.zeros(size=(Hkv, dim, C), dtype=key.dtype, device=device)
                 smm.mean = torch.zeros(size=(Hkv, dim), dtype=key.dtype, device=device)
-                smm.cluster_block_ids = torch.full(fill_value=-1, size=(Hkv, C, SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT),
+                smm.cluster_compact_block_ids = torch.full(fill_value=-1, size=(Hkv, C, SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT),
                                                    dtype=torch.int32, device=device)
-                smm.cluster_sizes = torch.zeros(size=(Hkv, C),
+                smm.cluster_temp_kv_pos = torch.zeros(size=(Hkv, C, cluster_block_size, 2), dtype=torch.int32, device=device)
+                smm.cluster_total_kv_counts = torch.zeros(size=(Hkv, C),
                                                 dtype=torch.int32, device=device)
                 smm.in_cluster_token_count = 0
                 
@@ -1306,7 +1331,7 @@ class FlashAttentionImpl(AttentionImpl):
                 # For decode, we assume there is only one new token
                 assert(key.shape[0] == 1)
                 smm = attn_metadata.sparse_manager_metadata[req_index]
-                if smm.in_cluster_token_count < smm.cluster_sizes.shape[-1]:
+                if smm.in_cluster_token_count < smm.cluster_centers_T.shape[-1]:
                     labels = torch.full(fill_value=smm.in_cluster_token_count, size=key.shape[:2], dtype=torch.int32, device=key.device)
                     smm.cluster_centers_T[:, :, smm.in_cluster_token_count] = key[0]
                 else:
@@ -1315,8 +1340,12 @@ class FlashAttentionImpl(AttentionImpl):
 
             used_free_blocks = append_kv_to_clusters(
                 cluster_storage,
-                smm.cluster_block_ids,
-                smm.cluster_sizes,
+                smm.cluster_compact_block_ids,
+                smm.cluster_temp_kv_pos,
+                smm.cluster_total_kv_counts,
+                smm.temp_block_ids,
+                smm.temp_block_kv_counts,
+                smm.temp_block_kv_owner,
                 free_blocks_info["allocated_block_ids_gpu"][free_blocks_info["used_count_gpu"]:],
                 key.contiguous(),
                 value.contiguous(),

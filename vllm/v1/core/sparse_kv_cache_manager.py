@@ -445,6 +445,7 @@ class SparseKVManager(FullAttentionManager):
         info["num_cluster"] = self._spec.num_clusters
         info["num_segment"] = self._spec.n_segment
         info["nprobe"] = self._spec.nprobe
+        info["num_kv_heads"] = self._spec.num_kv_heads
         
         return info
 

@@ -142,7 +142,7 @@ from vllm.v1.core.sparse_kv_cache_manager import (
     sparse_kv_unit_key,
     sparse_qh_unit_key,
 )
-from vllm.v1.core.sparse_kv_utils import SparseManagerMetadata
+from vllm.v1.core.sparse_kv_utils import RequestSparseClusterInfo, SparseManagerMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -994,9 +994,8 @@ class GPUModelRunner(
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
 
-        # req_id -> layer_name -> SparseManagerMetadata
-        SparseManagerInfo: TypeAlias = dict[str, dict[str, SparseManagerMetadata]]
-        self._sparse_cluster_info: SparseManagerInfo = {}
+        # req_id -> RequestSparseClusterInfo
+        self._sparse_cluster_info: dict[str, RequestSparseClusterInfo] = {}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -2930,10 +2929,13 @@ class GPUModelRunner(
         
         # currently not support list
         if isinstance(attn_metadata, dict) and cluster_info is not None:
+            assert(num_reqs == 1)
             cluster_info_list = []
             num_cluster = None
             num_segment = None
+            num_kv_heads = None
             nprobe = None
+            cluster_block_size = None
             for ri in range(num_reqs):
                 rid = self.input_batch.req_ids[ri]
                 assert(len(cluster_info[rid]) == 1)
@@ -2944,11 +2946,15 @@ class GPUModelRunner(
                 if num_cluster is None:
                     num_cluster = this_cluster_info["num_cluster"]
                     num_segment = this_cluster_info["num_segment"]
+                    num_kv_heads = this_cluster_info["num_kv_heads"]
                     nprobe = this_cluster_info["nprobe"]
+                    cluster_block_size = this_cluster_info["cluster_block_size"]
                 else:
                     assert num_cluster == this_cluster_info["num_cluster"]
                     assert num_segment == this_cluster_info["num_segment"]
+                    assert num_kv_heads == this_cluster_info["num_kv_heads"]
                     assert nprobe == this_cluster_info["nprobe"]
+                    assert cluster_block_size == this_cluster_info["cluster_block_size"]
                 
                 this_cluster_info["allocated_block_ids_gpu"] = this_cluster_info["allocated_block_ids"].to(device=self.device)
                 this_cluster_info["used_count_gpu"] = this_cluster_info["used_count"].to(self.device)
@@ -2963,14 +2969,30 @@ class GPUModelRunner(
                 layer_attn.extra_sparse_manager_info["layer_name"] = layer_name
                 layer_attn.extra_sparse_manager_info["num_cluster"] = num_cluster
                 layer_attn.extra_sparse_manager_info["num_segment"] = num_segment
-                layer_attn.extra_sparse_manager_info["nprobe"] = nprobe    
+                layer_attn.extra_sparse_manager_info["nprobe"] = nprobe
+                layer_attn.extra_sparse_manager_info["cluster_block_size"] = cluster_block_size    
+                
                 layer_attn.cluster_allocated_block_info = cluster_info_list
                 layer_attn.sparse_manager_metadata = []
+                assert num_reqs == 1
                 for ri in range(num_reqs):
                     rid = self.input_batch.req_ids[ri]
+                    if cluster_info[rid][0] is None:
+                        continue
 
-                    sparse_manager_metadata = self._sparse_cluster_info.setdefault(rid, {}).setdefault(layer_name, SparseManagerMetadata())
-                    layer_attn.sparse_manager_metadata.append(sparse_manager_metadata)
+                    req_sparse_info = self._sparse_cluster_info.setdefault(rid, RequestSparseClusterInfo())
+                    smm = req_sparse_info.layers.setdefault(layer_name, 
+                        SparseManagerMetadata())
+                    if smm.temp_block_ids is None:
+                        max_temp_blocks_count = (num_kv_heads * num_cluster + 1) * (cluster_block_size - 1) // cluster_block_size
+                        allocated_block_ids_gpu = cluster_info_list[0][0]["allocated_block_ids_gpu"]
+                        used_count_gpu = cluster_info_list[0][0]["used_count_gpu"]
+                        smm.temp_block_ids = allocated_block_ids_gpu[used_count_gpu:used_count_gpu + max_temp_blocks_count]
+                        used_count_gpu.add_(max_temp_blocks_count)
+                        smm.temp_block_kv_counts = torch.zeros(size=(1,), dtype=torch.int32, device=self.device)
+                        smm.temp_block_kv_owner = torch.zeros(size=(max_temp_blocks_count * cluster_block_size, 2), dtype=torch.int32, device = self.device)
+
+                    layer_attn.sparse_manager_metadata.append(smm)
 
         return attn_metadata, spec_decode_common_attn_metadata
 

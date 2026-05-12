@@ -1,20 +1,29 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar
 import torch
 
 @dataclass
 class SparseManagerMetadata:
+    temp_block_ids: torch.Tensor | None = None              # [max_temp_blocks]
+    temp_block_kv_counts: torch.Tensor | None = None        # [1]
+    temp_block_kv_owner: torch.Tensor | None = None         # [max_temp_blocks * cluster_block_size, 2]
+
     # currently unused
     steady_zone_head: torch.Tensor | None = None    # [Hkv, steady_zone_head_count]
     steady_zone_tail: torch.Tensor | None = None    # [Hkv, steady_zone_tail_count]
 
-    INIT_CLUSTER_BLOCK_COUNT: ClassVar[int] = 8
-    cluster_block_ids: torch.Tensor | None = None   # [Hkv, C, max_cluster_block_count]
-    cluster_sizes: torch.Tensor | None = None       # [Hkv, C]
-    cluster_centers_T: torch.Tensor | None = None   # [Hkv, dim, C]
-    mean: torch.Tensor | None = None                # [Hkv, dim]
+    INIT_CLUSTER_BLOCK_COUNT: ClassVar[int] = 64
+    cluster_compact_block_ids: torch.Tensor | None = None   # [Hkv, C, max_cluster_block_count]
+    cluster_temp_kv_pos: torch.Tensor | None = None         # [Hkv, C, cluster_block_size, 2], 0 = temp block id, 1 = offset
+    cluster_total_kv_counts: torch.Tensor | None = None     # [Hkv, C]
+
+    cluster_centers_T: torch.Tensor | None = None           # [Hkv, dim, C]
+    mean: torch.Tensor | None = None                        # [Hkv, dim]
     in_cluster_token_count: int = 0                      
 
+@dataclass
+class RequestSparseClusterInfo:
+    layers: dict[str, SparseManagerMetadata] = field(default_factory=dict)
 
 import time
 from collections import defaultdict, deque

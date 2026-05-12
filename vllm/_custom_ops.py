@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Tuple
 
 import torch
 
@@ -3492,31 +3492,95 @@ if hasattr(torch.ops._C, "hadacore_transform"):
 
 
 def build_sparse_block_table(
-    top_clusters: torch.Tensor,
-    cluster_block_ids: torch.Tensor,
-    cluster_sizes: torch.Tensor,
-    block_storage: torch.Tensor,
-    free_block_ids: torch.Tensor,
+    top_clusters: torch.Tensor,               # [NQ, Hq, nprobe], int32, cuda
+    cluster_compact_block_ids: torch.Tensor, # [Hkv, C, maxB], int32, cuda
+    cluster_temp_kv_pos: torch.Tensor,       # [Hkv, C, block_size, 2], int32, cuda
+    cluster_total_kv_counts: torch.Tensor,   # [Hkv, C], int32, cuda
+    temp_block_ids: torch.Tensor,            # [max_temp_blocks], int32, cuda
+    block_storage: torch.Tensor,             # [2, total_blocks, block_size, dim], fp16/bf16/fp32, cuda
+    free_block_ids: torch.Tensor,            # [max_free_block], int32, cuda
     max_bt_len: int,
-):
-    return torch.ops._C.build_sparse_block_table(
-        top_clusters, cluster_block_ids, cluster_sizes,
-        block_storage, free_block_ids, max_bt_len,
-    )
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build sparse block table for selected clusters.
+
+    Returns:
+        out_block_table: [NQ, Hq, max_bt_len], int32
+        out_bt_len: [NQ, Hq], int32
+        out_seqused_k: [NQ, Hq], int32
+        used_free_block_count: [1], int32
+    """
+    return tuple(torch.ops._C.build_sparse_block_table(
+        top_clusters,
+        cluster_compact_block_ids,
+        cluster_temp_kv_pos,
+        cluster_total_kv_counts,
+        temp_block_ids,
+        block_storage,
+        free_block_ids,
+        int(max_bt_len),
+    ))
 
 def append_kv_to_clusters(
     block_storage: torch.Tensor,
-    cluster_block_ids: torch.Tensor,
-    cluster_sizes: torch.Tensor,
+    cluster_compact_block_ids: torch.Tensor,
+    cluster_temp_kv_pos: torch.Tensor,
+    cluster_total_kv_counts: torch.Tensor,
+    temp_block_ids: torch.Tensor,
+    temp_block_kv_counts: torch.Tensor,
+    temp_block_kv_owner: torch.Tensor,
     free_block_ids: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     label: torch.Tensor,
 ) -> torch.Tensor:
+    """
+    Append KV into clustered storage and compact any newly-full temp clusters.
+
+    This call is fully self-contained on the CUDA side:
+    - appends key/value into temp storage
+    - updates temp / cluster metadata
+    - compacts newly-full temp clusters into compact blocks
+    - fills holes from the temp tail
+    - returns the number of compact/free blocks consumed in this call
+
+    Args:
+        block_storage:
+            Tensor of shape [2, total_blocks, block_size, dim].
+        cluster_compact_block_ids:
+            Tensor of shape [Hkv, C, max_cluster_blocks], int32.
+        cluster_temp_kv_pos:
+            Tensor of shape [Hkv, C, block_size, 2], int32.
+        cluster_total_kv_counts:
+            Tensor of shape [Hkv, C], int32.
+        temp_block_ids:
+            Tensor of shape [max_temp_blocks], int32.
+        temp_block_kv_counts:
+            Tensor of shape [1], int32.
+        temp_block_kv_owner:
+            Tensor of shape [max_temp_blocks * block_size, 2], int32.
+        free_block_ids:
+            Tensor of shape [max_free_blocks], int32.
+        key:
+            Tensor of shape [Nq, Hkv, dim].
+        value:
+            Tensor of shape [Nq, Hkv, dim].
+        label:
+            Tensor of shape [Nq, Hkv], int32.
+
+    Returns:
+        used_free_blocks:
+            Tensor of shape [1], int32.
+            Number of compact/free blocks consumed by this call.
+    """
     return torch.ops._C.append_kv_to_clusters(
         block_storage,
-        cluster_block_ids,
-        cluster_sizes,
+        cluster_compact_block_ids,
+        cluster_temp_kv_pos,
+        cluster_total_kv_counts,
+        temp_block_ids,
+        temp_block_kv_counts,
+        temp_block_kv_owner,
         free_block_ids,
         key,
         value,
