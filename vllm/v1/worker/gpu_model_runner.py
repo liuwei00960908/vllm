@@ -7247,8 +7247,17 @@ class GPUModelRunner(
         )
         budget = int(spec.sparse_selection_budget())
 
+        bt_gpu = self.input_batch.block_table[kv_cache_gid].block_table.gpu
+        block_size = (
+            self.kv_cache_config.kv_cache_groups[kv_cache_gid]
+            .kv_cache_spec.block_size
+        )
+
         per_req_selected_ids: list[list[list[torch.Tensor]]] = []
         per_req_actual_kv_len: list[int] = []
+        per_req_phys: list[torch.Tensor] = []
+        per_req_slots: list[torch.Tensor] = []
+        per_req_k_len: list[int] = []
 
         start_t = time.perf_counter()
         for req_idx in range(num_reqs):
@@ -7303,22 +7312,56 @@ class GPUModelRunner(
                 spec=spec,
                 budget_override=select_budget,
             )
-            if pending_count > 0:
-                dec = torch.arange(
-                    prompt_len, prompt_len + pending_count,
-                    device=selected_ids.device, dtype=torch.int64,
-                ).unsqueeze(0).expand(selected_ids.size(0), -1)
-                selected_ids = torch.cat([selected_ids, dec], dim=1)
-                actual_kv_len += pending_count
             per_req_selected_ids.append(selected_ids)
             per_req_actual_kv_len.append(actual_kv_len)
+
+            device = q_flat.device
+            positions = torch.cat(
+                [
+                    torch.arange(
+                        actual_kv_len, device=device, dtype=torch.int64
+                    ),
+                    torch.arange(
+                        prompt_len, seq_len, device=device, dtype=torch.int64
+                    ),
+                ]
+            )
+            row = bt_gpu[req_idx]
+            phys_req = row[positions // block_size].to(torch.int64)
+            slots_req = (positions % block_size).to(torch.int64)
+            per_req_phys.append(phys_req)
+            per_req_slots.append(slots_req)
+            per_req_k_len.append(actual_kv_len + pending_count)
 
             # TODO: construct estimation zone by appending all unselected clusters' centroids
         logger.info(f"[_build_sparse_runtime_q_head_gather] Layer {layer_name}: select top-k for {num_reqs} requests costs {(time.perf_counter() - start_t) * 1000}ms")
 
+        if per_req_phys:
+            phys_cat = torch.cat(per_req_phys)
+            slots_cat = torch.cat(per_req_slots)
+            k_lens_t = torch.tensor(
+                per_req_k_len, dtype=torch.int32, device=phys_cat.device
+            )
+            cu_k = torch.zeros(
+                len(per_req_k_len) + 1,
+                dtype=torch.int32,
+                device=phys_cat.device,
+            )
+            cu_k[1:] = torch.cumsum(k_lens_t, dim=0)
+            max_seqlen_k = max(per_req_k_len)
+        else:
+            phys_cat = None
+            slots_cat = None
+            cu_k = None
+            max_seqlen_k = 0
+
         return {
             "per_req_selected_ids": per_req_selected_ids,
             "per_req_actual_kv_len": per_req_actual_kv_len,
+            "sparse_gather_phys": phys_cat,
+            "sparse_gather_slots": slots_cat,
+            "sparse_gather_cu_seqlens_k": cu_k,
+            "sparse_gather_max_seqlen_k": max_seqlen_k,
         }
 
 

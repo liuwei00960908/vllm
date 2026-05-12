@@ -899,9 +899,32 @@ class FlashAttentionImpl(AttentionImpl):
                 runtime_q_head_gather = getattr(
                         layer, "_vllm_sparse_runtime_q_head_gather", None
                     )
-                if runtime_q_head_gather is not None:
-                    per_req_actual_kv_len = runtime_q_head_gather["per_req_actual_kv_len"]
-                    seqused_k = torch.tensor(per_req_actual_kv_len, dtype=torch.int32, device=seqused_k.device)
+                if (
+                    runtime_q_head_gather is not None
+                    and runtime_q_head_gather.get("sparse_gather_phys") is not None
+                ):
+                    self._forward_compact_kv_gather(
+                        query=query[:num_actual_tokens],
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        output=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        phys=runtime_q_head_gather["sparse_gather_phys"],
+                        slots=runtime_q_head_gather["sparse_gather_slots"],
+                        cu_seqlens_k=runtime_q_head_gather[
+                            "sparse_gather_cu_seqlens_k"
+                        ],
+                        max_seqlen_k=runtime_q_head_gather[
+                            "sparse_gather_max_seqlen_k"
+                        ],
+                        causal=attn_metadata.causal,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+                    layer._vllm_sparse_runtime_q_head_gather = None
+                    return output
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -964,25 +987,22 @@ class FlashAttentionImpl(AttentionImpl):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         output: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
         cu_seqlens_q: torch.Tensor,
         max_seqlen_q: int,
+        phys: torch.Tensor,
+        slots: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_k: int,
+        causal: bool,
         q_descale: torch.Tensor,
         k_descale: torch.Tensor,
         v_descale: torch.Tensor,
     ) -> None:
         """Gather selected K/V pages into a contiguous tensor and run varlen FA."""
-        phys = attn_metadata.sparse_gather_phys.to(
-            dtype=torch.int64, device=key_cache.device
-        )
-        slots = attn_metadata.sparse_gather_slots.to(
-            dtype=torch.int64, device=key_cache.device
-        )
-        cu_k = attn_metadata.sparse_gather_cu_seqlens_k
+        phys = phys.to(dtype=torch.int64, device=key_cache.device)
+        slots = slots.to(dtype=torch.int64, device=key_cache.device)
         k_compact = key_cache[phys, slots]
         v_compact = value_cache[phys, slots]
-        k_lens = cu_k[1:] - cu_k[:-1]
-        max_seqlen_k = int(k_lens.max().item())
         win = (
             list(self.sliding_window)
             if self.sliding_window is not None
@@ -995,11 +1015,11 @@ class FlashAttentionImpl(AttentionImpl):
             out=output,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            cu_seqlens_k=cu_k,
+            cu_seqlens_k=cu_seqlens_k,
             seqused_k=None,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
-            causal=attn_metadata.causal,
+            causal=causal,
             alibi_slopes=None,
             window_size=win,
             block_table=None,
