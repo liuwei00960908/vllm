@@ -9,8 +9,9 @@ import torch
 
 def main():
     USE_SPARSE_ATTENTION = True
-    context_length = 200
+    context_length = 20000
     block_size = 16
+    print_output = False
 
     # ====================== 1. 引擎配置（和server端完全一致） ======================
     if USE_SPARSE_ATTENTION:
@@ -26,9 +27,9 @@ def main():
             async_scheduling=False,
             sparse_attention={
                 "cluster_granularity": "token",
-                "num_clusters": 16,
+                "num_clusters": 32,
                 "n_segment": 1,
-                "nprobe": 16,
+                "nprobe": 8,
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,
@@ -81,7 +82,8 @@ def main():
 
     while engine.has_unfinished_requests():
         step_count += 1
-        print(f"\n--- 第 {step_count} 次 engine.step() ---")
+        if print_output:
+            print(f"\n--- 第 {step_count} 次 engine.step() ---")
 
         # ✅ 核心！每次step()会执行：
         # 1. Scheduler.schedule() 调度请求
@@ -100,8 +102,9 @@ def main():
                 generated_text = output.outputs[0].text
             else:
                 # 打印本次生成的token
-                new_token = output.outputs[0].text
-                print(f"生成token: {repr(new_token)}")
+                if print_output:
+                    new_token = output.outputs[0].text
+                    print(f"生成token: {repr(new_token)}")
 
     # ====================== 5. 输出最终结果 ======================
     print("\n=== 生成完成 ===")

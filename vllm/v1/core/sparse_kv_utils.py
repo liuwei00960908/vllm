@@ -12,7 +12,7 @@ class SparseManagerMetadata:
     steady_zone_head: torch.Tensor | None = None    # [Hkv, steady_zone_head_count]
     steady_zone_tail: torch.Tensor | None = None    # [Hkv, steady_zone_tail_count]
 
-    INIT_CLUSTER_BLOCK_COUNT: ClassVar[int] = 64
+    INIT_CLUSTER_BLOCK_COUNT: ClassVar[int] = 1024
     cluster_compact_block_ids: torch.Tensor | None = None   # [Hkv, C, max_cluster_block_count]
     cluster_temp_kv_pos: torch.Tensor | None = None         # [Hkv, C, cluster_block_size, 2], 0 = temp block id, 1 = offset
     cluster_total_kv_counts: torch.Tensor | None = None     # [Hkv, C]
