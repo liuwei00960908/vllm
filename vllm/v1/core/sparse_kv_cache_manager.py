@@ -111,6 +111,10 @@ SPARSE_LEGACY_FLAT_LAYER = "__flat__"
 SPARSE_KV_KEY = "##kv"
 SPARSE_QH_KEY = "##qh"
 
+_SPARSE_FREE_PREFILL_AFTER_SAVE = (
+    int(os.getenv("VLLM_SPARSE_FREE_PREFILL_AFTER_SAVE", "0")) == 1
+)
+
 
 def sparse_kv_unit_key(layer: str, kv_idx: int) -> str:
     return f"{layer}{SPARSE_KV_KEY}{kv_idx}"
@@ -618,6 +622,8 @@ class SparseKVManager(FullAttentionManager):
         # scheduled in the current step.
         self._last_num_tokens_main_model: dict[str, int] = {}
 
+        self._prefill_offloaded: set[str] = set()
+
     def _debug_log_state(self, request_id: str, phase: str, **kwargs) -> None:
         if not self._debug_state_transitions:
             return
@@ -848,6 +854,7 @@ class SparseKVManager(FullAttentionManager):
         self._decode_block.pop(request_id, None)
         self._decode_block_fill.pop(request_id, None)
         self._last_num_tokens_main_model.pop(request_id, None)
+        self._prefill_offloaded.discard(request_id)
 
         super().free(request_id)
         self._layer_states.pop(request_id, None)
@@ -864,6 +871,28 @@ class SparseKVManager(FullAttentionManager):
         self._step_trace.pop(request_id, None)
         self._prefill_token_count.pop(request_id, None)
         self._first_select_probe_done.discard(request_id)
+
+    def free_prefill_blocks_after_save(self, request_id: str) -> int:
+        if not _SPARSE_FREE_PREFILL_AFTER_SAVE:
+            return 0
+        if request_id in self._prefill_offloaded:
+            return 0
+        blocks = (
+            self._prefill_blocks.get(request_id)
+            or self.req_to_blocks.get(request_id, [])
+        )
+        to_free = [b for b in blocks if not b.is_null]
+        if to_free:
+            self.block_pool.free_blocks(reversed(to_free))
+        self._prefill_offloaded.add(request_id)
+        self._prefill_blocks.pop(request_id, None)
+        req_blocks = self.req_to_blocks.get(request_id)
+        if req_blocks is not None:
+            req_blocks.clear()
+        return len(to_free)
+
+    def is_prefill_offloaded(self, request_id: str) -> bool:
+        return request_id in self._prefill_offloaded
 
     def _estimate_decode_tokens_this_step(
         self, request_id: str, num_tokens_main_model: int

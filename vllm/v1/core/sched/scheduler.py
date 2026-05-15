@@ -1753,6 +1753,7 @@ class Scheduler(SchedulerInterface):
                 model_runner_output.sparse_new_value_features,
             )
         trace_mark("sparse_post_decode_rebalance")
+        prefill_done_ids: set[str] = set()
         if model_runner_output.sparse_block_features:
             vfeat_map = model_runner_output.sparse_block_value_features or {}
             meta_map = model_runner_output.sparse_prefill_cluster_meta or {}
@@ -1763,7 +1764,17 @@ class Scheduler(SchedulerInterface):
                     vfeat_map.get(req_id),
                     prefill_cluster_meta=meta_map.get(req_id),
                 )
+                prefill_done_ids.add(req_id)
         trace_mark("sparse_notify_prefill_done")
+
+        if kv_connector_output and kv_connector_output.prefill_saved_req_ids:
+            prefill_done_ids.update(kv_connector_output.prefill_saved_req_ids)
+        if prefill_done_ids and self.connector is not None:
+            sparse_mgr = self.kv_cache_manager.get_sparse_manager()
+            if sparse_mgr is not None:
+                for rid in prefill_done_ids:
+                    sparse_mgr.free_prefill_blocks_after_save(rid)
+        trace_mark("sparse_free_prefill_after_save")
         if model_runner_output.sparse_query_vectors:
             self.kv_cache_manager.sparse_update_query_vectors(
                 model_runner_output.sparse_query_vectors

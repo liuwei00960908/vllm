@@ -378,6 +378,12 @@ class KVConnectorBase_V1(ABC):
         """
         return None, None
 
+    def get_prefill_saved(self) -> set[str] | None:
+        """Request ids whose last-prefill chunk just finished saving to the
+        external KV store. The scheduler may drop their on-GPU prefill blocks
+        while keeping the request running."""
+        return None
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
         Get the set of block IDs that failed to load.

@@ -119,6 +119,7 @@ class KVConnectorModelRunnerMixin:
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
             )
+            output.prefill_saved_req_ids = kv_connector.get_prefill_saved()
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()

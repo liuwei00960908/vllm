@@ -144,6 +144,7 @@ class KVConnectorOutput:
     # [req_ids]
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
+    prefill_saved_req_ids: set[str] | None = None
     kv_connector_stats: KVConnectorStats | None = None
     kv_cache_events: KVConnectorKVEvents | None = None
     kv_connector_worker_meta: KVConnectorWorkerMetadata | None = None
@@ -161,6 +162,7 @@ class KVConnectorOutput:
         return (
             not self.finished_sending
             and not self.finished_recving
+            and not self.prefill_saved_req_ids
             and not self.kv_connector_stats
             and not self.kv_cache_events
             and not self.invalid_block_ids
@@ -175,6 +177,9 @@ class KVConnectorOutput:
         )
         finished_recving = _combine_non_none(
             set.union, [output.finished_recving for output in outputs]
+        )
+        prefill_saved_req_ids = _combine_non_none(
+            set.union, [output.prefill_saved_req_ids for output in outputs]
         )
         kv_connector_stats = _combine_non_none(
             lambda x, y: x.aggregate(y),
@@ -198,6 +203,7 @@ class KVConnectorOutput:
         return cls(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            prefill_saved_req_ids=prefill_saved_req_ids,
             kv_connector_stats=kv_connector_stats,
             kv_cache_events=kv_cache_events,
             invalid_block_ids=invalid_block_ids,

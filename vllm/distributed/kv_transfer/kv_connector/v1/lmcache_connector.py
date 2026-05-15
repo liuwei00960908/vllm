@@ -163,6 +163,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         self._lmcache_engine.wait_for_layer_load(layer_name, selected_tokens)
 
+    def get_prefill_saved(self) -> set[str] | None:
+        fn = getattr(self._lmcache_engine, "get_prefill_saved", None)
+        return fn() if fn is not None else None
+
     def save_kv_layer(
         self,
         layer_name: str,
