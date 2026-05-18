@@ -705,7 +705,13 @@ class SparseKVManager(FullAttentionManager):
         total_computed_tokens: int,
         num_tokens_main_model: int,
     ) -> int:
-        if request_id not in self.num_cached_block:
+        # Offloaded requests skip the prefill branch even on the first decode
+        # step: their prefill blocks were already freed, so the standard
+        # prefill calc would over-allocate (re-allocating the entire prompt).
+        if (
+            request_id not in self.num_cached_block
+            and request_id not in self._prefill_offloaded
+        ):
             # Prefill: standard page-aligned calculation.
             return super().get_num_blocks_to_allocate(
                 request_id,
@@ -758,6 +764,14 @@ class SparseKVManager(FullAttentionManager):
         num_tokens: int,
         num_tokens_main_model: int,
     ) -> list[KVCacheBlock]:
+        # Offloaded requests jump straight to the decode-offload allocator,
+        # bypassing the prefill branch even on their first decode step.
+        if request_id in self._prefill_offloaded:
+            req_blocks = self.req_to_blocks[request_id]
+            return self._allocate_new_blocks_offloaded(
+                request_id, req_blocks, num_tokens_main_model
+            )
+
         if request_id not in self.num_cached_block:
             # Prefill: allocate sequentially for all prompt tokens.
             return super().allocate_new_blocks(
@@ -765,11 +779,6 @@ class SparseKVManager(FullAttentionManager):
             )
 
         req_blocks = self.req_to_blocks[request_id]
-
-        if request_id in self._prefill_offloaded:
-            return self._allocate_new_blocks_offloaded(
-                request_id, req_blocks, num_tokens_main_model
-            )
 
         if request_id not in self._prefill_blocks:
             self._prefill_blocks[request_id] = list(req_blocks)
