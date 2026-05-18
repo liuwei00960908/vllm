@@ -3521,6 +3521,70 @@ def build_sparse_block_table(
         int(max_bt_len),
     ))
 
+if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "build_sparse_block_table_out"):
+
+    @register_fake("_C::build_sparse_block_table_out")
+    def _build_sparse_block_table_out_fake(
+        top_clusters: torch.Tensor,
+        cluster_compact_block_ids: torch.Tensor,
+        cluster_temp_kv_pos: torch.Tensor,
+        cluster_total_kv_counts: torch.Tensor,
+        temp_block_ids: torch.Tensor,
+        block_storage: torch.Tensor,
+        free_block_ids: torch.Tensor,
+        max_bt_len: int,
+        out_block_table: torch.Tensor,
+        out_bt_len: torch.Tensor,
+        out_seqused_k: torch.Tensor,
+        workspace_state: torch.Tensor,
+        workspace_row_free_base: torch.Tensor,
+        workspace_row_plan_base: torch.Tensor,
+        workspace_plan_row: torch.Tensor,
+        workspace_plan_src_tb_idx: torch.Tensor,
+        workspace_plan_src_tb_off: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return out_block_table, out_bt_len, out_seqused_k
+
+
+def build_sparse_block_table_out(
+    top_clusters: torch.Tensor,
+    cluster_compact_block_ids: torch.Tensor,
+    cluster_temp_kv_pos: torch.Tensor,
+    cluster_total_kv_counts: torch.Tensor,
+    temp_block_ids: torch.Tensor,
+    block_storage: torch.Tensor,
+    free_block_ids: torch.Tensor,
+    max_bt_len: int,
+    out_block_table: torch.Tensor,
+    out_bt_len: torch.Tensor,
+    out_seqused_k: torch.Tensor,
+    workspace_state: torch.Tensor,
+    workspace_row_free_base: torch.Tensor,
+    workspace_row_plan_base: torch.Tensor,
+    workspace_plan_row: torch.Tensor,
+    workspace_plan_src_tb_idx: torch.Tensor,
+    workspace_plan_src_tb_off: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return tuple(torch.ops._C.build_sparse_block_table_out(
+        top_clusters,
+        cluster_compact_block_ids,
+        cluster_temp_kv_pos,
+        cluster_total_kv_counts,
+        temp_block_ids,
+        block_storage,
+        free_block_ids,
+        int(max_bt_len),
+        out_block_table,
+        out_bt_len,
+        out_seqused_k,
+        workspace_state,
+        workspace_row_free_base,
+        workspace_row_plan_base,
+        workspace_plan_row,
+        workspace_plan_src_tb_idx,
+        workspace_plan_src_tb_off,
+    ))
+
 def append_kv_to_clusters(
     block_storage: torch.Tensor,
     cluster_compact_block_ids: torch.Tensor,
@@ -3582,6 +3646,59 @@ def append_kv_to_clusters(
         temp_block_kv_counts,
         temp_block_kv_owner,
         free_block_ids,
+        key,
+        value,
+        label,
+    )
+
+
+if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "append_kv_to_clusters_inplace"):
+
+    @register_fake("_C::append_kv_to_clusters_inplace")
+    def _append_kv_to_clusters_inplace_fake(
+        block_storage: torch.Tensor,
+        cluster_compact_block_ids: torch.Tensor,
+        cluster_temp_kv_pos: torch.Tensor,
+        cluster_total_kv_counts: torch.Tensor,
+        temp_block_ids: torch.Tensor,
+        temp_block_kv_counts: torch.Tensor,
+        temp_block_kv_owner: torch.Tensor,
+        free_block_ids: torch.Tensor,
+        used_free_block_count: torch.Tensor,
+        error_code: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        label: torch.Tensor,
+    ) -> torch.Tensor:
+        return used_free_block_count
+
+
+def append_kv_to_clusters_inplace(
+    block_storage: torch.Tensor,
+    cluster_compact_block_ids: torch.Tensor,
+    cluster_temp_kv_pos: torch.Tensor,
+    cluster_total_kv_counts: torch.Tensor,
+    temp_block_ids: torch.Tensor,
+    temp_block_kv_counts: torch.Tensor,
+    temp_block_kv_owner: torch.Tensor,
+    free_block_ids: torch.Tensor,
+    used_free_block_count: torch.Tensor,
+    error_code: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    label: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.append_kv_to_clusters_inplace(
+        block_storage,
+        cluster_compact_block_ids,
+        cluster_temp_kv_pos,
+        cluster_total_kv_counts,
+        temp_block_ids,
+        temp_block_kv_counts,
+        temp_block_kv_owner,
+        free_block_ids,
+        used_free_block_count,
+        error_code,
         key,
         value,
         label,

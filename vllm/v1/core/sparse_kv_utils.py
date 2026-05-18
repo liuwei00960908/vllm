@@ -2,6 +2,176 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 import torch
 
+
+@dataclass
+class SparseBlockTableBuffers:
+    block_table: torch.Tensor | None = None
+    bt_len: torch.Tensor | None = None
+    seqused_k: torch.Tensor | None = None
+    workspace_state: torch.Tensor | None = None
+    workspace_row_free_base: torch.Tensor | None = None
+    workspace_row_plan_base: torch.Tensor | None = None
+    workspace_plan_row: torch.Tensor | None = None
+    workspace_plan_src_tb_idx: torch.Tensor | None = None
+    workspace_plan_src_tb_off: torch.Tensor | None = None
+
+    @property
+    def used_free_block_count(self) -> torch.Tensor:
+        assert self.workspace_state is not None
+        return self.workspace_state[1:2]
+
+    def ensure_capacity(
+        self,
+        *,
+        device: torch.device,
+        rows: int,
+        max_bt_len: int,
+        plan_capacity: int,
+    ) -> None:
+        if self.block_table is None or self.block_table.shape != (rows, max_bt_len):
+            self.block_table = torch.empty(
+                (rows, max_bt_len), dtype=torch.int32, device=device
+            )
+        if self.bt_len is None or self.bt_len.shape != (rows,):
+            self.bt_len = torch.empty((rows,), dtype=torch.int32, device=device)
+        if self.seqused_k is None or self.seqused_k.shape != (rows,):
+            self.seqused_k = torch.empty((rows,), dtype=torch.int32, device=device)
+        if self.workspace_state is None or self.workspace_state.shape[0] < 3:
+            self.workspace_state = torch.empty((3,), dtype=torch.int32, device=device)
+        if (self.workspace_row_free_base is None
+                or self.workspace_row_free_base.shape[0] < rows):
+            self.workspace_row_free_base = torch.empty(
+                (rows,), dtype=torch.int32, device=device
+            )
+        if (self.workspace_row_plan_base is None
+                or self.workspace_row_plan_base.shape[0] < rows):
+            self.workspace_row_plan_base = torch.empty(
+                (rows,), dtype=torch.int32, device=device
+            )
+        if self.workspace_plan_row is None or self.workspace_plan_row.shape[0] < plan_capacity:
+            self.workspace_plan_row = torch.empty(
+                (plan_capacity,), dtype=torch.int32, device=device
+            )
+        if (self.workspace_plan_src_tb_idx is None
+                or self.workspace_plan_src_tb_idx.shape[0] < plan_capacity):
+            self.workspace_plan_src_tb_idx = torch.empty(
+                (plan_capacity,), dtype=torch.int32, device=device
+            )
+        if (self.workspace_plan_src_tb_off is None
+                or self.workspace_plan_src_tb_off.shape[0] < plan_capacity):
+            self.workspace_plan_src_tb_off = torch.empty(
+                (plan_capacity,), dtype=torch.int32, device=device
+            )
+
+    def build(
+        self,
+        *,
+        top_clusters: torch.Tensor,
+        cluster_compact_block_ids: torch.Tensor,
+        cluster_temp_kv_pos: torch.Tensor,
+        cluster_total_kv_counts: torch.Tensor,
+        temp_block_ids: torch.Tensor,
+        block_storage: torch.Tensor,
+        free_block_ids: torch.Tensor,
+        max_bt_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from vllm._custom_ops import build_sparse_block_table_out
+
+        rows = top_clusters.shape[0] * top_clusters.shape[1]
+        plan_capacity = max(
+            rows * top_clusters.shape[2] * max(int(block_storage.shape[2]) - 1, 0), 1
+        )
+        self.ensure_capacity(
+            device=top_clusters.device,
+            rows=rows,
+            max_bt_len=max_bt_len,
+            plan_capacity=plan_capacity,
+        )
+        assert self.block_table is not None
+        assert self.bt_len is not None
+        assert self.seqused_k is not None
+        assert self.workspace_state is not None
+        assert self.workspace_row_free_base is not None
+        assert self.workspace_row_plan_base is not None
+        assert self.workspace_plan_row is not None
+        assert self.workspace_plan_src_tb_idx is not None
+        assert self.workspace_plan_src_tb_off is not None
+        return build_sparse_block_table_out(
+            top_clusters,
+            cluster_compact_block_ids,
+            cluster_temp_kv_pos,
+            cluster_total_kv_counts,
+            temp_block_ids,
+            block_storage,
+            free_block_ids,
+            max_bt_len,
+            self.block_table,
+            self.bt_len,
+            self.seqused_k,
+            self.workspace_state,
+            self.workspace_row_free_base,
+            self.workspace_row_plan_base,
+            self.workspace_plan_row,
+            self.workspace_plan_src_tb_idx,
+            self.workspace_plan_src_tb_off,
+        )
+
+
+@dataclass
+class SparseAppendBuffers:
+    used_free_block_count: torch.Tensor | None = None
+    error_code: torch.Tensor | None = None
+
+    def ensure_capacity(self, *, device: torch.device) -> None:
+        if self.used_free_block_count is None or self.used_free_block_count.numel() != 1:
+            self.used_free_block_count = torch.empty(
+                (1,), dtype=torch.int32, device=device
+            )
+        if self.error_code is None or self.error_code.numel() != 1:
+            self.error_code = torch.empty((1,), dtype=torch.int32, device=device)
+
+    def append(
+        self,
+        *,
+        block_storage: torch.Tensor,
+        cluster_compact_block_ids: torch.Tensor,
+        cluster_temp_kv_pos: torch.Tensor,
+        cluster_total_kv_counts: torch.Tensor,
+        temp_block_ids: torch.Tensor,
+        temp_block_kv_counts: torch.Tensor,
+        temp_block_kv_owner: torch.Tensor,
+        free_block_ids: torch.Tensor,
+        used_free_block_count: torch.Tensor | None,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        label: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm._custom_ops import append_kv_to_clusters_inplace
+
+        self.ensure_capacity(device=key.device)
+        assert self.error_code is not None
+        counter = used_free_block_count
+        if counter is None:
+            assert self.used_free_block_count is not None
+            counter = self.used_free_block_count
+            counter.zero_()
+        return append_kv_to_clusters_inplace(
+            block_storage,
+            cluster_compact_block_ids,
+            cluster_temp_kv_pos,
+            cluster_total_kv_counts,
+            temp_block_ids,
+            temp_block_kv_counts,
+            temp_block_kv_owner,
+            free_block_ids,
+            counter,
+            self.error_code,
+            key,
+            value,
+            label,
+        )
+
+
 @dataclass
 class SparseManagerMetadata:
     temp_block_ids: torch.Tensor | None = None              # [max_temp_blocks]
@@ -19,7 +189,10 @@ class SparseManagerMetadata:
 
     cluster_centers_T: torch.Tensor | None = None           # [Hkv, dim, C]
     mean: torch.Tensor | None = None                        # [Hkv, dim]
-    in_cluster_token_count: int = 0                      
+    in_cluster_token_count: int = 0
+    block_table_buffers: SparseBlockTableBuffers | None = None
+    append_buffers: SparseAppendBuffers | None = None
+    cu_seqlens_q_buffer: torch.Tensor | None = None
 
 @dataclass
 class RequestSparseClusterInfo:

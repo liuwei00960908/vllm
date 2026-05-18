@@ -27,10 +27,11 @@ from vllm.v1.core.sparse_kmeans_torch import (
     prefill_cluster_meta_from_features_torch_batched,
 )
 from vllm.v1.core.sparse_kv_utils import (
+    SparseAppendBuffers,
+    SparseBlockTableBuffers,
     SparseClusterBlockInfo,
     SparseManagerMetadata,
 )
-from vllm._custom_ops import append_kv_to_clusters, build_sparse_block_table
 
 logger = init_logger(__name__)
 
@@ -295,16 +296,18 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 f"have {free_block_ids.numel()}, need at least "
                 f"{required_free_blocks}"
             )
-
-            block_table, _, seqused_k, _ = build_sparse_block_table(
-                top_clusters,
-                smm.cluster_compact_block_ids,
-                smm.cluster_temp_kv_pos,
-                smm.cluster_total_kv_counts,
-                smm.temp_block_ids,
-                cluster_storage,
-                free_block_ids,
-                max_blocks,
+            if smm.block_table_buffers is None:
+                smm.block_table_buffers = SparseBlockTableBuffers()
+            assert smm.block_table_buffers is not None
+            block_table, _, seqused_k = smm.block_table_buffers.build(
+                top_clusters=top_clusters,
+                cluster_compact_block_ids=smm.cluster_compact_block_ids,
+                cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
+                cluster_total_kv_counts=smm.cluster_total_kv_counts,
+                temp_block_ids=smm.temp_block_ids,
+                block_storage=cluster_storage,
+                free_block_ids=free_block_ids,
+                max_bt_len=max_blocks,
             )
 
             num_rows = num_queries * hq
@@ -313,11 +316,17 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             out_flat = output.reshape(num_rows, 1, -1)
             seqused_k_flat = seqused_k.reshape(num_rows)
             block_table_flat = block_table.reshape(num_rows, -1)
-            cu_seqlens_q_batch = torch.arange(
-                num_rows + 1,
-                device=device,
-                dtype=cu_seqlens_q.dtype,
-            )
+            if (
+                smm.cu_seqlens_q_buffer is None
+                or smm.cu_seqlens_q_buffer.shape[0] < num_rows + 1
+                or smm.cu_seqlens_q_buffer.dtype != cu_seqlens_q.dtype
+            ):
+                smm.cu_seqlens_q_buffer = torch.arange(
+                    num_rows + 1,
+                    device=device,
+                    dtype=cu_seqlens_q.dtype,
+                )
+            cu_seqlens_q_batch = smm.cu_seqlens_q_buffer[: num_rows + 1]
 
             flash_attn_varlen_func(
                 q=q_flat,
@@ -452,22 +461,23 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                     )
                     labels = score.argmax(dim=-1).to(dtype=torch.int32)[:, :, 0]
 
-            used_free_blocks = append_kv_to_clusters(
-                cluster_storage,
-                smm.cluster_compact_block_ids,
-                smm.cluster_temp_kv_pos,
-                smm.cluster_total_kv_counts,
-                smm.temp_block_ids,
-                smm.temp_block_kv_counts,
-                smm.temp_block_kv_owner,
-                free_blocks_info.allocated_block_ids_gpu[
-                    free_blocks_info.used_count_gpu:
-                ],
-                key.contiguous(),
-                value.contiguous(),
-                labels,
+            if smm.append_buffers is None:
+                smm.append_buffers = SparseAppendBuffers()
+            assert smm.append_buffers is not None
+            used_free_blocks = smm.append_buffers.append(
+                block_storage=cluster_storage,
+                cluster_compact_block_ids=smm.cluster_compact_block_ids,
+                cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
+                cluster_total_kv_counts=smm.cluster_total_kv_counts,
+                temp_block_ids=smm.temp_block_ids,
+                temp_block_kv_counts=smm.temp_block_kv_counts,
+                temp_block_kv_owner=smm.temp_block_kv_owner,
+                free_block_ids=free_blocks_info.allocated_block_ids_gpu,
+                used_free_block_count=free_blocks_info.used_count_gpu,
+                key=key.contiguous(),
+                value=value.contiguous(),
+                label=labels,
             )
-            free_blocks_info.used_count_gpu.add_(used_free_blocks)
             smm.in_cluster_token_count += key.shape[0]
             return
 

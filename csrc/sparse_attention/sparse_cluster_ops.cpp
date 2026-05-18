@@ -170,6 +170,82 @@ torch::Tensor append_kv_to_clusters_cuda(
     return used_free_block_count;
 }
 
+torch::Tensor append_kv_to_clusters_inplace_cuda(
+    torch::Tensor block_storage,
+    torch::Tensor cluster_compact_block_ids,
+    torch::Tensor cluster_temp_kv_pos,
+    torch::Tensor cluster_total_kv_counts,
+    torch::Tensor temp_block_ids,
+    torch::Tensor temp_block_kv_counts,
+    torch::Tensor temp_block_kv_owner,
+    torch::Tensor free_block_ids,
+    torch::Tensor used_free_block_count,
+    torch::Tensor error_code,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor label
+) {
+    check_cuda_contig(block_storage, "block_storage");
+    check_cuda_contig(cluster_compact_block_ids, "cluster_compact_block_ids");
+    check_cuda_contig(cluster_temp_kv_pos, "cluster_temp_kv_pos");
+    check_cuda_contig(cluster_total_kv_counts, "cluster_total_kv_counts");
+    check_cuda_contig(temp_block_ids, "temp_block_ids");
+    check_cuda_contig(temp_block_kv_counts, "temp_block_kv_counts");
+    check_cuda_contig(temp_block_kv_owner, "temp_block_kv_owner");
+    check_cuda_contig(free_block_ids, "free_block_ids");
+    check_cuda_contig(used_free_block_count, "used_free_block_count");
+    check_cuda_contig(error_code, "error_code");
+    check_cuda_contig(key, "key");
+    check_cuda_contig(value, "value");
+    check_cuda_contig(label, "label");
+
+    TORCH_CHECK(used_free_block_count.scalar_type() == torch::kInt32,
+                "used_free_block_count must be int32");
+    TORCH_CHECK(error_code.scalar_type() == torch::kInt32,
+                "error_code must be int32");
+    TORCH_CHECK(used_free_block_count.numel() == 1,
+                "used_free_block_count must be [1]");
+    TORCH_CHECK(error_code.numel() == 1,
+                "error_code must be [1]");
+
+    const int Nq = static_cast<int>(key.size(0));
+    const int Hkv = static_cast<int>(key.size(1));
+    const int dim = static_cast<int>(key.size(2));
+    const int C = static_cast<int>(cluster_compact_block_ids.size(1));
+    const int maxB = static_cast<int>(cluster_compact_block_ids.size(2));
+    const int total_blocks = static_cast<int>(block_storage.size(1));
+    const int block_size = static_cast<int>(block_storage.size(2));
+    const int max_temp_blocks = static_cast<int>(temp_block_ids.size(0));
+    const int max_free_block = static_cast<int>(free_block_ids.size(0));
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(block_storage));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int rc = append_kv_to_clusters_launcher_raw(
+        key.data_ptr(),
+        value.data_ptr(),
+        map_storage_dtype(block_storage.scalar_type()),
+        label.data_ptr<int32_t>(),
+        temp_block_ids.data_ptr<int32_t>(),
+        temp_block_kv_counts.data_ptr<int32_t>(),
+        temp_block_kv_owner.data_ptr<int32_t>(),
+        block_storage.data_ptr(),
+        cluster_compact_block_ids.data_ptr<int32_t>(),
+        cluster_temp_kv_pos.data_ptr<int32_t>(),
+        cluster_total_kv_counts.data_ptr<int32_t>(),
+        free_block_ids.data_ptr<int32_t>(),
+        max_free_block,
+        used_free_block_count.data_ptr<int32_t>(),
+        error_code.data_ptr<int32_t>(),
+        Nq, Hkv, C, maxB,
+        total_blocks, block_size, dim,
+        max_temp_blocks,
+        stream);
+
+    TORCH_CHECK(rc == ERR_OK, "append_kv_to_clusters launcher failed, rc=", rc);
+    return used_free_block_count;
+}
+
 TORCH_LIBRARY_FRAGMENT(_C, ops) {
     ops.def(
         "append_kv_to_clusters("
@@ -185,8 +261,25 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
         "  Tensor value,"
         "  Tensor label"
         ") -> Tensor");
+    ops.def(
+        "append_kv_to_clusters_inplace("
+        "  Tensor block_storage,"
+        "  Tensor cluster_compact_block_ids,"
+        "  Tensor cluster_temp_kv_pos,"
+        "  Tensor cluster_total_kv_counts,"
+        "  Tensor temp_block_ids,"
+        "  Tensor temp_block_kv_counts,"
+        "  Tensor temp_block_kv_owner,"
+        "  Tensor free_block_ids,"
+        "  Tensor used_free_block_count,"
+        "  Tensor error_code,"
+        "  Tensor key,"
+        "  Tensor value,"
+        "  Tensor label"
+        ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
     m.impl("append_kv_to_clusters", &append_kv_to_clusters_cuda);
+    m.impl("append_kv_to_clusters_inplace", &append_kv_to_clusters_inplace_cuda);
 }
