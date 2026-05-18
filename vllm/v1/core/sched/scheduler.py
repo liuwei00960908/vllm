@@ -1780,11 +1780,25 @@ class Scheduler(SchedulerInterface):
 
         if kv_connector_output and kv_connector_output.prefill_saved_req_ids:
             prefill_done_ids.update(kv_connector_output.prefill_saved_req_ids)
-        if prefill_done_ids and self.connector is not None:
-            sparse_mgr = self.kv_cache_manager.get_sparse_manager()
-            if sparse_mgr is not None:
-                for rid in prefill_done_ids:
-                    sparse_mgr.free_prefill_blocks_after_save(rid)
+        # Fallback signal: detect prefill-complete directly from request state.
+        # Needed because the runner does not populate `sparse_block_features`
+        # and external LMCache may not expose `get_prefill_saved`. With
+        # LMCACHE_USE_LAYERWISE=true, save_kv_layer + wait_for_save run
+        # synchronously inside execute_model, so by the time we see
+        # num_computed_tokens >= num_prompt_tokens the save is already durable.
+        sparse_mgr = self.kv_cache_manager.get_sparse_manager()
+        if sparse_mgr is not None and self.connector is not None:
+            for rid in scheduler_output.num_scheduled_tokens:
+                req = self.requests.get(rid)
+                if (
+                    req is not None
+                    and req.num_computed_tokens >= req.num_prompt_tokens
+                    and not sparse_mgr.is_prefill_offloaded(rid)
+                ):
+                    prefill_done_ids.add(rid)
+        if prefill_done_ids and self.connector is not None and sparse_mgr is not None:
+            for rid in prefill_done_ids:
+                sparse_mgr.free_prefill_blocks_after_save(rid)
         trace_mark("sparse_free_prefill_after_save")
         if model_runner_output.sparse_query_vectors:
             self.kv_cache_manager.sparse_update_query_vectors(
