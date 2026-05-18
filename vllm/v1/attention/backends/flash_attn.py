@@ -1001,21 +1001,6 @@ class FlashAttentionImpl(AttentionImpl):
         """Gather selected K/V pages into a contiguous tensor and run varlen FA."""
         phys = phys.to(dtype=torch.int64, device=key_cache.device)
         slots = slots.to(dtype=torch.int64, device=key_cache.device)
-        import logging
-        _log = logging.getLogger(__name__)
-        phys_cpu = phys.detach().to("cpu")
-        slots_cpu = slots.detach().to("cpu")
-        _log.warning(
-            "[sparse-gather] key_cache.shape=%s phys.numel=%d "
-            "phys[min,max]=%s,%s slots[min,max]=%s,%s "
-            "phys[:8]=%s slots[:8]=%s phys[-8:]=%s slots[-8:]=%s",
-            tuple(key_cache.shape),
-            phys.numel(),
-            int(phys_cpu.min()), int(phys_cpu.max()),
-            int(slots_cpu.min()), int(slots_cpu.max()),
-            phys_cpu[:8].tolist(), slots_cpu[:8].tolist(),
-            phys_cpu[-8:].tolist(), slots_cpu[-8:].tolist(),
-        )
         k_compact = key_cache[phys, slots]
         v_compact = value_cache[phys, slots]
         win = (

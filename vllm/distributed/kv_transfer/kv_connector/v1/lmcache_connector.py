@@ -371,6 +371,27 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                         load_spec=load_spec,
                     )
                 )
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.warning(
+                "[sparse-offload-load] req=%s n_load=%d block_size=%d "
+                "n_scratch_blocks=%d scratch_ids[0]=%d scratch_ids[-1]=%d "
+                "slot_mapping.shape=%s slot_mapping[:8]=%s "
+                "slot_mapping[-8:]=%s slot_mapping.max=%d slot_mapping.min=%d "
+                "load_spec=%s",
+                req_id,
+                n_load,
+                block_size,
+                len(scratch_ids),
+                int(scratch_ids[0]),
+                int(scratch_ids[-1]),
+                tuple(slot_mapping.shape),
+                slot_mapping[:8].tolist(),
+                slot_mapping[-8:].tolist(),
+                int(slot_mapping.max()),
+                int(slot_mapping.min()),
+                load_spec,
+            )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
