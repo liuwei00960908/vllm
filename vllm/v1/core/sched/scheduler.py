@@ -1107,6 +1107,8 @@ class Scheduler(SchedulerInterface):
         sparse_retrieve_block_indices: dict[str, list[int]] = {}
         sparse_selected_block_indices_by_layer: dict[str, dict[str, list[int]]] = {}
         sparse_chrono_phys_block_ids: dict[str, list[int]] = {}
+        sparse_offloaded_req_ids: set[str] = set()
+        sparse_scratch_block_ids: dict[str, list[int]] = {}
         resumed_req_ids = set()
         sparse_mgr = self.kv_cache_manager.get_sparse_manager()
         runner_selects_sparse_tokens = (
@@ -1260,6 +1262,13 @@ class Scheduler(SchedulerInterface):
                 sparse_selected_block_indices_by_layer[req_id] = by_layer
             if chrono is not None:
                 sparse_chrono_phys_block_ids[req_id] = chrono
+            if sparse_mgr is not None and sparse_mgr.is_prefill_offloaded(req_id):
+                sparse_offloaded_req_ids.add(req_id)
+                scratch = sparse_mgr.get_scratch_blocks(req_id)
+                if scratch:
+                    sparse_scratch_block_ids[req_id] = [
+                        b.block_id for b in scratch
+                    ]
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_for_worker = req.num_output_tokens + req.num_output_placeholders
             token_sparse_async = (
@@ -1304,6 +1313,8 @@ class Scheduler(SchedulerInterface):
             sparse_chrono_phys_block_ids=(
                 sparse_chrono_phys_block_ids or None
             ),
+            sparse_offloaded_req_ids=sparse_offloaded_req_ids or None,
+            sparse_scratch_block_ids=sparse_scratch_block_ids or None,
         )
 
     def _try_schedule_encoder_inputs(

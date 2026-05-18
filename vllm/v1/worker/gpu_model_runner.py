@@ -574,6 +574,8 @@ class GPUModelRunner(
         # at ~7-8s per prompt.  Track emission here and gate so the payload
         # goes out exactly once per request.
         self._sparse_prefill_emitted: set[str] = set()
+        self._sparse_offloaded_req_ids: set[str] = set()
+        self._sparse_scratch_block_ids: dict[str, list[int]] = {}
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -1126,6 +1128,8 @@ class GPUModelRunner(
             self.num_prompt_logprobs.pop(req_id, None)
             self._sparse_prefill_emitted.discard(req_id)
             self._sparse_online_index.pop(req_id, None)
+            self._sparse_offloaded_req_ids.discard(req_id)
+            self._sparse_scratch_block_ids.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1252,6 +1256,12 @@ class GPUModelRunner(
             req_data.sparse_selected_block_indices_by_layer or {}
         )
         sparse_chrono_phys_map = req_data.sparse_chrono_phys_block_ids or {}
+        self._sparse_offloaded_req_ids.update(
+            req_data.sparse_offloaded_req_ids or set()
+        )
+        self._sparse_scratch_block_ids.update(
+            req_data.sparse_scratch_block_ids or {}
+        )
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         token_sparse_async_real_tokens = False
         if self.use_async_scheduling and self._has_sparse_attn and hasattr(
@@ -7316,13 +7326,22 @@ class GPUModelRunner(
             per_req_actual_kv_len.append(actual_kv_len)
 
             device = q_flat.device
+            offloaded = rid in self._sparse_offloaded_req_ids
+            if offloaded:
+                scratch_ids = self._sparse_scratch_block_ids.get(rid, [])
+                n_scratch_tokens = len(scratch_ids) * block_size
+                decode_start = n_scratch_tokens
+                decode_end = n_scratch_tokens + pending_count
+            else:
+                decode_start = prompt_len
+                decode_end = seq_len
             positions = torch.cat(
                 [
                     torch.arange(
                         actual_kv_len, device=device, dtype=torch.int64
                     ),
                     torch.arange(
-                        prompt_len, seq_len, device=device, dtype=torch.int64
+                        decode_start, decode_end, device=device, dtype=torch.int64
                     ),
                 ]
             )

@@ -623,6 +623,8 @@ class SparseKVManager(FullAttentionManager):
         self._last_num_tokens_main_model: dict[str, int] = {}
 
         self._prefill_offloaded: set[str] = set()
+        self._scratch_blocks: dict[str, list[KVCacheBlock]] = {}
+        self._decode_history_blocks: dict[str, list[KVCacheBlock]] = {}
 
     def _debug_log_state(self, request_id: str, phase: str, **kwargs) -> None:
         if not self._debug_state_transitions:
@@ -712,17 +714,21 @@ class SparseKVManager(FullAttentionManager):
                 total_computed_tokens,
                 num_tokens_main_model,
             )
-        # Decode: allocate a new block only when there is no active decode
-        # block, or when the active decode block does not have enough room.
         step_tokens = self._estimate_decode_tokens_this_step(
             request_id, num_tokens_main_model
         )
+        extra = 0
+        if (
+            request_id in self._prefill_offloaded
+            and request_id not in self._scratch_blocks
+        ):
+            extra = self._scratch_block_count()
         cur_decode = self._decode_block.get(request_id)
         if cur_decode is None or cur_decode.is_null:
-            return 1
+            return extra + 1
         fill = self._decode_block_fill.get(request_id, 0)
         remaining = max(0, self.block_size - fill)
-        return 1 if step_tokens > remaining else 0
+        return extra + (1 if step_tokens > remaining else 0)
 
     def allocate_new_computed_blocks(
         self,
@@ -758,13 +764,13 @@ class SparseKVManager(FullAttentionManager):
                 request_id, num_tokens, num_tokens_main_model
             )
 
-        # ── Decode ────────────────────────────────────────────────────────
-        # Key principle (Bug 1 fix): we NEVER free historical blocks during
-        # decode so their KV data stays selectable. This includes prefill
-        # blocks and finalized decode blocks from previous steps.
         req_blocks = self.req_to_blocks[request_id]
 
-        # On the first decode call, snapshot all prefill blocks.
+        if request_id in self._prefill_offloaded:
+            return self._allocate_new_blocks_offloaded(
+                request_id, req_blocks, num_tokens_main_model
+            )
+
         if request_id not in self._prefill_blocks:
             self._prefill_blocks[request_id] = list(req_blocks)
 
@@ -827,6 +833,57 @@ class SparseKVManager(FullAttentionManager):
         # the block table row via add_row (not just append the new block).
         return list(req_blocks)
 
+    def _allocate_new_blocks_offloaded(
+        self,
+        request_id: str,
+        req_blocks: list[KVCacheBlock],
+        num_tokens_main_model: int,
+    ) -> list[KVCacheBlock]:
+        if request_id not in self._scratch_blocks:
+            n = self._scratch_block_count()
+            new = self.block_pool.get_new_blocks(n) if n > 0 else []
+            self._scratch_blocks[request_id] = new
+            for b in new:
+                self.new_block_ids.append(b.block_id)
+            self._decode_history_blocks.setdefault(request_id, [])
+
+        scratch = self._scratch_blocks[request_id]
+        history = self._decode_history_blocks.setdefault(request_id, [])
+
+        step_tokens = self._estimate_decode_tokens_this_step(
+            request_id, num_tokens_main_model
+        )
+        cur_decode = self._decode_block.get(request_id)
+        fill = self._decode_block_fill.get(request_id, 0)
+        allocated_new_decode = False
+        if cur_decode is None or cur_decode.is_null:
+            cur_decode = self.block_pool.get_new_blocks(1)[0]
+            self._decode_block[request_id] = cur_decode
+            self._decode_block_fill[request_id] = 0
+            fill = 0
+            allocated_new_decode = True
+        elif fill + step_tokens > self.block_size:
+            history.append(cur_decode)
+            cur_decode = self.block_pool.get_new_blocks(1)[0]
+            self._decode_block[request_id] = cur_decode
+            self._decode_block_fill[request_id] = 0
+            fill = 0
+            allocated_new_decode = True
+
+        req_blocks.clear()
+        req_blocks.extend(scratch)
+        req_blocks.extend(history)
+        req_blocks.append(cur_decode)
+
+        if allocated_new_decode:
+            self.new_block_ids.append(cur_decode.block_id)
+        self._decode_block_fill[request_id] = min(
+            self.block_size, fill + step_tokens
+        )
+        self._last_num_tokens_main_model[request_id] = num_tokens_main_model
+        self.num_cached_block[request_id] = 0
+        return list(req_blocks)
+
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
         # Sparse blocks are not entered into the prefix-hash cache.
         # Advance the pointer so repeated calls are idempotent.
@@ -855,6 +912,12 @@ class SparseKVManager(FullAttentionManager):
         self._decode_block_fill.pop(request_id, None)
         self._last_num_tokens_main_model.pop(request_id, None)
         self._prefill_offloaded.discard(request_id)
+        for b in self._scratch_blocks.pop(request_id, []):
+            if not b.is_null:
+                self.block_pool.free_blocks([b])
+        for b in self._decode_history_blocks.pop(request_id, []):
+            if not b.is_null:
+                self.block_pool.free_blocks([b])
 
         super().free(request_id)
         self._layer_states.pop(request_id, None)
@@ -889,10 +952,24 @@ class SparseKVManager(FullAttentionManager):
         req_blocks = self.req_to_blocks.get(request_id)
         if req_blocks is not None:
             req_blocks.clear()
+        logger.info(                                                                                  
+            "[sparse-offload] freed %d prefill blocks for req=%s; "                                   
+            "block_pool free=%d/%d",                                                                  
+            len(to_free),                                                                      
+            request_id,                                                                               
+            self.block_pool.get_num_free_blocks(),                                                    
+            self.block_pool.num_gpu_blocks,                                                           
+       )                                  
         return len(to_free)
 
     def is_prefill_offloaded(self, request_id: str) -> bool:
         return request_id in self._prefill_offloaded
+
+    def _scratch_block_count(self) -> int:
+        return cdiv(self._spec.effective_max_selected_tokens, self.block_size)
+
+    def get_scratch_blocks(self, request_id: str) -> list[KVCacheBlock]:
+        return self._scratch_blocks.get(request_id, [])
 
     def _estimate_decode_tokens_this_step(
         self, request_id: str, num_tokens_main_model: int

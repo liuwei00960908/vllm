@@ -302,7 +302,75 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
-        return self._lmcache_engine.build_connector_meta(scheduler_output)
+        meta = self._lmcache_engine.build_connector_meta(scheduler_output)
+        self._maybe_inject_offloaded_loads(meta, scheduler_output)
+        return meta
+
+    def _maybe_inject_offloaded_loads(
+        self,
+        meta: KVConnectorMetadata,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        cached = scheduler_output.scheduled_cached_reqs
+        offloaded = cached.sparse_offloaded_req_ids
+        scratch_map = cached.sparse_scratch_block_ids
+        if not offloaded or not scratch_map:
+            return
+        requests = getattr(meta, "requests", None)
+        if requests is None:
+            return
+        block_size = getattr(self._lmcache_engine, "_block_size", None)
+        trackers = getattr(self._lmcache_engine, "_request_trackers", None)
+        if block_size is None or trackers is None:
+            return
+        try:
+            from lmcache.integration.vllm.vllm_v1_adapter import (
+                LoadSpec, ReqMeta,
+            )
+        except ImportError:
+            from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.vllm_v1_adapter import (  # noqa: E501
+                LoadSpec, ReqMeta,
+            )
+
+        existing = {r.req_id: r for r in requests if hasattr(r, "req_id")}
+        for req_id in offloaded:
+            scratch_ids = scratch_map.get(req_id) or []
+            if not scratch_ids:
+                continue
+            tracker = trackers.get(req_id)
+            if tracker is None:
+                continue
+            token_ids = list(tracker.token_ids)
+            prompt_len = int(getattr(tracker, "prompt_len", len(token_ids)))
+            scratch_cap = len(scratch_ids) * block_size
+            n_load = min(prompt_len, scratch_cap)
+            if n_load <= 0:
+                continue
+            block_ids_t = torch.tensor(scratch_ids, dtype=torch.long)
+            offsets = torch.arange(0, block_size, dtype=torch.long)
+            slot_mapping = (
+                offsets.reshape(1, block_size)
+                + block_ids_t.reshape(-1, 1) * block_size
+            ).flatten()[:n_load]
+            load_spec = LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=n_load,
+                can_load=True,
+            )
+            r = existing.get(req_id)
+            if r is not None:
+                r.token_ids = token_ids[:n_load]
+                r.slot_mapping = slot_mapping
+                r.load_spec = load_spec
+            else:
+                requests.append(
+                    ReqMeta(
+                        req_id=req_id,
+                        token_ids=token_ids[:n_load],
+                        slot_mapping=slot_mapping,
+                        load_spec=load_spec,
+                    )
+                )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """

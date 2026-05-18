@@ -134,6 +134,8 @@ class CachedRequestData:
     )
     # Token-sparse: chronological physical block ids (see SparseKVManager).
     sparse_chrono_phys_block_ids: dict[str, list[int]] | None = None
+    sparse_offloaded_req_ids: set[str] | None = None
+    sparse_scratch_block_ids: dict[str, list[int]] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -188,6 +190,8 @@ class CachedRequestData:
             sparse_retrieve_block_indices=None,
             sparse_selected_block_indices_by_layer=None,
             sparse_chrono_phys_block_ids=None,
+            sparse_offloaded_req_ids=None,
+            sparse_scratch_block_ids=None,
         )
 
 
