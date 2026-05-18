@@ -1427,9 +1427,16 @@ class GPUModelRunner(
                 and selected_count == 0
                 and retrieve_count == 0
             )
+            # Offloaded reqs must replace the row from the first decode step,
+            # even when num_output_tokens == 0, because the stale prefill row
+            # (e.g. 1540 blocks) plus a fresh sparse payload (~641 blocks)
+            # would overflow max_num_blocks_per_req under `append_row`.
             sparse_should_replace_row = (
                 self._has_sparse_attn
-                and num_output_tokens > 0
+                and (
+                    num_output_tokens > 0
+                    or req_id in self._sparse_offloaded_req_ids
+                )
                 and not sparse_row_collapse_guard
             )
 
@@ -1452,7 +1459,11 @@ class GPUModelRunner(
             # state so the guard survives output_token_ids alignment.
             is_sparse_decode = (
                 self._has_sparse_attn
-                and (num_output_tokens > 0 or _worker_had_output_before_trunc)
+                and (
+                    num_output_tokens > 0
+                    or _worker_had_output_before_trunc
+                    or req_id in self._sparse_offloaded_req_ids
+                )
             )
             if not resumed_from_preemption:
                 if new_block_ids is not None:
