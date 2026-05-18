@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Sparse FlashAttention backend and implementation."""
 
-from dataclasses import replace
+from dataclasses import dataclass, field, fields
 from typing import ClassVar
 
 import torch
@@ -26,10 +26,22 @@ from vllm.v1.attention.backends.flash_attn import (
 from vllm.v1.core.sparse_kmeans_torch import (
     prefill_cluster_meta_from_features_torch_batched,
 )
-from vllm.v1.core.sparse_kv_utils import SparseManagerMetadata
+from vllm.v1.core.sparse_kv_utils import (
+    SparseClusterBlockInfo,
+    SparseManagerMetadata,
+)
 from vllm._custom_ops import append_kv_to_clusters, build_sparse_block_table
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class SparseFlashAttentionMetadata(FlashAttentionMetadata):
+    cluster_allocated_block_info: (
+        list[tuple[SparseClusterBlockInfo | None, ...]] | None
+    ) = None
+    sparse_manager_metadata: list[SparseManagerMetadata] | None = None
+    extra_sparse_manager_info: dict[str, object] = field(default_factory=dict)
 
 
 class SparseFlashAttentionBackend(FlashAttentionBackend):
@@ -106,6 +118,24 @@ class SparseFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     ) -> AttentionCGSupport:
         return AttentionCGSupport.NEVER
 
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: "CommonAttentionMetadata",
+        fast_build: bool = False,
+    ) -> SparseFlashAttentionMetadata:
+        metadata = super().build(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build=fast_build,
+        )
+        return SparseFlashAttentionMetadata(
+            **{
+                field.name: getattr(metadata, field.name)
+                for field in fields(FlashAttentionMetadata)
+            }
+        )
+
 
 class SparseFlashAttentionImpl(FlashAttentionImpl):
     def forward(
@@ -115,7 +145,7 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
+        attn_metadata: SparseFlashAttentionMetadata,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -257,11 +287,16 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             top_clusters = torch.topk(score, k=nprobe, dim=-1).indices.to(
                 dtype=torch.int32
             )
-            free_block_ids = cluster_allocated_block_info["allocated_block_ids_gpu"]
-            used_count = cluster_allocated_block_info["used_count_gpu"]
-            free_block_ids = free_block_ids[used_count:]
+            free_block_ids = cluster_allocated_block_info.reusable_block_ids_gpu
+            assert free_block_ids is not None
+            required_free_blocks = num_queries * hq * nprobe
+            assert free_block_ids.numel() >= required_free_blocks, (
+                "Sparse reusable scratch pool is undersized: "
+                f"have {free_block_ids.numel()}, need at least "
+                f"{required_free_blocks}"
+            )
 
-            block_table, _, seqused_k, free_block_used = build_sparse_block_table(
+            block_table, _, seqused_k, _ = build_sparse_block_table(
                 top_clusters,
                 smm.cluster_compact_block_ids,
                 smm.cluster_temp_kv_pos,
@@ -271,7 +306,6 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 free_block_ids,
                 max_blocks,
             )
-            cluster_allocated_block_info["used_count_gpu"].add_(free_block_used)
 
             num_rows = num_queries * hq
             device = query.device
@@ -426,14 +460,14 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 smm.temp_block_ids,
                 smm.temp_block_kv_counts,
                 smm.temp_block_kv_owner,
-                free_blocks_info["allocated_block_ids_gpu"][
-                    free_blocks_info["used_count_gpu"]:
+                free_blocks_info.allocated_block_ids_gpu[
+                    free_blocks_info.used_count_gpu:
                 ],
                 key.contiguous(),
                 value.contiguous(),
                 labels,
             )
-            free_blocks_info["used_count_gpu"].add_(used_free_blocks)
+            free_blocks_info.used_count_gpu.add_(used_free_blocks)
             smm.in_cluster_token_count += key.shape[0]
             return
 

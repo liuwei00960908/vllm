@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.v1.core.sparse_kv_utils import SparseClusterBlockInfo
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -299,7 +300,7 @@ class ModelRunnerOutput:
     sparse_block_value_features: "dict[str, dict[str, np.ndarray]] | None" = None
 
     # req_id -> kv_manager_list -> name : value
-    cluster_info: "dict[str, tuple[dict[str, object]]] | None" = None
+    cluster_info: "dict[str, tuple[SparseClusterBlockInfo | None, ...]] | None" = None
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

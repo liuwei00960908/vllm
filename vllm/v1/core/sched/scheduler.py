@@ -5,7 +5,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -61,6 +61,9 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sparse_kv_utils import SparseClusterBlockInfo
 
 logger = init_logger(__name__)
 
@@ -354,7 +357,7 @@ class Scheduler(SchedulerInterface):
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
-        cluster_info: dict[str, object] = {}
+        cluster_info: dict[str, tuple[SparseClusterBlockInfo | None, ...]] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -1486,7 +1489,9 @@ class Scheduler(SchedulerInterface):
                         continue
                         
                     kv_cache_manager = self.kv_cache_manager.coordinator.single_type_managers[i]
-                    kv_cache_manager._notify_blocks_for_cluster_used(req_id, cluster_info[i]["used_count"])
+                    kv_cache_manager._notify_blocks_for_cluster_used(
+                        req_id, cluster_info[i].used_count
+                    )
         
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():

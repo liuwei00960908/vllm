@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.sparse_kv_utils import SparseClusterBlockInfo
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
@@ -259,7 +260,7 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
-    cluster_info: dict[str, object] | None = None
+    cluster_info: "dict[str, tuple[SparseClusterBlockInfo | None, ...]] | None" = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

@@ -3,7 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import ClassVar
 
 import numpy as np
@@ -25,8 +25,6 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-
-from vllm.v1.core.sparse_kv_utils import SparseManagerMetadata
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -247,14 +245,6 @@ class FlashAttentionMetadata:
     # Per query-head block-table sparse decode: [H, num_seqs, max_blocks], [H, num_seqs].
     sparse_per_head_block_table: torch.Tensor | None = None
     sparse_per_head_seq_lens: torch.Tensor | None = None
-
-    # All layers share the same cluster_allocated_block_info
-    cluster_allocated_block_info: list[dict[str, object]] | None = None
-    # Each layer has its own sparse_manager_metadata
-    # req_index -> SparseManagerMetadata
-    sparse_manager_metadata: list[SparseManagerMetadata] | None = None
-    extra_sparse_manager_info: dict[str, object] = field(default_factory=dict)
-
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,

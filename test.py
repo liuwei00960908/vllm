@@ -22,7 +22,7 @@ def main():
             dtype="bfloat16",
             max_model_len=context_length,
             block_size=block_size, 
-            enforce_eager=True,
+            enforce_eager=False,
             gpu_memory_utilization=0.5,
             async_scheduling=False,
             sparse_attention={

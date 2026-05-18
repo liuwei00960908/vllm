@@ -541,6 +541,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 )
             return SparseAttentionSpec(
                 num_layer=vllm_config.model_config.hf_config.num_hidden_layers,
+                num_query_heads=self.num_heads,
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,

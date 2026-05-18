@@ -97,7 +97,11 @@ from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import KVCacheSpec, SparseAttentionSpec
 from vllm.v1.request import Request
-from vllm.v1.core.sparse_kv_utils import kvprof_start, kvprof_end
+from vllm.v1.core.sparse_kv_utils import (
+    SparseClusterBlockInfo,
+    kvprof_end,
+    kvprof_start,
+)
 
 if TYPE_CHECKING:
     pass
@@ -404,31 +408,94 @@ class SparseKVManager(FullAttentionManager):
 
         # request_id -> _ClusterManager
         self._req_to_cluster_blocks: dict[str, list[KVCacheBlock]] = {}
+        self._req_to_temp_block_ids: dict[str, list[int]] = {}
+        self._req_to_reusable_cluster_blocks_id: dict[str, list[int]] = {}
         self._req_to_unused_cluster_blocks_id: dict[str, list[int]] = {}
 
     def _get_cluster_block_size(self):
         # Since the cluster of each head cannot be shared with other heads, we will reshape 
         # the kv_cache. For clusters, the block_size needs to be multiplied by head_num.
         return self._spec.num_kv_heads * self.block_size
-    
-    def _allocate_blocks_for_cluster(self, req_id, num_new_token):
+
+    def _get_temp_block_count_per_layer(self) -> int:
         cluster_block_size = self._get_cluster_block_size()
+        return (
+            (self._spec.num_kv_heads * self._spec.num_clusters + 1)
+            * (cluster_block_size - 1)
+        ) // cluster_block_size
 
-        # A redundant block for each cluster
-        num_required_blocks = cdiv(max(0, num_new_token - self._spec.num_kv_heads * self._spec.num_clusters), 
-                                   cluster_block_size) + self._spec.num_kv_heads * self._spec.num_clusters
-        num_required_blocks = num_required_blocks * self._spec.num_layer
+    def _get_total_temp_block_count(self) -> int:
+        return self._get_temp_block_count_per_layer() * self._spec.num_layer
 
-        # free blocks for forward
-        num_required_blocks += self._spec.num_layer * self._spec.num_kv_heads * self._spec.num_clusters
+    def _get_required_reusable_block_count(self, num_new_token: int) -> int:
+        # build_sparse_block_table() resets its scratch usage every call, so the
+        # pool only needs to cover the current decode step for a single layer.
+        # A row is one (query token, query head) pair and can need at most
+        # nprobe scratch blocks in the all-tail worst case.
+        per_row = min(self._spec.nprobe, self._spec.num_clusters)
+        rows = max(0, num_new_token) * self._spec.num_query_heads
+        return rows * per_row
+
+    def _ensure_reusable_cluster_blocks(self, req_id: str, num_new_token: int) -> None:
+        reusable_block_ids = self._req_to_reusable_cluster_blocks_id.setdefault(
+            req_id, []
+        )
+        num_required_blocks = self._get_required_reusable_block_count(num_new_token)
+        num_missing_blocks = max(0, num_required_blocks - len(reusable_block_ids))
+        if num_missing_blocks == 0:
+            return
+
+        reusable_blocks = self._allocate_cluster_blocks(req_id, num_missing_blocks)
+        reusable_block_ids.extend([block.block_id for block in reusable_blocks])
+
+    def _get_prefill_persistent_block_count(self, num_new_token: int) -> int:
+        cluster_block_size = self._get_cluster_block_size()
+        per_layer = (
+            cdiv(
+                max(0, num_new_token - cluster_block_size + 1),
+                cluster_block_size,
+            )
+            * self._spec.num_kv_heads
+        )
+        return per_layer * self._spec.num_layer
+
+    def _get_decode_persistent_block_count(self, num_new_token: int) -> int:
+        return max(0, num_new_token) * self._spec.num_layer * self._spec.num_kv_heads
+
+    def _allocate_cluster_blocks(
+        self, req_id: str, num_blocks: int
+    ) -> list[KVCacheBlock]:
+        if num_blocks <= 0:
+            return []
+        new_blocks = self.block_pool.get_new_blocks(num_blocks)
+        self._req_to_cluster_blocks.setdefault(req_id, []).extend(new_blocks)
+        return new_blocks
+
+    def _allocate_blocks_for_cluster(self, req_id, num_new_token):
+        if req_id not in self._req_to_temp_block_ids:
+            temp_blocks = self._allocate_cluster_blocks(
+                req_id, self._get_total_temp_block_count()
+            )
+            self._req_to_temp_block_ids[req_id] = [
+                block.block_id for block in temp_blocks
+            ]
+
+        if req_id in self.num_cached_block:
+            self._ensure_reusable_cluster_blocks(req_id, num_new_token)
 
         unused_blocks_id_list = self._req_to_unused_cluster_blocks_id.setdefault(req_id, [])
-        num_required_blocks -= len(unused_blocks_id_list)
-        num_required_blocks = max(0, num_required_blocks)
-        
-        new_blocks = self.block_pool.get_new_blocks(num_required_blocks)
-        self._req_to_cluster_blocks.setdefault(req_id, []).extend(new_blocks)
+        num_required_blocks = (
+            self._get_decode_persistent_block_count(num_new_token)
+            if req_id in self.num_cached_block
+            else self._get_prefill_persistent_block_count(num_new_token)
+        )
+        num_required_blocks = max(0, num_required_blocks - len(unused_blocks_id_list))
+        if len(unused_blocks_id_list) == 0:
+            # append_kv_to_clusters requires a non-empty free_block_ids tensor
+            # even on steps where no compact block is ultimately consumed.
+            num_required_blocks = max(1, num_required_blocks)
 
+        new_blocks = self._allocate_cluster_blocks(req_id, num_required_blocks)
         unused_blocks_id_list.extend([block.block_id for block in new_blocks])
         return None
     
@@ -437,17 +504,26 @@ class SparseKVManager(FullAttentionManager):
         return None
 
     def generate_cluster_block_info(self, req_id, num_new_token):
-        info = dict()
-
-        info["allocated_block_ids"] = torch.tensor(self._req_to_unused_cluster_blocks_id.setdefault(req_id, []), dtype=torch.int32)
-        info["used_count"] = torch.zeros(size=(1,), dtype=torch.int32)
-        info["cluster_block_size"] = self._get_cluster_block_size()
-        info["num_cluster"] = self._spec.num_clusters
-        info["num_segment"] = self._spec.n_segment
-        info["nprobe"] = self._spec.nprobe
-        info["num_kv_heads"] = self._spec.num_kv_heads
-        
-        return info
+        return SparseClusterBlockInfo(
+            temp_block_ids=torch.tensor(
+            self._req_to_temp_block_ids.setdefault(req_id, []),
+            dtype=torch.int32,
+            ),
+            reusable_block_ids=torch.tensor(
+            self._req_to_reusable_cluster_blocks_id.setdefault(req_id, []),
+            dtype=torch.int32,
+            ),
+            allocated_block_ids=torch.tensor(
+            self._req_to_unused_cluster_blocks_id.setdefault(req_id, []),
+            dtype=torch.int32,
+            ),
+            used_count=torch.zeros(size=(1,), dtype=torch.int32),
+            cluster_block_size=self._get_cluster_block_size(),
+            num_cluster=self._spec.num_clusters,
+            num_segment=self._spec.n_segment,
+            nprobe=self._spec.nprobe,
+            num_kv_heads=self._spec.num_kv_heads,
+        )
 
     def _debug_log_state(self, request_id: str, phase: str, **kwargs) -> None:
         if not self._debug_state_transitions:
@@ -657,6 +733,8 @@ class SparseKVManager(FullAttentionManager):
         if request_id in self._req_to_cluster_blocks:
             self.block_pool.free_blocks(self._req_to_cluster_blocks[request_id])
             self._req_to_cluster_blocks.pop(request_id)
+            self._req_to_temp_block_ids.pop(request_id, None)
+            self._req_to_reusable_cluster_blocks_id.pop(request_id, None)
             self._req_to_unused_cluster_blocks_id.pop(request_id)
 
         # Free non-selected prefill blocks that are no longer referenced by

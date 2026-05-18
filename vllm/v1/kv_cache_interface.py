@@ -400,6 +400,8 @@ class SparseAttentionSpec(FullAttentionSpec):
     """Position segments for segment K-Means."""
     num_layer: int = 24
     """layer num"""
+    num_query_heads: int = 0
+    """Per-rank query head count used to size decode scratch buffers."""
 
     # ── Retrieve zone ───────────────────────────────────────────────────
     nprobe: int = 16
@@ -522,6 +524,8 @@ class SparseAttentionSpec(FullAttentionSpec):
             num_clusters=specs[0].num_clusters,
             n_segment=specs[0].n_segment,
             nprobe=specs[0].nprobe,
+            num_layer=specs[0].num_layer,
+            num_query_heads=specs[0].num_query_heads,
             static_pattern_start=specs[0].static_pattern_start,
             static_pattern_end=specs[0].static_pattern_end,
             prefill_topk_query_window=specs[0].prefill_topk_query_window,

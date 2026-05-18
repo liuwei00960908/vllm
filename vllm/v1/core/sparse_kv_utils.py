@@ -25,6 +25,24 @@ class SparseManagerMetadata:
 class RequestSparseClusterInfo:
     layers: dict[str, SparseManagerMetadata] = field(default_factory=dict)
 
+
+@dataclass
+class SparseClusterBlockInfo:
+    temp_block_ids: torch.Tensor | None = None
+    reusable_block_ids: torch.Tensor | None = None
+    allocated_block_ids: torch.Tensor | None = None
+    used_count: torch.Tensor | int = 0
+    cluster_block_size: int = 0
+    num_cluster: int = 0
+    num_segment: int = 0
+    nprobe: int = 0
+    num_kv_heads: int = 0
+
+    temp_block_ids_gpu: torch.Tensor | None = None
+    reusable_block_ids_gpu: torch.Tensor | None = None
+    allocated_block_ids_gpu: torch.Tensor | None = None
+    used_count_gpu: torch.Tensor | None = None
+
 import time
 from collections import defaultdict, deque
 
