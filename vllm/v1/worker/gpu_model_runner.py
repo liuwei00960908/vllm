@@ -7335,6 +7335,22 @@ class GPUModelRunner(
             )
             per_req_selected_ids.append(selected_ids)
             per_req_actual_kv_len.append(actual_kv_len)
+            sel_cpu = selected_ids.detach().to("cpu")
+            logger.warning(
+                "[sparse-sel] rid=%s layer=%s actual_kv_len=%d "
+                "selected.shape=%s sel.min=%d sel.max=%d prompt_len=%d "
+                "pending=%d head_n=%d tail_start=%d budget=%d "
+                "cluster_size.shape=%s cluster_size.max=%d "
+                "cluster_members.shape=%s cluster_members.max=%d",
+                rid, layer_name, actual_kv_len,
+                tuple(selected_ids.shape),
+                int(sel_cpu.min()), int(sel_cpu.max()),
+                prompt_len, pending_count, head_n, tail_start, select_budget,
+                tuple(layer_stats.cluster_size.shape),
+                int(layer_stats.cluster_size.max()),
+                tuple(layer_stats.cluster_members.shape),
+                int(layer_stats.cluster_members.max()),
+            )
 
             device = q_flat.device
             offloaded = rid in self._sparse_offloaded_req_ids
