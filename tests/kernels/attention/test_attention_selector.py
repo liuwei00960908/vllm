@@ -16,8 +16,15 @@ from vllm.platforms import current_platform
 from vllm.platforms.cpu import CpuPlatform
 from vllm.platforms.cuda import CudaPlatform
 from vllm.platforms.rocm import RocmPlatform
+from vllm.model_executor.layers.attention import Attention
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.sparse_flash_attn import (
+    SparseFlashAttentionImpl,
+    SparseFlashAttentionMetadataBuilder,
+)
 from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
+from vllm.v1.kv_cache_interface import SparseAttentionSpec
 
 
 @pytest.fixture(autouse=True)
@@ -294,6 +301,91 @@ def test_invalid_backend():
     ):
         # Invalid backend name should raise ValueError when creating enum
         AttentionConfig(backend=AttentionBackendEnum["INVALID"])
+
+
+def test_sparse_backend_selection_cuda():
+    attention_config = AttentionConfig()
+    cache_config = CacheConfig(
+        block_size=16,
+        sparse_attention={
+            "num_clusters": 32,
+            "n_segment": 1,
+            "nprobe": 32,
+        },
+    )
+    vllm_config = VllmConfig(
+        attention_config=attention_config,
+        cache_config=cache_config,
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+    ):
+        backend = get_attn_backend(
+            head_size=64,
+            dtype=torch.float16,
+            kv_cache_dtype=None,
+            use_sparse=True,
+        )
+    assert backend.get_name() == "SPARSE_FLASH_ATTN"
+
+
+def test_attention_constructs_sparse_impl_cuda():
+    attention_config = AttentionConfig()
+    cache_config = CacheConfig(
+        block_size=16,
+        sparse_attention={
+            "num_clusters": 32,
+            "n_segment": 1,
+            "nprobe": 32,
+        },
+    )
+    vllm_config = VllmConfig(
+        attention_config=attention_config,
+        cache_config=cache_config,
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+    ):
+        attn = Attention(
+            num_heads=4,
+            head_size=64,
+            scale=1.0,
+            num_kv_heads=2,
+            cache_config=cache_config,
+        )
+    assert attn.attn_backend.get_name() == "SPARSE_FLASH_ATTN"
+    assert isinstance(attn.impl, SparseFlashAttentionImpl)
+
+
+def test_sparse_flash_attn_builder_disables_cudagraphs():
+    attention_config = AttentionConfig(backend=AttentionBackendEnum.SPARSE_FLASH_ATTN)
+    cache_config = CacheConfig(block_size=16)
+    vllm_config = VllmConfig(
+        attention_config=attention_config,
+        cache_config=cache_config,
+    )
+
+    with set_current_vllm_config(vllm_config):
+        assert (
+            SparseFlashAttentionMetadataBuilder.get_cudagraph_support(
+                vllm_config,
+                SparseAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=2,
+                    head_size=64,
+                    dtype=torch.float16,
+                    num_clusters=32,
+                    n_segment=1,
+                    nprobe=32,
+                    max_selected_blocks=32,
+                ),
+            )
+            == AttentionCGSupport.NEVER
+        )
 
 
 @pytest.mark.parametrize("auto_value", ["auto", "AUTO", "Auto"])

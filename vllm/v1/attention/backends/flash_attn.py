@@ -3,7 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import numpy as np
@@ -26,9 +26,7 @@ from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
-from vllm.v1.core.sparse_kmeans_torch import prefill_cluster_meta_from_features_torch_batched
-from vllm.v1.core.sparse_kv_utils import SparseManagerMetadata, kvprof_start, kvprof_end
-from vllm._custom_ops import build_sparse_block_table, append_kv_to_clusters
+from vllm.v1.core.sparse_kv_utils import SparseManagerMetadata
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -295,14 +293,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         else AttentionCGSupport.UNIFORM_BATCH
     )
     supports_update_block_table: bool = True
-
-    @classmethod
-    def get_cudagraph_support(
-        cls,
-        vllm_config: "VllmConfig",
-        kv_cache_spec: "AttentionSpec",
-    ) -> AttentionCGSupport:
-        return cls._cudagraph_support
 
     def __init__(
         self,
@@ -732,281 +722,17 @@ class FlashAttentionImpl(AttentionImpl):
             value_cache = value_cache.view(dtype)
 
         if not attn_metadata.use_cascade:
-            cu_seqlens_q = attn_metadata.query_start_loc
-            seqused_k = attn_metadata.seq_lens
-            max_seqlen_q = attn_metadata.max_query_len
-            max_seqlen_k = attn_metadata.max_seq_len
-            block_table = attn_metadata.block_table
-            scheduler_metadata = attn_metadata.scheduler_metadata
-
-            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-
-            q_descale = layer._q_scale.expand(descale_shape)
-            k_descale = layer._k_scale.expand(descale_shape)
-            v_descale = layer._v_scale.expand(descale_shape)
-
-            if self.dcp_world_size > 1:
-                self._forward_with_dcp(
-                    query[:num_actual_tokens],
-                    key[:num_actual_tokens],
-                    value[:num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    output[:num_actual_tokens],
-                    attn_metadata,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                )
-                return output
-            else:
-                sliding_window_size = (
-                    list(self.sliding_window)
-                    if self.sliding_window is not None
-                    else None
-                )
-                use_sparse_cluster = (
-                    len(attn_metadata.sparse_manager_metadata) > 0 and
-                    attn_metadata.sparse_manager_metadata[0].mean is not None
-                )
-                if use_sparse_cluster:
-                    # TODO: there may be several request concurrently
-                    cluster_storage = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4])
-                    req_index = 0
-                    smm = attn_metadata.sparse_manager_metadata[0]
-                    cluster_allocated_block_info = attn_metadata.cluster_allocated_block_info[req_index][0]
-                
-                    is_prefill = smm.in_cluster_token_count == query.shape[0]
-                    if is_prefill:
-                        flash_attn_varlen_func(
-                            q=query[:num_actual_tokens],
-                            k=key,
-                            v=value,
-                            out=output[:num_actual_tokens],
-                            cu_seqlens_q=cu_seqlens_q,
-                            max_seqlen_q=max_seqlen_q,
-                            cu_seqlens_k=cu_seqlens_q,
-                            max_seqlen_k=max_seqlen_k,
-                            softmax_scale=self.scale,
-                            causal=attn_metadata.causal,
-                            alibi_slopes=self.alibi_slopes,
-                            window_size=sliding_window_size,
-                            block_table=None,
-                            softcap=self.logits_soft_cap,
-                            scheduler_metadata=scheduler_metadata,
-                            fa_version=self.vllm_flash_attn_version,
-                            q_descale=q_descale,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
-                            num_splits=attn_metadata.max_num_splits,
-                            s_aux=self.sinks,
-                        )
-                        return output
-                    
-                    Hkv = smm.mean.shape[0]
-                    cluster_block_size = cluster_storage.shape[2]
-                    Nq = num_actual_tokens
-                    Hq = query.shape[1]
-                    head_group_size = Hq // Hkv
-                    maxB = block_table.shape[-1]
-                    nprobe = attn_metadata.extra_sparse_manager_info["nprobe"]
-                    dim = query.shape[-1]
-
-                    if smm.in_cluster_token_count < smm.cluster_centers_T.shape[2]:
-                        cluster_centers_T = smm.cluster_centers_T[:, :, :smm.in_cluster_token_count]
-                    else:
-                        cluster_centers_T = smm.cluster_centers_T
-                    nprobe = min(nprobe, cluster_centers_T.shape[2])
-                    query_centered = query.reshape(Nq, Hkv, head_group_size, dim) - smm.mean[None, :, None]
-                    score = torch.matmul(query_centered, cluster_centers_T[None])
-                    score = score.reshape(Nq, Hq, -1)
-                    top_clusters = torch.topk(score, k=nprobe, dim=-1).indices.to(dtype=torch.int32)
-                    free_block_ids = cluster_allocated_block_info["allocated_block_ids_gpu"]
-                    used_count = cluster_allocated_block_info["used_count_gpu"]
-                    free_block_ids = free_block_ids[used_count:]
-
-                    block_table, valid_block_size, seqused_k, free_block_used = build_sparse_block_table(
-                        top_clusters, smm.cluster_compact_block_ids, smm.cluster_temp_kv_pos, 
-                        smm.cluster_total_kv_counts, smm.temp_block_ids, cluster_storage, free_block_ids, maxB)
-
-                    N = Nq * Hq
-                    device = query.device
-                    q_flat = query.reshape(N, 1, -1)
-                    out_flat = output.reshape(N, 1, -1)
-                    seqused_k_flat = seqused_k.reshape(N)
-                    block_table_flat = block_table.reshape(N, -1)
-                    cu_seqlens_q_batch = torch.arange(
-                        N + 1, device=device, dtype=cu_seqlens_q.dtype,
-                    )
-                    
-                    flash_attn_varlen_func(
-                        q=q_flat,
-                        k=cluster_storage[0, :, :, None, :],
-                        v=cluster_storage[1, :, :, None, :],
-                        out=out_flat,
-                        cu_seqlens_q=cu_seqlens_q_batch,
-                        max_seqlen_q=1,
-                        seqused_k=seqused_k_flat,
-                        max_seqlen_k=maxB * cluster_block_size,
-                        softmax_scale=self.scale,
-                        causal=attn_metadata.causal,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=sliding_window_size,
-                        block_table=block_table_flat,
-                        softcap=self.logits_soft_cap,
-                        scheduler_metadata=None,
-                        fa_version=self.vllm_flash_attn_version,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        num_splits=attn_metadata.max_num_splits,
-                        s_aux=self.sinks,
-                    )
-
-                    return output
-
-                else:
-                    flash_attn_varlen_func(
-                        q=query[:num_actual_tokens],
-                        k=key_cache,
-                        v=value_cache,
-                        out=output[:num_actual_tokens],
-                        cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=max_seqlen_q,
-                        seqused_k=seqused_k,
-                        max_seqlen_k=max_seqlen_k,
-                        softmax_scale=self.scale,
-                        causal=attn_metadata.causal,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=sliding_window_size,
-                        block_table=block_table,
-                        softcap=self.logits_soft_cap,
-                        scheduler_metadata=scheduler_metadata,
-                        fa_version=self.vllm_flash_attn_version,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        num_splits=attn_metadata.max_num_splits,
-                        s_aux=self.sinks,
-                    )
-                    return output
-
-                use_q_head_gather = (
-                    attn_metadata.sparse_q_head_gather is not None
-                    and self.alibi_slopes is None
-                    and self.sinks is None
-                    and sliding_window_size == [-1, -1]
-                    and not self.kv_cache_dtype.startswith("fp8")
-                )
-                runtime_q_head_gather = getattr(
-                    layer, "_vllm_sparse_runtime_q_head_gather", None
-                )
-                if runtime_q_head_gather is not None:
-                    attn_metadata = replace(
-                        attn_metadata,
-                        sparse_q_head_gather=runtime_q_head_gather,
-                        sparse_gather_phys=None,
-                        sparse_gather_slots=None,
-                        sparse_gather_cu_seqlens_k=None,
-                    )
-                    use_q_head_gather = True
-                use_gather = (
-                    attn_metadata.sparse_gather_phys is not None
-                    and attn_metadata.sparse_gather_cu_seqlens_k is not None
-                    and attn_metadata.sparse_q_head_gather is None
-                    and self.alibi_slopes is None
-                    and self.sinks is None
-                    and sliding_window_size == [-1, -1]
-                    and not self.kv_cache_dtype.startswith("fp8")
-                )
-                use_per_head_bt = attn_metadata.sparse_per_head_block_table is not None
-                # TODO(sparse-debug): remove after locating compact-gather routing issues.
-                logger.debug(
-                    "[SparseDebug] FA sparse branch layer=%s num_tok=%d "
-                    "use_q_head_gather=%s use_gather=%s use_per_head_bt=%s | "
-                    "sparse_q_head_gather=%s sparse_gather_phys=%s sparse_per_head_bt=%s | "
-                    "alibi=%s sinks=%s sliding=%s fp8_kv=%s",
-                    getattr(layer, "__class__", type(layer)).__name__,
-                    int(num_actual_tokens),
-                    use_q_head_gather,
-                    use_gather,
-                    use_per_head_bt,
-                    attn_metadata.sparse_q_head_gather is not None,
-                    attn_metadata.sparse_gather_phys is not None,
-                    attn_metadata.sparse_per_head_block_table is not None,
-                    self.alibi_slopes is not None,
-                    self.sinks is not None,
-                    sliding_window_size,
-                    bool(self.kv_cache_dtype.startswith("fp8")),
-                )
-                if use_q_head_gather:
-                    self._forward_per_head_compact_kv_gather(
-                        query[:num_actual_tokens],
-                        key_cache,
-                        value_cache,
-                        output[:num_actual_tokens],
-                        attn_metadata,
-                        cu_seqlens_q,
-                        max_seqlen_q,
-                        q_descale,
-                        k_descale,
-                        v_descale,
-                    )
-                    if runtime_q_head_gather is not None:
-                        layer._vllm_sparse_runtime_q_head_gather = None
-                elif use_per_head_bt:
-                    self._forward_per_head_block_table_sparse(
-                        query[:num_actual_tokens],
-                        key_cache,
-                        value_cache,
-                        output[:num_actual_tokens],
-                        attn_metadata,
-                        cu_seqlens_q,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        scheduler_metadata,
-                        q_descale,
-                        k_descale,
-                        v_descale,
-                    )
-                elif use_gather:
-                    self._forward_compact_kv_gather(
-                        query[:num_actual_tokens],
-                        key_cache,
-                        value_cache,
-                        output[:num_actual_tokens],
-                        attn_metadata,
-                        cu_seqlens_q,
-                        max_seqlen_q,
-                        q_descale,
-                        k_descale,
-                        v_descale,
-                    )
-                else:
-                    flash_attn_varlen_func(
-                        q=query[:num_actual_tokens],
-                        k=key_cache,
-                        v=value_cache,
-                        out=output[:num_actual_tokens],
-                        cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=max_seqlen_q,
-                        seqused_k=seqused_k,
-                        max_seqlen_k=max_seqlen_k,
-                        softmax_scale=self.scale,
-                        causal=attn_metadata.causal,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=sliding_window_size,
-                        block_table=block_table,
-                        softcap=self.logits_soft_cap,
-                        scheduler_metadata=scheduler_metadata,
-                        fa_version=self.vllm_flash_attn_version,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        num_splits=attn_metadata.max_num_splits,
-                        s_aux=self.sinks,
-                    )
-                return output
+            return self._forward_decoder_attention(
+                layer,
+                query,
+                key,
+                value,
+                key_cache,
+                value_cache,
+                output,
+                attn_metadata,
+                num_actual_tokens,
+            )
 
         # Cascade attention (rare case).
         cascade_attention(
@@ -1033,6 +759,73 @@ class FlashAttentionImpl(AttentionImpl):
             q_descale=layer._q_scale,
             k_descale=layer._k_scale,
             v_descale=layer._v_scale,
+            s_aux=self.sinks,
+        )
+        return output
+
+    def _forward_decoder_attention(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        num_actual_tokens: int,
+    ) -> torch.Tensor:
+        cu_seqlens_q = attn_metadata.query_start_loc
+        seqused_k = attn_metadata.seq_lens
+        max_seqlen_q = attn_metadata.max_query_len
+        max_seqlen_k = attn_metadata.max_seq_len
+        block_table = attn_metadata.block_table
+        scheduler_metadata = attn_metadata.scheduler_metadata
+
+        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+        q_descale = layer._q_scale.expand(descale_shape)
+        k_descale = layer._k_scale.expand(descale_shape)
+        v_descale = layer._v_scale.expand(descale_shape)
+
+        if self.dcp_world_size > 1:
+            self._forward_with_dcp(
+                query[:num_actual_tokens],
+                key[:num_actual_tokens],
+                value[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[:num_actual_tokens],
+                attn_metadata,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            return output
+
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else None
+        )
+        flash_attn_varlen_func(
+            q=query[:num_actual_tokens],
+            k=key_cache,
+            v=value_cache,
+            out=output[:num_actual_tokens],
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,
+            window_size=sliding_window_size,
+            block_table=block_table,
+            softcap=self.logits_soft_cap,
+            scheduler_metadata=scheduler_metadata,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
             s_aux=self.sinks,
         )
         return output
@@ -1281,80 +1074,7 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        attn_metadata = self.get_attn_metadata_for_update()
         self.clear_attn_metadata_for_update()
-        use_sparse_cluster = False
-        if attn_metadata is not None and len(attn_metadata.cluster_allocated_block_info) != 0:
-            # TODO: there may exist several request
-            assert(len(attn_metadata.cluster_allocated_block_info) == 1)
-            req_index = 0
-            # TODO: there may exist several kv_manager
-            assert(len(attn_metadata.cluster_allocated_block_info[req_index]) == 1)
-            # TODO: there may exist several segment
-            assert(attn_metadata.extra_sparse_manager_info["num_segment"] == 1)
-            use_sparse_cluster = (
-                attn_metadata.cluster_allocated_block_info[req_index][0] is not None
-            )
-        
-        if use_sparse_cluster:
-            free_blocks_info = attn_metadata.cluster_allocated_block_info[req_index][0]
-            smm = attn_metadata.sparse_manager_metadata[req_index]
-            is_prefill = smm.mean is None
-            Hkv = key.shape[1]
-            C = attn_metadata.extra_sparse_manager_info["num_cluster"]
-            dim = key.shape[-1]
-            cluster_storage = kv_cache.reshape(kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4])
-            cluster_block_size = cluster_storage.shape[-2]
-            if is_prefill:
-                device = key.device
-                smm.cluster_centers_T = torch.zeros(size=(Hkv, dim, C), dtype=key.dtype, device=device)
-                smm.mean = torch.zeros(size=(Hkv, dim), dtype=key.dtype, device=device)
-                smm.cluster_compact_block_ids = torch.full(fill_value=-1, size=(Hkv, C, SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT),
-                                                   dtype=torch.int32, device=device)
-                smm.cluster_temp_kv_pos = torch.zeros(size=(Hkv, C, cluster_block_size, 2), dtype=torch.int32, device=device)
-                smm.cluster_total_kv_counts = torch.zeros(size=(Hkv, C),
-                                                dtype=torch.int32, device=device)
-                smm.in_cluster_token_count = 0
-                
-                res = prefill_cluster_meta_from_features_torch_batched(
-                    key.transpose(0, 1),
-                    C,
-                    attn_metadata.extra_sparse_manager_info["num_segment"],
-                    granularity = "token"
-                )
-                labels = res["token_to_cluster"].transpose_(-1, -2).to(dtype=torch.int32).contiguous()
-
-                valid_len = res["cluster_centres"].shape[1]
-                smm.cluster_centers_T[:, :, :valid_len] = res["cluster_centres"].transpose(1, 2)
-                smm.mean = res["mean_key"].to(dtype=key.dtype)
-            else:
-                # For decode, we assume there is only one new token
-                assert(key.shape[0] == 1)
-                smm = attn_metadata.sparse_manager_metadata[req_index]
-                if smm.in_cluster_token_count < smm.cluster_centers_T.shape[-1]:
-                    labels = torch.full(fill_value=smm.in_cluster_token_count, size=key.shape[:2], dtype=torch.int32, device=key.device)
-                    smm.cluster_centers_T[:, :, smm.in_cluster_token_count] = key[0]
-                else:
-                    score = torch.matmul((key - smm.mean[None])[:, :, None], smm.cluster_centers_T[None])
-                    labels = score.argmax(dim=-1).to(dtype=torch.int32)[:, :, 0]
-
-            used_free_blocks = append_kv_to_clusters(
-                cluster_storage,
-                smm.cluster_compact_block_ids,
-                smm.cluster_temp_kv_pos,
-                smm.cluster_total_kv_counts,
-                smm.temp_block_ids,
-                smm.temp_block_kv_counts,
-                smm.temp_block_kv_owner,
-                free_blocks_info["allocated_block_ids_gpu"][free_blocks_info["used_count_gpu"]:],
-                key.contiguous(),
-                value.contiguous(),
-                labels
-            )
-            free_blocks_info["used_count_gpu"].add_(used_free_blocks)
-            smm.in_cluster_token_count += key.shape[0]
-
-            return
 
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,

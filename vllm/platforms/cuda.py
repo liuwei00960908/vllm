@@ -49,6 +49,7 @@ torch.backends.cuda.enable_cudnn_sdp(False)
 @cache
 def _get_backend_priorities(
     use_mla: bool,
+    use_sparse: bool,
     device_capability: DeviceCapability,
     num_heads: int | None = None,
     kv_cache_dtype: CacheDType | None = None,
@@ -95,6 +96,8 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
+    elif use_sparse:
+        return [AttentionBackendEnum.SPARSE_FLASH_ATTN]
     else:
         if device_capability.major == 10:
             return [
@@ -224,6 +227,7 @@ class CudaPlatformBase(Platform):
 
         backend_priorities = _get_backend_priorities(
             attn_selector_config.use_mla,
+            attn_selector_config.use_sparse,
             device_capability,
             num_heads,
             attn_selector_config.kv_cache_dtype,

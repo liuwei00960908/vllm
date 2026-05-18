@@ -269,6 +269,12 @@ class Attention(nn.Module, AttentionLayerBase):
         # During model initialization, the default dtype is set as the model
         # weight and activation dtype.
         dtype = torch.get_default_dtype()
+        use_sparse = (
+            attn_type == AttentionType.DECODER
+            and cache_config is not None
+            and getattr(cache_config, "sparse_attention", None) is not None
+            and sliding_window is None
+        )
         if attn_backend is None:
             self.attn_backend = get_attn_backend(
                 head_size,
@@ -276,6 +282,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dtype,
                 use_mla=False,
                 has_sink=self.has_sink,
+                use_sparse=use_sparse,
                 use_mm_prefix=self.use_mm_prefix,
                 use_per_head_quant_scales=use_per_head_quant_scales,
                 attn_type=attn_type,

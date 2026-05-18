@@ -9,7 +9,7 @@ import torch
 
 def main():
     USE_SPARSE_ATTENTION = True
-    context_length = 20000
+    context_length = 200
     block_size = 16
     print_output = False
 
@@ -29,7 +29,7 @@ def main():
                 "cluster_granularity": "token",
                 "num_clusters": 32,
                 "n_segment": 1,
-                "nprobe": 8,
+                "nprobe": 32,
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,
@@ -43,7 +43,7 @@ def main():
             dtype="bfloat16",
             max_model_len=context_length,
             block_size=block_size, 
-            enforce_eager=True,
+            enforce_eager=False,
             gpu_memory_utilization=0.5,
             async_scheduling=False,
         )
