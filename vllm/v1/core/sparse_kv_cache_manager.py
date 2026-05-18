@@ -975,7 +975,17 @@ class SparseKVManager(FullAttentionManager):
         return request_id in self._prefill_offloaded
 
     def _scratch_block_count(self) -> int:
-        return cdiv(self._spec.effective_max_selected_tokens, self.block_size)
+        # Scratch must hold the full per-step selection footprint:
+        # head_n (static prefix) + max_selected_tokens (dynamic) + tail_len
+        # (static suffix). Sizing only for max_selected_tokens leaves the
+        # static-zone tokens reading past the end of the row.
+        spec = self._spec
+        return cdiv(
+            spec.effective_max_selected_tokens
+            + int(spec.static_pattern_start)
+            + int(spec.static_pattern_end),
+            self.block_size,
+        )
 
     def get_scratch_blocks(self, request_id: str) -> list[KVCacheBlock]:
         return self._scratch_blocks.get(request_id, [])
