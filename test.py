@@ -4,13 +4,14 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import vllm
 print(vllm.__file__)
 
+import time
 from vllm import EngineArgs, LLMEngine, SamplingParams
 import torch
 from transformers import AutoTokenizer
 
 def main():
     USE_SPARSE_ATTENTION = True
-    context_length = 200
+    context_length = 2000
     block_size = 16
     print_output = False
 
@@ -23,7 +24,7 @@ def main():
             dtype="bfloat16",
             max_model_len=context_length,
             block_size=block_size, 
-            enforce_eager=False,
+            enforce_eager=True,
             gpu_memory_utilization=0.5,
             async_scheduling=False,
             sparse_attention={
@@ -44,7 +45,7 @@ def main():
             dtype="bfloat16",
             max_model_len=context_length,
             block_size=block_size, 
-            enforce_eager=False,
+            enforce_eager=True,
             gpu_memory_utilization=0.5,
             async_scheduling=False,
         )
@@ -58,7 +59,8 @@ def main():
     request_id = "debug_req_001"  # 字符串类型，和你之前问的一致
     tokenizer = AutoTokenizer.from_pretrained(engine_args.model)
     prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "说一下vllm是什么"}],
+        [{"role": "user", 
+          "content": "请直接续写下面的文本，不要解释，不要停顿，不要加标点：\n你好你好你好你好你好你好你好你好你好你好"}],
         tokenize=False,
         add_generation_prompt=True,
     )
@@ -85,6 +87,7 @@ def main():
     print("=== 开始执行引擎主循环 ===")
     step_count = 0
     generated_text = ""
+    loop_start_time = time.perf_counter()
 
     while engine.has_unfinished_requests():
         step_count += 1
@@ -112,11 +115,22 @@ def main():
                     new_token = output.outputs[0].text
                     print(f"生成token: {repr(new_token)}")
 
+    loop_elapsed = time.perf_counter() - loop_start_time
+    generated_tokens = len(
+        tokenizer.encode(generated_text, add_special_tokens=False)
+    )
+    tokens_per_second = (
+        generated_tokens / loop_elapsed if loop_elapsed > 0 else 0.0
+    )
+
     # ====================== 5. 输出最终结果 ======================
     print("\n=== 生成完成 ===")
     print(f"完整输出: {generated_text}")
     print(f"总step数: {step_count}")
     print(f"其中: 第1步 = prefill阶段，第2-{step_count}步 = decode阶段")
+    print(f"生成token数: {generated_tokens}")
+    print(f"耗时: {loop_elapsed:.3f}s")
+    print(f"tokens/s: {tokens_per_second:.3f}")
 
 if __name__ == "__main__":
     main()
