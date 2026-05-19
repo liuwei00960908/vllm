@@ -3024,6 +3024,8 @@ class GPUModelRunner(
         if src is None:
             dst.fill_(fill_value)
             return
+        src_flat = src.reshape(-1)
+        dst_flat = dst.reshape(-1)
         if (
             src.is_cuda
             and src.device == dst.device
@@ -3032,14 +3034,16 @@ class GPUModelRunner(
             and src.data_ptr() == dst.data_ptr()
         ):
             return
-        dst.fill_(fill_value)
-        src_gpu = src.to(device=self.device, dtype=dst.dtype)
-        if src_gpu.numel() > dst.numel():
+        if src_flat.numel() > dst_flat.numel():
             raise ValueError(
                 "Sparse CUDA graph buffer is undersized: "
-                f"dst={tuple(dst.shape)}, src={tuple(src_gpu.shape)}"
+                f"dst={tuple(dst.shape)}, src={tuple(src.shape)}"
             )
-        dst.reshape(-1)[: src_gpu.numel()].copy_(src_gpu.reshape(-1))
+        if src_flat.numel() < dst_flat.numel():
+            dst_flat[src_flat.numel():].fill_(fill_value)
+        if src_flat.dtype != dst.dtype:
+            src_flat = src_flat.to(dtype=dst.dtype)
+        dst_flat[: src_flat.numel()].copy_(src_flat, non_blocking=True)
 
     def _get_sparse_cluster_info_tensor(
         self,

@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 
 def main():
     USE_SPARSE_ATTENTION = True
-    context_length = 2000
+    context_length = 500
     block_size = 16
     test_speed = True
     print_output = False
