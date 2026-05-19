@@ -341,17 +341,32 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             if tracker is None:
                 continue
             token_ids = list(tracker.token_ids)
-            prompt_len = int(getattr(tracker, "prompt_len", len(token_ids)))
+            tracker_prompt_len = int(getattr(tracker, "prompt_len", len(token_ids)))
             scratch_cap = len(scratch_ids) * block_size
-            n_load = min(prompt_len, scratch_cap)
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.warning(
+                "[sparse-offload-inject] req=%s tracker.prompt_len=%d "
+                "len(tracker.token_ids)=%d scratch_cap=%d",
+                req_id, tracker_prompt_len, len(token_ids), scratch_cap,
+            )
+            # Cover all prompt positions if possible; never exceed what
+            # tracker actually has (else token_ids/slot_mapping length mismatch).
+            n_load = min(tracker_prompt_len, len(token_ids))
             if n_load <= 0:
                 continue
+            # LMCache requires len(slot_mapping) == len(tokens) == n_load.
+            # With rank-indexed scatter, only the first `scratch_cap` entries
+            # are written to; pad the rest with 0 (never accessed because
+            # num_selected per layer <= scratch_cap).
             block_ids_t = torch.tensor(scratch_ids, dtype=torch.long)
             offsets = torch.arange(0, block_size, dtype=torch.long)
-            slot_mapping = (
+            real_slots = (
                 offsets.reshape(1, block_size)
                 + block_ids_t.reshape(-1, 1) * block_size
-            ).flatten()[:n_load]
+            ).flatten()
+            slot_mapping = torch.zeros(n_load, dtype=torch.long)
+            slot_mapping[:scratch_cap] = real_slots[:scratch_cap]
             load_spec = LoadSpec(
                 vllm_cached_tokens=0,
                 lmcache_cached_tokens=n_load,
