@@ -117,7 +117,12 @@ class SparseFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         vllm_config: "VllmConfig",
         kv_cache_spec: "AttentionSpec",
     ) -> AttentionCGSupport:
-        return AttentionCGSupport.NEVER
+        if (
+            vllm_config.scheduler_config.max_num_seqs != 1
+            or getattr(kv_cache_spec, "n_segment", 1) != 1
+        ):
+            return AttentionCGSupport.NEVER
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def build(
         self,
@@ -225,10 +230,13 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             list(self.sliding_window) if self.sliding_window is not None else None
         )
         sparse_manager_metadata = attn_metadata.sparse_manager_metadata
+        cluster_allocated_block_info = attn_metadata.cluster_allocated_block_info
         use_sparse_cluster = (
             sparse_manager_metadata is not None
             and len(sparse_manager_metadata) > 0
             and sparse_manager_metadata[0].mean is not None
+            and cluster_allocated_block_info is not None
+            and len(cluster_allocated_block_info) > 0
         )
         if use_sparse_cluster:
             cluster_storage = kv_cache.reshape(
@@ -236,9 +244,7 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             )
             req_index = 0
             smm = sparse_manager_metadata[0]
-            cluster_allocated_block_info = attn_metadata.cluster_allocated_block_info[
-                req_index
-            ][0]
+            cluster_allocated_block_info = cluster_allocated_block_info[req_index][0]
 
             is_prefill = smm.in_cluster_token_count == num_actual_tokens
             if is_prefill:
@@ -380,17 +386,23 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata = self.get_attn_metadata_for_update()
         self.clear_attn_metadata_for_update()
         use_sparse_cluster = False
-        if attn_metadata is not None and len(attn_metadata.cluster_allocated_block_info) != 0:
-            assert len(attn_metadata.cluster_allocated_block_info) == 1
+        cluster_allocated_block_info = (
+            None if attn_metadata is None else attn_metadata.cluster_allocated_block_info
+        )
+        if (
+            cluster_allocated_block_info is not None
+            and len(cluster_allocated_block_info) != 0
+        ):
+            assert len(cluster_allocated_block_info) == 1
             req_index = 0
-            assert len(attn_metadata.cluster_allocated_block_info[req_index]) == 1
+            assert len(cluster_allocated_block_info[req_index]) == 1
             assert attn_metadata.extra_sparse_manager_info["num_segment"] == 1
             use_sparse_cluster = (
-                attn_metadata.cluster_allocated_block_info[req_index][0] is not None
+                cluster_allocated_block_info[req_index][0] is not None
             )
 
         if use_sparse_cluster:
-            free_blocks_info = attn_metadata.cluster_allocated_block_info[req_index][0]
+            free_blocks_info = cluster_allocated_block_info[req_index][0]
             smm = attn_metadata.sparse_manager_metadata[req_index]
             num_actual_tokens = attn_metadata.num_actual_tokens
             key_actual = key[:num_actual_tokens]

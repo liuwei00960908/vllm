@@ -147,6 +147,8 @@ from vllm.v1.core.sparse_kv_cache_manager import (
 )
 from vllm.v1.core.sparse_kv_utils import (
     RequestSparseClusterInfo,
+    SparseAppendBuffers,
+    SparseBlockTableBuffers,
     SparseClusterBlockInfo,
     SparseManagerMetadata,
 )
@@ -579,6 +581,8 @@ class GPUModelRunner(
         self._sparse_layer_spec_by_name: dict[str, SparseAttentionSpec] = {}
         self._sparse_layer_gid_by_name: dict[str, int] = {}
         self._sparse_online_index: dict[str, dict[str, _SparseOnlineLayerState]] = {}
+        self._sparse_cudagraph_cluster_info: dict[int, SparseClusterBlockInfo] = {}
+        self._sparse_cudagraph_metadata: dict[str, SparseManagerMetadata] = {}
         # Snapshot of per-request output length BEFORE this step appends sampled
         # tokens. Used by sparse feature collection to classify prefill/decode
         # boundary correctly.
@@ -2417,6 +2421,9 @@ class GPUModelRunner(
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None
 
+        uses_full_cudagraph_metadata = (
+            for_cudagraph_capture or num_tokens_padded is not None
+        )
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
@@ -2656,7 +2663,11 @@ class GPUModelRunner(
             )
             boundary_disable_sparse = False
             boundary_req_ids: list[str] = []
-            if is_sparse_group:
+            if (
+                is_sparse_group
+                and not for_cudagraph_capture
+                and len(self.input_batch.req_ids) >= num_reqs
+            ):
                 for req_idx in range(num_reqs):
                     rid = self.input_batch.req_ids[req_idx]
                     seq_i = int(cm._seq_lens_cpu[req_idx].item())
@@ -2934,6 +2945,19 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
         
+        if (
+            uses_full_cudagraph_metadata
+            and isinstance(attn_metadata, dict)
+            and self._attach_sparse_cudagraph_metadata(
+                attn_metadata=attn_metadata,
+                cluster_info=cluster_info,
+                num_reqs=num_reqs,
+                num_tokens_padded=num_tokens_padded,
+                for_cudagraph_capture=for_cudagraph_capture,
+            )
+        ):
+            return attn_metadata, spec_decode_common_attn_metadata
+
         # currently not support list
         if isinstance(attn_metadata, dict) and cluster_info is not None:
             assert(num_reqs == 1)
@@ -3027,6 +3051,420 @@ class GPUModelRunner(
                     layer_attn.sparse_manager_metadata.append(smm)
 
         return attn_metadata, spec_decode_common_attn_metadata
+
+    def _copy_sparse_cudagraph_tensor(
+        self,
+        dst: torch.Tensor,
+        src: torch.Tensor | None,
+        *,
+        fill_value: int | float = 0,
+    ) -> None:
+        dst.fill_(fill_value)
+        if src is None:
+            return
+        src_gpu = src.to(device=self.device, dtype=dst.dtype)
+        if src_gpu.numel() > dst.numel():
+            raise ValueError(
+                "Sparse CUDA graph buffer is undersized: "
+                f"dst={tuple(dst.shape)}, src={tuple(src_gpu.shape)}"
+            )
+        dst.reshape(-1)[: src_gpu.numel()].copy_(src_gpu.reshape(-1))
+
+    def _get_sparse_cluster_info_tensor(
+        self,
+        info: SparseClusterBlockInfo,
+        gpu_attr_name: str,
+        cpu_attr_name: str,
+    ) -> torch.Tensor | None:
+        src = getattr(info, gpu_attr_name)
+        if src is not None:
+            return src
+        src = getattr(info, cpu_attr_name)
+        if src is None:
+            return None
+        if isinstance(src, torch.Tensor):
+            return src
+        return torch.tensor([src], dtype=torch.int32)
+
+    def _ensure_sparse_cudagraph_cluster_info(
+        self,
+        kv_cache_gid: int,
+        spec: SparseAttentionSpec,
+        num_tokens_padded: int,
+    ) -> SparseClusterBlockInfo:
+        info = self._sparse_cudagraph_cluster_info.get(kv_cache_gid)
+        cluster_block_size = spec.num_kv_heads * spec.block_size
+        temp_block_count_per_layer = (
+            (spec.num_kv_heads * spec.num_clusters + 1)
+            * (cluster_block_size - 1)
+        ) // cluster_block_size
+        total_temp_blocks = temp_block_count_per_layer * spec.num_layer
+        reusable_blocks = max(
+            1,
+            num_tokens_padded
+            * spec.num_query_heads
+            * min(spec.nprobe, spec.num_clusters),
+        )
+        allocated_blocks = max(
+            1, num_tokens_padded * spec.num_layer * spec.num_kv_heads
+        )
+
+        def needs_new(tensor: torch.Tensor | None, size: int) -> bool:
+            return tensor is None or tensor.numel() < size
+
+        if info is None:
+            info = SparseClusterBlockInfo(
+                cluster_block_size=cluster_block_size,
+                num_cluster=spec.num_clusters,
+                num_segment=spec.n_segment,
+                nprobe=spec.nprobe,
+                num_kv_heads=spec.num_kv_heads,
+            )
+            self._sparse_cudagraph_cluster_info[kv_cache_gid] = info
+
+        if needs_new(info.temp_block_ids_gpu, total_temp_blocks):
+            info.temp_block_ids_gpu = torch.zeros(
+                (total_temp_blocks,), dtype=torch.int32, device=self.device
+            )
+        if needs_new(info.reusable_block_ids_gpu, reusable_blocks):
+            info.reusable_block_ids_gpu = torch.zeros(
+                (reusable_blocks,), dtype=torch.int32, device=self.device
+            )
+        if needs_new(info.allocated_block_ids_gpu, allocated_blocks):
+            info.allocated_block_ids_gpu = torch.zeros(
+                (allocated_blocks,), dtype=torch.int32, device=self.device
+            )
+        if info.used_count_gpu is None or info.used_count_gpu.numel() != 1:
+            info.used_count_gpu = torch.zeros(
+                (1,), dtype=torch.int32, device=self.device
+            )
+        return info
+
+    def _ensure_sparse_cudagraph_metadata(
+        self,
+        layer_name: str,
+        spec: SparseAttentionSpec,
+        num_tokens_padded: int,
+        max_bt_len: int,
+    ) -> SparseManagerMetadata:
+        smm = self._sparse_cudagraph_metadata.setdefault(
+            layer_name, SparseManagerMetadata()
+        )
+        hkv = spec.num_kv_heads
+        hq = spec.num_query_heads
+        dim = spec.head_size
+        cluster_block_size = spec.num_kv_heads * spec.block_size
+        temp_block_count_per_layer = (
+            (hkv * spec.num_clusters + 1) * (cluster_block_size - 1)
+        ) // cluster_block_size
+
+        if smm.temp_block_kv_counts is None:
+            smm.temp_block_kv_counts = torch.zeros(
+                (1,), dtype=torch.int32, device=self.device
+            )
+        if (
+            smm.temp_block_kv_owner is None
+            or smm.temp_block_kv_owner.shape[0]
+            < temp_block_count_per_layer * cluster_block_size
+        ):
+            smm.temp_block_kv_owner = torch.full(
+                (temp_block_count_per_layer * cluster_block_size, 2),
+                fill_value=-1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if smm.cluster_centers_T is None or smm.cluster_centers_T.shape != (
+            hkv,
+            dim,
+            spec.num_clusters,
+        ):
+            smm.cluster_centers_T = torch.zeros(
+                (hkv, dim, spec.num_clusters),
+                dtype=spec.dtype,
+                device=self.device,
+            )
+        if smm.mean is None or smm.mean.shape != (hkv, dim):
+            smm.mean = torch.zeros((hkv, dim), dtype=spec.dtype, device=self.device)
+        if (
+            smm.cluster_compact_block_ids is None
+            or smm.cluster_compact_block_ids.shape
+            != (hkv, spec.num_clusters, SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT)
+        ):
+            smm.cluster_compact_block_ids = torch.zeros(
+                (
+                    hkv,
+                    spec.num_clusters,
+                    SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT,
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if (
+            smm.cluster_temp_kv_pos is None
+            or smm.cluster_temp_kv_pos.shape
+            != (hkv, spec.num_clusters, cluster_block_size, 2)
+        ):
+            smm.cluster_temp_kv_pos = torch.zeros(
+                (hkv, spec.num_clusters, cluster_block_size, 2),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if (
+            smm.cluster_total_kv_counts is None
+            or smm.cluster_total_kv_counts.shape != (hkv, spec.num_clusters)
+        ):
+            smm.cluster_total_kv_counts = torch.ones(
+                (hkv, spec.num_clusters), dtype=torch.int32, device=self.device
+            )
+
+        rows = num_tokens_padded * hq
+        plan_capacity = max(
+            rows
+            * min(spec.nprobe, spec.num_clusters)
+            * max(cluster_block_size - 1, 0),
+            1,
+        )
+        if smm.block_table_buffers is None:
+            smm.block_table_buffers = SparseBlockTableBuffers()
+        smm.block_table_buffers.ensure_capacity(
+            device=self.device,
+            rows=rows,
+            max_bt_len=max_bt_len,
+            plan_capacity=plan_capacity,
+        )
+        if smm.append_buffers is None:
+            smm.append_buffers = SparseAppendBuffers()
+        smm.append_buffers.ensure_capacity(device=self.device)
+        if (
+            smm.cu_seqlens_q_buffer is None
+            or smm.cu_seqlens_q_buffer.shape[0] < rows + 1
+        ):
+            smm.cu_seqlens_q_buffer = torch.arange(
+                rows + 1, dtype=torch.int32, device=self.device
+            )
+        smm.in_cluster_token_count = max(spec.num_clusters, num_tokens_padded) + 1
+        return smm
+
+    def _attach_sparse_cudagraph_metadata(
+        self,
+        *,
+        attn_metadata: AttnMetadataDict,
+        cluster_info: dict[str, tuple[SparseClusterBlockInfo | None, ...]] | None,
+        num_reqs: int,
+        num_tokens_padded: int,
+        for_cudagraph_capture: bool,
+    ) -> bool:
+        if not self._has_sparse_attn:
+            return False
+        if not for_cudagraph_capture and (cluster_info is None or num_reqs != 1):
+            return False
+
+        rid = None if for_cudagraph_capture else self.input_batch.req_ids[0]
+        graph_infos: dict[int, SparseClusterBlockInfo] = {}
+        temp_cursors: dict[int, int] = defaultdict(int)
+
+        for layer_name, layer_attn in attn_metadata.items():
+            if not isinstance(layer_attn, SparseFlashAttentionMetadata):
+                continue
+            spec = self._sparse_layer_spec_by_name.get(layer_name)
+            if spec is None or spec.n_segment != 1:
+                return False
+            kv_cache_gid = self._sparse_layer_gid_by_name[layer_name]
+            graph_info = graph_infos.get(kv_cache_gid)
+            if graph_info is None:
+                graph_info = self._ensure_sparse_cudagraph_cluster_info(
+                    kv_cache_gid, spec, num_tokens_padded
+                )
+                graph_infos[kv_cache_gid] = graph_info
+                if cluster_info is not None and rid is not None:
+                    src_info = cluster_info[rid][kv_cache_gid]
+                    if src_info is None:
+                        return False
+                    src_temp_block_ids = self._get_sparse_cluster_info_tensor(
+                        src_info, "temp_block_ids_gpu", "temp_block_ids"
+                    )
+                    src_reusable_block_ids = self._get_sparse_cluster_info_tensor(
+                        src_info, "reusable_block_ids_gpu", "reusable_block_ids"
+                    )
+                    src_allocated_block_ids = self._get_sparse_cluster_info_tensor(
+                        src_info, "allocated_block_ids_gpu", "allocated_block_ids"
+                    )
+                    src_used_count = self._get_sparse_cluster_info_tensor(
+                        src_info, "used_count_gpu", "used_count"
+                    )
+                    if (
+                        src_temp_block_ids is None
+                        or src_reusable_block_ids is None
+                        or src_allocated_block_ids is None
+                        or src_used_count is None
+                    ):
+                        return False
+                    self._copy_sparse_cudagraph_tensor(
+                        graph_info.temp_block_ids_gpu,
+                        src_temp_block_ids,
+                    )
+                    self._copy_sparse_cudagraph_tensor(
+                        graph_info.reusable_block_ids_gpu,
+                        src_reusable_block_ids,
+                    )
+                    self._copy_sparse_cudagraph_tensor(
+                        graph_info.allocated_block_ids_gpu,
+                        src_allocated_block_ids,
+                    )
+                    self._copy_sparse_cudagraph_tensor(
+                        graph_info.used_count_gpu,
+                        src_used_count,
+                    )
+                    cluster_info[rid] = tuple(
+                        graph_info if i == kv_cache_gid else item
+                        for i, item in enumerate(cluster_info[rid])
+                    )
+                else:
+                    assert graph_info.used_count_gpu is not None
+                    graph_info.used_count_gpu.zero_()
+
+            max_bt_len = layer_attn.block_table.shape[-1]
+            smm = self._ensure_sparse_cudagraph_metadata(
+                layer_name, spec, num_tokens_padded, max_bt_len
+            )
+            temp_count_per_layer = (
+                (spec.num_kv_heads * spec.num_clusters + 1)
+                * (graph_info.cluster_block_size - 1)
+            ) // graph_info.cluster_block_size
+            assert graph_info.temp_block_ids_gpu is not None
+            cursor = temp_cursors[kv_cache_gid]
+            smm.temp_block_ids = graph_info.temp_block_ids_gpu[
+                cursor : cursor + temp_count_per_layer
+            ]
+            temp_cursors[kv_cache_gid] = cursor + temp_count_per_layer
+
+            if cluster_info is None or rid is None:
+                self._copy_sparse_cudagraph_tensor(smm.cluster_centers_T, None)
+                self._copy_sparse_cudagraph_tensor(smm.mean, None)
+                self._copy_sparse_cudagraph_tensor(
+                    smm.cluster_compact_block_ids, None
+                )
+                self._copy_sparse_cudagraph_tensor(smm.cluster_temp_kv_pos, None)
+                self._copy_sparse_cudagraph_tensor(
+                    smm.cluster_total_kv_counts, None, fill_value=1
+                )
+                self._copy_sparse_cudagraph_tensor(smm.temp_block_kv_counts, None)
+                self._copy_sparse_cudagraph_tensor(
+                    smm.temp_block_kv_owner, None, fill_value=-1
+                )
+            else:
+                req_sparse_info = self._sparse_cluster_info.get(rid)
+                src_smm = (
+                    None
+                    if req_sparse_info is None
+                    else req_sparse_info.layers.get(layer_name)
+                )
+                if src_smm is None or src_smm.mean is None:
+                    return False
+                if int(src_smm.in_cluster_token_count) < spec.num_clusters:
+                    return False
+                self._copy_sparse_cudagraph_tensor(
+                    smm.cluster_centers_T, src_smm.cluster_centers_T
+                )
+                self._copy_sparse_cudagraph_tensor(smm.mean, src_smm.mean)
+                self._copy_sparse_cudagraph_tensor(
+                    smm.cluster_compact_block_ids,
+                    src_smm.cluster_compact_block_ids,
+                )
+                self._copy_sparse_cudagraph_tensor(
+                    smm.cluster_temp_kv_pos,
+                    src_smm.cluster_temp_kv_pos,
+                )
+                self._copy_sparse_cudagraph_tensor(
+                    smm.cluster_total_kv_counts,
+                    src_smm.cluster_total_kv_counts,
+                )
+                self._copy_sparse_cudagraph_tensor(
+                    smm.temp_block_kv_counts,
+                    src_smm.temp_block_kv_counts,
+                )
+                self._copy_sparse_cudagraph_tensor(
+                    smm.temp_block_kv_owner,
+                    src_smm.temp_block_kv_owner,
+                    fill_value=-1,
+                )
+                smm.in_cluster_token_count = max(
+                    int(src_smm.in_cluster_token_count),
+                    num_tokens_padded + 1,
+                )
+
+            layer_attn.extra_sparse_manager_info[
+                "req_id_list"
+            ] = self.input_batch.req_ids
+            layer_attn.extra_sparse_manager_info["layer_name"] = layer_name
+            layer_attn.extra_sparse_manager_info["num_cluster"] = spec.num_clusters
+            layer_attn.extra_sparse_manager_info["num_segment"] = spec.n_segment
+            layer_attn.extra_sparse_manager_info["nprobe"] = spec.nprobe
+            layer_attn.extra_sparse_manager_info[
+                "cluster_block_size"
+            ] = graph_info.cluster_block_size
+            layer_attn.cluster_allocated_block_info = [(graph_info,)]
+            layer_attn.sparse_manager_metadata = [smm]
+
+        return bool(graph_infos)
+
+    def _sync_sparse_cudagraph_metadata(
+        self,
+        attn_metadata: AttnMetadataDict | list[AttnMetadataDict],
+    ) -> None:
+        if not self._has_sparse_attn or not isinstance(attn_metadata, dict):
+            return
+        if not self.input_batch.req_ids:
+            return
+        rid = self.input_batch.req_ids[0]
+        req_sparse_info = self._sparse_cluster_info.get(rid)
+        if req_sparse_info is None:
+            return
+
+        def copy_graph_tensor(
+            src_smm: SparseManagerMetadata,
+            graph_smm: SparseManagerMetadata,
+            attr_name: str,
+        ) -> None:
+            src = getattr(graph_smm, attr_name)
+            if src is None:
+                return
+            dst = getattr(src_smm, attr_name)
+            if dst is None:
+                raise RuntimeError(
+                    "Sparse CUDA graph state cannot be synced because "
+                    f"{attr_name} is missing for request {rid}"
+                )
+            self._copy_sparse_cudagraph_tensor(dst, src)
+
+        for layer_name, layer_attn in attn_metadata.items():
+            if not isinstance(layer_attn, SparseFlashAttentionMetadata):
+                continue
+            graph_smm = self._sparse_cudagraph_metadata.get(layer_name)
+            if graph_smm is None:
+                continue
+            if (
+                not layer_attn.sparse_manager_metadata
+                or layer_attn.sparse_manager_metadata[0] is not graph_smm
+            ):
+                continue
+            src_smm = req_sparse_info.layers.get(layer_name)
+            if src_smm is None or src_smm.mean is None:
+                raise RuntimeError(
+                    "Sparse CUDA graph state cannot be synced because "
+                    f"metadata is missing for request {rid}, layer {layer_name}"
+                )
+            for attr_name in (
+                "cluster_centers_T",
+                "mean",
+                "cluster_compact_block_ids",
+                "cluster_temp_kv_pos",
+                "cluster_total_kv_counts",
+                "temp_block_kv_counts",
+                "temp_block_kv_owner",
+            ):
+                copy_graph_tensor(src_smm, graph_smm, attr_name)
+            src_smm.in_cluster_token_count += layer_attn.num_actual_tokens
 
     def _compute_cascade_attn_prefix_lens(
         self,
@@ -4303,15 +4741,30 @@ class GPUModelRunner(
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        disable_sparse_full_cudagraph = self._disable_sparse_full_cudagraph(
+            num_reqs=num_reqs,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            force_uniform_decode=force_uniform_decode,
+        )
 
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
+            invalid_modes = (
+                {CUDAGraphMode.FULL}
+                if disable_full or disable_sparse_full_cudagraph
+                else None
+            )
+            if invalid_modes is not None and valid_modes is not None:
+                valid_modes = set(valid_modes) - invalid_modes
+                if not valid_modes:
+                    valid_modes = {CUDAGraphMode.NONE}
+                invalid_modes = None
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes=invalid_modes,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -4373,6 +4826,34 @@ class GPUModelRunner(
             num_tokens_across_dp,
             cudagraph_stats,
         )
+
+    def _disable_sparse_full_cudagraph(
+        self,
+        *,
+        num_reqs: int,
+        max_num_scheduled_tokens: int,
+        force_uniform_decode: bool | None,
+    ) -> bool:
+        if not self._has_sparse_attn:
+            return False
+        if num_reqs != 1 or max_num_scheduled_tokens != 1 or self.dcp_world_size > 1:
+            return True
+        # Dummy full-graph capture has no real request state yet; it uses the
+        # persistent sparse graph buffers that are populated before each replay.
+        if force_uniform_decode is not None:
+            return False
+        if not self.input_batch.req_ids:
+            return True
+        req_sparse_info = self._sparse_cluster_info.get(self.input_batch.req_ids[0])
+        if req_sparse_info is None:
+            return True
+        for layer_name, spec in self._sparse_layer_spec_by_name.items():
+            smm = req_sparse_info.layers.get(layer_name)
+            if smm is None or smm.mean is None:
+                return True
+            if int(smm.in_cluster_token_count) < spec.num_clusters:
+                return True
+        return False
 
     def _register_layerwise_nvtx_hooks(self) -> None:
         """
@@ -4751,6 +5232,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if cudagraph_mode == CUDAGraphMode.FULL:
+            self._sync_sparse_cudagraph_metadata(attn_metadata)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -8443,6 +8926,11 @@ class GPUModelRunner(
     ) -> FlashAttentionMetadata:
         """Attach paged-cache gather indices for token-sparse compact KV attention."""
         if for_cudagraph_capture or self.dcp_world_size > 1:
+            return attn_metadata_i
+        if (
+            len(self.input_batch.req_ids) < num_reqs
+            or len(self.input_batch.num_prompt_tokens) < num_reqs
+        ):
             return attn_metadata_i
 
         self._sparse_log_first_decode_kv_snapshot(
