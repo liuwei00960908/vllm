@@ -3059,9 +3059,18 @@ class GPUModelRunner(
         *,
         fill_value: int | float = 0,
     ) -> None:
-        dst.fill_(fill_value)
         if src is None:
+            dst.fill_(fill_value)
             return
+        if (
+            src.is_cuda
+            and src.device == dst.device
+            and src.dtype == dst.dtype
+            and src.shape == dst.shape
+            and src.data_ptr() == dst.data_ptr()
+        ):
+            return
+        dst.fill_(fill_value)
         src_gpu = src.to(device=self.device, dtype=dst.dtype)
         if src_gpu.numel() > dst.numel():
             raise ValueError(
@@ -3421,22 +3430,6 @@ class GPUModelRunner(
         if req_sparse_info is None:
             return
 
-        def copy_graph_tensor(
-            src_smm: SparseManagerMetadata,
-            graph_smm: SparseManagerMetadata,
-            attr_name: str,
-        ) -> None:
-            src = getattr(graph_smm, attr_name)
-            if src is None:
-                return
-            dst = getattr(src_smm, attr_name)
-            if dst is None:
-                raise RuntimeError(
-                    "Sparse CUDA graph state cannot be synced because "
-                    f"{attr_name} is missing for request {rid}"
-                )
-            self._copy_sparse_cudagraph_tensor(dst, src)
-
         for layer_name, layer_attn in attn_metadata.items():
             if not isinstance(layer_attn, SparseFlashAttentionMetadata):
                 continue
@@ -3454,17 +3447,8 @@ class GPUModelRunner(
                     "Sparse CUDA graph state cannot be synced because "
                     f"metadata is missing for request {rid}, layer {layer_name}"
                 )
-            for attr_name in (
-                "cluster_centers_T",
-                "mean",
-                "cluster_compact_block_ids",
-                "cluster_temp_kv_pos",
-                "cluster_total_kv_counts",
-                "temp_block_kv_counts",
-                "temp_block_kv_owner",
-            ):
-                copy_graph_tensor(src_smm, graph_smm, attr_name)
-            src_smm.in_cluster_token_count += layer_attn.num_actual_tokens
+            graph_smm.in_cluster_token_count += layer_attn.num_actual_tokens
+            req_sparse_info.layers[layer_name] = graph_smm
 
     def _compute_cascade_attn_prefix_lens(
         self,
