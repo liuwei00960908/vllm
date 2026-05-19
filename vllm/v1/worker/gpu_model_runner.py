@@ -2128,7 +2128,31 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+        # For offloaded reqs, the row layout is [scratch..., cur_decode], so
+        # decode-step slot_mapping must use scratch-space positions, not the
+        # original sequence position (which would index past the row).
+        slot_mapping_positions = positions_np
+        if self._sparse_offloaded_req_ids:
+            slot_mapping_positions = positions_np.copy()
+            bsz = self.cache_config.block_size
+            for req_idx in range(num_reqs):
+                rid = self.input_batch.req_ids[req_idx]
+                if rid not in self._sparse_offloaded_req_ids:
+                    continue
+                scratch_ids = self._sparse_scratch_block_ids.get(rid, [])
+                if not scratch_ids:
+                    continue
+                n_scratch_tokens = len(scratch_ids) * bsz
+                prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
+                start = int(cu_num_tokens[req_idx - 1]) if req_idx > 0 else 0
+                end = int(cu_num_tokens[req_idx])
+                slot_mapping_positions[start:end] = (
+                    n_scratch_tokens
+                    + (positions_np[start:end] - prompt_len)
+                )
+        self.input_batch.block_table.compute_slot_mapping(
+            req_indices, slot_mapping_positions
+        )
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
