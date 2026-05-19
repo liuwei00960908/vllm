@@ -9,6 +9,12 @@
 extern "C" int append_kv_to_clusters_launcher_raw(
     const void* d_key,
     const void* d_value,
+    int64_t key_stride0,
+    int64_t key_stride1,
+    int64_t key_stride2,
+    int64_t value_stride0,
+    int64_t value_stride1,
+    int64_t value_stride2,
     int32_t storage_dtype,
     const int32_t* d_label,
     const int32_t* d_temp_block_ids,
@@ -39,6 +45,10 @@ static inline void check_cuda_contig(const torch::Tensor& x, const char* name) {
     TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
 }
 
+static inline void check_cuda(const torch::Tensor& x, const char* name) {
+    TORCH_CHECK(x.is_cuda(), name, " must be CUDA");
+}
+
 torch::Tensor append_kv_to_clusters_cuda(
     torch::Tensor block_storage,
     torch::Tensor cluster_compact_block_ids,
@@ -60,8 +70,8 @@ torch::Tensor append_kv_to_clusters_cuda(
     check_cuda_contig(temp_block_kv_counts, "temp_block_kv_counts");
     check_cuda_contig(temp_block_kv_owner, "temp_block_kv_owner");
     check_cuda_contig(free_block_ids, "free_block_ids");
-    check_cuda_contig(key, "key");
-    check_cuda_contig(value, "value");
+    check_cuda(key, "key");
+    check_cuda(value, "value");
     check_cuda_contig(label, "label");
 
     TORCH_CHECK(cluster_compact_block_ids.scalar_type() == torch::kInt32,
@@ -107,6 +117,10 @@ torch::Tensor append_kv_to_clusters_cuda(
     TORCH_CHECK(value.scalar_type() == block_storage.scalar_type(),
                 "value dtype must equal block_storage dtype");
     TORCH_CHECK(key.sizes() == value.sizes(), "key/value shape mismatch");
+    TORCH_CHECK(key.stride(0) >= 0 && key.stride(1) >= 0 && key.stride(2) >= 0,
+                "key strides must be non-negative");
+    TORCH_CHECK(value.stride(0) >= 0 && value.stride(1) >= 0 && value.stride(2) >= 0,
+                "value strides must be non-negative");
 
     const int Nq = static_cast<int>(key.size(0));
     const int Hkv = static_cast<int>(key.size(1));
@@ -147,6 +161,12 @@ torch::Tensor append_kv_to_clusters_cuda(
     int rc = append_kv_to_clusters_launcher_raw(
         key.data_ptr(),
         value.data_ptr(),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
         map_storage_dtype(block_storage.scalar_type()),
         label.data_ptr<int32_t>(),
         temp_block_ids.data_ptr<int32_t>(),
@@ -195,8 +215,8 @@ torch::Tensor append_kv_to_clusters_inplace_cuda(
     check_cuda_contig(free_block_ids, "free_block_ids");
     check_cuda_contig(used_free_block_count, "used_free_block_count");
     check_cuda_contig(error_code, "error_code");
-    check_cuda_contig(key, "key");
-    check_cuda_contig(value, "value");
+    check_cuda(key, "key");
+    check_cuda(value, "value");
     check_cuda_contig(label, "label");
 
     TORCH_CHECK(used_free_block_count.scalar_type() == torch::kInt32,
@@ -207,6 +227,17 @@ torch::Tensor append_kv_to_clusters_inplace_cuda(
                 "used_free_block_count must be [1]");
     TORCH_CHECK(error_code.numel() == 1,
                 "error_code must be [1]");
+    TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+                "key/value must be [Nq,Hkv,dim]");
+    TORCH_CHECK(key.scalar_type() == block_storage.scalar_type(),
+                "key dtype must equal block_storage dtype");
+    TORCH_CHECK(value.scalar_type() == block_storage.scalar_type(),
+                "value dtype must equal block_storage dtype");
+    TORCH_CHECK(key.sizes() == value.sizes(), "key/value shape mismatch");
+    TORCH_CHECK(key.stride(0) >= 0 && key.stride(1) >= 0 && key.stride(2) >= 0,
+                "key strides must be non-negative");
+    TORCH_CHECK(value.stride(0) >= 0 && value.stride(1) >= 0 && value.stride(2) >= 0,
+                "value strides must be non-negative");
 
     const int Nq = static_cast<int>(key.size(0));
     const int Hkv = static_cast<int>(key.size(1));
@@ -224,6 +255,12 @@ torch::Tensor append_kv_to_clusters_inplace_cuda(
     int rc = append_kv_to_clusters_launcher_raw(
         key.data_ptr(),
         value.data_ptr(),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
         map_storage_dtype(block_storage.scalar_type()),
         label.data_ptr<int32_t>(),
         temp_block_ids.data_ptr<int32_t>(),

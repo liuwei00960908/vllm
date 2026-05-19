@@ -165,6 +165,10 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             return output.fill_(0)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        query_actual = query[:num_actual_tokens]
+        key_actual = key[:num_actual_tokens]
+        value_actual = value[:num_actual_tokens]
+        output_actual = output[:num_actual_tokens]
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return super().forward(
                 layer,
@@ -236,13 +240,13 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 req_index
             ][0]
 
-            is_prefill = smm.in_cluster_token_count == query.shape[0]
+            is_prefill = smm.in_cluster_token_count == num_actual_tokens
             if is_prefill:
                 flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k=key,
-                    v=value,
-                    out=output[:num_actual_tokens],
+                    q=query_actual,
+                    k=key_actual,
+                    v=value_actual,
+                    out=output_actual,
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     cu_seqlens_k=cu_seqlens_q,
@@ -280,7 +284,7 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 cluster_centers_t = smm.cluster_centers_T
             nprobe = min(nprobe, cluster_centers_t.shape[2])
             query_centered = (
-                query.reshape(num_queries, hkv, head_group_size, dim)
+                query_actual.reshape(num_queries, hkv, head_group_size, dim)
                 - smm.mean[None, :, None]
             )
             score = torch.matmul(query_centered, cluster_centers_t[None])
@@ -312,8 +316,8 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
 
             num_rows = num_queries * hq
             device = query.device
-            q_flat = query.reshape(num_rows, 1, -1)
-            out_flat = output.reshape(num_rows, 1, -1)
+            q_flat = query_actual.reshape(num_rows, 1, -1)
+            out_flat = output_actual.reshape(num_rows, 1, -1)
             seqused_k_flat = seqused_k.reshape(num_rows)
             block_table_flat = block_table.reshape(num_rows, -1)
             if (
@@ -388,10 +392,13 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
         if use_sparse_cluster:
             free_blocks_info = attn_metadata.cluster_allocated_block_info[req_index][0]
             smm = attn_metadata.sparse_manager_metadata[req_index]
+            num_actual_tokens = attn_metadata.num_actual_tokens
+            key_actual = key[:num_actual_tokens]
+            value_actual = value[:num_actual_tokens]
             is_prefill = smm.mean is None
-            hkv = key.shape[1]
+            hkv = key_actual.shape[1]
             num_clusters = attn_metadata.extra_sparse_manager_info["num_cluster"]
-            dim = key.shape[-1]
+            dim = key_actual.shape[-1]
             cluster_storage = kv_cache.reshape(
                 kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4]
             )
@@ -427,7 +434,7 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 smm.in_cluster_token_count = 0
 
                 res = prefill_cluster_meta_from_features_torch_batched(
-                    key.transpose(0, 1),
+                    key_actual.transpose(0, 1),
                     num_clusters,
                     attn_metadata.extra_sparse_manager_info["num_segment"],
                     granularity="token",
@@ -445,18 +452,18 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 ].transpose(1, 2)
                 smm.mean = res["mean_key"].to(dtype=key.dtype)
             else:
-                assert key.shape[0] == 1
+                assert key_actual.shape[0] == 1
                 if smm.in_cluster_token_count < smm.cluster_centers_T.shape[-1]:
                     labels = torch.full(
                         fill_value=smm.in_cluster_token_count,
-                        size=key.shape[:2],
+                        size=key_actual.shape[:2],
                         dtype=torch.int32,
                         device=key.device,
                     )
-                    smm.cluster_centers_T[:, :, smm.in_cluster_token_count] = key[0]
+                    smm.cluster_centers_T[:, :, smm.in_cluster_token_count] = key_actual[0]
                 else:
                     score = torch.matmul(
-                        (key - smm.mean[None])[:, :, None],
+                        (key_actual - smm.mean[None])[:, :, None],
                         smm.cluster_centers_T[None],
                     )
                     labels = score.argmax(dim=-1).to(dtype=torch.int32)[:, :, 0]
@@ -474,11 +481,11 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 temp_block_kv_owner=smm.temp_block_kv_owner,
                 free_block_ids=free_blocks_info.allocated_block_ids_gpu,
                 used_free_block_count=free_blocks_info.used_count_gpu,
-                key=key.contiguous(),
-                value=value.contiguous(),
+                key=key_actual,
+                value=value_actual,
                 label=labels,
             )
-            smm.in_cluster_token_count += key.shape[0]
+            smm.in_cluster_token_count += num_actual_tokens
             return
 
         return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)

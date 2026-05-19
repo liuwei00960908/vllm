@@ -7,9 +7,15 @@
 #include "sparse_attention_common.h"
 
 template <typename T>
-__device__ __forceinline__ void strided_copy_vec(T* dst, const T* src, int dim, int start, int stride) {
+__device__ __forceinline__ void strided_copy_vec(
+    T* dst,
+    const T* src,
+    int dim,
+    int start,
+    int stride,
+    int64_t src_dim_stride = 1) {
     for (int d = start; d < dim; d += stride) {
-        dst[d] = src[d];
+        dst[d] = src[(int64_t)d * src_dim_stride];
     }
 }
 
@@ -35,8 +41,8 @@ __device__ __forceinline__ int64_t temp_pos_index(int h, int c, int slot, int C,
 
 template <typename T, int MAX_HKV, int MAX_REMOVED>
 __global__ void k_append_kv_to_clusters_persistent(
-    const T* __restrict__ key,                        // [Nq, Hkv, dim]
-    const T* __restrict__ value,                      // [Nq, Hkv, dim]
+    const T* __restrict__ key,                        // [Nq, Hkv, dim] (strided)
+    const T* __restrict__ value,                      // [Nq, Hkv, dim] (strided)
     const int32_t* __restrict__ label,                // [Nq, Hkv]
 
     const int32_t* __restrict__ temp_block_ids,       // [max_temp_blocks]
@@ -51,6 +57,12 @@ __global__ void k_append_kv_to_clusters_persistent(
     int32_t* __restrict__ used_free_block_count,      // [1]
     int32_t* __restrict__ error_code,                 // [1]
 
+    int64_t key_stride0,
+    int64_t key_stride1,
+    int64_t key_stride2,
+    int64_t value_stride0,
+    int64_t value_stride1,
+    int64_t value_stride2,
     int Nq, int Hkv, int C, int maxB,
     int total_blocks, int block_size, int dim,
     int max_temp_blocks, int max_free_block)
@@ -140,16 +152,17 @@ __global__ void k_append_kv_to_clusters_persistent(
             bid = __shfl_sync(FULL_MASK, bid, 0);
 
             if (bid >= 0) {
-                int64_t src_base = ((int64_t)q * Hkv + h) * dim;
-                const T* src_k = key + src_base;
-                const T* src_v = value + src_base;
+                int64_t src_k_base = (int64_t)q * key_stride0 + (int64_t)h * key_stride1;
+                int64_t src_v_base = (int64_t)q * value_stride0 + (int64_t)h * value_stride1;
+                const T* src_k = key + src_k_base;
+                const T* src_v = value + src_v_base;
 
                 int64_t dst_elem = block_elem_offset(bid, tb_off, block_size, dim);
                 T* dst_k = block_storage + dst_elem;
                 T* dst_v = block_storage + pstride + dst_elem;
 
-                strided_copy_vec(dst_k, src_k, dim, lane, WARP_SIZE);
-                strided_copy_vec(dst_v, src_v, dim, lane, WARP_SIZE);
+                strided_copy_vec(dst_k, src_k, dim, lane, WARP_SIZE, key_stride2);
+                strided_copy_vec(dst_v, src_v, dim, lane, WARP_SIZE, value_stride2);
 
                 if (lane == 0) {
                     cluster_temp_kv_pos[temp_pos_index(h, cid, slot, C, block_size, 0)] = tb_idx;
@@ -432,6 +445,12 @@ static int pick_warps(int rows) {
 extern "C" int append_kv_to_clusters_launcher_raw(
     const void* d_key,
     const void* d_value,
+    int64_t key_stride0,
+    int64_t key_stride1,
+    int64_t key_stride2,
+    int64_t value_stride0,
+    int64_t value_stride1,
+    int64_t value_stride2,
     int32_t storage_dtype,
     const int32_t* d_label,
     const int32_t* d_temp_block_ids,
@@ -490,6 +509,12 @@ extern "C" int append_kv_to_clusters_launcher_raw(
                 d_temp_block_kv_owner,
                 d_used_free_block_count,
                 d_error_code,
+                key_stride0,
+                key_stride1,
+                key_stride2,
+                value_stride0,
+                value_stride1,
+                value_stride2,
                 Nq, Hkv, C, maxB,
                 total_blocks, block_size, dim,
                 max_temp_blocks, max_free_block);
@@ -509,6 +534,12 @@ extern "C" int append_kv_to_clusters_launcher_raw(
                 d_temp_block_kv_owner,
                 d_used_free_block_count,
                 d_error_code,
+                key_stride0,
+                key_stride1,
+                key_stride2,
+                value_stride0,
+                value_stride1,
+                value_stride2,
                 Nq, Hkv, C, maxB,
                 total_blocks, block_size, dim,
                 max_temp_blocks, max_free_block);
@@ -528,6 +559,12 @@ extern "C" int append_kv_to_clusters_launcher_raw(
                 d_temp_block_kv_owner,
                 d_used_free_block_count,
                 d_error_code,
+                key_stride0,
+                key_stride1,
+                key_stride2,
+                value_stride0,
+                value_stride1,
+                value_stride2,
                 Nq, Hkv, C, maxB,
                 total_blocks, block_size, dim,
                 max_temp_blocks, max_free_block);

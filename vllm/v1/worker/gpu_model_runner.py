@@ -2978,6 +2978,9 @@ class GPUModelRunner(
 
                 cluster_info_list.append(cluster_info[rid])
 
+            if not cluster_info_list:
+                return attn_metadata, spec_decode_common_attn_metadata
+
             temp_block_count_per_layer = (
                 (num_kv_heads * num_cluster + 1) * (cluster_block_size - 1)
             ) // cluster_block_size

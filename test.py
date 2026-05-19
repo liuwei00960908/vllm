@@ -6,6 +6,7 @@ print(vllm.__file__)
 
 from vllm import EngineArgs, LLMEngine, SamplingParams
 import torch
+from transformers import AutoTokenizer
 
 def main():
     USE_SPARSE_ATTENTION = True
@@ -55,7 +56,12 @@ def main():
 
     # ====================== 3. 硬编码请求（模拟server收到HTTP请求） ======================
     request_id = "debug_req_001"  # 字符串类型，和你之前问的一致
-    prompt = "说一下世界形式，能说多长说多长，不要少于2万字"
+    tokenizer = AutoTokenizer.from_pretrained(engine_args.model)
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "说一下vllm是什么"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     sampling_params = SamplingParams(
         max_tokens=context_length,  # 生成20个token，足够看完整流程
         temperature=0.0,  # 固定输出，方便调试
