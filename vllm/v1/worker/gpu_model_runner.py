@@ -7402,6 +7402,10 @@ class GPUModelRunner(
             per_req_phys.append(phys_req)
             per_req_slots.append(slots_req)
             per_req_k_len.append(actual_kv_len + pending_count)
+            _dst_attn = (phys_req[:actual_kv_len] * block_size + slots_req[:actual_kv_len])
+            print(f"[vllm-dst] layer={layer_name} rid={rid} actual_kv_len={actual_kv_len} "
+                f"bt_row[:8]={row[:8].tolist()} block_size={block_size} "
+                f"attn_dst[:8]={_dst_attn[:8].tolist()} attn_dst[-4:]={_dst_attn[-4:].tolist()}")
 
             # TODO: construct estimation zone by appending all unselected clusters' centroids
         logger.info(f"[_build_sparse_runtime_q_head_gather] Layer {layer_name}: select top-k for {num_reqs} requests costs {(time.perf_counter() - start_t) * 1000}ms")
