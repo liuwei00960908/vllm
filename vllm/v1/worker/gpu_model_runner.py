@@ -2229,16 +2229,8 @@ class GPUModelRunner(
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
 
         # NOTE: _override_sparse_slot_mapping is intentionally DISABLED.
-        # compute_slot_mapping above uses the *original* (non-sparse)
-        # block_table, which already maps each decode token to the correct
-        # physical slot.  The sparse block-table rewrite
-        # (_build_sparse_layer_block_table_tensor) only produces a separate
-        # tensor for the attention kernel and never mutates
-        # input_batch.block_table.  The old override mis-computed
-        # fill_offset = num_output_tokens % block_size instead of the
-        # correct (prompt_len + num_output_tokens - 1) % block_size,
-        # corrupting newly-written KV cache entries and causing garbled
-        # output.
+        # compute_slot_mapping above uses the original block_table, which
+        # already maps each decode token to the correct physical slot.
         # if self._has_sparse_attn:
         #     self._override_sparse_slot_mapping(num_reqs, cu_num_tokens)
 
@@ -2499,8 +2491,6 @@ class GPUModelRunner(
             *,
             skip_block_table_cache: bool = False,
             layer_names_override: list[str] | None = None,
-            sparse_per_head_block_table: torch.Tensor | None = None,
-            sparse_per_head_seq_lens: torch.Tensor | None = None,
             disable_token_sparse_boundary: bool = False,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
@@ -2580,17 +2570,6 @@ class GPUModelRunner(
                         "_maybe_patch_sparse_compact_kv_metadata",
                         time.perf_counter() - _t0_sparse_patch,
                     )
-            if (
-                sparse_per_head_block_table is not None
-                and sparse_per_head_seq_lens is not None
-                and isinstance(attn_metadata_i, FlashAttentionMetadata)
-            ):
-                attn_metadata_i = replace(
-                    attn_metadata_i,
-                    sparse_per_head_block_table=sparse_per_head_block_table,
-                    sparse_per_head_seq_lens=sparse_per_head_seq_lens,
-                )
-
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
@@ -2656,45 +2635,12 @@ class GPUModelRunner(
                         len(boundary_req_ids),
                         boundary_req_ids[:2],
                     )
-            # Token-level compact gather uses sparse_q_head_gather metadata
-            # (phys, slot, cu_seqlens_k) to index KV directly with
-            # block_table=None.  The underlying block_table and seq_lens
-            # must therefore stay *unmodified* so that when compact gather
-            # is unavailable (e.g. first decode step) FA falls back to
-            # standard paged attention with the full, correct metadata.
-            # Skipping _override_sparse_seq_lens here also eliminates the
-            # async-scheduling state drift that caused repeated-token output.
-            _group_is_tok_compact = (
-                is_sparse_group
-                and isinstance(kv_cache_group.kv_cache_spec, SparseAttentionSpec)
-                and kv_cache_group.kv_cache_spec.cluster_granularity == "token"
-                and kv_cache_group.kv_cache_spec.use_compact_kv_gather
-            )
-            if is_sparse_group and not boundary_disable_sparse and not _group_is_tok_compact:
-                _t0_sparse_seq = (
-                    time.perf_counter() if self._sparse_perf_stats_enabled else None
-                )
-                cm_union = self._override_sparse_seq_lens(
-                    cm,
-                    kv_cache_gid,
-                    num_reqs,
-                    num_reqs_padded,
-                    kv_cache_group.kv_cache_spec.block_size,
-                )
-                if _t0_sparse_seq is not None:
-                    self._sparse_perf_record(
-                        "_override_sparse_seq_lens",
-                        time.perf_counter() - _t0_sparse_seq,
-                    )
-            else:
-                cm_union = cm
-
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
-                        spec_decode_common_attn_metadata = cm_union
+                        spec_decode_common_attn_metadata = cm
                 else:
-                    spec_decode_common_attn_metadata = cm_union
+                    spec_decode_common_attn_metadata = cm
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 attn_group_i = self.attn_groups[kv_cache_gid][attn_gid]
@@ -2705,161 +2651,56 @@ class GPUModelRunner(
                         spec_sp.cluster_granularity == "token"
                         and spec_sp.use_compact_kv_gather
                     )
-                    for layer_name in attn_group_i.layer_names:
-                        attn_mod_sh = (
-                            self.compilation_config.static_forward_context.get(
-                                layer_name
-                            )
-                        )
-                        n_heads_sh = (
-                            int(attn_mod_sh.num_heads)
-                            if attn_mod_sh is not None
-                            else 1
-                        )
-                        bsz = spec_sp.block_size
-                        sp_bt: torch.Tensor | None = None
-                        sp_sl: torch.Tensor | None = None
-                        decode_override: np.ndarray | None = None
-                        if boundary_disable_sparse:
-                            cm_layer = copy(cm_union)
-                            cm_layer.block_table_tensor = (
-                                cm_union.block_table_tensor.clone()
-                            )
-                        elif is_tok_compact:
-                            # Token-level compact gather uses
-                            # sparse_q_head_gather metadata (phys, slot,
-                            # cu_seqlens_k) to index KV directly – it
-                            # passes block_table=None to FA.  Therefore
-                            # the block_table and seq_lens in
-                            # CommonAttentionMetadata must remain
-                            # *unmodified* so that when compact gather is
-                            # unavailable (e.g. first decode step) FA
-                            # falls back to standard paged attention with
-                            # the full, correct block_table.
-                            cm_layer = copy(cm_union)
-                            cm_layer.block_table_tensor = (
-                                cm_union.block_table_tensor.clone()
-                            )
-                        else:
-                            per_bt, per_sl = (
-                                self._build_sparse_per_head_block_table_and_lens(
-                                    cm_union.block_table_tensor,
-                                    cm_union,
-                                    kv_cache_gid,
-                                    layer_name,
-                                    n_heads_sh,
-                                    num_reqs,
-                                    num_reqs_padded,
-                                    bsz,
-                                )
-                            )
-                            if per_bt is not None and per_sl is not None:
-                                cm_layer = copy(cm)
-                                cm_layer.block_table_tensor = per_bt[0]
-                                cm_layer.seq_lens = per_sl[0]
-                                cm_layer._seq_lens_cpu = torch.tensor(
-                                    per_sl[0].cpu().numpy(), dtype=torch.int32
-                                )
-                                if num_reqs > 0:
-                                    cm_layer.max_seq_len = int(
-                                        per_sl[0, :num_reqs].max().item()
+                    if is_tok_compact:
+                        for layer_name in attn_group_i.layer_names:
+                            if ubatch_slices is not None:
+                                for ubid, _cm in enumerate(
+                                    split_attn_metadata(ubatch_slices, cm)
+                                ):
+                                    _build_attn_group_metadata(
+                                        kv_cache_gid,
+                                        attn_gid,
+                                        _cm,
+                                        ubid,
+                                        skip_block_table_cache=True,
+                                        layer_names_override=[layer_name],
+                                        disable_token_sparse_boundary=(
+                                            boundary_disable_sparse
+                                        ),
                                     )
-                                sp_bt, sp_sl = per_bt, per_sl
                             else:
-                                cm_layer = copy(cm)
-                                cm_layer.block_table_tensor = (
-                                    cm_union.block_table_tensor.clone()
-                                )
-                                _t0_sparse_seq = (
-                                    time.perf_counter()
-                                    if self._sparse_perf_stats_enabled
-                                    else None
-                                )
-                                cm_layer = self._override_sparse_seq_lens(
-                                    cm_layer,
-                                    kv_cache_gid,
-                                    num_reqs,
-                                    num_reqs_padded,
-                                    bsz,
-                                    decode_num_blocks_override=None,
-                                )
-                                if _t0_sparse_seq is not None:
-                                    self._sparse_perf_record(
-                                        "_override_sparse_seq_lens",
-                                        time.perf_counter() - _t0_sparse_seq,
-                                    )
-                        if (
-                            (self._sparse_probe_info_enabled
-                             or self._sparse_debug_decode_tokens)
-                            and num_reqs > 0
-                        ):
-                            req0 = self.input_batch.req_ids[0]
-                            blk0 = int(
-                                self.input_batch.block_table[
-                                    kv_cache_gid
-                                ].num_blocks_per_row[0]
-                            )
-                            seq0 = int(cm_layer._seq_lens_cpu[0].item())
-                            ov0 = (
-                                -1
-                                if decode_override is None
-                                else int(decode_override[0])
-                            )
-                            logger.info(
-                                "[SparseProbe] seq_lens_bridge req_id=%s "
-                                "layer=%s is_tok_compact=%s "
-                                "decode_num_blocks_override=%d "
-                                "num_blocks_per_row=%d seq_len_cpu=%d block_size=%d",
-                                req0,
-                                layer_name,
-                                is_tok_compact,
-                                ov0,
-                                blk0,
-                                seq0,
-                                int(bsz),
-                            )
-                            logger.info(
-                                "[SparseRC] layer_bridge req_id=%s layer=%s gid=%d "
-                                "union_seq_len=%d layer_seq_len=%d "
-                                "union_blocks=%d layer_override_blocks=%d",
-                                req0,
-                                layer_name,
-                                kv_cache_gid,
-                                int(cm_union._seq_lens_cpu[0].item()),
-                                seq0,
-                                blk0,
-                                ov0,
-                            )
-                        if ubatch_slices is not None:
-                            for ubid, _cm in enumerate(
-                                split_attn_metadata(ubatch_slices, cm_layer)
-                            ):
                                 _build_attn_group_metadata(
                                     kv_cache_gid,
                                     attn_gid,
-                                    _cm,
-                                    ubid,
+                                    cm,
+                                    None,
                                     skip_block_table_cache=True,
                                     layer_names_override=[layer_name],
-                                    sparse_per_head_block_table=sp_bt,
-                                    sparse_per_head_seq_lens=sp_sl,
-                                    disable_token_sparse_boundary=boundary_disable_sparse,
+                                    disable_token_sparse_boundary=(
+                                        boundary_disable_sparse
+                                    ),
                                 )
-                        else:
+                    elif ubatch_slices is not None:
+                        for ubid, _cm in enumerate(
+                            split_attn_metadata(ubatch_slices, cm)
+                        ):
                             _build_attn_group_metadata(
                                 kv_cache_gid,
                                 attn_gid,
-                                cm_layer,
-                                None,
-                                skip_block_table_cache=True,
-                                layer_names_override=[layer_name],
-                                sparse_per_head_block_table=sp_bt,
-                                sparse_per_head_seq_lens=sp_sl,
+                                _cm,
+                                ubid,
                                 disable_token_sparse_boundary=boundary_disable_sparse,
                             )
+                    else:
+                        _build_attn_group_metadata(
+                            kv_cache_gid,
+                            attn_gid,
+                            cm,
+                            disable_token_sparse_boundary=boundary_disable_sparse,
+                        )
                 elif ubatch_slices is not None:
                     for ubid, _cm in enumerate(
-                        split_attn_metadata(ubatch_slices, cm_union)
+                        split_attn_metadata(ubatch_slices, cm)
                     ):
                         _build_attn_group_metadata(
                             kv_cache_gid,
@@ -2873,7 +2714,7 @@ class GPUModelRunner(
                     _build_attn_group_metadata(
                         kv_cache_gid,
                         attn_gid,
-                        cm_union,
+                        cm,
                         disable_token_sparse_boundary=boundary_disable_sparse,
                     )
 
@@ -8785,213 +8626,6 @@ class GPUModelRunner(
             if row is not None:
                 out[req_idx] = int(len(row))
         return out
-
-    def _build_sparse_layer_block_table_tensor(
-        self,
-        union_bt: torch.Tensor,
-        kv_cache_gid: int,
-        sparse_row_key: str,
-        num_reqs: int,
-        num_reqs_padded: int,
-    ) -> torch.Tensor:
-        """Shrink each sparse-decode row for ``sparse_row_key`` (``layer##qh{j}``)."""
-        out = union_bt.clone()
-        pad_id = -1
-        for req_idx in range(num_reqs):
-            req_id = self.input_batch.req_ids[req_idx]
-            row = self._sparse_layer_decode_phys_row(
-                req_id, kv_cache_gid, sparse_row_key
-            )
-            if row is None:
-                continue
-            out[req_idx].fill_(pad_id)
-            row_t = torch.tensor(row, dtype=torch.int32, device=out.device)
-            out[req_idx, : row_t.shape[0]] = row_t
-        out[num_reqs:num_reqs_padded].fill_(pad_id)
-        return out
-
-    def _build_sparse_per_head_block_table_and_lens(
-        self,
-        union_bt: torch.Tensor,
-        cm: "CommonAttentionMetadata",
-        kv_cache_gid: int,
-        layer_name: str,
-        num_heads: int,
-        num_reqs: int,
-        num_reqs_padded: int,
-        block_size: int,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Stack per-query-head sparse block tables ``[H, S, max_blocks]`` and seq lens."""
-        _, max_blocks = union_bt.shape
-        device = union_bt.device
-        stacked = torch.full(
-            (num_heads, num_reqs_padded, max_blocks),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
-        row_lens = np.full((num_heads, num_reqs_padded), -1, dtype=np.int32)
-        any_sparse = False
-        for qh in range(num_heads):
-            sk = sparse_qh_unit_key(layer_name, qh)
-            for req_idx in range(num_reqs):
-                req_id = self.input_batch.req_ids[req_idx]
-                row = self._sparse_layer_decode_phys_row(req_id, kv_cache_gid, sk)
-                if row is None:
-                    stacked[qh, req_idx] = union_bt[req_idx]
-                else:
-                    any_sparse = True
-                    row_len = len(row)
-                    row_lens[qh, req_idx] = row_len
-                    stacked[qh, req_idx, :row_len] = torch.as_tensor(
-                        row, dtype=torch.int32, device=device
-                    )
-        if not any_sparse:
-            return None, None
-        seq_lens_np = cm._seq_lens_cpu.numpy().copy()
-        per_head_lens = np.zeros((num_heads, num_reqs_padded), dtype=np.int32)
-        blk_table = self.input_batch.block_table[kv_cache_gid]
-        for qh in range(num_heads):
-            for req_idx in range(num_reqs):
-                req_id = self.input_batch.req_ids[req_idx]
-                req_state = self.requests.get(req_id)
-                if req_state is None:
-                    per_head_lens[qh, req_idx] = int(seq_lens_np[req_idx])
-                    continue
-                if len(req_state.output_token_ids) == 0:
-                    per_head_lens[qh, req_idx] = int(seq_lens_np[req_idx])
-                    continue
-                old_seq_len = int(seq_lens_np[req_idx])
-                num_blocks = int(blk_table.num_blocks_per_row[req_idx])
-                ob = int(row_lens[qh, req_idx])
-                if ob >= 0:
-                    num_blocks = ob
-                sparse_cap = num_blocks * block_size
-                per_head_lens[qh, req_idx] = min(old_seq_len, sparse_cap)
-        seq_t = torch.tensor(per_head_lens, dtype=torch.int32, device=device)
-        return stacked, seq_t
-
-    def _override_sparse_seq_lens(
-        self,
-        cm: "CommonAttentionMetadata",
-        kv_cache_gid: int,
-        num_reqs: int,
-        num_reqs_padded: int,
-        block_size: int,
-        decode_num_blocks_override: np.ndarray | None = None,
-    ) -> "CommonAttentionMetadata":
-        """Bug 2 fix: replace seq_lens with sparse block-table length.
-
-        For sparse decode requests the block table only contains the selected
-        history blocks plus the single decode block.  The standard
-        ``seq_lens`` value (full context length) would make the attention
-        kernel attempt to read KV from blocks that don't exist in the sparse
-        table, producing garbage outputs.
-
-        This helper builds a corrected ``seq_lens`` GPU tensor where each
-        decode request's length is capped to
-        ``num_blocks_in_sparse_table * block_size``.
-        Prefill requests are left unchanged (their block tables still cover
-        the full prompt).
-        """
-        blk_table = self.input_batch.block_table[kv_cache_gid]
-        seq_lens_np = cm._seq_lens_cpu.numpy().copy()
-
-        for req_idx in range(num_reqs):
-            req_id = self.input_batch.req_ids[req_idx]
-            req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            num_output_tokens = len(req_state.output_token_ids)
-            if num_output_tokens == 0:
-                continue  # prefill – leave seq_len as-is
-            old_seq_len = int(seq_lens_np[req_idx])
-            # Decode: cap to actual number of sparse blocks * block_size.
-            num_blocks = int(blk_table.num_blocks_per_row[req_idx])
-            if decode_num_blocks_override is not None and req_idx < len(
-                decode_num_blocks_override
-            ):
-                ob = int(decode_num_blocks_override[req_idx])
-                if ob >= 0:
-                    num_blocks = ob
-            sparse_cap_seq_len = num_blocks * block_size
-            # Keep seq_len within sparse-table capacity, but never expose
-            # unwritten decode-block tail beyond the currently materialized
-            # sequence length.
-            new_seq_len = min(old_seq_len, sparse_cap_seq_len)
-            seq_lens_np[req_idx] = new_seq_len
-            if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
-                override_blocks = -1
-                if decode_num_blocks_override is not None and req_idx < len(
-                    decode_num_blocks_override
-                ):
-                    override_blocks = int(decode_num_blocks_override[req_idx])
-                logger.info(
-                    "[SparseRC] seq_lens req_id=%s gid=%d req_idx=%d "
-                    "old_seq_len=%d new_seq_len=%d sparse_cap_seq_len=%d "
-                    "num_blocks=%d block_size=%d decode_override=%d "
-                    "num_output_tokens=%d",
-                    req_id,
-                    kv_cache_gid,
-                    req_idx,
-                    old_seq_len,
-                    new_seq_len,
-                    sparse_cap_seq_len,
-                    num_blocks,
-                    block_size,
-                    override_blocks,
-                    num_output_tokens,
-                )
-            # Diagnostic: sparse capacity can be larger than materialized
-            # tokens while the decode block is not yet full. This is expected
-            # as long as we keep applied seq_len equal to old_seq_len.
-            tail_slack = sparse_cap_seq_len - old_seq_len
-            if 0 < tail_slack < block_size:
-                if new_seq_len != old_seq_len:
-                    logger.warning_once(
-                        "Sparse decode tail exposure detected: req_id=%s gid=%d "
-                        "old_seq_len=%d sparse_cap_seq_len=%d applied_seq_len=%d "
-                        "block_size=%d num_blocks=%d num_output_tokens=%d",
-                        req_id,
-                        kv_cache_gid,
-                        old_seq_len,
-                        sparse_cap_seq_len,
-                        new_seq_len,
-                        block_size,
-                        num_blocks,
-                        num_output_tokens,
-                    )
-                else:
-                    logger.debug_once(
-                        "Sparse decode tail slack observed and safely hidden "
-                        "(applied_seq_len == old_seq_len)."
-                    )
-            self._debug_log_sparse_decode_tokens(
-                req_id=req_id,
-                req_idx=req_idx,
-                seq_len=new_seq_len,
-            )
-            self._debug_log_sparse_forward_kv_tokens(
-                req_id=req_id,
-                req_idx=req_idx,
-                seq_len=new_seq_len,
-                kv_cache_gid=kv_cache_gid,
-                block_size=block_size,
-            )
-
-        sparse_seq_lens_gpu = torch.tensor(
-            seq_lens_np[:num_reqs_padded],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        new_cm = copy(cm)
-        new_cm.seq_lens = sparse_seq_lens_gpu
-        new_cm._seq_lens_cpu = torch.tensor(
-            seq_lens_np[:num_reqs_padded], dtype=torch.int32
-        )
-        if num_reqs > 0:
-            new_cm.max_seq_len = int(seq_lens_np[:num_reqs].max())
-        return new_cm
 
     def _debug_log_sparse_decode_tokens(
         self, req_id: str, req_idx: int, seq_len: int

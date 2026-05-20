@@ -10,7 +10,8 @@ import torch
 from transformers import AutoTokenizer
 
 def main():
-    USE_SPARSE_ATTENTION = True
+    USE_SPARSE_ATTENTION = os.environ.get("TEST_USE_SPARSE_ATTENTION", "1") != "0"
+    PROFILE_DECODE_ONLY = os.environ.get("TEST_PROFILE_DECODE_ONLY", "0") == "1"
     context_length = 500
     block_size = 16
     test_speed = True
@@ -99,6 +100,7 @@ def main():
     step_count = 0
     generated_text = ""
     loop_start_time = time.perf_counter()
+    decode_range_id = None
 
     while engine.has_unfinished_requests():
         step_count += 1
@@ -114,6 +116,9 @@ def main():
         # 6. 采样生成token
         # 断点位置2：这里打断点，进入step()看完整流程
         outputs = engine.step()
+        if PROFILE_DECODE_ONLY and step_count == 1:
+            torch.cuda.synchronize()
+            decode_range_id = torch.cuda.nvtx.range_start("decode_only")
 
         # 处理输出
         for output in outputs:
@@ -125,6 +130,10 @@ def main():
                 if print_output:
                     new_token = output.outputs[0].text
                     print(f"生成token: {repr(new_token)}")
+
+    if decode_range_id is not None:
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_end(decode_range_id)
 
     loop_elapsed = time.perf_counter() - loop_start_time
     generated_tokens = len(
