@@ -2902,6 +2902,84 @@ class GPUModelRunner(
             return src
         return torch.tensor([src], dtype=torch.int32)
 
+    def _pack_sparse_cudagraph_cluster_info(
+        self,
+        graph_info: SparseClusterBlockInfo,
+        src_temp_block_ids: torch.Tensor,
+        src_reusable_block_ids: torch.Tensor,
+        src_allocated_block_ids: torch.Tensor,
+        src_used_count: torch.Tensor,
+    ) -> None:
+        packed_cpu = graph_info.packed_block_info_cpu
+        packed_gpu = graph_info.packed_block_info_gpu
+        assert packed_cpu is not None and packed_gpu is not None
+        assert graph_info.temp_block_ids_gpu is not None
+        assert graph_info.reusable_block_ids_gpu is not None
+        assert graph_info.allocated_block_ids_gpu is not None
+        assert graph_info.used_count_gpu is not None
+
+        temp_len = graph_info.temp_block_ids_gpu.numel()
+        reusable_len = graph_info.reusable_block_ids_gpu.numel()
+        allocated_len = graph_info.allocated_block_ids_gpu.numel()
+        used_count_len = graph_info.used_count_gpu.numel()
+        total_len = temp_len + reusable_len + allocated_len + used_count_len
+        assert packed_cpu.numel() >= total_len
+
+        packed_cpu_view = packed_cpu[:total_len]
+        packed_cpu_view.zero_()
+
+        cpu_segments: list[tuple[int, int]] = []
+
+        def copy_to_pack(
+            dst_start: int,
+            dst_len: int,
+            src: torch.Tensor,
+            name: str,
+        ) -> None:
+            src_flat = src.reshape(-1)
+            if src_flat.numel() > dst_len:
+                raise ValueError(
+                    "Sparse CUDA graph packed buffer is undersized for "
+                    f"{name}: dst={dst_len}, src={src_flat.numel()}"
+                )
+            if src_flat.is_cuda:
+                if src_flat.numel() < dst_len:
+                    packed_gpu[
+                        dst_start + src_flat.numel() : dst_start + dst_len
+                    ].zero_()
+                packed_gpu[dst_start : dst_start + src_flat.numel()].copy_(
+                    src_flat, non_blocking=True
+                )
+                return
+            if src_flat.dtype != packed_cpu.dtype:
+                src_flat = src_flat.to(dtype=packed_cpu.dtype)
+            packed_cpu_view[
+                dst_start : dst_start + src_flat.numel()
+            ].copy_(src_flat, non_blocking=False)
+            cpu_segments.append((dst_start, dst_len))
+
+        offset = 0
+        copy_to_pack(offset, temp_len, src_temp_block_ids, "temp_block_ids")
+        offset += temp_len
+        copy_to_pack(
+            offset, reusable_len, src_reusable_block_ids, "reusable_block_ids"
+        )
+        offset += reusable_len
+        copy_to_pack(
+            offset, allocated_len, src_allocated_block_ids, "allocated_block_ids"
+        )
+        offset += allocated_len
+        copy_to_pack(offset, used_count_len, src_used_count, "used_count")
+
+        if len(cpu_segments) == 4:
+            packed_gpu[:total_len].copy_(packed_cpu_view, non_blocking=True)
+        else:
+            for dst_start, length in cpu_segments:
+                packed_gpu[dst_start : dst_start + length].copy_(
+                    packed_cpu_view[dst_start : dst_start + length],
+                    non_blocking=True,
+                )
+
     def _ensure_sparse_cudagraph_cluster_info(
         self,
         kv_cache_gid: int,
@@ -2938,22 +3016,28 @@ class GPUModelRunner(
             )
             self._sparse_cudagraph_cluster_info[kv_cache_gid] = info
 
-        if needs_new(info.temp_block_ids_gpu, total_temp_blocks):
-            info.temp_block_ids_gpu = torch.zeros(
-                (total_temp_blocks,), dtype=torch.int32, device=self.device
+        packed_len = total_temp_blocks + reusable_blocks + allocated_blocks + 1
+        if needs_new(info.packed_block_info_gpu, packed_len):
+            info.packed_block_info_gpu = torch.zeros(
+                (packed_len,), dtype=torch.int32, device=self.device
             )
-        if needs_new(info.reusable_block_ids_gpu, reusable_blocks):
-            info.reusable_block_ids_gpu = torch.zeros(
-                (reusable_blocks,), dtype=torch.int32, device=self.device
+        if (
+            info.packed_block_info_cpu is None
+            or info.packed_block_info_cpu.numel() < packed_len
+        ):
+            info.packed_block_info_cpu = torch.empty(
+                (packed_len,), dtype=torch.int32, pin_memory=True
             )
-        if needs_new(info.allocated_block_ids_gpu, allocated_blocks):
-            info.allocated_block_ids_gpu = torch.zeros(
-                (allocated_blocks,), dtype=torch.int32, device=self.device
-            )
-        if info.used_count_gpu is None or info.used_count_gpu.numel() != 1:
-            info.used_count_gpu = torch.zeros(
-                (1,), dtype=torch.int32, device=self.device
-            )
+        packed_gpu = info.packed_block_info_gpu
+        assert packed_gpu is not None
+        offset = 0
+        info.temp_block_ids_gpu = packed_gpu[offset : offset + total_temp_blocks]
+        offset += total_temp_blocks
+        info.reusable_block_ids_gpu = packed_gpu[offset : offset + reusable_blocks]
+        offset += reusable_blocks
+        info.allocated_block_ids_gpu = packed_gpu[offset : offset + allocated_blocks]
+        offset += allocated_blocks
+        info.used_count_gpu = packed_gpu[offset : offset + 1]
         return info
 
     def _ensure_sparse_cudagraph_metadata(
@@ -3115,20 +3199,11 @@ class GPUModelRunner(
                         or src_used_count is None
                     ):
                         return False
-                    self._copy_sparse_cudagraph_tensor(
-                        graph_info.temp_block_ids_gpu,
+                    self._pack_sparse_cudagraph_cluster_info(
+                        graph_info,
                         src_temp_block_ids,
-                    )
-                    self._copy_sparse_cudagraph_tensor(
-                        graph_info.reusable_block_ids_gpu,
                         src_reusable_block_ids,
-                    )
-                    self._copy_sparse_cudagraph_tensor(
-                        graph_info.allocated_block_ids_gpu,
                         src_allocated_block_ids,
-                    )
-                    self._copy_sparse_cudagraph_tensor(
-                        graph_info.used_count_gpu,
                         src_used_count,
                     )
                     cluster_info[rid] = tuple(

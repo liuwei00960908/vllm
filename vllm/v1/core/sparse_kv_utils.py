@@ -215,6 +215,8 @@ class SparseClusterBlockInfo:
     reusable_block_ids_gpu: torch.Tensor | None = None
     allocated_block_ids_gpu: torch.Tensor | None = None
     used_count_gpu: torch.Tensor | None = None
+    packed_block_info_cpu: torch.Tensor | None = None
+    packed_block_info_gpu: torch.Tensor | None = None
 
 import time
 from collections import defaultdict, deque
