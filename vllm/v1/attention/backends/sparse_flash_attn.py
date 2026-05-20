@@ -238,122 +238,34 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             and cluster_allocated_block_info is not None
             and len(cluster_allocated_block_info) > 0
         )
-        if use_sparse_cluster:
-            cluster_storage = kv_cache.reshape(
-                kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4]
-            )
-            req_index = 0
-            smm = sparse_manager_metadata[0]
-            cluster_allocated_block_info = cluster_allocated_block_info[req_index][0]
+        assert use_sparse_cluster, (
+            "SparseFlashAttentionImpl requires sparse cluster metadata."
+        )
+        cluster_storage = kv_cache.reshape(
+            kv_cache.shape[0], kv_cache.shape[1], -1, kv_cache.shape[4]
+        )
+        req_index = 0
+        smm = sparse_manager_metadata[0]
+        cluster_allocated_block_info = cluster_allocated_block_info[req_index][0]
 
-            is_prefill = smm.in_cluster_token_count == num_actual_tokens
-            if is_prefill:
-                flash_attn_varlen_func(
-                    q=query_actual,
-                    k=key_actual,
-                    v=value_actual,
-                    out=output_actual,
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    cu_seqlens_k=cu_seqlens_q,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=sliding_window_size,
-                    block_table=None,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
-                )
-                return output
-
-            hkv = smm.mean.shape[0]
-            cluster_block_size = cluster_storage.shape[2]
-            num_queries = num_actual_tokens
-            hq = query.shape[1]
-            head_group_size = hq // hkv
-            max_blocks = block_table.shape[-1]
-            nprobe = attn_metadata.extra_sparse_manager_info["nprobe"]
-            dim = query.shape[-1]
-
-            if smm.in_cluster_token_count < smm.cluster_centers_T.shape[2]:
-                cluster_centers_t = smm.cluster_centers_T[
-                    :, :, :smm.in_cluster_token_count
-                ]
-            else:
-                cluster_centers_t = smm.cluster_centers_T
-            nprobe = min(nprobe, cluster_centers_t.shape[2])
-            query_centered = (
-                query_actual.reshape(num_queries, hkv, head_group_size, dim)
-                - smm.mean[None, :, None]
-            )
-            score = torch.matmul(query_centered, cluster_centers_t[None])
-            score = score.reshape(num_queries, hq, -1)
-            top_clusters = torch.topk(score, k=nprobe, dim=-1).indices.to(
-                dtype=torch.int32
-            )
-            free_block_ids = cluster_allocated_block_info.reusable_block_ids_gpu
-            assert free_block_ids is not None
-            required_free_blocks = num_queries * hq * nprobe
-            assert free_block_ids.numel() >= required_free_blocks, (
-                "Sparse reusable scratch pool is undersized: "
-                f"have {free_block_ids.numel()}, need at least "
-                f"{required_free_blocks}"
-            )
-            if smm.block_table_buffers is None:
-                smm.block_table_buffers = SparseBlockTableBuffers()
-            assert smm.block_table_buffers is not None
-            block_table, _, seqused_k = smm.block_table_buffers.build(
-                top_clusters=top_clusters,
-                cluster_compact_block_ids=smm.cluster_compact_block_ids,
-                cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
-                cluster_total_kv_counts=smm.cluster_total_kv_counts,
-                temp_block_ids=smm.temp_block_ids,
-                block_storage=cluster_storage,
-                free_block_ids=free_block_ids,
-                max_bt_len=max_blocks,
-            )
-
-            num_rows = num_queries * hq
-            device = query.device
-            q_flat = query_actual.reshape(num_rows, 1, -1)
-            out_flat = output_actual.reshape(num_rows, 1, -1)
-            seqused_k_flat = seqused_k.reshape(num_rows)
-            block_table_flat = block_table.reshape(num_rows, -1)
-            if (
-                smm.cu_seqlens_q_buffer is None
-                or smm.cu_seqlens_q_buffer.shape[0] < num_rows + 1
-                or smm.cu_seqlens_q_buffer.dtype != cu_seqlens_q.dtype
-            ):
-                smm.cu_seqlens_q_buffer = torch.arange(
-                    num_rows + 1,
-                    device=device,
-                    dtype=cu_seqlens_q.dtype,
-                )
-            cu_seqlens_q_batch = smm.cu_seqlens_q_buffer[: num_rows + 1]
-
+        is_prefill = smm.in_cluster_token_count == num_actual_tokens
+        if is_prefill:
             flash_attn_varlen_func(
-                q=q_flat,
-                k=cluster_storage[0, :, :, None, :],
-                v=cluster_storage[1, :, :, None, :],
-                out=out_flat,
-                cu_seqlens_q=cu_seqlens_q_batch,
-                max_seqlen_q=1,
-                seqused_k=seqused_k_flat,
-                max_seqlen_k=max_blocks * cluster_block_size,
+                q=query_actual,
+                k=key_actual,
+                v=value_actual,
+                out=output_actual,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_k=cu_seqlens_q,
+                max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.scale,
                 causal=attn_metadata.causal,
                 alibi_slopes=self.alibi_slopes,
                 window_size=sliding_window_size,
-                block_table=block_table_flat,
+                block_table=None,
                 softcap=self.logits_soft_cap,
-                scheduler_metadata=None,
+                scheduler_metadata=scheduler_metadata,
                 fa_version=self.vllm_flash_attn_version,
                 q_descale=q_descale,
                 k_descale=k_descale,
@@ -362,18 +274,96 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 s_aux=self.sinks,
             )
             return output
+
+        hkv = smm.mean.shape[0]
+        cluster_block_size = cluster_storage.shape[2]
+        num_queries = num_actual_tokens
+        hq = query.shape[1]
+        head_group_size = hq // hkv
+        max_blocks = block_table.shape[-1]
+        nprobe = attn_metadata.extra_sparse_manager_info["nprobe"]
+        dim = query.shape[-1]
+
+        if smm.in_cluster_token_count < smm.cluster_centers_T.shape[2]:
+            cluster_centers_t = smm.cluster_centers_T[
+                :, :, :smm.in_cluster_token_count
+            ]
         else:
-            return super().forward(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
+            cluster_centers_t = smm.cluster_centers_T
+        nprobe = min(nprobe, cluster_centers_t.shape[2])
+        query_centered = (
+            query_actual.reshape(num_queries, hkv, head_group_size, dim)
+            - smm.mean[None, :, None]
+        )
+        score = torch.matmul(query_centered, cluster_centers_t[None])
+        score = score.reshape(num_queries, hq, -1)
+        top_clusters = torch.topk(score, k=nprobe, dim=-1).indices.to(
+            dtype=torch.int32
+        )
+        free_block_ids = cluster_allocated_block_info.reusable_block_ids_gpu
+        assert free_block_ids is not None
+        required_free_blocks = num_queries * hq * nprobe
+        assert free_block_ids.numel() >= required_free_blocks, (
+            "Sparse reusable scratch pool is undersized: "
+            f"have {free_block_ids.numel()}, need at least "
+            f"{required_free_blocks}"
+        )
+        if smm.block_table_buffers is None:
+            smm.block_table_buffers = SparseBlockTableBuffers()
+        assert smm.block_table_buffers is not None
+        block_table, _, seqused_k = smm.block_table_buffers.build(
+            top_clusters=top_clusters,
+            cluster_compact_block_ids=smm.cluster_compact_block_ids,
+            cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
+            cluster_total_kv_counts=smm.cluster_total_kv_counts,
+            temp_block_ids=smm.temp_block_ids,
+            block_storage=cluster_storage,
+            free_block_ids=free_block_ids,
+            max_bt_len=max_blocks,
+        )
+
+        num_rows = num_queries * hq
+        device = query.device
+        q_flat = query_actual.reshape(num_rows, 1, -1)
+        out_flat = output_actual.reshape(num_rows, 1, -1)
+        seqused_k_flat = seqused_k.reshape(num_rows)
+        block_table_flat = block_table.reshape(num_rows, -1)
+        if (
+            smm.cu_seqlens_q_buffer is None
+            or smm.cu_seqlens_q_buffer.shape[0] < num_rows + 1
+            or smm.cu_seqlens_q_buffer.dtype != cu_seqlens_q.dtype
+        ):
+            smm.cu_seqlens_q_buffer = torch.arange(
+                num_rows + 1,
+                device=device,
+                dtype=cu_seqlens_q.dtype,
             )
+        cu_seqlens_q_batch = smm.cu_seqlens_q_buffer[: num_rows + 1]
+
+        flash_attn_varlen_func(
+            q=q_flat,
+            k=cluster_storage[0, :, :, None, :],
+            v=cluster_storage[1, :, :, None, :],
+            out=out_flat,
+            cu_seqlens_q=cu_seqlens_q_batch,
+            max_seqlen_q=1,
+            seqused_k=seqused_k_flat,
+            max_seqlen_k=max_blocks * cluster_block_size,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,
+            window_size=sliding_window_size,
+            block_table=block_table_flat,
+            softcap=self.logits_soft_cap,
+            scheduler_metadata=None,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
+            s_aux=self.sinks,
+        )
+        return output
 
     def do_kv_cache_update(
         self,
@@ -500,4 +490,10 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             smm.in_cluster_token_count += num_actual_tokens
             return
 
-        return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+        return super().do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+        )

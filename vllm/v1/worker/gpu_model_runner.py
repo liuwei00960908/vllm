@@ -7194,6 +7194,7 @@ class GPUModelRunner(
                 skip_eplb=True,
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
+                is_graph_capturing=force_attention,
             )
         self._dummy_run(
             desc.num_tokens,
