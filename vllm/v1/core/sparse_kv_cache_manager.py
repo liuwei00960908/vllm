@@ -891,6 +891,13 @@ class SparseKVManager(FullAttentionManager):
         )
         self._last_num_tokens_main_model[request_id] = num_tokens_main_model
         self.num_cached_block[request_id] = 0
+        logger.info(
+            "[sparse-decode-alloc] req=%s scratch=%d history=%d decode=1"
+            " new_decode_this_step=%d total_rb=%d pool_free=%d/%d",
+            request_id, len(scratch), len(history), int(allocated_new_decode),
+            len(req_blocks), self.block_pool.get_num_free_blocks(),
+            self.block_pool.num_gpu_blocks,
+        )
         return list(req_blocks)
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
