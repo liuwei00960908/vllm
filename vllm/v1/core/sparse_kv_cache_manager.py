@@ -83,6 +83,7 @@ To enable the Estimation Zone:
 from __future__ import annotations
 
 import os
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeAlias
@@ -107,6 +108,26 @@ if TYPE_CHECKING:
     pass
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _SparseBlockReservationState:
+    temp_block_ids: torch.Tensor | None = None
+    reusable_block_ids: torch.Tensor | None = None
+    reusable_count: int = 0
+    unused_block_ids: torch.Tensor | None = None
+    unused_count: int = 0
+    window_block_ids: torch.Tensor | None = None
+    window_lens: torch.Tensor | None = None
+    window_seqs: torch.Tensor | None = None
+    free_window_slots: deque[int] = field(default_factory=deque)
+    inflight_window_slots: deque[int] = field(default_factory=deque)
+    scheduled_slot: int = -1
+    scheduled_seq: int = -1
+    next_window_seq: int = 0
+    used_count: torch.Tensor = field(
+        default_factory=lambda: torch.zeros((1,), dtype=torch.int32)
+    )
 
 # Single-array API (tests / callers that pass one ``[num_blocks, D]`` matrix)
 # is stored under this synthetic layer name.
@@ -408,9 +429,7 @@ class SparseKVManager(FullAttentionManager):
 
         # request_id -> _ClusterManager
         self._req_to_cluster_blocks: dict[str, list[KVCacheBlock]] = {}
-        self._req_to_temp_block_ids: dict[str, list[int]] = {}
-        self._req_to_reusable_cluster_blocks_id: dict[str, list[int]] = {}
-        self._req_to_unused_cluster_blocks_id: dict[str, list[int]] = {}
+        self._req_to_block_reservation: dict[str, _SparseBlockReservationState] = {}
 
     def _get_cluster_block_size(self):
         # Since the cluster of each head cannot be shared with other heads, we will reshape 
@@ -436,17 +455,123 @@ class SparseKVManager(FullAttentionManager):
         rows = max(0, num_new_token) * self._spec.num_query_heads
         return rows * per_row
 
+    @staticmethod
+    def _new_i32_tensor(capacity: int) -> torch.Tensor:
+        return torch.empty((capacity,), dtype=torch.int32)
+
+    def _ensure_1d_capacity(
+        self,
+        tensor: torch.Tensor | None,
+        count: int,
+        capacity: int,
+    ) -> torch.Tensor:
+        if tensor is not None and tensor.numel() >= capacity:
+            return tensor
+        new_capacity = max(capacity, 1 if tensor is None else tensor.numel() * 2)
+        new_tensor = self._new_i32_tensor(new_capacity)
+        if tensor is not None and count > 0:
+            new_tensor[:count].copy_(tensor[:count])
+        return new_tensor
+
+    @staticmethod
+    def _fill_block_ids(
+        tensor: torch.Tensor,
+        start: int,
+        blocks: list[KVCacheBlock],
+    ) -> None:
+        for i, block in enumerate(blocks):
+            tensor[start + i] = block.block_id
+
+    def _push_unused_block_ids(
+        self,
+        state: _SparseBlockReservationState,
+        block_ids: torch.Tensor,
+    ) -> None:
+        count = int(block_ids.numel())
+        if count == 0:
+            return
+        new_count = state.unused_count + count
+        state.unused_block_ids = self._ensure_1d_capacity(
+            state.unused_block_ids,
+            state.unused_count,
+            new_count,
+        )
+        state.unused_block_ids[state.unused_count:new_count].copy_(block_ids)
+        state.unused_count = new_count
+
+    def _ensure_window_capacity(
+        self,
+        state: _SparseBlockReservationState,
+        window_len: int,
+    ) -> None:
+        if state.window_block_ids is None:
+            state.window_block_ids = torch.empty(
+                (2, max(1, window_len)), dtype=torch.int32
+            )
+            state.window_lens = torch.zeros((2,), dtype=torch.int32)
+            state.window_seqs = torch.full((2,), -1, dtype=torch.int64)
+            state.free_window_slots.extend((0, 1))
+            return
+
+        rows, cols = state.window_block_ids.shape
+        need_rows = rows if state.free_window_slots else rows * 2
+        need_cols = max(cols, window_len)
+        if need_rows == rows and need_cols == cols:
+            return
+
+        new_windows = torch.empty((need_rows, need_cols), dtype=torch.int32)
+        new_windows[:rows, :cols].copy_(state.window_block_ids)
+        new_lens = torch.zeros((need_rows,), dtype=torch.int32)
+        new_seqs = torch.full((need_rows,), -1, dtype=torch.int64)
+        assert state.window_lens is not None
+        assert state.window_seqs is not None
+        new_lens[:rows].copy_(state.window_lens)
+        new_seqs[:rows].copy_(state.window_seqs)
+        state.window_block_ids = new_windows
+        state.window_lens = new_lens
+        state.window_seqs = new_seqs
+        state.free_window_slots.extend(range(rows, need_rows))
+
+    def _reserve_window_slot(
+        self,
+        state: _SparseBlockReservationState,
+        window_len: int,
+    ) -> int:
+        self._ensure_window_capacity(state, window_len)
+        assert state.window_lens is not None
+        assert state.window_seqs is not None
+        slot = state.free_window_slots.popleft()
+        window_seq = state.next_window_seq
+        state.next_window_seq += 1
+        state.window_lens[slot] = window_len
+        state.window_seqs[slot] = window_seq
+        state.inflight_window_slots.append(slot)
+        state.scheduled_slot = slot
+        state.scheduled_seq = window_seq
+        return slot
+
     def _ensure_reusable_cluster_blocks(self, req_id: str, num_new_token: int) -> None:
-        reusable_block_ids = self._req_to_reusable_cluster_blocks_id.setdefault(
-            req_id, []
+        state = self._req_to_block_reservation.setdefault(
+            req_id, _SparseBlockReservationState()
         )
         num_required_blocks = self._get_required_reusable_block_count(num_new_token)
-        num_missing_blocks = max(0, num_required_blocks - len(reusable_block_ids))
+        num_missing_blocks = max(0, num_required_blocks - state.reusable_count)
         if num_missing_blocks == 0:
             return
 
         reusable_blocks = self._allocate_cluster_blocks(req_id, num_missing_blocks)
-        reusable_block_ids.extend([block.block_id for block in reusable_blocks])
+        new_count = state.reusable_count + num_missing_blocks
+        state.reusable_block_ids = self._ensure_1d_capacity(
+            state.reusable_block_ids,
+            state.reusable_count,
+            new_count,
+        )
+        self._fill_block_ids(
+            state.reusable_block_ids,
+            state.reusable_count,
+            reusable_blocks,
+        )
+        state.reusable_count = new_count
 
     def _get_prefill_persistent_block_count(self, num_new_token: int) -> int:
         cluster_block_size = self._get_cluster_block_size()
@@ -472,57 +597,145 @@ class SparseKVManager(FullAttentionManager):
         return new_blocks
 
     def _allocate_blocks_for_cluster(self, req_id, num_new_token):
-        if req_id not in self._req_to_temp_block_ids:
+        state = self._req_to_block_reservation.setdefault(
+            req_id, _SparseBlockReservationState()
+        )
+        if state.temp_block_ids is None:
             temp_blocks = self._allocate_cluster_blocks(
                 req_id, self._get_total_temp_block_count()
             )
-            self._req_to_temp_block_ids[req_id] = [
-                block.block_id for block in temp_blocks
-            ]
+            state.temp_block_ids = self._new_i32_tensor(len(temp_blocks))
+            self._fill_block_ids(state.temp_block_ids, 0, temp_blocks)
 
         if req_id in self.num_cached_block:
             self._ensure_reusable_cluster_blocks(req_id, num_new_token)
 
-        unused_blocks_id_list = self._req_to_unused_cluster_blocks_id.setdefault(req_id, [])
         num_required_blocks = (
             self._get_decode_persistent_block_count(num_new_token)
             if req_id in self.num_cached_block
             else self._get_prefill_persistent_block_count(num_new_token)
         )
-        num_required_blocks = max(0, num_required_blocks - len(unused_blocks_id_list))
-        if len(unused_blocks_id_list) == 0:
-            # append_kv_to_clusters requires a non-empty free_block_ids tensor
-            # even on steps where no compact block is ultimately consumed.
-            num_required_blocks = max(1, num_required_blocks)
+        # append_kv_to_clusters requires a non-empty free_block_ids tensor even
+        # on steps where no compact block is ultimately consumed.
+        num_required_blocks = max(1, num_required_blocks)
 
-        new_blocks = self._allocate_cluster_blocks(req_id, num_required_blocks)
-        unused_blocks_id_list.extend([block.block_id for block in new_blocks])
+        num_reused = min(state.unused_count, num_required_blocks)
+        num_missing_blocks = num_required_blocks - num_reused
+        slot = self._reserve_window_slot(state, num_required_blocks)
+        assert state.window_block_ids is not None
+
+        if num_reused:
+            assert state.unused_block_ids is not None
+            reused_start = state.unused_count - num_reused
+            state.window_block_ids[slot, :num_reused].copy_(
+                state.unused_block_ids[reused_start:state.unused_count]
+            )
+            state.unused_count = reused_start
+
+        if num_missing_blocks:
+            new_blocks = self._allocate_cluster_blocks(req_id, num_missing_blocks)
+            self._fill_block_ids(state.window_block_ids[slot], num_reused, new_blocks)
         return None
-    
-    def _notify_blocks_for_cluster_used(self, req_id, num_block_used):
-        del self._req_to_unused_cluster_blocks_id[req_id][0:num_block_used]
-        return None
+
+    def _rollback_scheduled_cluster_blocks(self, req_id: str) -> None:
+        state = self._req_to_block_reservation.get(req_id)
+        if state is None or state.scheduled_slot < 0:
+            return
+
+        slot = state.scheduled_slot
+        state.scheduled_slot = -1
+        state.scheduled_seq = -1
+        if not state.inflight_window_slots or state.inflight_window_slots[-1] != slot:
+            raise AssertionError(
+                "Sparse cluster scheduled window rollback is out of order for "
+                f"request {req_id}."
+            )
+        state.inflight_window_slots.pop()
+
+        assert state.window_lens is not None
+        assert state.window_block_ids is not None
+        scheduled_len = int(state.window_lens[slot].item())
+        self._push_unused_block_ids(
+            state, state.window_block_ids[slot, :scheduled_len]
+        )
+        state.free_window_slots.append(slot)
+
+    def _notify_blocks_for_cluster_used(
+        self,
+        req_id: str,
+        num_block_used: int,
+        window_seq: int,
+    ) -> bool:
+        state = self._req_to_block_reservation.get(req_id)
+        if state is None or not state.inflight_window_slots:
+            return True
+
+        slot = state.inflight_window_slots[0]
+        assert state.window_seqs is not None
+        front_seq = int(state.window_seqs[slot].item())
+        if window_seq != front_seq:
+            if window_seq < front_seq:
+                raise AssertionError(
+                    f"Stale sparse cluster feedback seq {window_seq} for "
+                    f"request {req_id}; front seq is {front_seq}."
+                )
+            return False
+
+        state.inflight_window_slots.popleft()
+        if state.scheduled_slot == slot:
+            state.scheduled_slot = -1
+            state.scheduled_seq = -1
+        assert state.window_lens is not None
+        assert state.window_block_ids is not None
+        window_len = int(state.window_lens[slot].item())
+
+        num_block_used = int(num_block_used)
+        assert 0 <= num_block_used <= window_len, (
+            f"Sparse cluster used_count {num_block_used} exceeds scheduled "
+            f"block window size {window_len} for request {req_id}."
+        )
+        if num_block_used < window_len:
+            self._push_unused_block_ids(
+                state, state.window_block_ids[slot, num_block_used:window_len]
+            )
+        state.free_window_slots.append(slot)
+        return True
 
     def generate_cluster_block_info(self, req_id, num_new_token):
+        state = self._req_to_block_reservation.setdefault(
+            req_id, _SparseBlockReservationState()
+        )
+        temp_block_ids = (
+            state.temp_block_ids
+            if state.temp_block_ids is not None
+            else self._new_i32_tensor(0)
+        )
+        reusable_block_ids = (
+            state.reusable_block_ids[: state.reusable_count]
+            if state.reusable_block_ids is not None
+            else self._new_i32_tensor(0)
+        )
+        allocated_block_ids = self._new_i32_tensor(0)
+        window_seq = -1
+        if state.scheduled_slot >= 0:
+            assert state.window_lens is not None
+            assert state.window_block_ids is not None
+            scheduled_len = int(state.window_lens[state.scheduled_slot].item())
+            allocated_block_ids = state.window_block_ids[
+                state.scheduled_slot, :scheduled_len
+            ]
+            window_seq = state.scheduled_seq
         return SparseClusterBlockInfo(
-            temp_block_ids=torch.tensor(
-            self._req_to_temp_block_ids.setdefault(req_id, []),
-            dtype=torch.int32,
-            ),
-            reusable_block_ids=torch.tensor(
-            self._req_to_reusable_cluster_blocks_id.setdefault(req_id, []),
-            dtype=torch.int32,
-            ),
-            allocated_block_ids=torch.tensor(
-            self._req_to_unused_cluster_blocks_id.setdefault(req_id, []),
-            dtype=torch.int32,
-            ),
-            used_count=torch.zeros(size=(1,), dtype=torch.int32),
+            temp_block_ids=temp_block_ids,
+            reusable_block_ids=reusable_block_ids,
+            allocated_block_ids=allocated_block_ids,
+            used_count=state.used_count,
             cluster_block_size=self._get_cluster_block_size(),
             num_cluster=self._spec.num_clusters,
             num_segment=self._spec.n_segment,
             nprobe=self._spec.nprobe,
             num_kv_heads=self._spec.num_kv_heads,
+            window_seq=window_seq,
         )
 
     def _debug_log_state(self, request_id: str, phase: str, **kwargs) -> None:
@@ -733,9 +946,7 @@ class SparseKVManager(FullAttentionManager):
         if request_id in self._req_to_cluster_blocks:
             self.block_pool.free_blocks(self._req_to_cluster_blocks[request_id])
             self._req_to_cluster_blocks.pop(request_id)
-            self._req_to_temp_block_ids.pop(request_id, None)
-            self._req_to_reusable_cluster_blocks_id.pop(request_id, None)
-            self._req_to_unused_cluster_blocks_id.pop(request_id)
+            self._req_to_block_reservation.pop(request_id, None)
 
         # Free non-selected prefill blocks that are no longer referenced by
         # req_to_blocks (they were "held" to preserve KV data but not picked

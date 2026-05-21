@@ -104,6 +104,7 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        self._pending_sparse_cluster_feedback: deque[tuple[str, int, Any]] = deque()
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -350,6 +351,7 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+        self._process_sparse_cluster_feedback()
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -1304,6 +1306,55 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _enqueue_sparse_cluster_feedback(
+        self,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        if model_runner_output.cluster_info is None:
+            return
+        for req_id, cluster_info in model_runner_output.cluster_info.items():
+            for i, info in enumerate(cluster_info):
+                if info is not None:
+                    self._pending_sparse_cluster_feedback.append((req_id, i, info))
+
+    def _process_sparse_cluster_feedback(self) -> None:
+        if not self._pending_sparse_cluster_feedback:
+            return
+
+        pending = self._pending_sparse_cluster_feedback
+        while pending:
+            made_progress = False
+            next_pending: deque[tuple[str, int, Any]] = deque()
+            while pending:
+                req_id, manager_idx, info = pending.popleft()
+                used_count_ready_event = info.used_count_ready_event
+                if (
+                    used_count_ready_event is not None
+                    and not used_count_ready_event.query()
+                ):
+                    next_pending.append((req_id, manager_idx, info))
+                    continue
+
+                used_count = info.used_count
+                if hasattr(used_count, "item"):
+                    used_count = int(used_count.item())
+
+                kv_cache_manager = (
+                    self.kv_cache_manager.coordinator.single_type_managers[manager_idx]
+                )
+                if kv_cache_manager._notify_blocks_for_cluster_used(
+                    req_id, used_count, info.window_seq
+                ):
+                    made_progress = True
+                else:
+                    next_pending.append((req_id, manager_idx, info))
+
+            pending = next_pending
+            if not made_progress:
+                break
+
+        self._pending_sparse_cluster_feedback = pending
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1317,16 +1368,8 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
-        if model_runner_output.cluster_info is not None:
-            for req_id, cluster_info in model_runner_output.cluster_info.items():
-                for i in range(len(cluster_info)):
-                    if cluster_info[i] is None:
-                        continue
-                        
-                    kv_cache_manager = self.kv_cache_manager.coordinator.single_type_managers[i]
-                    kv_cache_manager._notify_blocks_for_cluster_used(
-                        req_id, cluster_info[i].used_count
-                    )
+        self._enqueue_sparse_cluster_feedback(model_runner_output)
+        self._process_sparse_cluster_feedback()
         
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():

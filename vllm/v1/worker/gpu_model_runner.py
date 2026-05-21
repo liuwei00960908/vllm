@@ -393,6 +393,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    cluster_info: dict[str, tuple[SparseClusterBlockInfo | None, ...]] | None
 
 
 class GPUModelRunner(
@@ -518,6 +519,11 @@ class GPUModelRunner(
         self._sparse_layer_gid_by_name: dict[str, int] = {}
         self._sparse_cudagraph_cluster_info: dict[int, SparseClusterBlockInfo] = {}
         self._sparse_cudagraph_metadata: dict[str, SparseManagerMetadata] = {}
+        self._sparse_used_count_copy_stream = torch.cuda.Stream()
+        self._sparse_used_count_cpu_buffers: list[torch.Tensor | None] = []
+        self._sparse_used_count_events: list[torch.Event | None] = []
+        self._sparse_used_count_ready_events: list[torch.Event | None] = []
+        self._sparse_used_count_buffer_idx = 0
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -2733,6 +2739,7 @@ class GPUModelRunner(
                         src_allocated_block_ids,
                         src_used_count,
                     )
+                    graph_info.window_seq = src_info.window_seq
                     cluster_info[rid] = tuple(
                         graph_info if i == kv_cache_gid else item
                         for i, item in enumerate(cluster_info[rid])
@@ -4574,6 +4581,7 @@ class GPUModelRunner(
             )
         if cudagraph_mode == CUDAGraphMode.FULL:
             self._sync_sparse_cudagraph_metadata(attn_metadata)
+        cluster_info = self._start_sparse_cluster_info_copy(scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4645,6 +4653,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            cluster_info,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -4683,6 +4692,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            cluster_info,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4843,8 +4853,6 @@ class GPUModelRunner(
                     capturer.save_captured_experts(indices=self.slot_mapping)  # noqa
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
-
-            cluster_info = self._collect_sparse_cluster_info(scheduler_output)
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -7345,22 +7353,92 @@ class GPUModelRunner(
                 sparse_layers,
             )
 
-    def _collect_sparse_cluster_info(
+    def _get_sparse_used_count_copy_slot(
+        self,
+        num_reqs: int,
+        num_groups: int,
+    ) -> tuple[torch.Tensor, torch.Event, torch.Event]:
+        ring_size = max(
+            2 if self.use_async_scheduling else 1,
+            self.parallel_config.pipeline_parallel_size,
+        )
+        slot = self._sparse_used_count_buffer_idx % ring_size
+        self._sparse_used_count_buffer_idx += 1
+        while len(self._sparse_used_count_cpu_buffers) < ring_size:
+            self._sparse_used_count_cpu_buffers.append(None)
+            self._sparse_used_count_events.append(None)
+            self._sparse_used_count_ready_events.append(None)
+
+        shape = (max(1, num_reqs), max(1, num_groups))
+        cpu_buf = self._sparse_used_count_cpu_buffers[slot]
+        if (
+            cpu_buf is None
+            or cpu_buf.shape[0] < shape[0]
+            or cpu_buf.shape[1] < shape[1]
+        ):
+            cpu_buf = torch.empty(
+                shape,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            self._sparse_used_count_cpu_buffers[slot] = cpu_buf
+
+        event = self._sparse_used_count_events[slot]
+        if event is None:
+            event = torch.Event()
+            self._sparse_used_count_events[slot] = event
+        ready_event = self._sparse_used_count_ready_events[slot]
+        if ready_event is None:
+            ready_event = torch.Event()
+            self._sparse_used_count_ready_events[slot] = ready_event
+        return cpu_buf, event, ready_event
+
+    def _start_sparse_cluster_info_copy(
         self,
         scheduler_output: "SchedulerOutput",
-    ):
-        res = dict()
-        for req_id, cluster_info_src in scheduler_output.cluster_info.items():
-            cluster_info_dst = res.setdefault(req_id, [])
-            for i in range(len(cluster_info_src)):
-                if cluster_info_src[i] is None:
-                    cluster_info_dst.append(None)
-                else:
-                    cluster_info_dst.append(
-                        SparseClusterBlockInfo(
-                            used_count=cluster_info_src[i].used_count_gpu.cpu().item()
+    ) -> dict[str, tuple[SparseClusterBlockInfo | None, ...]] | None:
+        if not scheduler_output.cluster_info:
+            return None
+
+        num_reqs = len(scheduler_output.cluster_info)
+        num_groups = max(
+            len(cluster_info_src)
+            for cluster_info_src in scheduler_output.cluster_info.values()
+        )
+        used_count_cpu, dependency_event, ready_event = (
+            self._get_sparse_used_count_copy_slot(
+                num_reqs, num_groups
+            )
+        )
+        res: dict[str, tuple[SparseClusterBlockInfo | None, ...]] = {}
+
+        default_stream = torch.cuda.current_stream()
+        default_stream.record_event(dependency_event)
+        with torch.cuda.stream(self._sparse_used_count_copy_stream):
+            self._sparse_used_count_copy_stream.wait_event(dependency_event)
+            for req_idx, (req_id, cluster_info_src) in enumerate(
+                scheduler_output.cluster_info.items()
+            ):
+                cluster_info_dst = []
+                for i in range(len(cluster_info_src)):
+                    if cluster_info_src[i] is None:
+                        cluster_info_dst.append(None)
+                    else:
+                        used_count_gpu = cluster_info_src[i].used_count_gpu
+                        assert used_count_gpu is not None
+                        used_count_dst = used_count_cpu[req_idx, i : i + 1]
+                        used_count_dst.copy_(used_count_gpu, non_blocking=True)
+                        cluster_info_dst.append(
+                            SparseClusterBlockInfo(
+                                used_count=used_count_dst,
+                                used_count_ready_event=ready_event,
+                                window_seq=cluster_info_src[i].window_seq,
+                            )
                         )
-                    )
+                res[req_id] = tuple(cluster_info_dst)
+            ready_event.record()
+
         return res
 
     def init_routed_experts_capturer(self):

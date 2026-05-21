@@ -354,6 +354,11 @@ class KVCacheManager:
         )
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            for kv_cache_manager in self.coordinator.single_type_managers:
+                if isinstance(kv_cache_manager, SparseKVManager):
+                    kv_cache_manager._rollback_scheduled_cluster_blocks(
+                        request.request_id
+                    )
             # Cannot allocate new blocks
             return None
 

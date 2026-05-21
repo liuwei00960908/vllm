@@ -217,6 +217,8 @@ class SparseClusterBlockInfo:
     used_count_gpu: torch.Tensor | None = None
     packed_block_info_cpu: torch.Tensor | None = None
     packed_block_info_gpu: torch.Tensor | None = None
+    used_count_ready_event: torch.Event | None = None
+    window_seq: int = -1
 
 import time
 from collections import defaultdict, deque

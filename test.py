@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 def main():
     USE_SPARSE_ATTENTION = os.environ.get("TEST_USE_SPARSE_ATTENTION", "1") != "0"
     PROFILE_DECODE_ONLY = os.environ.get("TEST_PROFILE_DECODE_ONLY", "0") == "1"
+    ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
     context_length = 500
     block_size = 16
     test_speed = True
@@ -29,7 +30,7 @@ def main():
             max_num_seqs=1,
             enforce_eager=False,
             gpu_memory_utilization=0.5,
-            async_scheduling=False,
+            async_scheduling=ASYNC_SCHEDULING,
             sparse_attention={
                 "cluster_granularity": "token",
                 "num_clusters": 32,
@@ -51,7 +52,7 @@ def main():
             max_num_seqs=1,
             enforce_eager=False,
             gpu_memory_utilization=0.5,
-            async_scheduling=False,
+            async_scheduling=ASYNC_SCHEDULING,
         )
 
     # ====================== 2. 初始化引擎（server启动时做的事） ======================
