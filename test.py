@@ -100,10 +100,14 @@ def main():
     step_count = 0
     generated_text = ""
     loop_start_time = time.perf_counter()
+    prefill_elapsed = 0.0
+    decode_start_time = None
+    decode_end_time = None
     decode_range_id = None
 
     while engine.has_unfinished_requests():
         step_count += 1
+        step_start_time = time.perf_counter()
         if print_output:
             print(f"\n--- 第 {step_count} 次 engine.step() ---")
 
@@ -116,9 +120,13 @@ def main():
         # 6. 采样生成token
         # 断点位置2：这里打断点，进入step()看完整流程
         outputs = engine.step()
-        if PROFILE_DECODE_ONLY and step_count == 1:
-            torch.cuda.synchronize()
-            decode_range_id = torch.cuda.nvtx.range_start("decode_only")
+        if step_count == 1:
+            if PROFILE_DECODE_ONLY:
+                torch.cuda.synchronize()
+            prefill_elapsed = time.perf_counter() - step_start_time
+            if PROFILE_DECODE_ONLY:
+                decode_range_id = torch.cuda.nvtx.range_start("decode_only")
+            decode_start_time = time.perf_counter()
 
         # 处理输出
         for output in outputs:
@@ -133,14 +141,26 @@ def main():
 
     if decode_range_id is not None:
         torch.cuda.synchronize()
+        decode_end_time = time.perf_counter()
         torch.cuda.nvtx.range_end(decode_range_id)
+    else:
+        decode_end_time = time.perf_counter()
 
-    loop_elapsed = time.perf_counter() - loop_start_time
+    loop_elapsed = decode_end_time - loop_start_time
     generated_tokens = len(
         tokenizer.encode(generated_text, add_special_tokens=False)
     )
-    tokens_per_second = (
-        generated_tokens / loop_elapsed if loop_elapsed > 0 else 0.0
+    prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+    decode_tokens = max(0, generated_tokens - 1) if step_count > 1 else 0
+    decode_elapsed = (
+        decode_end_time - decode_start_time
+        if decode_start_time is not None else 0.0
+    )
+    prefill_tokens_per_second = (
+        prompt_tokens / prefill_elapsed if prefill_elapsed > 0 else 0.0
+    )
+    decode_tokens_per_second = (
+        decode_tokens / decode_elapsed if decode_elapsed > 0 else 0.0
     )
 
     # ====================== 5. 输出最终结果 ======================
@@ -150,7 +170,12 @@ def main():
     print(f"其中: 第1步 = prefill阶段，第2-{step_count}步 = decode阶段")
     print(f"生成token数: {generated_tokens}")
     print(f"耗时: {loop_elapsed:.3f}s")
-    print(f"tokens/s: {tokens_per_second:.3f}")
+    print(f"prefill token数: {prompt_tokens}")
+    print(f"prefill耗时: {prefill_elapsed:.3f}s")
+    print(f"prefill tokens/s: {prefill_tokens_per_second:.3f}")
+    print(f"decode token数: {decode_tokens}")
+    print(f"decode耗时: {decode_elapsed:.3f}s")
+    print(f"decode tokens/s: {decode_tokens_per_second:.3f}")
 
 if __name__ == "__main__":
     main()
