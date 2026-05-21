@@ -547,16 +547,6 @@ class ReqMeta:
         )
 
 
-def _attach_sparse_head_token_indices(
-    req_meta: ReqMeta | None, tok_by_qh: dict[str, list[int]] | None
-) -> None:
-    if req_meta is None or not tok_by_qh:
-        return
-    flat, by_layer = _sparse_token_map_to_per_head_rows(tok_by_qh)
-    req_meta.per_head_token_indices = flat
-    req_meta.per_head_token_indices_by_layer = by_layer
-
-
 def need_gpu_interim_buffer(lmcache_config: LMCacheEngineConfig):
     return not lmcache_config.enable_pd
 
@@ -1599,9 +1589,6 @@ class LMCacheConnectorV1Impl:
             self._unfinished_requests.pop(finished_req_id, None)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        sparse_tok_by_req: dict[str, dict[str, list[int]]] | None = None
-        if not isinstance(cached_reqs, list):
-            sparse_tok_by_req = cached_reqs.sparse_selected_token_indices_by_layer
 
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
@@ -1655,10 +1642,6 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
-                if sparse_tok_by_req:
-                    _attach_sparse_head_token_indices(
-                        req_meta, sparse_tok_by_req.get(request.req_id)
-                    )
                 meta.add_request(req_meta)
 
         # NOTE: For backward compatibility with vllm version < 0.9.2,
@@ -1706,16 +1689,12 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
-                if sparse_tok_by_req:
-                    _attach_sparse_head_token_indices(
-                        req_meta, sparse_tok_by_req.get(req_id)
-                    )
                 meta.add_request(req_meta)
 
         return meta
 
     @_lmcache_nvtx_annotate
-def request_finished(
+    def request_finished(
         self,
         request: "Request",
         block_ids: list[int],

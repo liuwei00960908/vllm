@@ -593,46 +593,6 @@ class KVCacheManager:
                 ignore_prefill_topk_cache=mgr._spec.refresh_topk_each_decode,
             )
 
-    def sparse_ensure_decode_selection(self, request_id: str) -> tuple[bool, str]:
-        """Best-effort on-demand sparse selection refresh for decode bridging.
-
-        Returns:
-            (did_run_select, reason)
-        """
-        mgr = self.get_sparse_manager()
-        if mgr is None:
-            return False, "no_sparse_mgr"
-        # Already selected for this request in this step.
-        if mgr._selected_block_indices_by_layer.get(request_id):
-            return False, "already_selected"
-        if not mgr.req_to_blocks.get(request_id):
-            return False, "no_req_blocks"
-        if request_id not in mgr._layer_states or not mgr._layer_states.get(request_id):
-            return False, "no_layer_state"
-        if mgr._num_index_units(request_id) <= 0:
-            return False, "no_index_units"
-        qv = mgr.get_pending_query(request_id)
-        if qv is None:
-            return False, "no_pending_query"
-        if len(qv) == 0:
-            return False, "empty_pending_query"
-        mgr.select(
-            request_id,
-            qv,
-            mgr._spec.sparse_selection_budget(),
-            ignore_prefill_topk_cache=mgr._spec.refresh_topk_each_decode,
-        )
-        sel = mgr._selected_block_indices_by_layer.get(request_id)
-        if not sel:
-            return True, "select_empty"
-        tok = mgr._selected_token_indices_by_layer.get(request_id)
-        if mgr._token_mode() and (not tok):
-            return True, "token_mode_no_tok"
-        chrono = mgr.get_chrono_phys_block_ids(request_id)
-        if len(chrono) == 0:
-            return True, "empty_chrono"
-        return True, "ok"
-
     def sparse_post_decode_rebalance(
         self,
         new_block_features: dict[str, np.ndarray],
@@ -654,62 +614,6 @@ class KVCacheManager:
         vfeat_map = new_value_features or {}
         for req_id, feat in new_block_features.items():
             mgr.rebalance(req_id, feat, vfeat_map.get(req_id))
-
-    def get_sparse_selected_block_indices(
-        self, request_id: str
-    ) -> list[int] | None:
-        """Return sparse-selected logical block indices for a request."""
-        mgr = self.get_sparse_manager()
-        if mgr is None:
-            return None
-        selected = mgr._selected_block_indices.get(request_id)
-        if selected is None:
-            return None
-        return list(selected)
-
-    def get_sparse_retrieve_block_indices(
-        self, request_id: str
-    ) -> list[int] | None:
-        """Return sparse retrieve-zone logical block indices for a request."""
-        mgr = self.get_sparse_manager()
-        if mgr is None:
-            return None
-        selected = mgr._selected_retrieve_block_indices.get(request_id)
-        if selected is None:
-            return None
-        return list(selected)
-
-    def get_sparse_selected_block_indices_by_layer(
-        self, request_id: str
-    ) -> dict[str, list[int]] | None:
-        """Return per-layer sparse logical block indices (decode forward subset)."""
-        mgr = self.get_sparse_manager()
-        if mgr is None:
-            return None
-        by_layer = mgr._selected_block_indices_by_layer.get(request_id)
-        if not by_layer:
-            return None
-        return {k: list(v) for k, v in by_layer.items()}
-
-    def get_sparse_selected_token_indices_by_layer(
-        self, request_id: str
-    ) -> dict[str, list[int]] | None:
-        """Global token indices per query-head key (``layer##qh{i}``, token sparse mode)."""
-        mgr = self.get_sparse_manager()
-        if mgr is None:
-            return None
-        by_layer = mgr._selected_token_indices_by_layer.get(request_id)
-        if not by_layer:
-            return None
-        return {k: list(v) for k, v in by_layer.items()}
-
-    def get_sparse_chrono_phys_block_ids(self, request_id: str) -> list[int] | None:
-        """Chronological physical KV block ids for gather addressing."""
-        mgr = self.get_sparse_manager()
-        if mgr is None:
-            return None
-        phys = mgr.get_chrono_phys_block_ids(request_id)
-        return phys if phys else None
 
     def get_sparse_prefill_token_count(self, request_id: str) -> int | None:
         mgr = self.get_sparse_manager()

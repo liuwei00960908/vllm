@@ -813,30 +813,6 @@ class Scheduler(SchedulerInterface):
                     if isinstance(manager, SparseKVManager) else None
                     for manager in self.kv_cache_manager.coordinator.single_type_managers
                 )
-                selected_probe = self.kv_cache_manager.get_sparse_selected_block_indices(
-                    request_id
-                )
-                retrieve_probe = self.kv_cache_manager.get_sparse_retrieve_block_indices(
-                    request_id
-                )
-                rebuilt_probe = req_to_new_blocks[request_id].get_block_ids(
-                    allow_none=True
-                )
-                rebuilt_lens_probe = (
-                    [] if rebuilt_probe is None else [len(g) for g in rebuilt_probe]
-                )
-                if (selected_probe is not None and len(selected_probe) > 0) or any(
-                    rebuilt_lens_probe
-                ):
-                    logger.debug(
-                        "[SparseProbe] sched_resume_source req_id=%s "
-                        "selected_logical_blocks=%d retrieve_logical_blocks=%d "
-                        "source_new_block_ids_lens=%s",
-                        request_id,
-                        0 if selected_probe is None else len(selected_probe),
-                        0 if retrieve_probe is None else len(retrieve_probe),
-                        rebuilt_lens_probe,
-                    )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -1082,11 +1058,6 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
-        sparse_selected_block_indices: dict[str, list[int]] = {}
-        sparse_retrieve_block_indices: dict[str, list[int]] = {}
-        sparse_selected_block_indices_by_layer: dict[str, dict[str, list[int]]] = {}
-        sparse_selected_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
-        sparse_chrono_phys_block_ids: dict[str, list[int]] = {}
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1115,123 +1086,11 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            selected = self.kv_cache_manager.get_sparse_selected_block_indices(req_id)
-            retrieve = self.kv_cache_manager.get_sparse_retrieve_block_indices(req_id)
-            by_layer = (
-                self.kv_cache_manager.get_sparse_selected_block_indices_by_layer(req_id)
+            block_ids_payload = req_to_new_blocks[req_id].get_block_ids(
+                allow_none=True
             )
-            tok_by_layer = (
-                self.kv_cache_manager.get_sparse_selected_token_indices_by_layer(
-                    req_id
-                )
-            )
-            chrono = self.kv_cache_manager.get_sparse_chrono_phys_block_ids(req_id)
-            has_sparse_mgr = self.kv_cache_manager.get_sparse_manager() is not None
-            decode_phase = (req.num_output_tokens + req.num_output_placeholders) > 0
-            is_sparse_decode_req = has_sparse_mgr and decode_phase
-            phase_gate_sparse_meta = False
-            phase_gate_reason = ""
-            if is_sparse_decode_req:
-                missing_sparse_meta = (
-                    by_layer is None or tok_by_layer is None or chrono is None
-                )
-                # Decode-phase invariant: sparse metadata must be ready before
-                # packaging CachedRequestData. Re-run selection from pending
-                # query to resolve first-decode transition races.
-                ensure_reason = "not_needed"
-                if missing_sparse_meta:
-                    refreshed, ensure_reason = (
-                        self.kv_cache_manager.sparse_ensure_decode_selection(
-                        req_id
-                        )
-                    )
-                    if refreshed:
-                        selected = (
-                            self.kv_cache_manager.get_sparse_selected_block_indices(
-                                req_id
-                            )
-                        )
-                        retrieve = (
-                            self.kv_cache_manager.get_sparse_retrieve_block_indices(
-                                req_id
-                            )
-                        )
-                        by_layer = (
-                            self.kv_cache_manager.get_sparse_selected_block_indices_by_layer(
-                                req_id
-                            )
-                        )
-                        tok_by_layer = (
-                            self.kv_cache_manager.get_sparse_selected_token_indices_by_layer(
-                                req_id
-                            )
-                        )
-                        chrono = (
-                            self.kv_cache_manager.get_sparse_chrono_phys_block_ids(
-                                req_id
-                            )
-                        )
-                # Sparse decode worker expects a FULL row (selected history +
-                # decode tail). Incremental allocation payload ([] / [1] on
-                # rollover) would be misinterpreted as full-row replacement.
-                missing_sparse_meta = (
-                    by_layer is None or tok_by_layer is None or chrono is None
-                )
-                if missing_sparse_meta:
-                    phase_gate_sparse_meta = True
-                    phase_gate_reason = ensure_reason or "missing_sparse_meta"
-                if phase_gate_sparse_meta:
-                    block_ids_payload = req_to_new_blocks[req_id].get_block_ids(
-                        allow_none=True
-                    )
-                else:
-                    block_ids_payload = self.kv_cache_manager.get_blocks(
-                        req_id
-                    ).get_block_ids(allow_none=True)
-                if by_layer is None or tok_by_layer is None or chrono is None:
-                    # Keep scheduler/worker chrono view consistent with the
-                    # payload row when sparse selection is present but chrono
-                    # map is transiently missing.
-                    if chrono is None and not phase_gate_sparse_meta and block_ids_payload:
-                        if len(block_ids_payload) > 0 and len(block_ids_payload[0]) > 0:
-                            chrono = list(block_ids_payload[0])
-                    logger.debug(
-                        "[SparseRC:bridge_sched] req_id=%s "
-                        "missing by_layer=%s tok=%s chrono=%s "
-                        "selected_len=%d retrieve_len=%d "
-                        "num_output_tokens=%d num_placeholders=%d "
-                        "ensure_reason=%s payload_row_lens=%s",
-                        req_id,
-                        by_layer is None,
-                        tok_by_layer is None,
-                        chrono is None,
-                        0 if selected is None else len(selected),
-                        0 if retrieve is None else len(retrieve),
-                        req.num_output_tokens,
-                        req.num_output_placeholders,
-                        ensure_reason,
-                        (
-                            []
-                            if block_ids_payload is None
-                            else [len(x) for x in block_ids_payload]
-                        ),
-                    )
-            else:
-                block_ids_payload = req_to_new_blocks[req_id].get_block_ids(
-                    allow_none=True
-                )
             new_block_ids.append(block_ids_payload)
 
-            if selected is not None:
-                sparse_selected_block_indices[req_id] = selected
-            if retrieve is not None:
-                sparse_retrieve_block_indices[req_id] = retrieve
-            if by_layer is not None:
-                sparse_selected_block_indices_by_layer[req_id] = by_layer
-            if tok_by_layer is not None:
-                sparse_selected_token_indices_by_layer[req_id] = tok_by_layer
-            if chrono is not None:
-                sparse_chrono_phys_block_ids[req_id] = chrono
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_for_worker = req.num_output_tokens + req.num_output_placeholders
             sparse_mgr = self.kv_cache_manager.get_sparse_manager()
@@ -1246,19 +1105,6 @@ class Scheduler(SchedulerInterface):
                 # scheduler bookkeeping detail and should not advance worker
                 # decode/output phase counters.
                 num_output_for_worker = req.num_output_tokens
-            if phase_gate_sparse_meta:
-                # Keep worker in prefill-context mode for one transition step
-                # until sparse layer_state is ready.
-                num_output_for_worker = req.num_output_tokens
-                logger.debug(
-                    "[SparseRC:phase_gate] req_id=%s gate=%s "
-                    "num_output_tokens=%d num_placeholders=%d worker_num_output_tokens=%d",
-                    req_id,
-                    phase_gate_reason or "missing_sparse_meta",
-                    req.num_output_tokens,
-                    req.num_output_placeholders,
-                    num_output_for_worker,
-                )
             num_output_tokens.append(num_output_for_worker)
 
         return CachedRequestData(
@@ -1269,17 +1115,6 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
-            sparse_selected_block_indices=sparse_selected_block_indices or None,
-            sparse_retrieve_block_indices=sparse_retrieve_block_indices or None,
-            sparse_selected_block_indices_by_layer=(
-                sparse_selected_block_indices_by_layer or None
-            ),
-            sparse_selected_token_indices_by_layer=(
-                sparse_selected_token_indices_by_layer or None
-            ),
-            sparse_chrono_phys_block_ids=(
-                sparse_chrono_phys_block_ids or None
-            ),
         )
 
     def _try_schedule_encoder_inputs(

@@ -103,7 +103,6 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
-from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
@@ -121,7 +120,6 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.sparse_flash_attn import (
@@ -133,10 +131,6 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.core.sparse_kv_cache_manager import (
-    SparseKVManager,
-    sparse_qh_unit_key,
-)
 from vllm.v1.core.sparse_kv_utils import (
     RequestSparseClusterInfo,
     SparseAppendBuffers,
@@ -227,17 +221,6 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# Sparse first-decode hard debug (NO env vars).
-# When True: prints SparseFirstTok kv/sample lines (if sparse attention is on)
-# and calls os._exit(0) after Nth valid new output token is appended in
-# bookkeeping. Set to False before merge or normal serving.
-# ---------------------------------------------------------------------------
-_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN = False
-# Stop after this many valid generated tokens for a request.
-# 1 = first token, 2 = second token (useful for capturing "V" -> "Vo").
-_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N = 6
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -531,101 +514,10 @@ class GPUModelRunner(
         self._sparse_probe_info_enabled: bool = (
             int(os.getenv("VLLM_SPARSE_PROBE_INFO", "0")) == 1
         )
-        # Sparse performance stats switch (independent from debug/probe logs).
-        self._sparse_perf_stats_enabled: bool = (
-            int(os.getenv("VLLM_SPARSE_PERF_STATS", "0")) == 1
-        )
-        self._sparse_perf_log_interval: int = max(
-            1, int(os.getenv("VLLM_SPARSE_PERF_LOG_INTERVAL", "50"))
-        )
-        self._sparse_perf_steps: int = 0
-        self._sparse_perf_accum_ms: dict[str, float] = defaultdict(float)
-        self._sparse_perf_accum_calls: dict[str, int] = defaultdict(int)
-        # Optional sparse decode token debug logs.
-        self._sparse_debug_decode_tokens: bool = bool(
-            int(os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS", "0"))
-        )
-        # Latest scheduler-selected logical blocks per request. This is used to
-        # print the KV blocks/tokens that are actually fed to sparse attention.
-        self._sparse_debug_selected_logical_blocks: dict[str, list[int]] = {}
-        # Merged (union) logical indices aligned with ``req_state.block_ids`` history.
-        self._sparse_merged_logical: dict[str, list[int]] = {}
-        # Per-layer logical selections for building layer-specific sparse block tables.
-        self._sparse_by_layer_logical: dict[str, dict[str, list[int]]] = {}
-        self._sparse_token_indices_by_layer: dict[str, dict[str, list[int]]] = {}
-        self._sparse_chrono_phys: dict[str, list[int]] = {}
         self._sparse_layer_spec_by_name: dict[str, SparseAttentionSpec] = {}
         self._sparse_layer_gid_by_name: dict[str, int] = {}
         self._sparse_cudagraph_cluster_info: dict[int, SparseClusterBlockInfo] = {}
         self._sparse_cudagraph_metadata: dict[str, SparseManagerMetadata] = {}
-        # Snapshot of per-request output length BEFORE this step appends sampled
-        # tokens. Used by sparse compact-gather routing to classify the
-        # prefill/decode boundary correctly.
-        self._sparse_output_tokens_before_step: dict[str, int] = {}
-        # One-shot diagnostics for logical/physical length mismatch.
-        self._sparse_mismatch_logged: set[tuple[str, str, int]] = set()
-        self._sparse_debug_decode_tokens_max: int = int(
-            os.getenv("VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX", "256")
-        )
-        # One-shot KV + logits diagnostics for the first decode step only
-        # (reduces log volume vs full per-layer compact_gather tracing).
-        self._sparse_debug_first_token: bool = bool(
-            int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN", "0"))
-        )
-        self._sparse_debug_first_token_all_layers: bool = bool(
-            int(os.getenv("VLLM_SPARSE_DEBUG_FIRST_TOKEN_ALL_LAYERS", "0"))
-        )
-        # Cleared at the start of each _build_attention_metadata call.
-        self._sparse_first_token_forward_rid_this_step: set[str] = set()
-        self._sparse_ft_kv_layer_pair_this_step: set[tuple[str, str]] = set()
-        self._sparse_ft_pending_sample: set[str] = set()
-        self._sparse_first_token_sample_logged: set[str] = set()
-        # <= 0 means "no cap" (print all selected blocks).
-        self._sparse_debug_max_blocks: int = int(
-            os.getenv("VLLM_SPARSE_DEBUG_MAX_BLOCKS", "0")
-        )
-        self._sparse_debug_tokenizer = None
-        if (
-            self._sparse_debug_decode_tokens
-            or self._sparse_debug_first_token
-            or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-        ):
-            try:
-                self._sparse_debug_tokenizer = cached_tokenizer_from_config(
-                    self.model_config
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to initialize tokenizer for sparse decode debug logs: %s",
-                    e,
-                )
-        if self._sparse_debug_decode_tokens:
-            logger.info(
-                "Sparse decode debug logging enabled: "
-                "VLLM_SPARSE_DEBUG_DECODE_TOKENS=1 "
-                "VLLM_SPARSE_DEBUG_DECODE_TOKENS_MAX=%d "
-                "VLLM_SPARSE_DEBUG_MAX_BLOCKS=%d",
-                self._sparse_debug_decode_tokens_max,
-                self._sparse_debug_max_blocks,
-            )
-        if self._sparse_debug_first_token:
-            logger.info(
-                "Sparse first-token debug enabled: VLLM_SPARSE_DEBUG_FIRST_TOKEN=1 "
-                "optional ALL_LAYERS=%d",
-                int(self._sparse_debug_first_token_all_layers),
-            )
-        if _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
-            logger.critical(
-                "_SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN=True: process will "
-                "os._exit(0) after valid output token count reaches %d.",
-                int(_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N),
-            )
-        if self._sparse_perf_stats_enabled:
-            logger.info(
-                "Sparse perf stats enabled: VLLM_SPARSE_PERF_STATS=1 "
-                "VLLM_SPARSE_PERF_LOG_INTERVAL=%d",
-                self._sparse_perf_log_interval,
-            )
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -1299,28 +1191,7 @@ class GPUModelRunner(
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
-        sparse_selected_map = req_data.sparse_selected_block_indices or {}
-        sparse_retrieve_map = req_data.sparse_retrieve_block_indices or {}
-        sparse_by_layer_map = (
-            req_data.sparse_selected_block_indices_by_layer or {}
-        )
-        sparse_tok_by_layer_map = (
-            req_data.sparse_selected_token_indices_by_layer or {}
-        )
-        sparse_chrono_phys_map = req_data.sparse_chrono_phys_block_ids or {}
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        token_sparse_async_real_tokens = False
-        if self.use_async_scheduling and self._has_sparse_attn and hasattr(
-            self, "kv_cache_config"
-        ):
-            for group in self.kv_cache_config.kv_cache_groups:
-                spec = group.kv_cache_spec
-                if (
-                    isinstance(spec, SparseAttentionSpec)
-                    and spec.cluster_granularity == "token"
-                ):
-                    token_sparse_async_real_tokens = True
-                    break
 
         # Save scheduler-allocated spec lengths before trimming so
         # prev_num_draft_len keeps the optimistic count for rejection correction.
@@ -1372,21 +1243,7 @@ class GPUModelRunner(
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
                     num_rejected = req_state.prev_num_draft_len - num_accepted
                     num_computed_tokens -= num_rejected
-                    if (
-                        token_sparse_async_real_tokens
-                        and num_accepted > 0
-                        and self.input_batch.prev_sampled_token_ids is not None
-                    ):
-                        accepted_tid = int(
-                            self.input_batch.prev_sampled_token_ids[
-                                prev_req_index, 0
-                            ].item()
-                        )
-                        req_state.output_token_ids.extend(
-                            [accepted_tid] * num_accepted
-                        )
-                    else:
-                        req_state.output_token_ids.extend([-1] * num_accepted)
+                    req_state.output_token_ids.extend([-1] * num_accepted)
 
                     if is_ngram_gpu and num_accepted > 0 and req_index is not None:
                         self.input_batch.num_tokens_no_spec[req_index] += num_accepted
@@ -1395,7 +1252,6 @@ class GPUModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
             new_token_ids_len = -1
 
-            _worker_had_output_before_trunc = len(req_state.output_token_ids) > 0
             if not is_last_rank:
                 if not req_data.new_token_ids:
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
@@ -1429,219 +1285,25 @@ class GPUModelRunner(
                     )
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
-            selected_logical_blocks = sparse_selected_map.get(req_id)
-            retrieve_logical_blocks = sparse_retrieve_map.get(req_id)
-            selected_count = (
-                0 if selected_logical_blocks is None else len(selected_logical_blocks)
-            )
-            retrieve_count = (
-                0 if retrieve_logical_blocks is None else len(retrieve_logical_blocks)
-            )
-            incoming_row_lens = (
-                [] if new_block_ids is None else [len(ids) for ids in new_block_ids]
-            )
-            prev_row_lens = [len(ids) for ids in req_state.block_ids]
-            if self._has_sparse_attn and num_output_tokens > 0:
-                by_layer = sparse_by_layer_map.get(req_id)
-                tok_by_layer = sparse_tok_by_layer_map.get(req_id)
-                chrono_by_req = sparse_chrono_phys_map.get(req_id)
-                if by_layer is None or tok_by_layer is None or chrono_by_req is None:
-                    logger.debug(
-                        "[SparseRC:bridge_worker] req_id=%s "
-                        "missing by_layer=%s tok=%s chrono=%s "
-                        "selected_len=%d retrieve_len=%d num_output_tokens=%d "
-                        "incoming_row_lens=%s prev_row_lens=%s "
-                        "cached_prev by_layer_keys=%d tok_keys=%d chrono_len=%d",
-                        req_id,
-                        by_layer is None,
-                        tok_by_layer is None,
-                        chrono_by_req is None,
-                        selected_count,
-                        retrieve_count,
-                        num_output_tokens,
-                        incoming_row_lens,
-                        prev_row_lens,
-                        len(self._sparse_by_layer_logical.get(req_id, {})),
-                        len(self._sparse_token_indices_by_layer.get(req_id, {})),
-                        len(self._sparse_chrono_phys.get(req_id, [])),
-                    )
-            sparse_row_collapse_guard = (
-                self._has_sparse_attn
-                and num_output_tokens > 0
-                and new_block_ids is not None
-                and len(prev_row_lens) > 0
-                and len(incoming_row_lens) > 0
-                and max(prev_row_lens) > 1
-                and max(incoming_row_lens) <= 1
-                and selected_count == 0
-                and retrieve_count == 0
-            )
             sparse_should_replace_row = (
-                self._has_sparse_attn
-                and num_output_tokens > 0
-                and not sparse_row_collapse_guard
+                self._has_sparse_attn and num_output_tokens > 0
             )
 
             # Update the block IDs.
-            # For sparse decode requests we usually REPLACE the entire block
-            # table row (not append) because the sparse manager rebuilds
-            # req_to_blocks from scratch each step (Bug 1 fix).  But when
-            # sparse selection unexpectedly goes empty while the request had
-            # long history, replacing with a single decode block would collapse
-            # seq_lens to one block and permanently poison subsequent steps.
-            # In async scheduling the scheduler's num_output_tokens may
-            # lag one step behind the worker's output_token_ids (the worker
-            # already appended the sampled token in _bookkeeping_sync but
-            # the scheduler hasn't confirmed it yet).  Clearing sparse
-            # metadata based solely on num_output_tokens==0 would destroy
-            # the prefill-stage sparse selection that was just computed,
-            # causing compact gather to fall back to an empty token set
-            # for the remainder of the request.
-            # _worker_had_output_before_trunc captures the pre-truncation
-            # state so the guard survives output_token_ids alignment.
-            is_sparse_decode = (
-                self._has_sparse_attn
-                and (num_output_tokens > 0 or _worker_had_output_before_trunc)
-            )
             if not resumed_from_preemption:
                 if new_block_ids is not None:
-                    if is_sparse_decode and sparse_should_replace_row:
-                        # Sparse decode: replace block IDs in-place so
-                        # that any subsequent resumption uses the correct
-                        # (sparse) block set.
+                    if sparse_should_replace_row:
                         for gid, new_ids_for_group in enumerate(new_block_ids):
                             req_state.block_ids[gid].clear()
                             req_state.block_ids[gid].extend(new_ids_for_group)
-                        if (
-                            self._sparse_probe_info_enabled
-                            or self._sparse_debug_decode_tokens
-                        ):
+                        if self._sparse_probe_info_enabled:
                             new_ids_lens = [len(ids) for ids in new_block_ids]
                             row_lens_after = [len(ids) for ids in req_state.block_ids]
                             logger.info(
                                 "[SparseProbe] block_ids_update req_id=%s "
-                                "selected_logical_blocks=%d retrieve_logical_blocks=%d "
                                 "new_ids_lens=%s row_lens_after=%s",
                                 req_id,
-                                0
-                                if selected_logical_blocks is None
-                                else len(selected_logical_blocks),
-                                0
-                                if retrieve_logical_blocks is None
-                                else len(retrieve_logical_blocks),
                                 new_ids_lens,
-                                row_lens_after,
-                            )
-                        if retrieve_logical_blocks is not None:
-                            self._debug_log_sparse_selected_kv_tokens(
-                                req_id=req_id,
-                                req_state=req_state,
-                                selected_logical_blocks=retrieve_logical_blocks,
-                                zone_name="retrieve",
-                            )
-                        if selected_logical_blocks is not None:
-                            self._sparse_debug_selected_logical_blocks[req_id] = list(
-                                selected_logical_blocks
-                            )
-                            self._sparse_merged_logical[req_id] = list(
-                                selected_logical_blocks
-                            )
-                            by_l = sparse_by_layer_map.get(req_id)
-                            if by_l is not None:
-                                self._sparse_by_layer_logical[req_id] = {
-                                    k: list(v) for k, v in by_l.items()
-                                }
-                            else:
-                                self._sparse_by_layer_logical.pop(req_id, None)
-                            self._debug_log_sparse_selected_kv_tokens(
-                                req_id=req_id,
-                                req_state=req_state,
-                                selected_logical_blocks=selected_logical_blocks,
-                                zone_name="merged",
-                            )
-                        else:
-                            if is_sparse_decode:
-                                # Decode-step sparse metadata may transiently
-                                # miss one scheduler payload. Keep previous
-                                # mapping to avoid disabling compact gather
-                                # for all layers in this step.
-                                if (
-                                    self._sparse_probe_info_enabled
-                                    or self._sparse_debug_decode_tokens
-                                ):
-                                    logger.warning(
-                                        "[SparseRC] keep_prev_sparse_meta "
-                                        "req_id=%s kind=logical merged_prev=%d by_layer_prev=%d",
-                                        req_id,
-                                        len(self._sparse_merged_logical.get(req_id, [])),
-                                        len(self._sparse_by_layer_logical.get(req_id, {})),
-                                    )
-                            else:
-                                self._sparse_merged_logical.pop(req_id, None)
-                                self._sparse_by_layer_logical.pop(req_id, None)
-                        stl = sparse_tok_by_layer_map.get(req_id)
-                        if stl is not None:
-                            self._sparse_token_indices_by_layer[req_id] = {
-                                k: list(v) for k, v in stl.items()
-                            }
-                        else:
-                            if is_sparse_decode:
-                                if (
-                                    self._sparse_probe_info_enabled
-                                    or self._sparse_debug_decode_tokens
-                                ):
-                                    logger.warning(
-                                        "[SparseRC] keep_prev_sparse_meta "
-                                        "req_id=%s kind=tokens tok_prev_keys=%d",
-                                        req_id,
-                                        len(
-                                            self._sparse_token_indices_by_layer.get(
-                                                req_id, {}
-                                            )
-                                        ),
-                                    )
-                            else:
-                                self._sparse_token_indices_by_layer.pop(req_id, None)
-                        chrono = sparse_chrono_phys_map.get(req_id)
-                        if chrono is not None:
-                            self._sparse_chrono_phys[req_id] = list(chrono)
-                        else:
-                            if is_sparse_decode:
-                                if (
-                                    self._sparse_probe_info_enabled
-                                    or self._sparse_debug_decode_tokens
-                                ):
-                                    logger.warning(
-                                        "[SparseRC] keep_prev_sparse_meta "
-                                        "req_id=%s kind=chrono chrono_prev_len=%d",
-                                        req_id,
-                                        len(self._sparse_chrono_phys.get(req_id, [])),
-                                    )
-                            else:
-                                self._sparse_chrono_phys.pop(req_id, None)
-                    elif is_sparse_decode:
-                        # Guard against sparse-row collapse. Keep historical
-                        # row shape and append truly new blocks only.
-                        for block_ids, new_ids in zip(
-                            req_state.block_ids, new_block_ids
-                        ):
-                            for bid in new_ids:
-                                if not block_ids or block_ids[-1] != bid:
-                                    block_ids.append(bid)
-                        if (
-                            self._sparse_probe_info_enabled
-                            or self._sparse_debug_decode_tokens
-                        ):
-                            row_lens_after = [len(ids) for ids in req_state.block_ids]
-                            logger.warning(
-                                "[SparseProbe] block_ids_update_guard req_id=%s "
-                                "selected_logical_blocks=%d retrieve_logical_blocks=%d "
-                                "incoming_row_lens=%s prev_row_lens=%s row_lens_after=%s",
-                                req_id,
-                                selected_count,
-                                retrieve_count,
-                                incoming_row_lens,
-                                prev_row_lens,
                                 row_lens_after,
                             )
                     else:
@@ -1677,15 +1339,11 @@ class GPUModelRunner(
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                if is_sparse_decode and sparse_should_replace_row:
+                if sparse_should_replace_row:
                     # Sparse decode: rebuild the entire row (not append)
                     # because the sparse manager provides the full new block
                     # list (selected history + decode block).
                     self.input_batch.block_table.add_row(
-                        new_block_ids, req_index
-                    )
-                elif is_sparse_decode:
-                    self.input_batch.block_table.append_row(
                         new_block_ids, req_index
                     )
                 else:
@@ -1983,29 +1641,6 @@ class GPUModelRunner(
                 prev_draft_token_indices.extend(range(start, start + draft_len))
                 indices_match &= prev_index == flattened_index
                 max_flattened_index = max(max_flattened_index, flattened_index)
-                if (
-                    (self._sparse_debug_first_token
-                     or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN)
-                    and self.input_batch.prev_sampled_token_ids is not None
-                ):
-                    try:
-                        prev_tok = int(
-                            self.input_batch.prev_sampled_token_ids[
-                                prev_index, 0
-                            ].item()
-                        )
-                    except Exception:
-                        prev_tok = -1
-                    logger.info(
-                        "[SparseStep:consume] req_id=%s cur_idx=%d prev_idx=%d "
-                        "flattened_idx=%d draft_len=%d prev_tok=%d",
-                        req_id,
-                        int(cur_index),
-                        int(prev_index),
-                        int(flattened_index),
-                        int(draft_len),
-                        prev_tok,
-                    )
         num_common_tokens = len(sample_flattened_indices)
         total_without_spec = total_num_scheduled_tokens - total_num_spec_tokens
         if num_common_tokens < total_without_spec:
@@ -2228,12 +1863,6 @@ class GPUModelRunner(
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
 
-        # NOTE: _override_sparse_slot_mapping is intentionally DISABLED.
-        # compute_slot_mapping above uses the original block_table, which
-        # already maps each decode token to the correct physical slot.
-        # if self._has_sparse_attn:
-        #     self._override_sparse_slot_mapping(num_reqs, cu_num_tokens)
-
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
@@ -2286,9 +1915,7 @@ class GPUModelRunner(
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        if self._has_sparse_attn and (
-            self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens
-        ):
+        if self._has_sparse_attn and self._sparse_probe_info_enabled:
             pp_enabled = bool(get_pp_group().world_size > 1)
             logger.info(
                 "[SparseRC] runtime_mode use_async_scheduling=%s use_pp=%s "
@@ -2381,11 +2008,6 @@ class GPUModelRunner(
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
-
-        if self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
-            self._sparse_first_token_forward_rid_this_step.clear()
-            self._sparse_ft_kv_layer_pair_this_step.clear()
-            self._sparse_ft_pending_sample.clear()
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
@@ -2491,7 +2113,6 @@ class GPUModelRunner(
             *,
             skip_block_table_cache: bool = False,
             layer_names_override: list[str] | None = None,
-            disable_token_sparse_boundary: bool = False,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
@@ -2543,33 +2164,6 @@ class GPUModelRunner(
                 if builder.supports_update_block_table and not skip_block_table_cache:
                     cached_attn_metadata[cache_key] = attn_metadata_i
 
-            if (
-                not for_cudagraph_capture
-                and layer_names_override is not None
-                and len(layer_names_override) == 1
-                and isinstance(kv_cache_spec, SparseAttentionSpec)
-                and kv_cache_spec.cluster_granularity == "token"
-                and kv_cache_spec.use_compact_kv_gather
-                and not disable_token_sparse_boundary
-                and isinstance(attn_metadata_i, FlashAttentionMetadata)
-            ):
-                _t0_sparse_patch = (
-                    time.perf_counter() if self._sparse_perf_stats_enabled else None
-                )
-                attn_metadata_i = self._maybe_patch_sparse_compact_kv_metadata(
-                    attn_metadata_i,
-                    kv_cache_gid=kv_cache_gid,
-                    layer_name=layer_names_override[0],
-                    num_reqs=num_reqs,
-                    common_attn_metadata=common_attn_metadata,
-                    spec=kv_cache_spec,
-                    for_cudagraph_capture=for_cudagraph_capture,
-                )
-                if _t0_sparse_patch is not None:
-                    self._sparse_perf_record(
-                        "_maybe_patch_sparse_compact_kv_metadata",
-                        time.perf_counter() - _t0_sparse_patch,
-                    )
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
@@ -2602,39 +2196,6 @@ class GPUModelRunner(
             is_sparse_group = isinstance(
                 kv_cache_group.kv_cache_spec, SparseAttentionSpec
             )
-            boundary_disable_sparse = False
-            boundary_req_ids: list[str] = []
-            if (
-                is_sparse_group
-                and not for_cudagraph_capture
-                and len(self.input_batch.req_ids) >= num_reqs
-            ):
-                for req_idx in range(num_reqs):
-                    rid = self.input_batch.req_ids[req_idx]
-                    seq_i = int(cm._seq_lens_cpu[req_idx].item())
-                    p_i = int(self.input_batch.num_prompt_tokens[req_idx])
-                    rs = self.requests.get(rid)
-                    out_n = 0 if rs is None else len(rs.output_token_ids)
-                    # Async placeholder boundary: first decode forward can have
-                    # seq_len == prompt_len + 1 while no output token is yet
-                    # committed on worker side. Treat this as boundary as well
-                    # so token-sparse patching is disabled for that transition
-                    # step and cannot affect the first sampled token.
-                    if out_n == 0 and seq_i <= (p_i + 1):
-                        boundary_req_ids.append(rid)
-                boundary_disable_sparse = len(boundary_req_ids) > 0
-                if boundary_disable_sparse and (
-                    self._sparse_probe_info_enabled
-                    or self._sparse_debug_decode_tokens
-                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                ):
-                    logger.info(
-                        "[SparseRC] boundary_disable_sparse gid=%d reqs=%d "
-                        "req_id_head=%s",
-                        kv_cache_gid,
-                        len(boundary_req_ids),
-                        boundary_req_ids[:2],
-                    )
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
@@ -2645,59 +2206,27 @@ class GPUModelRunner(
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 attn_group_i = self.attn_groups[kv_cache_gid][attn_gid]
                 if is_sparse_group:
-                    spec_sp = kv_cache_group.kv_cache_spec
-                    assert isinstance(spec_sp, SparseAttentionSpec)
-                    is_tok_compact = (
-                        spec_sp.cluster_granularity == "token"
-                        and spec_sp.use_compact_kv_gather
-                    )
-                    if is_tok_compact:
-                        for layer_name in attn_group_i.layer_names:
-                            if ubatch_slices is not None:
-                                for ubid, _cm in enumerate(
-                                    split_attn_metadata(ubatch_slices, cm)
-                                ):
-                                    _build_attn_group_metadata(
-                                        kv_cache_gid,
-                                        attn_gid,
-                                        _cm,
-                                        ubid,
-                                        skip_block_table_cache=True,
-                                        layer_names_override=[layer_name],
-                                        disable_token_sparse_boundary=(
-                                            boundary_disable_sparse
-                                        ),
-                                    )
-                            else:
+                    for layer_name in attn_group_i.layer_names:
+                        if ubatch_slices is not None:
+                            for ubid, _cm in enumerate(
+                                split_attn_metadata(ubatch_slices, cm)
+                            ):
                                 _build_attn_group_metadata(
                                     kv_cache_gid,
                                     attn_gid,
-                                    cm,
-                                    None,
+                                    _cm,
+                                    ubid,
                                     skip_block_table_cache=True,
                                     layer_names_override=[layer_name],
-                                    disable_token_sparse_boundary=(
-                                        boundary_disable_sparse
-                                    ),
                                 )
-                    elif ubatch_slices is not None:
-                        for ubid, _cm in enumerate(
-                            split_attn_metadata(ubatch_slices, cm)
-                        ):
+                        else:
                             _build_attn_group_metadata(
                                 kv_cache_gid,
                                 attn_gid,
-                                _cm,
-                                ubid,
-                                disable_token_sparse_boundary=boundary_disable_sparse,
+                                cm,
+                                skip_block_table_cache=True,
+                                layer_names_override=[layer_name],
                             )
-                    else:
-                        _build_attn_group_metadata(
-                            kv_cache_gid,
-                            attn_gid,
-                            cm,
-                            disable_token_sparse_boundary=boundary_disable_sparse,
-                        )
                 elif ubatch_slices is not None:
                     for ubid, _cm in enumerate(
                         split_attn_metadata(ubatch_slices, cm)
@@ -2707,7 +2236,6 @@ class GPUModelRunner(
                             attn_gid,
                             _cm,
                             ubid,
-                            disable_token_sparse_boundary=boundary_disable_sparse,
                         )
 
                 else:
@@ -2715,7 +2243,6 @@ class GPUModelRunner(
                         kv_cache_gid,
                         attn_gid,
                         cm,
-                        disable_token_sparse_boundary=boundary_disable_sparse,
                     )
 
         if self.is_mm_prefix_lm:
@@ -4361,7 +3888,6 @@ class GPUModelRunner(
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
-        force_real_sampled_ids = False
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
@@ -4386,23 +3912,6 @@ class GPUModelRunner(
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
-            force_real_sampled_ids = False
-            if self._has_sparse_attn and hasattr(self, "kv_cache_config"):
-                for group in self.kv_cache_config.kv_cache_groups:
-                    spec = group.kv_cache_spec
-                    if (
-                        isinstance(spec, SparseAttentionSpec)
-                        and spec.cluster_granularity == "token"
-                    ):
-                        force_real_sampled_ids = True
-                        break
-            if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
-                logger.info(
-                    "[SparseRC] async_sampled_ids mode=%s has_sparse_attn=%s",
-                    "real" if force_real_sampled_ids else "placeholder",
-                    self._has_sparse_attn,
-                )
-
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
             # when preparing inputs.
@@ -4422,18 +3931,12 @@ class GPUModelRunner(
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
-        self._sparse_output_tokens_before_step.clear()
         for req_idx in range(num_sampled_tokens):
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
-            prev_output_n = len(req_state.output_token_ids)
-            prompt_n = int(self.input_batch.num_prompt_tokens[req_idx])
-            nspec_before = int(self.input_batch.num_tokens_no_spec[req_idx])
             if self.use_async_scheduling:
                 if req_idx in invalid_req_indices_set:
                     sampled_ids = None
-                elif force_real_sampled_ids:
-                    sampled_ids = [int(sampled_token_ids[req_idx, 0].item())]
                 else:
                     sampled_ids = [-1]
             else:
@@ -4443,8 +3946,6 @@ class GPUModelRunner(
 
             if not sampled_ids:
                 continue
-
-            self._sparse_output_tokens_before_step[req_id] = prev_output_n
 
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]
             end_idx = start_idx + num_sampled_ids
@@ -4459,25 +3960,6 @@ class GPUModelRunner(
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
             req_state.output_token_ids.extend(sampled_ids)
-            out_n_after = len(req_state.output_token_ids)
-            self._sparse_log_sample_step(
-                req_idx=req_idx,
-                req_id=req_id,
-                prev_output_n=prev_output_n,
-                sampled_ids=sampled_ids,
-                logits=logits,
-            )
-            if (
-                self._sparse_debug_first_token or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-            ) and prev_output_n <= 1:
-                self._sparse_log_first_sampled_token(
-                    req_idx=req_idx,
-                    req_id=req_id,
-                    prev_output_n=prev_output_n,
-                    sampled_ids=sampled_ids,
-                    logits=logits,
-                    spec_decode_metadata=spec_decode_metadata,
-                )
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -5017,9 +4499,6 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            _t0_attn_meta = (
-                time.perf_counter() if self._sparse_perf_stats_enabled else None
-            )
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -5036,11 +4515,6 @@ class GPUModelRunner(
                     cluster_info=scheduler_output.cluster_info
                 )
             )
-            if _t0_attn_meta is not None:
-                self._sparse_perf_record(
-                    "_build_attention_metadata",
-                    time.perf_counter() - _t0_attn_meta,
-                )
 
             (
                 input_ids,
@@ -5441,29 +4915,15 @@ class GPUModelRunner(
         # can map req_id -> previous batch row
         discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
         discard_req_indices_set = set(discard_req_indices)
-        force_real_sampled_ids = False
-        if self._has_sparse_attn and hasattr(self, "kv_cache_config"):
-            for group in self.kv_cache_config.kv_cache_groups:
-                spec = group.kv_cache_spec
-                if (
-                    isinstance(spec, SparseAttentionSpec)
-                    and spec.cluster_granularity == "token"
-                ):
-                    force_real_sampled_ids = True
-                    break
         prev_req_id_to_index: dict[str, int] = {}
         for i, req_id in enumerate(self.input_batch.req_ids):
             if i in discard_req_indices_set:
                 continue
             prev_req_id_to_index[req_id] = i
             # PP+async scheduling: advance per-request local cached output length by
-            # appending a placeholder token id. For token-sparse mode, keep
-            # the real sampled token id to avoid polluting token traces with -1.
+            # appending a placeholder token id.
             if (req_state := self.requests.get(req_id)) is not None:
-                if force_real_sampled_ids:
-                    req_state.output_token_ids.append(int(recv[i, 0].item()))
-                else:
-                    req_state.output_token_ids.append(-1)
+                req_state.output_token_ids.append(-1)
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -6456,9 +5916,6 @@ class GPUModelRunner(
                 self.query_start_loc.copy_to_gpu()
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-                _t0_attn_meta = (
-                    time.perf_counter() if self._sparse_perf_stats_enabled else None
-                )
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
@@ -6469,11 +5926,6 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
-                if _t0_attn_meta is not None:
-                    self._sparse_perf_record(
-                        "_build_attention_metadata",
-                        time.perf_counter() - _t0_attn_meta,
-                    )
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -7893,727 +7345,6 @@ class GPUModelRunner(
                 sparse_layers,
             )
 
-    def _sparse_perf_record(self, key: str, elapsed_s: float) -> None:
-        if not self._sparse_perf_stats_enabled or not self._has_sparse_attn:
-            return
-        self._sparse_perf_accum_ms[key] += float(elapsed_s) * 1000.0
-        self._sparse_perf_accum_calls[key] += 1
-
-    def _sparse_perf_flush_if_needed(self) -> None:
-        if not self._sparse_perf_stats_enabled or not self._has_sparse_attn:
-            return
-        self._sparse_perf_steps += 1
-        if self._sparse_perf_steps % self._sparse_perf_log_interval != 0:
-            return
-        if not self._sparse_perf_accum_ms:
-            logger.info(
-                "[SparsePerf] steps=%d no sparse perf samples collected",
-                self._sparse_perf_steps,
-            )
-            return
-
-        items = sorted(
-            self._sparse_perf_accum_ms.items(),
-            key=lambda kv: kv[1],
-            reverse=True,
-        )
-        parts: list[str] = []
-        for key, total_ms in items:
-            calls = max(1, self._sparse_perf_accum_calls.get(key, 0))
-            avg_ms = total_ms / calls
-            parts.append(
-                f"{key}:total_ms={total_ms:.2f},calls={calls},avg_ms={avg_ms:.3f}"
-            )
-        logger.info(
-            "[SparsePerf] window_steps=%d %s",
-            self._sparse_perf_log_interval,
-            " | ".join(parts),
-        )
-        self._sparse_perf_accum_ms.clear()
-        self._sparse_perf_accum_calls.clear()
-
-    def _sparse_simulate_compact_gather_one_req(
-        self,
-        *,
-        rid: str,
-        seq_len: int,
-        p_count: int,
-        chrono: list[int],
-        tok_map: dict[str, list[int]],
-        sk: str,
-        layer_name: str,
-        kv_cache_gid: int,
-        spec: SparseAttentionSpec,
-    ) -> tuple[bool, str]:
-        """Mirror gather_one_head logic for a single request (diagnostics only)."""
-        rs = self.requests.get(rid)
-        if rs is None:
-            return False, "no_req_state"
-        if kv_cache_gid >= len(rs.block_ids) or len(rs.block_ids[kv_cache_gid]) < 2:
-            return False, "block_ids_row_short"
-        if seq_len <= 0 or seq_len <= p_count:
-            return False, "not_decode"
-        bsz = spec.block_size
-        g_cur = seq_len - 1
-        toks = tok_map.get(sk)
-        if toks is None:
-            toks = tok_map.get(layer_name)
-        if toks is None:
-            return (
-                False,
-                f"missing_tok_or_chrono seq_len={seq_len} p_count={p_count} "
-                f"chrono_len={len(chrono)}",
-            )
-        decode_positions = set(range(p_count, seq_len))
-        sel = sorted(set(toks) | decode_positions | {g_cur})
-        sel = [g for g in sel if 0 <= g < seq_len]
-        ri_idx = self.input_batch.req_id_to_index.get(rid)
-        if ri_idx is None:
-            return False, f"missing_req_index rid={rid}"
-        blk_tbl = self.input_batch.block_table[kv_cache_gid]
-        bt_row = blk_tbl.block_table.np[ri_idx]
-        n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
-        for g in sel:
-            block_idx = g // bsz
-            sl = g % bsz
-            if block_idx < 0 or block_idx >= n_blks:
-                return (
-                    False,
-                    f"block_idx_oob g={g} block_idx={block_idx} "
-                    f"n_blks={n_blks} seq_len={seq_len}",
-                )
-            _phys_bid = int(bt_row[block_idx])
-        return True, f"ok sel_len={len(sel)}"
-
-    def _sparse_log_first_decode_kv_snapshot(
-        self,
-        *,
-        layer_name: str,
-        kv_cache_gid: int,
-        num_reqs: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        spec: SparseAttentionSpec,
-    ) -> None:
-        if not self._has_sparse_attn:
-            return
-        if not self._sparse_debug_first_token and not _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN:
-            return
-        bsz = spec.block_size
-        for ri in range(num_reqs):
-            rid = self.input_batch.req_ids[ri]
-            if self._sparse_debug_first_token_all_layers:
-                dedup_key = (rid, layer_name)
-                if dedup_key in self._sparse_ft_kv_layer_pair_this_step:
-                    continue
-            else:
-                if rid in self._sparse_first_token_forward_rid_this_step:
-                    continue
-            seq_len = int(common_attn_metadata._seq_lens_cpu[ri].item())
-            p_count = int(self.input_batch.num_prompt_tokens[ri])
-            n_comp = int(
-                common_attn_metadata._num_computed_tokens_cpu[ri].item()
-            )
-            rs = self.requests.get(rid)
-            if rs is None or seq_len <= p_count:
-                continue
-            if len(rs.output_token_ids) > 0:
-                continue
-            chrono = self._sparse_chrono_phys.get(rid, [])
-            merged = self._sparse_merged_logical.get(rid, [])
-            by_l = self._sparse_by_layer_logical.get(rid, {})
-            tok_all = self._sparse_token_indices_by_layer.get(rid, {})
-            sk0 = sparse_qh_unit_key(layer_name, 0)
-            toks0 = tok_all.get(sk0)
-            if toks0 is None:
-                toks0 = tok_all.get(layer_name)
-            bid_row = (
-                list(rs.block_ids[kv_cache_gid])
-                if kv_cache_gid < len(rs.block_ids)
-                else []
-            )
-            g_cur = seq_len - 1
-            decode_lb = SparseKVManager._global_token_to_logical_block(
-                g_cur, p_count, bsz
-            )
-            row0 = self._sparse_layer_decode_phys_row(rid, kv_cache_gid, sk0)
-            ok_sim, sim_reason = self._sparse_simulate_compact_gather_one_req(
-                rid=rid,
-                seq_len=seq_len,
-                p_count=p_count,
-                chrono=list(chrono),
-                tok_map=tok_all,
-                sk=sk0,
-                layer_name=layer_name,
-                kv_cache_gid=kv_cache_gid,
-                spec=spec,
-            )
-            tok_txt = ""
-            if self._sparse_debug_tokenizer is not None and rs.prompt_token_ids:
-                try:
-                    if g_cur >= p_count > 0:
-                        last_ctx = p_count - 1
-                    else:
-                        last_ctx = min(g_cur, len(rs.prompt_token_ids) - 1)
-                    if 0 <= last_ctx < len(rs.prompt_token_ids):
-                        tid = int(rs.prompt_token_ids[last_ctx])
-                        tok_txt = self._sparse_debug_tokenizer.decode([tid])
-                except Exception:
-                    tok_txt = ""
-            logger.info(
-                "[SparseFirstTok:kv] req_id=%s layer=%s gid=%d "
-                "seq_len=%d p_count=%d n_comp=%d g_cur=%d decode_lb=%d "
-                "chrono_len=%d merged_len=%d by_layer_keys=%d tok_map_keys=%d "
-                "block_ids_len=%d hist_phys_len=%d row0_len=%d "
-                "qh0_toks_head=%s merged_head=%s chrono_head=%s bid_hist_head=%s "
-                "row0_head=%s query_tok_decode=%r compact_qh0_ok=%s compact_qh0=%s",
-                rid,
-                layer_name,
-                kv_cache_gid,
-                seq_len,
-                p_count,
-                n_comp,
-                g_cur,
-                int(decode_lb),
-                len(chrono),
-                len(merged),
-                len(by_l),
-                len(tok_all),
-                len(bid_row),
-                max(0, len(bid_row) - 1),
-                -1 if row0 is None else len(row0),
-                (toks0 or [])[:12],
-                list(merged)[:12],
-                list(chrono)[:12],
-                bid_row[:-1][:12] if len(bid_row) > 1 else [],
-                (row0 or [])[:12],
-                tok_txt,
-                ok_sim,
-                sim_reason,
-            )
-            self._sparse_ft_pending_sample.add(rid)
-            if self._sparse_debug_first_token_all_layers:
-                self._sparse_ft_kv_layer_pair_this_step.add((rid, layer_name))
-            else:
-                self._sparse_first_token_forward_rid_this_step.add(rid)
-
-    def _sparse_log_first_sampled_token(
-        self,
-        *,
-        req_idx: int,
-        req_id: str,
-        prev_output_n: int,
-        sampled_ids: list[int],
-        logits: torch.Tensor | None,
-        spec_decode_metadata: SpecDecodeMetadata | None,
-    ) -> None:
-        if not self._has_sparse_attn:
-            return
-        if (
-            not self._sparse_debug_first_token
-            and not _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-        ):
-            return
-        if req_id in self._sparse_first_token_sample_logged and prev_output_n == 0:
-            return
-        if not sampled_ids:
-            return
-        tok = int(sampled_ids[0])
-        if tok < 0:
-            return
-        top_txt = ""
-        top_pairs: list[tuple[int, float]] = []
-        if logits is not None and logits.dim() >= 2 and req_idx < logits.size(0):
-            row = logits[req_idx]
-            k = min(8, row.numel())
-            vals, idx = torch.topk(row, k=k)
-            top_pairs = [
-                (int(idx[i].item()), float(vals[i].item())) for i in range(k)
-            ]
-            if self._sparse_debug_tokenizer is not None:
-                try:
-                    parts = []
-                    for tid, val in top_pairs[:5]:
-                        t = self._sparse_debug_tokenizer.decode([tid])
-                        parts.append(f"{tid}:{val:.3f}:{t!r}")
-                    top_txt = " ".join(parts)
-                except Exception:
-                    top_txt = str(top_pairs[:5])
-        sampled_txt = ""
-        if self._sparse_debug_tokenizer is not None:
-            try:
-                sampled_txt = self._sparse_debug_tokenizer.decode([tok])
-            except Exception:
-                sampled_txt = ""
-        spec_hint = (
-            "spec_decode"
-            if spec_decode_metadata is not None
-            else "no_spec_decode"
-        )
-        kv_same_step = req_id in self._sparse_ft_pending_sample
-        logger.info(
-            "[SparseFirstTok:sample] req_id=%s req_idx=%d tok_id=%d tok=%r "
-            "top8=%s top5_detok=%s kv_same_step=%s out_before=%d pp_rank=%s/%s %s",
-            req_id,
-            req_idx,
-            tok,
-            sampled_txt,
-            top_pairs,
-            top_txt,
-            kv_same_step,
-            int(prev_output_n),
-            get_pp_group().rank_in_group,
-            get_pp_group().world_size,
-            spec_hint,
-        )
-        if prev_output_n == 0:
-            self._sparse_first_token_sample_logged.add(req_id)
-
-    def _sparse_log_sample_step(
-        self,
-        *,
-        req_idx: int,
-        req_id: str,
-        prev_output_n: int,
-        sampled_ids: list[int],
-        logits: torch.Tensor | None,
-    ) -> None:
-        """Lightweight per-step sampled-token log for early decode debugging."""
-        if not self._has_sparse_attn:
-            return
-        if not (
-            self._sparse_debug_first_token
-            or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-        ):
-            return
-        if prev_output_n >= int(_SPARSE_HARD_DEBUG_STOP_AFTER_OUTPUT_N):
-            return
-        if not sampled_ids:
-            return
-        tok = int(sampled_ids[0])
-        if tok < 0:
-            return
-        tok_txt = ""
-        if self._sparse_debug_tokenizer is not None:
-            try:
-                tok_txt = self._sparse_debug_tokenizer.decode([tok])
-            except Exception:
-                tok_txt = ""
-        top_txt = ""
-        if logits is not None and logits.dim() >= 2 and req_idx < logits.size(0):
-            row = logits[req_idx]
-            k = min(3, row.numel())
-            vals, idx = torch.topk(row, k=k)
-            if self._sparse_debug_tokenizer is not None:
-                try:
-                    parts = []
-                    for i in range(k):
-                        tid = int(idx[i].item())
-                        tv = float(vals[i].item())
-                        tt = self._sparse_debug_tokenizer.decode([tid])
-                        parts.append(f"{tid}:{tv:.3f}:{tt!r}")
-                    top_txt = " ".join(parts)
-                except Exception:
-                    top_txt = str(
-                        [
-                            (int(idx[i].item()), float(vals[i].item()))
-                            for i in range(k)
-                        ]
-                    )
-        logger.info(
-            "[SparseStep:sample] req_id=%s step=%d tok_id=%d tok=%r top3=%s",
-            req_id,
-            int(prev_output_n + 1),
-            tok,
-            tok_txt,
-            top_txt,
-        )
-
-    def _maybe_patch_sparse_compact_kv_metadata(
-        self,
-        attn_metadata_i: FlashAttentionMetadata,
-        *,
-        kv_cache_gid: int,
-        layer_name: str,
-        num_reqs: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        spec: SparseAttentionSpec,
-        for_cudagraph_capture: bool,
-    ) -> FlashAttentionMetadata:
-        """Attach paged-cache gather indices for token-sparse compact KV attention."""
-        if for_cudagraph_capture or self.dcp_world_size > 1:
-            return attn_metadata_i
-        if (
-            len(self.input_batch.req_ids) < num_reqs
-            or len(self.input_batch.num_prompt_tokens) < num_reqs
-        ):
-            return attn_metadata_i
-
-        self._sparse_log_first_decode_kv_snapshot(
-            layer_name=layer_name,
-            kv_cache_gid=kv_cache_gid,
-            num_reqs=num_reqs,
-            common_attn_metadata=common_attn_metadata,
-            spec=spec,
-        )
-
-        attn_mod = self.compilation_config.static_forward_context.get(layer_name)
-        num_heads = int(attn_mod.num_heads) if attn_mod is not None else 1
-        dev = attn_metadata_i.block_table.device
-        req_ctx: list[
-            tuple[str, int, int, list[int], dict[str, list[int]]]
-        ] = []
-        for ri in range(num_reqs):
-            rid = self.input_batch.req_ids[ri]
-            req_ctx.append(
-                (
-                    rid,
-                    int(common_attn_metadata._seq_lens_cpu[ri].item()),
-                    int(self.input_batch.num_prompt_tokens[ri]),
-                    self._sparse_chrono_phys.get(rid, []),
-                    self._sparse_token_indices_by_layer.get(rid, {}),
-                )
-            )
-
-        gather_fail_reason: str | None = None
-
-        def gather_one_head(qh_idx: int) -> tuple[list[int], list[int], list[int]] | None:
-            nonlocal gather_fail_reason
-            phys_h: list[int] = []
-            slot_h: list[int] = []
-            cu_h: list[int] = [0]
-            debug_sel_all: list[int] = []
-            debug_lb_all: list[int] = []
-            debug_decode_lb: int = -1
-            sk = sparse_qh_unit_key(layer_name, qh_idx)
-            for rid, seq_len, p_count, chrono, tok_map in req_ctx:
-                rs = self.requests.get(rid)
-                if rs is None:
-                    gather_fail_reason = (
-                        f"missing_req_state rid={rid} qh={qh_idx} sk={sk}"
-                    )
-                    return None
-                # Decode-step readiness should be inferred from sparse row shape
-                # (history + active decode block), not from output_token_ids.
-                if (
-                    kv_cache_gid >= len(rs.block_ids)
-                    or len(rs.block_ids[kv_cache_gid]) < 2
-                ):
-                    row_len = (
-                        -1
-                        if kv_cache_gid >= len(rs.block_ids)
-                        else len(rs.block_ids[kv_cache_gid])
-                    )
-                    gather_fail_reason = (
-                        f"block_row_short rid={rid} qh={qh_idx} sk={sk} "
-                        f"gid={kv_cache_gid} row_len={row_len}"
-                    )
-                    return None
-                if seq_len <= 0:
-                    gather_fail_reason = (
-                        f"non_positive_seq_len rid={rid} qh={qh_idx} sk={sk} "
-                        f"seq_len={seq_len}"
-                    )
-                    return None
-                # Do not run decode compact-gather on pure prefill steps.
-                if seq_len <= p_count:
-                    gather_fail_reason = (
-                        f"not_decode_yet rid={rid} qh={qh_idx} sk={sk} "
-                        f"seq_len={seq_len} p_count={p_count} "
-                        f"out_tokens={len(rs.output_token_ids)}"
-                    )
-                    return None
-                out_before_step = self._sparse_output_tokens_before_step.get(
-                    rid, len(rs.output_token_ids)
-                )
-                if out_before_step <= 0:
-                    gather_fail_reason = (
-                        f"decode_boundary_uncommitted rid={rid} qh={qh_idx} "
-                        f"sk={sk} seq_len={seq_len} p_count={p_count} "
-                        f"out_before={int(out_before_step)} "
-                        f"out_tokens={len(rs.output_token_ids)}"
-                    )
-                    return None
-                g_cur = seq_len - 1
-                bsz = spec.block_size
-                toks = tok_map.get(sk)
-                if toks is None:
-                    # Legacy / transient map may only carry layer-level keys.
-                    toks = tok_map.get(layer_name)
-                if toks is None:
-                    # Fallback: if token-level indices are missing, derive
-                    # candidate token ids from selected logical blocks so
-                    # compact gather can still run on decode steps.
-                    # This preserves correctness better than disabling
-                    # compact gather for all layers/heads.
-                    fallback_lbs: list[int] = []
-                    by_l_fb = self._sparse_by_layer_logical.get(rid)
-                    if by_l_fb and sk in by_l_fb:
-                        fallback_lbs = [int(x) for x in by_l_fb[sk]]
-                    else:
-                        fallback_lbs = [
-                            int(x)
-                            for x in self._sparse_merged_logical.get(rid, [])
-                        ]
-                    if fallback_lbs:
-                        fb_toks: list[int] = []
-                        for lb_fb in fallback_lbs:
-                            g0_fb = SparseKVManager._logical_block_first_global(
-                                int(lb_fb), p_count, bsz
-                            )
-                            g1_fb = min(int(g0_fb) + int(bsz), int(seq_len))
-                            if g1_fb > g0_fb:
-                                fb_toks.extend(range(int(g0_fb), int(g1_fb)))
-                        toks = sorted(set(fb_toks))
-                    if toks is None or len(toks) == 0:
-                        gather_fail_reason = (
-                            f"missing_tok_or_chrono rid={rid} qh={qh_idx} sk={sk} "
-                            f"seq_len={seq_len} p_count={p_count} "
-                            f"has_toks=False chrono_len={len(chrono)} "
-                            f"fallback_lbs={len(fallback_lbs)}"
-                        )
-                        return None
-                # Sparse token selection from the scheduler may lag behind
-                # the actual sequence length under async scheduling (the
-                # scheduler's selection is computed one or more steps
-                # earlier).  Decode tokens generated after the selection
-                # snapshot will be absent from `toks`, creating gaps in
-                # the KV context that cause repeated/garbled output.
-                # Fix: always include every decode-phase token position
-                # [p_count, seq_len) so that no recently-generated KV is
-                # ever dropped.  The sparse budget only trims *prefill*
-                # history tokens; decode tokens are unconditional.
-                decode_positions = set(range(p_count, seq_len))
-                sel = sorted(set(toks) | decode_positions | {g_cur})
-                sel = [g for g in sel if 0 <= g < seq_len]
-                if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
-                    debug_sel_all = [int(x) for x in sel]
-                    debug_lb_all = [
-                        int(SparseKVManager._global_token_to_logical_block(g, p_count, bsz))
-                        for g in sel
-                    ]
-                # Resolve (phys_block, slot) via the *original* block
-                # table using the same addressing as compute_slot_mapping:
-                #   block_idx = g // block_size
-                #   slot      = g % block_size
-                # This avoids the sparse-manager's prefill/decode split
-                # addressing which diverges from vLLM's contiguous layout.
-                ri_idx = self.input_batch.req_id_to_index.get(rid)
-                if ri_idx is None:
-                    gather_fail_reason = (
-                        f"missing_req_index rid={rid} qh={qh_idx} sk={sk}"
-                    )
-                    return None
-                blk_tbl = self.input_batch.block_table[kv_cache_gid]
-                bt_row = blk_tbl.block_table.np[ri_idx]
-                n_blks = int(blk_tbl.num_blocks_per_row[ri_idx])
-                if qh_idx == 0 and layer_name.endswith("layers.0.self_attn.attn"):
-                    debug_decode_lb = g_cur // bsz
-                for g in sel:
-                    block_idx = g // bsz
-                    sl = g % bsz
-                    if block_idx < 0 or block_idx >= n_blks:
-                        gather_fail_reason = (
-                            f"block_idx_oob rid={rid} g={g} "
-                            f"block_idx={block_idx} n_blks={n_blks} "
-                            f"seq_len={seq_len}"
-                        )
-                        return None
-                    phys_bid = int(bt_row[block_idx])
-                    phys_h.append(phys_bid)
-                    slot_h.append(int(sl))
-                cu_h.append(cu_h[-1] + len(sel))
-            if not phys_h:
-                gather_fail_reason = "empty_phys_after_selection"
-                return None
-            if (
-                qh_idx == 0
-                and layer_name.endswith("layers.0.self_attn.attn")
-                and num_reqs > 0
-                and (
-                    self._sparse_probe_info_enabled
-                    or self._sparse_debug_decode_tokens
-                    or self._sparse_debug_first_token
-                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                )
-            ):
-                sel_detok: list[str] = []
-                rid0 = self.input_batch.req_ids[0]
-                rs0 = self.requests.get(rid0)
-                if (
-                    rs0 is not None
-                    and self._sparse_debug_tokenizer is not None
-                ):
-                    p0 = 0
-                    try:
-                        p0 = int(self.input_batch.num_prompt_tokens[0])
-                    except Exception:
-                        p0 = len(rs0.prompt_token_ids)
-                    for g in debug_sel_all[:24]:
-                        tid: int | None = None
-                        if g < p0:
-                            if 0 <= g < len(rs0.prompt_token_ids):
-                                tid = int(rs0.prompt_token_ids[g])
-                        else:
-                            di = int(g - p0)
-                            if 0 <= di < len(rs0.output_token_ids):
-                                tdi = int(rs0.output_token_ids[di])
-                                if tdi >= 0:
-                                    tid = tdi
-                        if tid is None:
-                            sel_detok.append(f"{g}:<na>")
-                            continue
-                        try:
-                            txt = self._sparse_debug_tokenizer.decode([tid])
-                        except Exception:
-                            txt = "<dec_err>"
-                        sel_detok.append(f"{g}:{tid}:{txt!r}")
-                logger.info(
-                    "[SparseRC:map_dbg] layer=%s req_id=%s qh=%d "
-                    "sel_all=%s lb_all=%s decode_lb=%d phys_all=%s slot_all=%s "
-                    "sel_detok=%s total=%d",
-                    layer_name,
-                    rid0,
-                    qh_idx,
-                    debug_sel_all,
-                    debug_lb_all,
-                    debug_decode_lb,
-                    [int(x) for x in phys_h],
-                    [int(x) for x in slot_h],
-                    sel_detok,
-                    len(phys_h),
-                )
-                # Direct sparse-vs-full equivalence probe at token-index level.
-                # Full-attention expected coverage is [0, seq_len-1] in decode.
-                expected_all = list(range(max(0, int(seq_len))))
-                sel_set = set(debug_sel_all)
-                exp_set = set(expected_all)
-                missing = sorted(exp_set - sel_set)
-                extra = sorted(sel_set - exp_set)
-                if (
-                    self._sparse_probe_info_enabled
-                    or self._sparse_debug_decode_tokens
-                    or self._sparse_debug_first_token
-                    or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-                ):
-                    logger.info(
-                        "[AttnAB:sel_diff] req_id=%s layer=%s qh=%d seq_len=%d "
-                        "sel_n=%d exp_n=%d missing_n=%d extra_n=%d "
-                        "missing_head=%s extra_head=%s",
-                        rid0,
-                        layer_name,
-                        qh_idx,
-                        int(seq_len),
-                        len(debug_sel_all),
-                        len(expected_all),
-                        len(missing),
-                        len(extra),
-                        missing[:24],
-                        extra[:24],
-                    )
-                # Step-5 focused comparison: inspect why the 5th sampled token
-                # diverges by comparing sparse-selected token coverage against
-                # full-history coverage in the same forward.
-                out_before_dbg = self._sparse_output_tokens_before_step.get(
-                    rid0,
-                    len(rs0.output_token_ids) if rs0 is not None else 0,
-                )
-                if out_before_dbg == 4 and rs0 is not None:
-                    expected_all = list(range(max(0, int(seq_len))))
-                    sel_set = set(debug_sel_all)
-                    exp_set = set(expected_all)
-                    missing = sorted(exp_set - sel_set)
-                    extra = sorted(sel_set - exp_set)
-                    miss_detok: list[str] = []
-                    extra_detok: list[str] = []
-                    p0 = int(self.input_batch.num_prompt_tokens[0])
-
-                    def _tok_text(gidx: int) -> str:
-                        tid: int | None = None
-                        if gidx < p0:
-                            if 0 <= gidx < len(rs0.prompt_token_ids):
-                                tid = int(rs0.prompt_token_ids[gidx])
-                        else:
-                            di = int(gidx - p0)
-                            if 0 <= di < len(rs0.output_token_ids):
-                                tdi = int(rs0.output_token_ids[di])
-                                if tdi >= 0:
-                                    tid = tdi
-                        if tid is None or self._sparse_debug_tokenizer is None:
-                            return "<na>"
-                        try:
-                            return self._sparse_debug_tokenizer.decode([tid])
-                        except Exception:
-                            return "<dec_err>"
-
-                    for g in missing[:16]:
-                        miss_detok.append(f"{g}:{_tok_text(int(g))!r}")
-                    for g in extra[:16]:
-                        extra_detok.append(f"{g}:{_tok_text(int(g))!r}")
-                    logger.info(
-                        "[SparseRC:step5_cmp] req_id=%s seq_len=%d out_before=%d "
-                        "sel_n=%d exp_n=%d missing_n=%d extra_n=%d "
-                        "missing_head=%s extra_head=%s",
-                        rid0,
-                        int(seq_len),
-                        int(out_before_dbg),
-                        len(debug_sel_all),
-                        len(expected_all),
-                        len(missing),
-                        len(extra),
-                        miss_detok,
-                        extra_detok,
-                    )
-            return phys_h, slot_h, cu_h
-
-        _sparse_compact_layer_verbose = (
-            self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens
-        ) and not (
-            (
-                self._sparse_debug_first_token
-                or _SPARSE_HARD_DEBUG_FIRST_NEW_TOKEN
-            )
-            and not self._sparse_debug_decode_tokens
-        )
-
-        triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        for qh in range(num_heads):
-            g = gather_one_head(qh)
-            if g is None:
-                if _sparse_compact_layer_verbose:
-                    req0 = self.input_batch.req_ids[0] if num_reqs > 0 else "<none>"
-                    logger.info(
-                        "[SparseRC] compact_gather layer=%s req_id=%s "
-                        "enabled=0 reason=%s",
-                        layer_name,
-                        req0,
-                        gather_fail_reason or "unknown",
-                    )
-                return attn_metadata_i
-            phys_h, slot_h, cu_h = g
-            triples.append(
-                (
-                    torch.tensor(phys_h, dtype=torch.int32, device=dev),
-                    torch.tensor(slot_h, dtype=torch.int32, device=dev),
-                    torch.tensor(cu_h, dtype=torch.int32, device=dev),
-                )
-            )
-        if _sparse_compact_layer_verbose and num_reqs > 0:
-            logger.info(
-                "[SparseRC] compact_gather layer=%s req_id=%s enabled=1 "
-                "num_heads=%d qh0_tokens=%d",
-                layer_name,
-                self.input_batch.req_ids[0],
-                num_heads,
-                int(triples[0][0].numel()) if triples else 0,
-            )
-        return replace(
-            attn_metadata_i,
-            sparse_gather_phys=None,
-            sparse_gather_slots=None,
-            sparse_gather_cu_seqlens_k=None,
-            sparse_q_head_gather=tuple(triples),
-        )
-
     def _collect_sparse_cluster_info(
         self,
         scheduler_output: "SchedulerOutput",
@@ -8631,512 +7362,6 @@ class GPUModelRunner(
                         )
                     )
         return res
-
-    def _sparse_layer_decode_phys_row(
-        self,
-        req_id: str,
-        kv_cache_gid: int,
-        sparse_row_key: str,
-    ) -> list[int] | None:
-        """Physical KV block ids (history then decode slot) for one sparse row.
-
-        ``sparse_row_key`` is ``layer##qh{j}`` (per query head).  When absent
-        from the per-head map, falls back to merged union order (legacy).
-
-        Uses the block_table (logical-index → physical-block-id mapping) to
-        resolve physical addresses rather than zipping with bid_row, which
-        can differ in length from the logical selection list.
-        """
-        rs = self.requests.get(req_id)
-        if rs is None or len(rs.output_token_ids) == 0:
-            return None
-        merged = self._sparse_merged_logical.get(req_id)
-        if not merged:
-            return None
-        bid_row = rs.block_ids[kv_cache_gid]
-        if len(bid_row) < 2:
-            return None
-        decode_id = int(bid_row[-1])
-
-        req_idx = self.input_batch.req_id_to_index.get(req_id)
-        if req_idx is None:
-            return None
-        blk_table = self.input_batch.block_table[kv_cache_gid]
-        bt_np = blk_table.block_table.np[req_idx]
-        num_blocks = int(blk_table.num_blocks_per_row[req_idx])
-
-        logical_to_phys: dict[int, int] = {}
-        for log_idx in merged:
-            li = int(log_idx)
-            if 0 <= li < num_blocks:
-                logical_to_phys[li] = int(bt_np[li])
-
-        by_l = self._sparse_by_layer_logical.get(req_id)
-        if by_l and sparse_row_key in by_l:
-            logical_order = [int(x) for x in by_l[sparse_row_key]]
-        else:
-            logical_order = [int(x) for x in merged]
-        row: list[int] = []
-        for lg in logical_order:
-            p = logical_to_phys.get(lg)
-            if p is not None:
-                row.append(p)
-        row.append(decode_id)
-        return row
-
-    def _sparse_decode_num_blocks_np(
-        self,
-        kv_cache_gid: int,
-        sparse_row_key: str,
-        num_reqs: int,
-        num_reqs_padded: int,
-    ) -> np.ndarray:
-        """Per-request sparse table width (in blocks) for one sparse row key."""
-        out = np.full(num_reqs_padded, -1, dtype=np.int32)
-        for req_idx in range(num_reqs):
-            req_id = self.input_batch.req_ids[req_idx]
-            row = self._sparse_layer_decode_phys_row(
-                req_id, kv_cache_gid, sparse_row_key
-            )
-            if row is not None:
-                out[req_idx] = int(len(row))
-        return out
-
-    def _debug_log_sparse_decode_tokens(
-        self, req_id: str, req_idx: int, seq_len: int
-    ) -> None:
-        """Optional per-step sparse decode token trace for debugging."""
-        if not self._sparse_debug_decode_tokens:
-            return
-        if seq_len <= 0:
-            return
-        token_ids = self.input_batch.token_ids_cpu[req_idx, :seq_len].tolist()
-        max_show = max(1, self._sparse_debug_decode_tokens_max)
-        shown_token_ids = token_ids[-max_show:]
-
-        decoded_text = None
-        token_pieces = None
-        if self._sparse_debug_tokenizer is not None:
-            try:
-                decoded_text = self._sparse_debug_tokenizer.decode(
-                    shown_token_ids,
-                    skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
-                )
-            except Exception:
-                decoded_text = None
-            try:
-                token_pieces = self._sparse_debug_tokenizer.convert_ids_to_tokens(
-                    shown_token_ids,
-                    skip_special_tokens=False,
-                )
-            except Exception:
-                token_pieces = None
-
-        logger.info(
-            "Sparse decode token trace: req_id=%s seq_len=%d shown=%d "
-            "token_ids=%s token_pieces=%r decoded_tail=%r",
-            req_id,
-            seq_len,
-            len(shown_token_ids),
-            shown_token_ids,
-            token_pieces,
-            decoded_text,
-        )
-        tail_has_neg1 = any(tid == -1 for tid in shown_token_ids)
-        first_neg1_rel = next(
-            (idx for idx, tid in enumerate(shown_token_ids) if tid == -1),
-            -1,
-        )
-        logger.info(
-            "[SparseRC] token_tail req_id=%s req_idx=%d seq_len=%d shown=%d "
-            "tail_has_neg1=%s first_neg1_rel=%d tail=%s",
-            req_id,
-            req_idx,
-            seq_len,
-            len(shown_token_ids),
-            tail_has_neg1,
-            first_neg1_rel,
-            shown_token_ids,
-        )
-
-    def _debug_log_sparse_selected_kv_tokens(
-        self,
-        req_id: str,
-        req_state: "CachedRequestState",
-        selected_logical_blocks: list[int],
-        zone_name: str = "merged",
-    ) -> None:
-        """Log original tokens that sparse decode KV actually uses."""
-        if not self._sparse_debug_decode_tokens:
-            return
-        if req_state.prompt_token_ids is None:
-            logger.debug(
-                "Sparse %s KV trace skipped (no prompt token IDs): req_id=%s",
-                zone_name,
-                req_id,
-            )
-            return
-        if not selected_logical_blocks:
-            logger.debug(
-                "Sparse %s KV trace: req_id=%s selected_blocks=[]",
-                zone_name,
-                req_id,
-            )
-            return
-
-        all_token_ids = req_state.prompt_token_ids + req_state.output_token_ids
-        # Debug mapping is for sparse-selected logical blocks; use sparse
-        # KV group block_size from config (fall back to first block table size).
-        block_size = None
-        if hasattr(self, "kv_cache_config"):
-            for grp in self.kv_cache_config.kv_cache_groups:
-                if isinstance(grp.kv_cache_spec, SparseAttentionSpec):
-                    block_size = int(grp.kv_cache_spec.block_size)
-                    break
-        if block_size is None:
-            block_size = int(self.input_batch.block_table[0].block_size)
-        max_blocks = self._sparse_debug_max_blocks
-        shown_blocks = (
-            selected_logical_blocks
-            if max_blocks <= 0
-            else selected_logical_blocks[: max(1, max_blocks)]
-        )
-        block_lines: list[str] = []
-
-        for logical_block_idx in shown_blocks:
-            start = int(logical_block_idx) * block_size
-            end = min(start + block_size, len(all_token_ids))
-            if start >= len(all_token_ids):
-                continue
-            block_token_ids = all_token_ids[start:end]
-            block_text = None
-            block_pieces = None
-            if self._sparse_debug_tokenizer is not None and block_token_ids:
-                try:
-                    block_text = self._sparse_debug_tokenizer.decode(
-                        block_token_ids,
-                        skip_special_tokens=False,
-                        clean_up_tokenization_spaces=False,
-                    )
-                except Exception:
-                    block_text = None
-                try:
-                    block_pieces = self._sparse_debug_tokenizer.convert_ids_to_tokens(
-                        block_token_ids,
-                        skip_special_tokens=False,
-                    )
-                except Exception:
-                    block_pieces = None
-            block_lines.append(
-                f"  - block={int(logical_block_idx)} span=[{start},{end}) "
-                f"len={len(block_token_ids)} ids={block_token_ids} "
-                f"pieces={block_pieces!r} text={block_text!r}"
-            )
-
-        logger.debug(
-            "Sparse %s KV trace:\n"
-            "req_id=%s\n"
-            "selected_blocks(total=%d shown=%d, max=%d)=%s\n"
-            "%s",
-            zone_name,
-            req_id,
-            len(selected_logical_blocks),
-            len(shown_blocks),
-            max_blocks,
-            shown_blocks,
-            "\n".join(block_lines) if block_lines else "  - (no mappable blocks)",
-        )
-
-    def _debug_log_sparse_forward_kv_tokens(
-        self,
-        req_id: str,
-        req_idx: int,
-        seq_len: int,
-        kv_cache_gid: int,
-        block_size: int,
-    ) -> None:
-        """Log KV tokens that are actually consumed by sparse attention forward."""
-        if not self._sparse_debug_decode_tokens:
-            return
-        if seq_len <= 0:
-            return
-        req_state = self.requests.get(req_id)
-        if req_state is None or req_state.prompt_token_ids is None:
-            logger.info(
-                "Sparse forward KV trace skipped: req_id=%s reason=%s",
-                req_id,
-                "missing_request_state_or_prompt_ids",
-            )
-            return
-
-        blk_table = self.input_batch.block_table[kv_cache_gid]
-        num_blocks = int(blk_table.num_blocks_per_row[req_idx])
-        block_ids = blk_table.block_table.np[req_idx, :num_blocks].tolist()
-        used_blocks = min(num_blocks, cdiv(seq_len, block_size))
-        used_block_ids = block_ids[:used_blocks]
-
-        all_token_ids = req_state.prompt_token_ids + req_state.output_token_ids
-        selected_logical_blocks = self._sparse_debug_selected_logical_blocks.get(
-            req_id, []
-        )
-
-        max_blocks = self._sparse_debug_max_blocks
-        shown_used_blocks = (
-            list(range(used_blocks))
-            if max_blocks <= 0
-            else list(range(min(used_blocks, max(1, max_blocks))))
-        )
-
-        block_lines: list[str] = []
-        for table_pos in shown_used_blocks:
-            physical_block_id = int(used_block_ids[table_pos])
-            block_token_ids: list[int] = []
-            source = "unknown"
-
-            if table_pos < len(selected_logical_blocks):
-                logical_block_idx = int(selected_logical_blocks[table_pos])
-                start = logical_block_idx * block_size
-                end = min(start + block_size, len(all_token_ids))
-                if start < len(all_token_ids):
-                    block_token_ids = all_token_ids[start:end]
-                source = f"logical_block={logical_block_idx}"
-            else:
-                # The extra block after selected history is the active decode block.
-                # We only map the currently materialized tail tokens.
-                compact_start = table_pos * block_size
-                compact_end = min((table_pos + 1) * block_size, seq_len)
-                n_tokens = max(0, compact_end - compact_start)
-                if n_tokens > 0:
-                    block_token_ids = all_token_ids[-n_tokens:]
-                source = "decode_block_tail(best_effort)"
-
-            block_text = None
-            block_pieces = None
-            if self._sparse_debug_tokenizer is not None and block_token_ids:
-                try:
-                    block_text = self._sparse_debug_tokenizer.decode(
-                        block_token_ids,
-                        skip_special_tokens=False,
-                        clean_up_tokenization_spaces=False,
-                    )
-                except Exception:
-                    block_text = None
-                try:
-                    block_pieces = self._sparse_debug_tokenizer.convert_ids_to_tokens(
-                        block_token_ids,
-                        skip_special_tokens=False,
-                    )
-                except Exception:
-                    block_pieces = None
-
-            block_lines.append(
-                f"  - table_pos={table_pos} block_id={physical_block_id} "
-                f"source={source} len={len(block_token_ids)} ids={block_token_ids} "
-                f"pieces={block_pieces!r} text={block_text!r}"
-            )
-
-        logger.info(
-            "Sparse forward KV trace:\n"
-            "req_id=%s gid=%d seq_len=%d block_size=%d\n"
-            "used_blocks(total=%d shown=%d, max=%d) block_ids=%s\n"
-            "%s",
-            req_id,
-            kv_cache_gid,
-            seq_len,
-            block_size,
-            used_blocks,
-            len(shown_used_blocks),
-            max_blocks,
-            used_block_ids,
-            "\n".join(block_lines) if block_lines else "  - (no mapped blocks)",
-        )
-
-    def _override_sparse_slot_mapping(
-        self, num_reqs: int, cu_num_tokens: np.ndarray
-    ) -> None:
-        """Bug 3 fix: write sparse-decode tokens into the decode block slot.
-
-        Standard ``compute_slot_mapping`` uses the full-context sequence
-        position to index the block table:
-          ``slot = block_table[req, position // block_size] * B + position % B``
-
-        For sparse requests the block table only has ``k+1`` entries
-        (k selected history blocks + 1 decode block), so
-        ``position // block_size`` is typically far out of range and
-        resolves to a null / stale block ID.
-
-        For each sparse decode request we override the slot to:
-          ``decode_block_id * block_size + fill_offset``
-        where ``decode_block_id`` is the last (newest) block in the sparse
-        table and ``fill_offset`` is the token's position within that block.
-        ``fill_offset`` is derived from the number of already generated decode
-        tokens modulo ``block_size``.
-
-        Args:
-            num_reqs: Number of active requests in the batch.
-            cu_num_tokens: Cumulative scheduled-token counts per request,
-                shape ``[num_reqs]`` (``cu_num_tokens[i]`` = end index of
-                request i's tokens in the flat batch; start index of
-                request 0 is 0, start of request i > 0 is
-                ``cu_num_tokens[i-1]``).
-        """
-        sparse_debug_enabled = self._sparse_debug_decode_tokens
-
-        if not hasattr(self, "kv_cache_config"):
-            # TODO(sparse-debug): remove after locating sparse slot_mapping issues.
-            if sparse_debug_enabled:
-                logger.info(
-                    "[SparseDebug] _override_sparse_slot_mapping "
-                    "SKIP no kv_cache_config"
-                )
-            return
-
-        sparse_gids = [
-            gid
-            for gid, grp in enumerate(self.kv_cache_config.kv_cache_groups)
-            if isinstance(grp.kv_cache_spec, SparseAttentionSpec)
-        ]
-        if not sparse_gids:
-            # TODO(sparse-debug): remove after locating sparse slot_mapping issues.
-            if sparse_debug_enabled:
-                logger.info(
-                    "[SparseDebug] _override_sparse_slot_mapping "
-                    "SKIP empty sparse_gids"
-                )
-            return
-
-        # TODO(sparse-debug): remove after locating sparse slot_mapping issues.
-        if sparse_debug_enabled:
-            logger.info(
-                "[SparseDebug] _override_sparse_slot_mapping ENTER num_reqs=%d "
-                "sparse_gids=%s cu_num_tokens_tail=%s",
-                int(num_reqs),
-                sparse_gids,
-                (
-                    int(cu_num_tokens[num_reqs - 1])
-                    if num_reqs > 0 and cu_num_tokens.size > 0
-                    else -1
-                ),
-            )
-
-        # For each sparse group, override the slot_mapping of decode reqs.
-        for gid in sparse_gids:
-            blk_table = self.input_batch.block_table[gid]
-            block_size = blk_table.block_size
-
-            for req_idx in range(num_reqs):
-                req_id = self.input_batch.req_ids[req_idx]
-                req_state = self.requests.get(req_id)
-
-                # Token range for this request in the flat batch.
-                tok_start = int(cu_num_tokens[req_idx - 1]) if req_idx > 0 else 0
-                tok_end = int(cu_num_tokens[req_idx])
-                num_sched = tok_end - tok_start
-
-                # TODO(sparse-debug): remove after locating sparse slot_mapping issues.
-                _out_n = (
-                    len(req_state.output_token_ids) if req_state is not None else -1
-                )
-                if sparse_debug_enabled:
-                    logger.info(
-                        "[SparseDebug] _override_sparse_slot_mapping "
-                        "gid=%d req_idx=%d req_id=%s has_req_state=%s "
-                        "num_sched=%d tok_start=%d tok_end=%d "
-                        "num_output_tokens=%d num_prompt_tokens=%s",
-                        gid,
-                        req_idx,
-                        req_id,
-                        req_state is not None,
-                        num_sched,
-                        tok_start,
-                        tok_end,
-                        _out_n,
-                        (
-                            int(self.input_batch.num_prompt_tokens[req_idx])
-                            if req_idx < len(self.input_batch.num_prompt_tokens)
-                            else None
-                        ),
-                    )
-
-                if req_state is None or num_sched == 0:
-                    continue
-
-                num_output_tokens = len(req_state.output_token_ids)
-                if num_output_tokens == 0:
-                    # Prefill: leave slot_mapping unchanged.
-                    continue
-
-                # Decode: redirect to the last (active decode) block.
-                # Sparse decode reuses this block until it is full, so writes
-                # must start from the current in-block offset.
-                num_blocks = int(blk_table.num_blocks_per_row[req_idx])
-                if num_blocks == 0:
-                    continue
-                decode_block_id = int(
-                    blk_table.block_table.np[req_idx, num_blocks - 1]
-                )
-                base_slot = decode_block_id * block_size
-                fill_offset = int(num_output_tokens % block_size)
-                # Override token slots for this request. For common decode
-                # (num_sched=1), this writes one slot. For multi-token decode,
-                # write contiguous offsets within the decode block.
-                if num_sched == 1:
-                    blk_table.slot_mapping.np[tok_start] = (
-                        base_slot + min(fill_offset, block_size - 1)
-                    )
-                else:
-                    fill_offsets = fill_offset + np.arange(
-                        num_sched, dtype=np.int64
-                    )
-                    if fill_offset + num_sched > block_size:
-                        logger.warning_once(
-                            "Sparse decode token burst exceeds decode-block "
-                            "capacity: req_id=%s gid=%d num_sched=%d "
-                            "fill_offset=%d block_size=%d decode_block_id=%d",
-                            req_id,
-                            gid,
-                            num_sched,
-                            fill_offset,
-                            block_size,
-                            decode_block_id,
-                        )
-                    fill_offsets = np.minimum(fill_offsets, block_size - 1)
-                    blk_table.slot_mapping.np[tok_start:tok_end] = (
-                        base_slot + fill_offsets
-                    )
-                if self._sparse_probe_info_enabled or self._sparse_debug_decode_tokens:
-                    mapped = blk_table.slot_mapping.np[tok_start:tok_end].tolist()
-                    logger.info(
-                        "[SparseRC] slot_map req_id=%s gid=%d req_idx=%d "
-                        "tok_start=%d tok_end=%d num_sched=%d "
-                        "decode_block_id=%d base_slot=%d fill_offset=%d mapped=%s",
-                        req_id,
-                        gid,
-                        req_idx,
-                        tok_start,
-                        tok_end,
-                        num_sched,
-                        decode_block_id,
-                        base_slot,
-                        fill_offset,
-                        mapped,
-                    )
-                if num_sched > 1:
-                    logger.warning_once(
-                        "Sparse decode multi-token slot mapping applied: "
-                        "req_id=%s gid=%d num_sched=%d decode_block_id=%d "
-                        "base_slot=%d tok_range=[%d,%d)",
-                        req_id,
-                        gid,
-                        num_sched,
-                        decode_block_id,
-                        base_slot,
-                        tok_start,
-                        tok_end,
-                    )
-
-    # ── End sparse KV attention helpers ──────────────────────────────────────
 
     def init_routed_experts_capturer(self):
         logger.info(
