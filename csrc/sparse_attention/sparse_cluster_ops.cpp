@@ -17,6 +17,9 @@ extern "C" int append_kv_to_clusters_launcher_raw(
     int64_t value_stride2,
     int32_t storage_dtype,
     const int32_t* d_label,
+    void* d_cluster_centers_T,
+    const void* d_mean,
+    int32_t* d_cluster_center_count,
     const int32_t* d_temp_block_ids,
     int32_t* d_temp_block_kv_counts,
     int32_t* d_temp_block_kv_owner,
@@ -31,6 +34,24 @@ extern "C" int append_kv_to_clusters_launcher_raw(
     int Nq, int Hkv, int C, int maxB,
     int total_blocks, int block_size, int dim,
     int max_temp_blocks,
+    cudaStream_t stream);
+
+extern "C" int sparse_select_topk_clusters_launcher_raw(
+    const void* d_query,
+    const void* d_cluster_centers_T,
+    const void* d_mean,
+    const int32_t* d_cluster_center_count,
+    int32_t* d_top_clusters,
+    int64_t query_stride0,
+    int64_t query_stride1,
+    int64_t query_stride2,
+    int32_t storage_dtype,
+    int Nq,
+    int Hq,
+    int Hkv,
+    int C,
+    int dim,
+    int nprobe,
     cudaStream_t stream);
 
 static inline int32_t map_storage_dtype(torch::ScalarType t) {
@@ -169,6 +190,9 @@ torch::Tensor append_kv_to_clusters_cuda(
         value.stride(2),
         map_storage_dtype(block_storage.scalar_type()),
         label.data_ptr<int32_t>(),
+        nullptr,
+        nullptr,
+        nullptr,
         temp_block_ids.data_ptr<int32_t>(),
         temp_block_kv_counts.data_ptr<int32_t>(),
         temp_block_kv_owner.data_ptr<int32_t>(),
@@ -263,6 +287,9 @@ torch::Tensor append_kv_to_clusters_inplace_cuda(
         value.stride(2),
         map_storage_dtype(block_storage.scalar_type()),
         label.data_ptr<int32_t>(),
+        nullptr,
+        nullptr,
+        nullptr,
         temp_block_ids.data_ptr<int32_t>(),
         temp_block_kv_counts.data_ptr<int32_t>(),
         temp_block_kv_owner.data_ptr<int32_t>(),
@@ -281,6 +308,201 @@ torch::Tensor append_kv_to_clusters_inplace_cuda(
 
     TORCH_CHECK(rc == ERR_OK, "append_kv_to_clusters launcher failed, rc=", rc);
     return used_free_block_count;
+}
+
+torch::Tensor append_kv_to_clusters_by_centers_inplace_cuda(
+    torch::Tensor block_storage,
+    torch::Tensor cluster_compact_block_ids,
+    torch::Tensor cluster_temp_kv_pos,
+    torch::Tensor cluster_total_kv_counts,
+    torch::Tensor temp_block_ids,
+    torch::Tensor temp_block_kv_counts,
+    torch::Tensor temp_block_kv_owner,
+    torch::Tensor free_block_ids,
+    torch::Tensor used_free_block_count,
+    torch::Tensor error_code,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor cluster_centers_T,
+    torch::Tensor mean,
+    torch::Tensor cluster_center_count
+) {
+    check_cuda_contig(block_storage, "block_storage");
+    check_cuda_contig(cluster_compact_block_ids, "cluster_compact_block_ids");
+    check_cuda_contig(cluster_temp_kv_pos, "cluster_temp_kv_pos");
+    check_cuda_contig(cluster_total_kv_counts, "cluster_total_kv_counts");
+    check_cuda_contig(temp_block_ids, "temp_block_ids");
+    check_cuda_contig(temp_block_kv_counts, "temp_block_kv_counts");
+    check_cuda_contig(temp_block_kv_owner, "temp_block_kv_owner");
+    check_cuda_contig(free_block_ids, "free_block_ids");
+    check_cuda_contig(used_free_block_count, "used_free_block_count");
+    check_cuda_contig(error_code, "error_code");
+    check_cuda(key, "key");
+    check_cuda(value, "value");
+    check_cuda_contig(cluster_centers_T, "cluster_centers_T");
+    check_cuda_contig(mean, "mean");
+    check_cuda_contig(cluster_center_count, "cluster_center_count");
+
+    TORCH_CHECK(used_free_block_count.scalar_type() == torch::kInt32,
+                "used_free_block_count must be int32");
+    TORCH_CHECK(error_code.scalar_type() == torch::kInt32,
+                "error_code must be int32");
+    TORCH_CHECK(used_free_block_count.numel() == 1,
+                "used_free_block_count must be [1]");
+    TORCH_CHECK(error_code.numel() == 1,
+                "error_code must be [1]");
+    TORCH_CHECK(cluster_center_count.scalar_type() == torch::kInt32,
+                "cluster_center_count must be int32");
+    TORCH_CHECK(cluster_center_count.numel() == 1,
+                "cluster_center_count must be [1]");
+    TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+                "key/value must be [Nq,Hkv,dim]");
+    TORCH_CHECK(key.scalar_type() == block_storage.scalar_type(),
+                "key dtype must equal block_storage dtype");
+    TORCH_CHECK(value.scalar_type() == block_storage.scalar_type(),
+                "value dtype must equal block_storage dtype");
+    TORCH_CHECK(cluster_centers_T.scalar_type() == block_storage.scalar_type(),
+                "cluster_centers_T dtype must equal block_storage dtype");
+    TORCH_CHECK(mean.scalar_type() == block_storage.scalar_type(),
+                "mean dtype must equal block_storage dtype");
+    TORCH_CHECK(key.sizes() == value.sizes(), "key/value shape mismatch");
+    TORCH_CHECK(key.stride(0) >= 0 && key.stride(1) >= 0 && key.stride(2) >= 0,
+                "key strides must be non-negative");
+    TORCH_CHECK(value.stride(0) >= 0 && value.stride(1) >= 0 && value.stride(2) >= 0,
+                "value strides must be non-negative");
+
+    const int Nq = static_cast<int>(key.size(0));
+    const int Hkv = static_cast<int>(key.size(1));
+    const int dim = static_cast<int>(key.size(2));
+    const int C = static_cast<int>(cluster_compact_block_ids.size(1));
+    const int maxB = static_cast<int>(cluster_compact_block_ids.size(2));
+    const int total_blocks = static_cast<int>(block_storage.size(1));
+    const int block_size = static_cast<int>(block_storage.size(2));
+    const int max_temp_blocks = static_cast<int>(temp_block_ids.size(0));
+    const int max_free_block = static_cast<int>(free_block_ids.size(0));
+
+    TORCH_CHECK(cluster_centers_T.dim() == 3,
+                "cluster_centers_T must be [Hkv,dim,C]");
+    TORCH_CHECK(cluster_centers_T.size(0) == Hkv &&
+                cluster_centers_T.size(1) == dim &&
+                cluster_centers_T.size(2) == C,
+                "cluster_centers_T shape mismatch");
+    TORCH_CHECK(mean.dim() == 2 && mean.size(0) == Hkv && mean.size(1) == dim,
+                "mean must be [Hkv,dim]");
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(block_storage));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int rc = append_kv_to_clusters_launcher_raw(
+        key.data_ptr(),
+        value.data_ptr(),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        map_storage_dtype(block_storage.scalar_type()),
+        nullptr,
+        cluster_centers_T.data_ptr(),
+        mean.data_ptr(),
+        cluster_center_count.data_ptr<int32_t>(),
+        temp_block_ids.data_ptr<int32_t>(),
+        temp_block_kv_counts.data_ptr<int32_t>(),
+        temp_block_kv_owner.data_ptr<int32_t>(),
+        block_storage.data_ptr(),
+        cluster_compact_block_ids.data_ptr<int32_t>(),
+        cluster_temp_kv_pos.data_ptr<int32_t>(),
+        cluster_total_kv_counts.data_ptr<int32_t>(),
+        free_block_ids.data_ptr<int32_t>(),
+        max_free_block,
+        used_free_block_count.data_ptr<int32_t>(),
+        error_code.data_ptr<int32_t>(),
+        Nq, Hkv, C, maxB,
+        total_blocks, block_size, dim,
+        max_temp_blocks,
+        stream);
+
+    TORCH_CHECK(rc == ERR_OK,
+                "append_kv_to_clusters_by_centers launcher failed, rc=", rc);
+    return used_free_block_count;
+}
+
+torch::Tensor sparse_select_topk_clusters_out_cuda(
+    torch::Tensor query,
+    torch::Tensor cluster_centers_T,
+    torch::Tensor mean,
+    torch::Tensor cluster_center_count,
+    int64_t nprobe,
+    torch::Tensor out_top_clusters
+) {
+    check_cuda(query, "query");
+    check_cuda_contig(cluster_centers_T, "cluster_centers_T");
+    check_cuda_contig(mean, "mean");
+    check_cuda_contig(cluster_center_count, "cluster_center_count");
+    check_cuda_contig(out_top_clusters, "out_top_clusters");
+
+    TORCH_CHECK(query.dim() == 3, "query must be [Nq,Hq,dim]");
+    TORCH_CHECK(cluster_centers_T.dim() == 3,
+                "cluster_centers_T must be [Hkv,dim,C]");
+    TORCH_CHECK(mean.dim() == 2, "mean must be [Hkv,dim]");
+    TORCH_CHECK(cluster_center_count.scalar_type() == torch::kInt32,
+                "cluster_center_count must be int32");
+    TORCH_CHECK(cluster_center_count.numel() == 1,
+                "cluster_center_count must be [1]");
+    TORCH_CHECK(out_top_clusters.scalar_type() == torch::kInt32,
+                "out_top_clusters must be int32");
+
+    TORCH_CHECK(query.scalar_type() == cluster_centers_T.scalar_type(),
+                "query dtype must equal cluster_centers_T dtype");
+    TORCH_CHECK(mean.scalar_type() == query.scalar_type(),
+                "mean dtype must equal query dtype");
+    TORCH_CHECK(query.stride(0) >= 0 && query.stride(1) >= 0 &&
+                query.stride(2) >= 0, "query strides must be non-negative");
+
+    const int Nq = static_cast<int>(query.size(0));
+    const int Hq = static_cast<int>(query.size(1));
+    const int dim = static_cast<int>(query.size(2));
+    const int Hkv = static_cast<int>(cluster_centers_T.size(0));
+    const int C = static_cast<int>(cluster_centers_T.size(2));
+    const int nprobe_i = static_cast<int>(nprobe);
+
+    TORCH_CHECK(cluster_centers_T.size(1) == dim,
+                "cluster_centers_T dim mismatch");
+    TORCH_CHECK(mean.size(0) == Hkv && mean.size(1) == dim,
+                "mean shape mismatch");
+    TORCH_CHECK(Hkv > 0 && Hq % Hkv == 0, "Hq must be divisible by Hkv");
+    TORCH_CHECK(nprobe_i > 0 && nprobe_i <= C && nprobe_i <= 32,
+                "nprobe must be in (0, min(C, 32)]");
+    TORCH_CHECK(out_top_clusters.dim() == 3 &&
+                out_top_clusters.size(0) == Nq &&
+                out_top_clusters.size(1) == Hq &&
+                out_top_clusters.size(2) == nprobe_i,
+                "out_top_clusters must be [Nq,Hq,nprobe]");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int rc = sparse_select_topk_clusters_launcher_raw(
+        query.data_ptr(),
+        cluster_centers_T.data_ptr(),
+        mean.data_ptr(),
+        cluster_center_count.data_ptr<int32_t>(),
+        out_top_clusters.data_ptr<int32_t>(),
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        map_storage_dtype(query.scalar_type()),
+        Nq,
+        Hq,
+        Hkv,
+        C,
+        dim,
+        nprobe_i,
+        stream);
+
+    TORCH_CHECK(rc == ERR_OK,
+                "sparse_select_topk_clusters launcher failed, rc=", rc);
+    return out_top_clusters;
 }
 
 TORCH_LIBRARY_FRAGMENT(_C, ops) {
@@ -314,9 +536,40 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
         "  Tensor value,"
         "  Tensor label"
         ") -> Tensor");
+    ops.def(
+        "append_kv_to_clusters_by_centers_inplace("
+        "  Tensor block_storage,"
+        "  Tensor cluster_compact_block_ids,"
+        "  Tensor cluster_temp_kv_pos,"
+        "  Tensor cluster_total_kv_counts,"
+        "  Tensor temp_block_ids,"
+        "  Tensor temp_block_kv_counts,"
+        "  Tensor temp_block_kv_owner,"
+        "  Tensor free_block_ids,"
+        "  Tensor used_free_block_count,"
+        "  Tensor error_code,"
+        "  Tensor key,"
+        "  Tensor value,"
+        "  Tensor cluster_centers_T,"
+        "  Tensor mean,"
+        "  Tensor cluster_center_count"
+        ") -> Tensor");
+    ops.def(
+        "sparse_select_topk_clusters_out("
+        "  Tensor query,"
+        "  Tensor cluster_centers_T,"
+        "  Tensor mean,"
+        "  Tensor cluster_center_count,"
+        "  int nprobe,"
+        "  Tensor out_top_clusters"
+        ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
     m.impl("append_kv_to_clusters", &append_kv_to_clusters_cuda);
     m.impl("append_kv_to_clusters_inplace", &append_kv_to_clusters_inplace_cuda);
+    m.impl("append_kv_to_clusters_by_centers_inplace",
+           &append_kv_to_clusters_by_centers_inplace_cuda);
+    m.impl("sparse_select_topk_clusters_out",
+           &sparse_select_topk_clusters_out_cuda);
 }

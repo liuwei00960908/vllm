@@ -13,9 +13,9 @@ def main():
     USE_SPARSE_ATTENTION = os.environ.get("TEST_USE_SPARSE_ATTENTION", "1") != "0"
     PROFILE_DECODE_ONLY = os.environ.get("TEST_PROFILE_DECODE_ONLY", "0") == "1"
     ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
-    context_length = 500
+    context_length = 5000
     block_size = 16
-    test_speed = True
+    test_speed = False
     print_output = False
 
     # ====================== 1. 引擎配置（和server端完全一致） ======================
@@ -35,7 +35,7 @@ def main():
                 "cluster_granularity": "token",
                 "num_clusters": 32,
                 "n_segment": 1,
-                "nprobe": 32,
+                "nprobe": 16,
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,

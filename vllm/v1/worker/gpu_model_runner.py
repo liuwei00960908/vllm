@@ -124,6 +124,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.sparse_flash_attn import (
     SparseFlashAttentionMetadata,
+    SparseManagerExtraInfo,
 )
 from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
@@ -2350,12 +2351,14 @@ class GPUModelRunner(
                 if not isinstance(layer_attn, SparseFlashAttentionMetadata):
                     continue
 
-                layer_attn.extra_sparse_manager_info["req_id_list"] = self.input_batch.req_ids
-                layer_attn.extra_sparse_manager_info["layer_name"] = layer_name
-                layer_attn.extra_sparse_manager_info["num_cluster"] = num_cluster
-                layer_attn.extra_sparse_manager_info["num_segment"] = num_segment
-                layer_attn.extra_sparse_manager_info["nprobe"] = nprobe
-                layer_attn.extra_sparse_manager_info["cluster_block_size"] = cluster_block_size    
+                layer_attn.extra_sparse_manager_info = SparseManagerExtraInfo(
+                    req_id_list=self.input_batch.req_ids,
+                    layer_name=layer_name,
+                    num_cluster=num_cluster,
+                    num_segment=num_segment,
+                    nprobe=nprobe,
+                    cluster_block_size=cluster_block_size,
+                )
                 
                 layer_attn.cluster_allocated_block_info = cluster_info_list
                 layer_attn.sparse_manager_metadata = []
@@ -2618,6 +2621,10 @@ class GPUModelRunner(
             )
         if smm.mean is None or smm.mean.shape != (hkv, dim):
             smm.mean = torch.zeros((hkv, dim), dtype=spec.dtype, device=self.device)
+        if smm.cluster_center_count is None or smm.cluster_center_count.numel() != 1:
+            smm.cluster_center_count = torch.empty(
+                (1,), dtype=torch.int32, device=self.device
+            )
         if (
             smm.cluster_compact_block_ids is None
             or smm.cluster_compact_block_ids.shape
@@ -2675,7 +2682,6 @@ class GPUModelRunner(
             smm.cu_seqlens_q_buffer = torch.arange(
                 rows + 1, dtype=torch.int32, device=self.device
             )
-        smm.in_cluster_token_count = max(spec.num_clusters, num_tokens_padded) + 1
         return smm
 
     def _attach_sparse_cudagraph_metadata(
@@ -2767,6 +2773,9 @@ class GPUModelRunner(
                 self._copy_sparse_cudagraph_tensor(smm.cluster_centers_T, None)
                 self._copy_sparse_cudagraph_tensor(smm.mean, None)
                 self._copy_sparse_cudagraph_tensor(
+                    smm.cluster_center_count, None, fill_value=spec.num_clusters
+                )
+                self._copy_sparse_cudagraph_tensor(
                     smm.cluster_compact_block_ids, None
                 )
                 self._copy_sparse_cudagraph_tensor(smm.cluster_temp_kv_pos, None)
@@ -2786,12 +2795,15 @@ class GPUModelRunner(
                 )
                 if src_smm is None or src_smm.mean is None:
                     return False
-                if int(src_smm.in_cluster_token_count) < spec.num_clusters:
+                if src_smm.cluster_center_count is None:
                     return False
                 self._copy_sparse_cudagraph_tensor(
                     smm.cluster_centers_T, src_smm.cluster_centers_T
                 )
                 self._copy_sparse_cudagraph_tensor(smm.mean, src_smm.mean)
+                self._copy_sparse_cudagraph_tensor(
+                    smm.cluster_center_count, src_smm.cluster_center_count
+                )
                 self._copy_sparse_cudagraph_tensor(
                     smm.cluster_compact_block_ids,
                     src_smm.cluster_compact_block_ids,
@@ -2813,21 +2825,14 @@ class GPUModelRunner(
                     src_smm.temp_block_kv_owner,
                     fill_value=-1,
                 )
-                smm.in_cluster_token_count = max(
-                    int(src_smm.in_cluster_token_count),
-                    num_tokens_padded + 1,
-                )
-
-            layer_attn.extra_sparse_manager_info[
-                "req_id_list"
-            ] = self.input_batch.req_ids
-            layer_attn.extra_sparse_manager_info["layer_name"] = layer_name
-            layer_attn.extra_sparse_manager_info["num_cluster"] = spec.num_clusters
-            layer_attn.extra_sparse_manager_info["num_segment"] = spec.n_segment
-            layer_attn.extra_sparse_manager_info["nprobe"] = spec.nprobe
-            layer_attn.extra_sparse_manager_info[
-                "cluster_block_size"
-            ] = graph_info.cluster_block_size
+            layer_attn.extra_sparse_manager_info = SparseManagerExtraInfo(
+                req_id_list=self.input_batch.req_ids,
+                layer_name=layer_name,
+                num_cluster=spec.num_clusters,
+                num_segment=spec.n_segment,
+                nprobe=spec.nprobe,
+                cluster_block_size=graph_info.cluster_block_size,
+            )
             layer_attn.cluster_allocated_block_info = [(graph_info,)]
             layer_attn.sparse_manager_metadata = [smm]
 
@@ -2863,7 +2868,6 @@ class GPUModelRunner(
                     "Sparse CUDA graph state cannot be synced because "
                     f"metadata is missing for request {rid}, layer {layer_name}"
                 )
-            graph_smm.in_cluster_token_count += layer_attn.num_actual_tokens
             req_sparse_info.layers[layer_name] = graph_smm
 
     def _compute_cascade_attn_prefix_lens(
@@ -4202,11 +4206,9 @@ class GPUModelRunner(
         req_sparse_info = self._sparse_cluster_info.get(self.input_batch.req_ids[0])
         if req_sparse_info is None:
             return True
-        for layer_name, spec in self._sparse_layer_spec_by_name.items():
+        for layer_name in self._sparse_layer_spec_by_name:
             smm = req_sparse_info.layers.get(layer_name)
             if smm is None or smm.mean is None:
-                return True
-            if int(smm.in_cluster_token_count) < spec.num_clusters:
                 return True
         return False
 

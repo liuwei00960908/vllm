@@ -5,6 +5,7 @@ import torch
 
 @dataclass
 class SparseBlockTableBuffers:
+    top_clusters: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
     bt_len: torch.Tensor | None = None
     seqused_k: torch.Tensor | None = None
@@ -62,6 +63,31 @@ class SparseBlockTableBuffers:
             self.workspace_plan_src_tb_off = torch.empty(
                 (plan_capacity,), dtype=torch.int32, device=device
             )
+
+    def select_top_clusters(
+        self,
+        *,
+        query: torch.Tensor,
+        cluster_centers_T: torch.Tensor,
+        mean: torch.Tensor,
+        cluster_center_count: torch.Tensor,
+        nprobe: int,
+    ) -> torch.Tensor:
+        from vllm._custom_ops import sparse_select_topk_clusters_out
+
+        out_shape = (query.shape[0], query.shape[1], nprobe)
+        if self.top_clusters is None or self.top_clusters.shape != out_shape:
+            self.top_clusters = torch.empty(
+                out_shape, dtype=torch.int32, device=query.device
+            )
+        return sparse_select_topk_clusters_out(
+            query,
+            cluster_centers_T,
+            mean,
+            cluster_center_count,
+            nprobe,
+            self.top_clusters,
+        )
 
     def build(
         self,
@@ -144,6 +170,51 @@ class SparseAppendBuffers:
         used_free_block_count: torch.Tensor | None,
         key: torch.Tensor,
         value: torch.Tensor,
+        cluster_centers_T: torch.Tensor,
+        mean: torch.Tensor,
+        cluster_center_count: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm._custom_ops import append_kv_to_clusters_by_centers_inplace
+
+        self.ensure_capacity(device=key.device)
+        assert self.error_code is not None
+        counter = used_free_block_count
+        if counter is None:
+            assert self.used_free_block_count is not None
+            counter = self.used_free_block_count
+            counter.zero_()
+        return append_kv_to_clusters_by_centers_inplace(
+            block_storage,
+            cluster_compact_block_ids,
+            cluster_temp_kv_pos,
+            cluster_total_kv_counts,
+            temp_block_ids,
+            temp_block_kv_counts,
+            temp_block_kv_owner,
+            free_block_ids,
+            counter,
+            self.error_code,
+            key,
+            value,
+            cluster_centers_T,
+            mean,
+            cluster_center_count,
+        )
+
+    def append_with_labels(
+        self,
+        *,
+        block_storage: torch.Tensor,
+        cluster_compact_block_ids: torch.Tensor,
+        cluster_temp_kv_pos: torch.Tensor,
+        cluster_total_kv_counts: torch.Tensor,
+        temp_block_ids: torch.Tensor,
+        temp_block_kv_counts: torch.Tensor,
+        temp_block_kv_owner: torch.Tensor,
+        free_block_ids: torch.Tensor,
+        used_free_block_count: torch.Tensor | None,
+        key: torch.Tensor,
+        value: torch.Tensor,
         label: torch.Tensor,
     ) -> torch.Tensor:
         from vllm._custom_ops import append_kv_to_clusters_inplace
@@ -189,7 +260,7 @@ class SparseManagerMetadata:
 
     cluster_centers_T: torch.Tensor | None = None           # [Hkv, dim, C]
     mean: torch.Tensor | None = None                        # [Hkv, dim]
-    in_cluster_token_count: int = 0
+    cluster_center_count: torch.Tensor | None = None        # [1]
     block_table_buffers: SparseBlockTableBuffers | None = None
     append_buffers: SparseAppendBuffers | None = None
     cu_seqlens_q_buffer: torch.Tensor | None = None

@@ -3673,6 +3673,47 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "append_kv_to_clusters_inp
         return used_free_block_count
 
 
+if hasattr(torch.ops, "_C") and hasattr(
+    torch.ops._C, "append_kv_to_clusters_by_centers_inplace"
+):
+
+    @register_fake("_C::append_kv_to_clusters_by_centers_inplace")
+    def _append_kv_to_clusters_by_centers_inplace_fake(
+        block_storage: torch.Tensor,
+        cluster_compact_block_ids: torch.Tensor,
+        cluster_temp_kv_pos: torch.Tensor,
+        cluster_total_kv_counts: torch.Tensor,
+        temp_block_ids: torch.Tensor,
+        temp_block_kv_counts: torch.Tensor,
+        temp_block_kv_owner: torch.Tensor,
+        free_block_ids: torch.Tensor,
+        used_free_block_count: torch.Tensor,
+        error_code: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cluster_centers_T: torch.Tensor,
+        mean: torch.Tensor,
+        cluster_center_count: torch.Tensor,
+    ) -> torch.Tensor:
+        return used_free_block_count
+
+
+if hasattr(torch.ops, "_C") and hasattr(
+    torch.ops._C, "sparse_select_topk_clusters_out"
+):
+
+    @register_fake("_C::sparse_select_topk_clusters_out")
+    def _sparse_select_topk_clusters_out_fake(
+        query: torch.Tensor,
+        cluster_centers_T: torch.Tensor,
+        mean: torch.Tensor,
+        cluster_center_count: torch.Tensor,
+        nprobe: int,
+        out_top_clusters: torch.Tensor,
+    ) -> torch.Tensor:
+        return out_top_clusters
+
+
 def append_kv_to_clusters_inplace(
     block_storage: torch.Tensor,
     cluster_compact_block_ids: torch.Tensor,
@@ -3702,4 +3743,58 @@ def append_kv_to_clusters_inplace(
         key,
         value,
         label,
+    )
+
+
+def append_kv_to_clusters_by_centers_inplace(
+    block_storage: torch.Tensor,
+    cluster_compact_block_ids: torch.Tensor,
+    cluster_temp_kv_pos: torch.Tensor,
+    cluster_total_kv_counts: torch.Tensor,
+    temp_block_ids: torch.Tensor,
+    temp_block_kv_counts: torch.Tensor,
+    temp_block_kv_owner: torch.Tensor,
+    free_block_ids: torch.Tensor,
+    used_free_block_count: torch.Tensor,
+    error_code: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cluster_centers_T: torch.Tensor,
+    mean: torch.Tensor,
+    cluster_center_count: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.append_kv_to_clusters_by_centers_inplace(
+        block_storage,
+        cluster_compact_block_ids,
+        cluster_temp_kv_pos,
+        cluster_total_kv_counts,
+        temp_block_ids,
+        temp_block_kv_counts,
+        temp_block_kv_owner,
+        free_block_ids,
+        used_free_block_count,
+        error_code,
+        key,
+        value,
+        cluster_centers_T,
+        mean,
+        cluster_center_count,
+    )
+
+
+def sparse_select_topk_clusters_out(
+    query: torch.Tensor,
+    cluster_centers_T: torch.Tensor,
+    mean: torch.Tensor,
+    cluster_center_count: torch.Tensor,
+    nprobe: int,
+    out_top_clusters: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.sparse_select_topk_clusters_out(
+        query,
+        cluster_centers_T,
+        mean,
+        cluster_center_count,
+        int(nprobe),
+        out_top_clusters,
     )
