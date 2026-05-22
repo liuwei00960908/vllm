@@ -116,6 +116,11 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
     const int32_t* __restrict__ cluster_total_kv_counts,
     const int32_t* __restrict__ temp_block_ids,
     const int32_t* __restrict__ free_block_ids,
+    const int32_t* __restrict__ steady_start_block_ids,
+    int steady_start_blocks,
+    const int32_t* __restrict__ steady_end_block_ids,
+    int steady_end_blocks,
+    const int32_t* __restrict__ steady_state,
     int32_t* __restrict__ out_block_table,
     int32_t* __restrict__ out_bt_len,
     int32_t* __restrict__ out_seqused_k,
@@ -165,6 +170,14 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
     const int64_t compact_base_h = (int64_t)hkv * C * maxB;
     const int64_t total_base_h = (int64_t)hkv * C;
     const int64_t temp_pos_base_h = (int64_t)hkv * C * block_size * 2;
+    const int steady_start_count = steady_state[1];
+    const int steady_end_count = steady_state[2];
+    const int steady_start_full = steady_start_count / block_size;
+    const int steady_start_tail = steady_start_count - steady_start_full * block_size;
+    const int steady_end_full = steady_end_count / block_size;
+    const int steady_end_tail = steady_end_count - steady_end_full * block_size;
+    const int steady_full_len = steady_start_full + steady_end_full;
+    const int steady_tail_sum = steady_start_tail + steady_end_tail;
 
     int my_full_nb = 0;
     int my_tail = 0;
@@ -227,10 +240,14 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
     int row_error = ERR_OK;
 
     if (lane == 0) {
-        const int free_blocks_needed = ceil_div_int(temp_sum, block_size);
-        const int bt_len = compact_len + free_blocks_needed;
+        const int pack_sum = steady_tail_sum + temp_sum;
+        const int free_blocks_needed = ceil_div_int(pack_sum, block_size);
+        const int bt_len = steady_full_len + compact_len + free_blocks_needed;
 
-        if (bt_len > max_bt_len) {
+        if (steady_start_full + (steady_start_tail > 0) > steady_start_blocks ||
+            steady_end_full + (steady_end_tail > 0) > steady_end_blocks) {
+            row_error = ERR_BAD_PARAM;
+        } else if (bt_len > max_bt_len) {
             row_error = ERR_BT_LEN_OVERFLOW;
         } else {
             if (free_blocks_needed > 0) {
@@ -240,15 +257,37 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
                 }
             }
 
-            if (row_error == ERR_OK && temp_sum > 0) {
-                base_plan = atomicAdd(total_plan_count, temp_sum);
+            if (row_error == ERR_OK && pack_sum > 0) {
+                base_plan = atomicAdd(total_plan_count, pack_sum);
             }
 
             out_row_free_base[row] = free_base;
             row_plan_base[row] = base_plan;
             out_bt_len[row] = bt_len;
-            out_seqused_k[row] = seq_sum;
+            out_seqused_k[row] = steady_start_count + steady_end_count + seq_sum;
 
+            if (row_error == ERR_OK) {
+                for (int i = 0; i < steady_start_full; ++i) {
+                    const int bid =
+                        steady_start_block_ids[(int64_t)hkv * steady_start_blocks + i];
+                    if (bid < 0 || bid >= total_blocks) {
+                        row_error = ERR_BAD_PARAM;
+                        break;
+                    }
+                    out_block_table[row_base + i] = bid;
+                }
+            }
+            if (row_error == ERR_OK) {
+                for (int i = 0; i < steady_end_full; ++i) {
+                    const int bid =
+                        steady_end_block_ids[(int64_t)hkv * steady_end_blocks + i];
+                    if (bid < 0 || bid >= total_blocks) {
+                        row_error = ERR_BAD_PARAM;
+                        break;
+                    }
+                    out_block_table[row_base + steady_start_full + i] = bid;
+                }
+            }
             if (row_error == ERR_OK) {
                 for (int i = 0; i < free_blocks_needed; ++i) {
                     const int bid = free_block_ids[free_base + i];
@@ -256,7 +295,7 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
                         row_error = ERR_BAD_PARAM;
                         break;
                     }
-                    out_block_table[row_base + compact_len + i] = bid;
+                    out_block_table[row_base + steady_full_len + compact_len + i] = bid;
                 }
             }
         }
@@ -275,6 +314,37 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
     const int lanes_per_cluster = lanes_per_cluster_raw > 0 ? lanes_per_cluster_raw : 1;
     const int covered_lanes = lanes_per_cluster * nprobe;
 
+    if (steady_start_tail > 0) {
+        const int bid = steady_start_block_ids[
+            (int64_t)hkv * steady_start_blocks + steady_start_full];
+        if (bid < 0 || bid >= total_blocks) {
+            warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
+            return;
+        }
+        for (int slot = lane; slot < steady_start_tail; slot += WARP_SIZE) {
+            const int p = base_plan + slot;
+            plan_row[p] = row;
+            plan_src_tb_idx[p] = bid;
+            plan_src_tb_off[p] = slot;
+        }
+    }
+
+    if (steady_end_tail > 0) {
+        const int bid = steady_end_block_ids[
+            (int64_t)hkv * steady_end_blocks + steady_end_full];
+        if (bid < 0 || bid >= total_blocks) {
+            warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
+            return;
+        }
+        const int tail_base = base_plan + steady_start_tail;
+        for (int slot = lane; slot < steady_end_tail; slot += WARP_SIZE) {
+            const int p = tail_base + slot;
+            plan_row[p] = row;
+            plan_src_tb_idx[p] = bid;
+            plan_src_tb_off[p] = slot;
+        }
+    }
+
     // Generate the per-token copy plan. Do this even when compact_len == 0,
     // because a row can have only tail tokens and no compact full blocks.
     if (lane < covered_lanes) {
@@ -289,7 +359,7 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
             const int64_t temp_pos_base =
                 temp_pos_base_h + (int64_t)cid * block_size * 2;
 
-            const int plan_base = base_plan + tail_prefix;
+            const int plan_base = base_plan + steady_tail_sum + tail_prefix;
 
             for (int slot = lane_in_cluster; slot < tail; slot += lanes_per_cluster) {
                 const int tb_idx =
@@ -310,7 +380,7 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
 
                 const int p = plan_base + slot;
                 plan_row[p] = row;
-                plan_src_tb_idx[p] = tb_idx;
+                plan_src_tb_idx[p] = src_bid;
                 plan_src_tb_off[p] = tb_off;
             }
         }
@@ -334,7 +404,7 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
                     warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
                     return;
                 }
-                out_block_table[row_base + write_base + bi] = bid;
+                out_block_table[row_base + steady_full_len + write_base + bi] = bid;
             }
         }
     }
@@ -366,10 +436,9 @@ __global__ void k_build_sparse_block_table_copy_from_plan_src_only(
 
     for (int p = global_warp_id; p < total_plan_count; p += warp_stride) {
         const int row = plan_row[p];
-        const int tb_idx = plan_src_tb_idx[p];
+        const int src_bid = plan_src_tb_idx[p];
         const int src_off = plan_src_tb_off[p];
 
-        const int src_bid = temp_block_ids[tb_idx];
         const int row_base_plan = row_plan_base[row];
         const int local_idx = p - row_base_plan;
 
@@ -396,6 +465,11 @@ extern "C" int build_sparse_block_table_launcher_raw(
     int32_t storage_dtype,
     const int32_t* d_free_block_ids,
     int32_t max_free_block,
+    const int32_t* d_steady_start_block_ids,
+    int32_t steady_start_blocks,
+    const int32_t* d_steady_end_block_ids,
+    int32_t steady_end_blocks,
+    const int32_t* d_steady_state,
     int32_t* d_out_block_table,
     int32_t* d_out_bt_len,
     int32_t* d_out_seqused_k,
@@ -450,9 +524,14 @@ extern "C" int build_sparse_block_table_launcher_raw(
             d_cluster_compact_block_ids,
             d_cluster_temp_kv_pos,
             d_cluster_total_kv_counts,
-            d_temp_block_ids,
-            d_free_block_ids,
-            d_out_block_table,
+        d_temp_block_ids,
+        d_free_block_ids,
+        d_steady_start_block_ids,
+        steady_start_blocks,
+        d_steady_end_block_ids,
+        steady_end_blocks,
+        d_steady_state,
+        d_out_block_table,
             d_out_bt_len,
             d_out_seqused_k,
             d_row_free_base,
