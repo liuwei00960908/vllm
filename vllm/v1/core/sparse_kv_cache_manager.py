@@ -113,8 +113,6 @@ logger = init_logger(__name__)
 @dataclass
 class _SparseBlockReservationState:
     temp_block_ids: torch.Tensor | None = None
-    steady_start_block_ids: torch.Tensor | None = None
-    steady_end_block_ids: torch.Tensor | None = None
     reusable_block_ids: torch.Tensor | None = None
     reusable_count: int = 0
     unused_block_ids: torch.Tensor | None = None
@@ -448,59 +446,12 @@ class SparseKVManager(FullAttentionManager):
     def _get_total_temp_block_count(self) -> int:
         return self._get_temp_block_count_per_layer() * self._spec.num_layer
 
-    def _align_steady_tokens(self, num_tokens: int) -> int:
-        if num_tokens <= 0:
-            return 0
-        cluster_block_size = self._get_cluster_block_size()
-        return cdiv(num_tokens, cluster_block_size) * cluster_block_size
-
-    def _get_steady_start_capacity(self) -> int:
-        return self._align_steady_tokens(self._spec.static_pattern_start)
-
-    def _get_steady_end_capacity(self) -> int:
-        return self._align_steady_tokens(self._spec.static_pattern_end)
-
-    def _get_steady_block_count_per_layer(self, capacity: int) -> int:
-        if capacity <= 0:
-            return 0
-        return (
-            self._spec.num_kv_heads
-            * cdiv(capacity, self._get_cluster_block_size())
-        )
-
-    def _get_steady_block_count_per_head(self) -> int:
-        cluster_block_size = self._get_cluster_block_size()
-        return cdiv(
-            self._get_steady_start_capacity()
-            + self._get_steady_end_capacity(),
-            cluster_block_size,
-        )
-
-    def _get_total_steady_start_block_count(self) -> int:
-        return (
-            self._get_steady_block_count_per_layer(
-                self._get_steady_start_capacity()
-            )
-            * self._spec.num_layer
-        )
-
-    def _get_total_steady_end_block_count(self) -> int:
-        return (
-            self._get_steady_block_count_per_layer(
-                self._get_steady_end_capacity()
-            )
-            * self._spec.num_layer
-        )
-
     def _get_required_reusable_block_count(self, num_new_token: int) -> int:
         # build_sparse_block_table() resets its scratch usage every call, so the
         # pool only needs to cover the current decode step for a single layer.
         # A row is one (query token, query head) pair and can need at most
         # nprobe scratch blocks in the all-tail worst case.
-        per_row = (
-            min(self._spec.nprobe, self._spec.num_clusters)
-            + self._get_steady_block_count_per_head()
-        )
+        per_row = min(self._spec.nprobe, self._spec.num_clusters)
         rows = max(0, num_new_token) * self._spec.num_query_heads
         return rows * per_row
 
@@ -656,20 +607,6 @@ class SparseKVManager(FullAttentionManager):
             state.temp_block_ids = self._new_i32_tensor(len(temp_blocks))
             self._fill_block_ids(state.temp_block_ids, 0, temp_blocks)
 
-        if state.steady_start_block_ids is None:
-            start_blocks = self._allocate_cluster_blocks(
-                req_id, self._get_total_steady_start_block_count()
-            )
-            state.steady_start_block_ids = self._new_i32_tensor(len(start_blocks))
-            self._fill_block_ids(state.steady_start_block_ids, 0, start_blocks)
-
-        if state.steady_end_block_ids is None:
-            end_blocks = self._allocate_cluster_blocks(
-                req_id, self._get_total_steady_end_block_count()
-            )
-            state.steady_end_block_ids = self._new_i32_tensor(len(end_blocks))
-            self._fill_block_ids(state.steady_end_block_ids, 0, end_blocks)
-
         if req_id in self.num_cached_block:
             self._ensure_reusable_cluster_blocks(req_id, num_new_token)
 
@@ -792,20 +729,8 @@ class SparseKVManager(FullAttentionManager):
             temp_block_ids=temp_block_ids,
             reusable_block_ids=reusable_block_ids,
             allocated_block_ids=allocated_block_ids,
-            steady_start_block_ids=(
-                state.steady_start_block_ids
-                if state.steady_start_block_ids is not None
-                else self._new_i32_tensor(0)
-            ),
-            steady_end_block_ids=(
-                state.steady_end_block_ids
-                if state.steady_end_block_ids is not None
-                else self._new_i32_tensor(0)
-            ),
             used_count=state.used_count,
             cluster_block_size=self._get_cluster_block_size(),
-            steady_start_capacity=self._get_steady_start_capacity(),
-            steady_end_capacity=self._get_steady_end_capacity(),
             num_cluster=self._spec.num_clusters,
             num_segment=self._spec.n_segment,
             nprobe=self._spec.nprobe,

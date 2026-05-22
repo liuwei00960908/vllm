@@ -136,7 +136,6 @@ from vllm.v1.core.sparse_kv_utils import (
     SparseAppendBuffers,
     SparseBlockTableBuffers,
     SparseClusterBlockInfo,
-    SparseManagerExtraInfo,
     SparseManagerMetadata,
 )
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -2333,12 +2332,6 @@ class GPUModelRunner(
                 this_cluster_info.allocated_block_ids_gpu = (
                     this_cluster_info.allocated_block_ids.to(device=self.device)
                 )
-                this_cluster_info.steady_start_block_ids_gpu = (
-                    this_cluster_info.steady_start_block_ids.to(device=self.device)
-                )
-                this_cluster_info.steady_end_block_ids_gpu = (
-                    this_cluster_info.steady_end_block_ids.to(device=self.device)
-                )
                 this_cluster_info.used_count_gpu = this_cluster_info.used_count.to(
                     self.device
                 )
@@ -2351,38 +2344,18 @@ class GPUModelRunner(
             temp_block_count_per_layer = (
                 (num_kv_heads * num_cluster + 1) * (cluster_block_size - 1)
             ) // cluster_block_size
-            steady_start_capacity = cluster_info_list[0][0].steady_start_capacity
-            steady_end_capacity = cluster_info_list[0][0].steady_end_capacity
-            steady_start_blocks_per_head = (
-                (steady_start_capacity + cluster_block_size - 1)
-                // cluster_block_size
-            )
-            steady_end_blocks_per_head = (
-                (steady_end_capacity + cluster_block_size - 1)
-                // cluster_block_size
-            )
-            steady_start_blocks_per_layer = (
-                num_kv_heads * steady_start_blocks_per_head
-            )
-            steady_end_blocks_per_layer = num_kv_heads * steady_end_blocks_per_head
             temp_block_cursor = 0
-            steady_start_cursor = 0
-            steady_end_cursor = 0
 
             for layer_name, layer_attn in attn_metadata.items():
                 if not isinstance(layer_attn, SparseFlashAttentionMetadata):
                     continue
 
-                layer_attn.extra_sparse_manager_info = SparseManagerExtraInfo(
-                    req_id_list=self.input_batch.req_ids,
-                    layer_name=layer_name,
-                    num_cluster=num_cluster,
-                    num_segment=num_segment,
-                    nprobe=nprobe,
-                    cluster_block_size=cluster_block_size,
-                    steady_start_capacity=steady_start_capacity,
-                    steady_end_capacity=steady_end_capacity,
-                )
+                layer_attn.extra_sparse_manager_info["req_id_list"] = self.input_batch.req_ids
+                layer_attn.extra_sparse_manager_info["layer_name"] = layer_name
+                layer_attn.extra_sparse_manager_info["num_cluster"] = num_cluster
+                layer_attn.extra_sparse_manager_info["num_segment"] = num_segment
+                layer_attn.extra_sparse_manager_info["nprobe"] = nprobe
+                layer_attn.extra_sparse_manager_info["cluster_block_size"] = cluster_block_size    
                 
                 layer_attn.cluster_allocated_block_info = cluster_info_list
                 layer_attn.sparse_manager_metadata = []
@@ -2410,35 +2383,6 @@ class GPUModelRunner(
                             dtype=torch.int32,
                             device=self.device,
                         )
-
-                    if smm.steady_zone_head is None:
-                        start_ids_gpu = cluster_info_list[0][0].steady_start_block_ids_gpu
-                        assert start_ids_gpu is not None
-                        start_slice = start_ids_gpu[
-                            steady_start_cursor:
-                            steady_start_cursor + steady_start_blocks_per_layer
-                        ]
-                        smm.steady_zone_head = start_slice.view(
-                            num_kv_heads, steady_start_blocks_per_head
-                        )
-                        steady_start_cursor += steady_start_blocks_per_layer
-                    if smm.steady_zone_tail is None:
-                        end_ids_gpu = cluster_info_list[0][0].steady_end_block_ids_gpu
-                        assert end_ids_gpu is not None
-                        end_slice = end_ids_gpu[
-                            steady_end_cursor:
-                            steady_end_cursor + steady_end_blocks_per_layer
-                        ]
-                        smm.steady_zone_tail = end_slice.view(
-                            num_kv_heads, steady_end_blocks_per_head
-                        )
-                        steady_end_cursor += steady_end_blocks_per_layer
-                    if smm.steady_state is None:
-                        smm.steady_state = torch.zeros(
-                            (4,), dtype=torch.int32, device=self.device
-                        )
-                    smm.steady_start_capacity = steady_start_capacity
-                    smm.steady_end_capacity = steady_end_capacity
 
                     layer_attn.sparse_manager_metadata.append(smm)
 
@@ -2497,8 +2441,6 @@ class GPUModelRunner(
         src_temp_block_ids: torch.Tensor,
         src_reusable_block_ids: torch.Tensor,
         src_allocated_block_ids: torch.Tensor,
-        src_steady_start_block_ids: torch.Tensor,
-        src_steady_end_block_ids: torch.Tensor,
         src_used_count: torch.Tensor,
     ) -> None:
         packed_cpu = graph_info.packed_block_info_cpu
@@ -2507,24 +2449,13 @@ class GPUModelRunner(
         assert graph_info.temp_block_ids_gpu is not None
         assert graph_info.reusable_block_ids_gpu is not None
         assert graph_info.allocated_block_ids_gpu is not None
-        assert graph_info.steady_start_block_ids_gpu is not None
-        assert graph_info.steady_end_block_ids_gpu is not None
         assert graph_info.used_count_gpu is not None
 
         temp_len = graph_info.temp_block_ids_gpu.numel()
         reusable_len = graph_info.reusable_block_ids_gpu.numel()
         allocated_len = graph_info.allocated_block_ids_gpu.numel()
-        steady_start_len = graph_info.steady_start_block_ids_gpu.numel()
-        steady_end_len = graph_info.steady_end_block_ids_gpu.numel()
         used_count_len = graph_info.used_count_gpu.numel()
-        total_len = (
-            temp_len
-            + reusable_len
-            + allocated_len
-            + steady_start_len
-            + steady_end_len
-            + used_count_len
-        )
+        total_len = temp_len + reusable_len + allocated_len + used_count_len
         assert packed_cpu.numel() >= total_len
 
         packed_cpu_view = packed_cpu[:total_len]
@@ -2571,23 +2502,9 @@ class GPUModelRunner(
             offset, allocated_len, src_allocated_block_ids, "allocated_block_ids"
         )
         offset += allocated_len
-        copy_to_pack(
-            offset,
-            steady_start_len,
-            src_steady_start_block_ids,
-            "steady_start_block_ids",
-        )
-        offset += steady_start_len
-        copy_to_pack(
-            offset,
-            steady_end_len,
-            src_steady_end_block_ids,
-            "steady_end_block_ids",
-        )
-        offset += steady_end_len
         copy_to_pack(offset, used_count_len, src_used_count, "used_count")
 
-        if len(cpu_segments) == 6:
+        if len(cpu_segments) == 4:
             packed_gpu[:total_len].copy_(packed_cpu_view, non_blocking=True)
         else:
             for dst_start, length in cpu_segments:
@@ -2604,24 +2521,6 @@ class GPUModelRunner(
     ) -> SparseClusterBlockInfo:
         info = self._sparse_cudagraph_cluster_info.get(kv_cache_gid)
         cluster_block_size = spec.num_kv_heads * spec.block_size
-        steady_start_capacity = (
-            (spec.static_pattern_start + cluster_block_size - 1)
-            // cluster_block_size
-            * cluster_block_size
-            if spec.static_pattern_start > 0
-            else 0
-        )
-        steady_end_capacity = (
-            (spec.static_pattern_end + cluster_block_size - 1)
-            // cluster_block_size
-            * cluster_block_size
-            if spec.static_pattern_end > 0
-            else 0
-        )
-        steady_blocks_per_head = (
-            (steady_start_capacity + steady_end_capacity + cluster_block_size - 1)
-            // cluster_block_size
-        )
         temp_block_count_per_layer = (
             (spec.num_kv_heads * spec.num_clusters + 1)
             * (cluster_block_size - 1)
@@ -2631,20 +2530,10 @@ class GPUModelRunner(
             1,
             num_tokens_padded
             * spec.num_query_heads
-            * (min(spec.nprobe, spec.num_clusters) + steady_blocks_per_head),
+            * min(spec.nprobe, spec.num_clusters),
         )
         allocated_blocks = max(
             1, num_tokens_padded * spec.num_layer * spec.num_kv_heads
-        )
-        steady_start_blocks = (
-            spec.num_layer
-            * spec.num_kv_heads
-            * ((steady_start_capacity + cluster_block_size - 1) // cluster_block_size)
-        )
-        steady_end_blocks = (
-            spec.num_layer
-            * spec.num_kv_heads
-            * ((steady_end_capacity + cluster_block_size - 1) // cluster_block_size)
         )
 
         def needs_new(tensor: torch.Tensor | None, size: int) -> bool:
@@ -2657,19 +2546,10 @@ class GPUModelRunner(
                 num_segment=spec.n_segment,
                 nprobe=spec.nprobe,
                 num_kv_heads=spec.num_kv_heads,
-                steady_start_capacity=steady_start_capacity,
-                steady_end_capacity=steady_end_capacity,
             )
             self._sparse_cudagraph_cluster_info[kv_cache_gid] = info
 
-        packed_len = (
-            total_temp_blocks
-            + reusable_blocks
-            + allocated_blocks
-            + steady_start_blocks
-            + steady_end_blocks
-            + 1
-        )
+        packed_len = total_temp_blocks + reusable_blocks + allocated_blocks + 1
         if needs_new(info.packed_block_info_gpu, packed_len):
             info.packed_block_info_gpu = torch.zeros(
                 (packed_len,), dtype=torch.int32, device=self.device
@@ -2690,17 +2570,7 @@ class GPUModelRunner(
         offset += reusable_blocks
         info.allocated_block_ids_gpu = packed_gpu[offset : offset + allocated_blocks]
         offset += allocated_blocks
-        info.steady_start_block_ids_gpu = packed_gpu[
-            offset : offset + steady_start_blocks
-        ]
-        offset += steady_start_blocks
-        info.steady_end_block_ids_gpu = packed_gpu[
-            offset : offset + steady_end_blocks
-        ]
-        offset += steady_end_blocks
         info.used_count_gpu = packed_gpu[offset : offset + 1]
-        info.steady_start_capacity = steady_start_capacity
-        info.steady_end_capacity = steady_end_capacity
         return info
 
     def _ensure_sparse_cudagraph_metadata(
@@ -2717,20 +2587,6 @@ class GPUModelRunner(
         hq = spec.num_query_heads
         dim = spec.head_size
         cluster_block_size = spec.num_kv_heads * spec.block_size
-        steady_start_capacity = (
-            (spec.static_pattern_start + cluster_block_size - 1)
-            // cluster_block_size
-            * cluster_block_size
-            if spec.static_pattern_start > 0
-            else 0
-        )
-        steady_end_capacity = (
-            (spec.static_pattern_end + cluster_block_size - 1)
-            // cluster_block_size
-            * cluster_block_size
-            if spec.static_pattern_end > 0
-            else 0
-        )
         temp_block_count_per_layer = (
             (hkv * spec.num_clusters + 1) * (cluster_block_size - 1)
         ) // cluster_block_size
@@ -2739,12 +2595,6 @@ class GPUModelRunner(
             smm.temp_block_kv_counts = torch.zeros(
                 (1,), dtype=torch.int32, device=self.device
             )
-        if smm.steady_state is None:
-            smm.steady_state = torch.zeros(
-                (4,), dtype=torch.int32, device=self.device
-            )
-        smm.steady_start_capacity = steady_start_capacity
-        smm.steady_end_capacity = steady_end_capacity
         if (
             smm.temp_block_kv_owner is None
             or smm.temp_block_kv_owner.shape[0]
@@ -2801,13 +2651,9 @@ class GPUModelRunner(
             )
 
         rows = num_tokens_padded * hq
-        steady_blocks_per_head = (
-            (steady_start_capacity + steady_end_capacity + cluster_block_size - 1)
-            // cluster_block_size
-        )
         plan_capacity = max(
             rows
-            * (min(spec.nprobe, spec.num_clusters) + steady_blocks_per_head)
+            * min(spec.nprobe, spec.num_clusters)
             * max(cluster_block_size - 1, 0),
             1,
         )
@@ -2876,16 +2722,6 @@ class GPUModelRunner(
                     src_allocated_block_ids = self._get_sparse_cluster_info_tensor(
                         src_info, "allocated_block_ids_gpu", "allocated_block_ids"
                     )
-                    src_steady_start_block_ids = self._get_sparse_cluster_info_tensor(
-                        src_info,
-                        "steady_start_block_ids_gpu",
-                        "steady_start_block_ids",
-                    )
-                    src_steady_end_block_ids = self._get_sparse_cluster_info_tensor(
-                        src_info,
-                        "steady_end_block_ids_gpu",
-                        "steady_end_block_ids",
-                    )
                     src_used_count = self._get_sparse_cluster_info_tensor(
                         src_info, "used_count_gpu", "used_count"
                     )
@@ -2893,8 +2729,6 @@ class GPUModelRunner(
                         src_temp_block_ids is None
                         or src_reusable_block_ids is None
                         or src_allocated_block_ids is None
-                        or src_steady_start_block_ids is None
-                        or src_steady_end_block_ids is None
                         or src_used_count is None
                     ):
                         return False
@@ -2903,8 +2737,6 @@ class GPUModelRunner(
                         src_temp_block_ids,
                         src_reusable_block_ids,
                         src_allocated_block_ids,
-                        src_steady_start_block_ids,
-                        src_steady_end_block_ids,
                         src_used_count,
                     )
                     graph_info.window_seq = src_info.window_seq
@@ -2924,40 +2756,12 @@ class GPUModelRunner(
                 (spec.num_kv_heads * spec.num_clusters + 1)
                 * (graph_info.cluster_block_size - 1)
             ) // graph_info.cluster_block_size
-            steady_start_blocks_per_head = (
-                (graph_info.steady_start_capacity + graph_info.cluster_block_size - 1)
-                // graph_info.cluster_block_size
-            )
-            steady_end_blocks_per_head = (
-                (graph_info.steady_end_capacity + graph_info.cluster_block_size - 1)
-                // graph_info.cluster_block_size
-            )
             assert graph_info.temp_block_ids_gpu is not None
             cursor = temp_cursors[kv_cache_gid]
             smm.temp_block_ids = graph_info.temp_block_ids_gpu[
                 cursor : cursor + temp_count_per_layer
             ]
             temp_cursors[kv_cache_gid] = cursor + temp_count_per_layer
-            steady_start_offset = (
-                cursor // temp_count_per_layer
-                * spec.num_kv_heads
-                * steady_start_blocks_per_head
-            )
-            steady_end_offset = (
-                cursor // temp_count_per_layer
-                * spec.num_kv_heads
-                * steady_end_blocks_per_head
-            )
-            assert graph_info.steady_start_block_ids_gpu is not None
-            assert graph_info.steady_end_block_ids_gpu is not None
-            smm.steady_zone_head = graph_info.steady_start_block_ids_gpu[
-                steady_start_offset:
-                steady_start_offset + spec.num_kv_heads * steady_start_blocks_per_head
-            ].view(spec.num_kv_heads, steady_start_blocks_per_head)
-            smm.steady_zone_tail = graph_info.steady_end_block_ids_gpu[
-                steady_end_offset:
-                steady_end_offset + spec.num_kv_heads * steady_end_blocks_per_head
-            ].view(spec.num_kv_heads, steady_end_blocks_per_head)
 
             if cluster_info is None or rid is None:
                 self._copy_sparse_cudagraph_tensor(smm.cluster_centers_T, None)
@@ -2973,7 +2777,6 @@ class GPUModelRunner(
                 self._copy_sparse_cudagraph_tensor(
                     smm.temp_block_kv_owner, None, fill_value=-1
                 )
-                self._copy_sparse_cudagraph_tensor(smm.steady_state, None)
             else:
                 req_sparse_info = self._sparse_cluster_info.get(rid)
                 src_smm = (
@@ -3010,31 +2813,21 @@ class GPUModelRunner(
                     src_smm.temp_block_kv_owner,
                     fill_value=-1,
                 )
-                if src_smm.steady_state is None:
-                    return False
-                self._copy_sparse_cudagraph_tensor(
-                    smm.steady_state,
-                    src_smm.steady_state,
-                )
-                smm.steady_total_token_count = src_smm.steady_total_token_count
-                smm.steady_start_count = src_smm.steady_start_count
-                smm.steady_end_count = src_smm.steady_end_count
-                smm.steady_end_start = src_smm.steady_end_start
                 smm.in_cluster_token_count = max(
                     int(src_smm.in_cluster_token_count),
                     num_tokens_padded + 1,
                 )
 
-            layer_attn.extra_sparse_manager_info = SparseManagerExtraInfo(
-                req_id_list=self.input_batch.req_ids,
-                layer_name=layer_name,
-                num_cluster=spec.num_clusters,
-                num_segment=spec.n_segment,
-                nprobe=spec.nprobe,
-                cluster_block_size=graph_info.cluster_block_size,
-                steady_start_capacity=graph_info.steady_start_capacity,
-                steady_end_capacity=graph_info.steady_end_capacity,
-            )
+            layer_attn.extra_sparse_manager_info[
+                "req_id_list"
+            ] = self.input_batch.req_ids
+            layer_attn.extra_sparse_manager_info["layer_name"] = layer_name
+            layer_attn.extra_sparse_manager_info["num_cluster"] = spec.num_clusters
+            layer_attn.extra_sparse_manager_info["num_segment"] = spec.n_segment
+            layer_attn.extra_sparse_manager_info["nprobe"] = spec.nprobe
+            layer_attn.extra_sparse_manager_info[
+                "cluster_block_size"
+            ] = graph_info.cluster_block_size
             layer_attn.cluster_allocated_block_info = [(graph_info,)]
             layer_attn.sparse_manager_metadata = [smm]
 
@@ -3070,10 +2863,7 @@ class GPUModelRunner(
                     "Sparse CUDA graph state cannot be synced because "
                     f"metadata is missing for request {rid}, layer {layer_name}"
                 )
-            evicted_count = graph_smm.advance_steady_python_state(
-                layer_attn.num_actual_tokens
-            )
-            graph_smm.in_cluster_token_count += evicted_count
+            graph_smm.in_cluster_token_count += layer_attn.num_actual_tokens
             req_sparse_info.layers[layer_name] = graph_smm
 
     def _compute_cascade_attn_prefix_lens(

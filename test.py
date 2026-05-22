@@ -13,7 +13,7 @@ def main():
     USE_SPARSE_ATTENTION = os.environ.get("TEST_USE_SPARSE_ATTENTION", "1") != "0"
     PROFILE_DECODE_ONLY = os.environ.get("TEST_PROFILE_DECODE_ONLY", "0") == "1"
     ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
-    context_length = 5000
+    context_length = 500
     block_size = 16
     test_speed = True
     print_output = False
@@ -35,7 +35,7 @@ def main():
                 "cluster_granularity": "token",
                 "num_clusters": 32,
                 "n_segment": 1,
-                "nprobe": 16,
+                "nprobe": 32,
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,
