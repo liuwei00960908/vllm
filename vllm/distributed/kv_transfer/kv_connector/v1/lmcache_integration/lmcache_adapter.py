@@ -188,6 +188,13 @@ class RequestTracker:
 
         mm_hashes, mm_positions = extract_mm_features(new_request, modify=True)
 
+        logger.info(
+            "[trk] req = %s FROM_NEW prompt_len=%d num_to_compute=%d "
+            "init_blocks=%d lmcache_cache=%d",
+            new_request.req_id, len(new_request.prompt_token_ids),
+            num_tokens_to_compute, len(unfolded_block_ids), lmcache_cached_tokens,
+        )
+
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
@@ -260,6 +267,9 @@ class RequestTracker:
             )
             self.token_ids = all_token_ids[:num_tokens_needed]
         else:
+            logger.info("[trk] %s new_block_ids=%d new_token_ids=%d existing_blocks=%d existing_tokens=%d",
+            self.req_id, len(new_block_ids), len(new_token_ids),
+            len(self.allocated_block_ids), len(self.token_ids))
             self.allocated_block_ids.extend(new_block_ids)
             self.token_ids.extend(new_token_ids)
 

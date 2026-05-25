@@ -899,32 +899,10 @@ class FlashAttentionImpl(AttentionImpl):
                 runtime_q_head_gather = getattr(
                         layer, "_vllm_sparse_runtime_q_head_gather", None
                     )
-                if (
-                    runtime_q_head_gather is not None
-                    and runtime_q_head_gather.get("sparse_gather_phys") is not None
-                ):
-                    self._forward_compact_kv_gather(
-                        query=query[:num_actual_tokens],
-                        key_cache=key_cache,
-                        value_cache=value_cache,
-                        output=output[:num_actual_tokens],
-                        cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=max_seqlen_q,
-                        phys=runtime_q_head_gather["sparse_gather_phys"],
-                        slots=runtime_q_head_gather["sparse_gather_slots"],
-                        cu_seqlens_k=runtime_q_head_gather[
-                            "sparse_gather_cu_seqlens_k"
-                        ],
-                        max_seqlen_k=runtime_q_head_gather[
-                            "sparse_gather_max_seqlen_k"
-                        ],
-                        causal=attn_metadata.causal,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                    )
-                    layer._vllm_sparse_runtime_q_head_gather = None
-                    return output
+                if runtime_q_head_gather is not None:
+                    per_req_actual_kv_len = runtime_q_head_gather["per_req_actual_kv_len"]
+                    seqused_k = torch.tensor(per_req_actual_kv_len, dtype=torch.int32, device=seqused_k.device)
+                # start_t = time.perf_counter()
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -948,6 +926,7 @@ class FlashAttentionImpl(AttentionImpl):
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
+                # logger.info(f"[forward] flash_attn_varlen_func cost {1000 * (time.perf_counter() - start_t)}ms")
                 if runtime_q_head_gather is not None:
                     layer._vllm_sparse_runtime_q_head_gather = None
                 return output

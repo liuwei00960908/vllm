@@ -46,14 +46,22 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
             self, "_vllm_sparse_runtime_q_head_gather", None
         )
         selected_tokens = None
+        token_start_index = None
+        cluster_start_index = None
+        retrieve_budget = 0
+        per_req_cluster_meta = None
         if runtime_q_head_gather:
             selected_tokens = runtime_q_head_gather["per_req_selected_ids"]
+            token_start_index = runtime_q_head_gather["per_req_token_start_index"]
+            cluster_start_index = runtime_q_head_gather["per_req_cluster_start_index"]
+            retrieve_budget = runtime_q_head_gather["retrieve_budget"]
+            per_req_cluster_meta = runtime_q_head_gather["per_req_cluster_meta"]
         connector = get_kv_transfer_group()
         if attn_metadata is None or not connector.has_connector_metadata():
             return func(*args, **kwargs)
 
         # Wait for KV layer on entry
-        connector.wait_for_layer_load(layer_name, selected_tokens)
+        connector.wait_for_layer_load(layer_name, selected_tokens, per_req_cluster_meta, token_start_index, cluster_start_index, retrieve_budget)
 
         # Execute the function
         result = func(*args, **kwargs)

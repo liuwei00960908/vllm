@@ -1398,24 +1398,6 @@ class GPUModelRunner(
             if self._has_sparse_attn and num_output_tokens > 0:
                 by_layer = sparse_by_layer_map.get(req_id)
                 chrono_by_req = sparse_chrono_phys_map.get(req_id)
-                if by_layer is None or chrono_by_req is None:
-                    logger.debug(
-                        "[SparseRC:bridge_worker] req_id=%s "
-                        "missing by_layer=%s chrono=%s "
-                        "selected_len=%d retrieve_len=%d num_output_tokens=%d "
-                        "incoming_row_lens=%s prev_row_lens=%s "
-                        "cached_prev by_layer_keys=%d chrono_len=%d",
-                        req_id,
-                        by_layer is None,
-                        chrono_by_req is None,
-                        selected_count,
-                        retrieve_count,
-                        num_output_tokens,
-                        incoming_row_lens,
-                        prev_row_lens,
-                        len(self._sparse_by_layer_logical.get(req_id, {})),
-                        len(self._sparse_chrono_phys.get(req_id, [])),
-                    )
             sparse_row_collapse_guard = (
                 self._has_sparse_attn
                 and num_output_tokens > 0
@@ -4195,6 +4177,7 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            start = time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4202,6 +4185,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            logger.info(f"model_forward {(time.perf_counter() - start) * 1000}")
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -7018,11 +7002,14 @@ class GPUModelRunner(
                             )
                             return
 
+                        start = time.perf_counter()
                         q_head_gather = self._build_sparse_runtime_q_head_gather(
                             layer_name=name,
                             query=q,
                             spec=spec,
                         )
+                        end = time.perf_counter()
+                        logger.info(f"[sha] _build_sparse_runtime_q_head_gather = {(end - start) * 1000}")
                         setattr(
                             module,
                             "_vllm_sparse_runtime_q_head_gather",
@@ -7052,16 +7039,7 @@ class GPUModelRunner(
         total_tokens: int,
         spec: SparseAttentionSpec,
         budget_override: int | None = None,
-    ) -> tuple[torch.Tensor, int]:
-        """
-        Select prompt tokens by expanding cluster member lists.
-
-        Returns:
-            selected_ids: [num_kv_heads, total_selected] int64 tensor.
-                Each row contains the concatenated head / dynamic / tail token ids.
-            valid_len: int, the number of valid tokens per head (all heads have the
-                same length due to min-size truncation).
-        """
+    ) -> tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]:
         num_kv_heads = q_kv_head_wise.size(0)
         head_dim = q_kv_head_wise.size(2)
         device = q_kv_head_wise.device
@@ -7081,7 +7059,7 @@ class GPUModelRunner(
         if head_n >= tail_start:
             ids = torch.arange(total_tokens, device=device, dtype=torch.int64)
             out = ids.unsqueeze(0).expand(num_kv_heads, -1).contiguous()
-            return out, total_tokens
+            return out, total_tokens, 0, None
 
         tail_len = total_tokens - tail_start
         cap = budget
@@ -7096,7 +7074,7 @@ class GPUModelRunner(
                 parts.append(torch.arange(tail_start, total_tokens, device=device, dtype=torch.int64))
             steady = torch.cat(parts)
             out = steady.unsqueeze(0).expand(num_kv_heads, -1).contiguous()
-            return out, steady.size(0)
+            return out, steady.size(0), 0, None
 
         # ---------- cluster scoring ----------
         centres = states.cluster_centres  # [H, C, D]
@@ -7107,45 +7085,12 @@ class GPUModelRunner(
         group_cluster_scores = cluster_probs.sum(dim=1)            # [H, C]
         top_clusters = torch.topk(group_cluster_scores, k=nprobe, dim=-1).indices  # [H, P]
 
-        # start_t = time.perf_counter()
-
-        # ---------- expand selected clusters ----------
-        members = states.cluster_members          # [H, C, max_cluster_size]
-        max_cluster_size = members.shape[2]
-        member_rows = members.gather(
-            1, top_clusters.unsqueeze(-1).expand(num_kv_heads, nprobe, max_cluster_size)
-        )                                          # [H, P, S]
+        # ---------- cumsum selected clusters for start index ----------
         size_rows = states.cluster_size.gather(1, top_clusters)    # [H, P]
-
-        slot_idx = torch.arange(max_cluster_size, device=device).view(1, 1, -1)
-        valid = slot_idx < size_rows.unsqueeze(-1)                 # [H, P, S]
-
-        valid_flat = valid.reshape(num_kv_heads, -1)               # [H, N]
-        member_flat = member_rows.reshape(num_kv_heads, -1)        # [H, N]
-        token_cu = torch.cumsum(valid_flat, dim=1)
-        select_flat = valid_flat & (token_cu <= cap)               # [H, N]
-
-        # ---------- truncate all heads to the same dynamic length ----------
-        counts = select_flat.sum(dim=1)            # [H]
-        min_size = counts.min().item()             # shortest dynamic count across heads
-
-        pos = torch.cumsum(select_flat, dim=1)   # [H, N], 1-indexed for selected positions
-        keep = select_flat & (pos <= min_size)         # [H, N]
-        col_idx = keep.nonzero()[:, 1].view(num_kv_heads, min_size)  # [H, min_size]
-        dyn_gpu = member_flat.gather(1, col_idx)                     # [H, min_size]
-
-        # ---------- assemble final tensor: head + dynamic + tail ----------
-        total_selected = head_n + min_size + tail_len
-        out = torch.empty((num_kv_heads, total_selected), dtype=torch.int64, device=device)
-
-        if head_n > 0:
-            out[:, :head_n] = torch.arange(head_n, device=device).unsqueeze(0)
-        out[:, head_n:head_n + min_size] = dyn_gpu
-        if tail_len > 0:
-            out[:, head_n + min_size:] = torch.arange(tail_start, total_tokens, device=device).unsqueeze(0)
-
-        # logger.info(f"[_sparse_select_tokens] construct tokens cost {1000 * (time.perf_counter() - start_t)}ms")
-        return out, total_selected
+        cluster_start_index = torch.cumsum(size_rows, dim=1, dtype=torch.int32)
+        # min_size = cumsum_selected[:, -1].min().item()
+        total_selected = head_n + tail_len + budget
+        return top_clusters, total_selected, 0, cluster_start_index
 
 
     def _get_or_create_sparse_ctx(
@@ -7292,17 +7237,11 @@ class GPUModelRunner(
         )
         budget = int(spec.sparse_selection_budget())
 
-        bt_gpu = self.input_batch.block_table[kv_cache_gid].block_table.gpu
-        block_size = (
-            self.kv_cache_config.kv_cache_groups[kv_cache_gid]
-            .kv_cache_spec.block_size
-        )
-
         per_req_selected_ids: list[list[list[torch.Tensor]]] = []
         per_req_actual_kv_len: list[int] = []
-        per_req_phys: list[torch.Tensor] = []
-        per_req_slots: list[torch.Tensor] = []
-        per_req_k_len: list[int] = []
+        per_req_token_start_index: list[torch.Tensor] = []
+        per_req_cluster_start_index: list[torch.Tensor] = []
+        per_req_cluster_meta: list[_SparseOnlineLayerState] = []
 
         start_t = time.perf_counter()
         for req_idx in range(num_reqs):
@@ -7322,17 +7261,6 @@ class GPUModelRunner(
                 # still in prefill, continue
                 continue
             prompt_len = min(p_count, seq_len)
-            pending_count = max(0, seq_len - prompt_len)
-            head_n = min(int(spec.static_pattern_start), prompt_len)
-            tail_start = max(
-                0, prompt_len - int(spec.static_pattern_end)
-            )
-            steady_count = (
-                prompt_len
-                if head_n >= tail_start
-                else head_n + (prompt_len - tail_start)
-            )
-            select_budget = max(0, budget - pending_count)
             out_before_step = self._sparse_output_tokens_before_step.get(
                 rid, len(req_state.output_token_ids)
             )
@@ -7350,88 +7278,31 @@ class GPUModelRunner(
             # q_tok [num_q_heads, head_size]
             q_kv_head_wise = q_tok.view(num_kv_heads, num_queries_per_kv, -1)
 
-            selected_ids, actual_kv_len = self._sparse_select_tokens(
+            selected_ids, actual_kv_len, token_start_index, cluster_start_index = self._sparse_select_tokens(
                 states=layer_stats,
                 q_kv_head_wise=q_kv_head_wise,
                 total_tokens=prompt_len,
                 spec=spec,
-                budget_override=select_budget,
+                budget_override=budget,
             )
             per_req_selected_ids.append(selected_ids)
             per_req_actual_kv_len.append(actual_kv_len)
-            sel_cpu = selected_ids.detach().to("cpu")
-            logger.warning(
-                "[sparse-sel] rid=%s layer=%s actual_kv_len=%d "
-                "selected.shape=%s sel.min=%d sel.max=%d prompt_len=%d "
-                "pending=%d head_n=%d tail_start=%d budget=%d "
-                "cluster_size.shape=%s cluster_size.max=%d "
-                "cluster_members.shape=%s cluster_members.max=%d",
-                rid, layer_name, actual_kv_len,
-                tuple(selected_ids.shape),
-                int(sel_cpu.min()), int(sel_cpu.max()),
-                prompt_len, pending_count, head_n, tail_start, select_budget,
-                tuple(layer_stats.cluster_size.shape),
-                int(layer_stats.cluster_size.max()),
-                tuple(layer_stats.cluster_members.shape),
-                int(layer_stats.cluster_members.max()),
-            )
+            per_req_token_start_index.append(token_start_index)
+            per_req_cluster_start_index.append(cluster_start_index)
+            per_req_cluster_meta.append(layer_stats)
 
-            device = q_flat.device
-            offloaded = rid in self._sparse_offloaded_req_ids
-            if offloaded:
-                scratch_ids = self._sparse_scratch_block_ids.get(rid, [])
-                n_scratch_tokens = len(scratch_ids) * block_size
-                decode_start = n_scratch_tokens
-                decode_end = n_scratch_tokens + pending_count
-            else:
-                decode_start = prompt_len
-                decode_end = seq_len
-            positions = torch.cat(
-                [
-                    torch.arange(
-                        actual_kv_len, device=device, dtype=torch.int64
-                    ),
-                    torch.arange(
-                        decode_start, decode_end, device=device, dtype=torch.int64
-                    ),
-                ]
-            )
-            row = bt_gpu[req_idx]
-            phys_req = row[positions // block_size].to(torch.int64)
-            slots_req = (positions % block_size).to(torch.int64)
-            per_req_phys.append(phys_req)
-            per_req_slots.append(slots_req)
-            per_req_k_len.append(actual_kv_len + pending_count)
-
+            # TODO: construct static zone by appending all decode tokens
+            # pending_count = int(seq_len) - int(p_count)
             # TODO: construct estimation zone by appending all unselected clusters' centroids
-        logger.info(f"[_build_sparse_runtime_q_head_gather] Layer {layer_name}: select top-k for {num_reqs} requests costs {(time.perf_counter() - start_t) * 1000}ms")
-
-        if per_req_phys:
-            phys_cat = torch.cat(per_req_phys)
-            slots_cat = torch.cat(per_req_slots)
-            k_lens_t = torch.tensor(
-                per_req_k_len, dtype=torch.int32, device=phys_cat.device
-            )
-            cu_k = torch.zeros(
-                len(per_req_k_len) + 1,
-                dtype=torch.int32,
-                device=phys_cat.device,
-            )
-            cu_k[1:] = torch.cumsum(k_lens_t, dim=0)
-            max_seqlen_k = max(per_req_k_len)
-        else:
-            phys_cat = None
-            slots_cat = None
-            cu_k = None
-            max_seqlen_k = 0
+        # logger.info(f"[_build_sparse_runtime_q_head_gather] Layer {layer_name}: select top-k for {num_reqs} requests costs {(time.perf_counter() - start_t) * 1000}ms")
 
         return {
             "per_req_selected_ids": per_req_selected_ids,
             "per_req_actual_kv_len": per_req_actual_kv_len,
-            "sparse_gather_phys": phys_cat,
-            "sparse_gather_slots": slots_cat,
-            "sparse_gather_cu_seqlens_k": cu_k,
-            "sparse_gather_max_seqlen_k": max_seqlen_k,
+            "per_req_token_start_index": per_req_token_start_index,
+            "per_req_cluster_start_index": per_req_cluster_start_index,
+            "retrieve_budget": budget,
+            "per_req_cluster_meta": per_req_cluster_meta,
         }
 
 

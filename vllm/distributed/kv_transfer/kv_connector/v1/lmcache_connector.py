@@ -150,7 +150,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
-    def wait_for_layer_load(self, layer_name: str, selected_tokens: list[torch.Tensor]) -> None:
+    def wait_for_layer_load(self, layer_name: str, selected_tokens: list[torch.Tensor], cluster_meta: list, token_start_index: list[torch.Tensor], cluster_start_index: list[torch.Tensor], retrieve_budget: int) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
         paged buffer. This is called from within attention layer to ensure
@@ -161,7 +161,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
-        self._lmcache_engine.wait_for_layer_load(layer_name, selected_tokens)
+        self._lmcache_engine.wait_for_layer_load(layer_name, selected_tokens, cluster_meta, token_start_index, cluster_start_index, retrieve_budget)
 
     def get_prefill_saved(self) -> set[str] | None:
         fn = getattr(self._lmcache_engine, "get_prefill_saved", None)
@@ -303,7 +303,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         meta = self._lmcache_engine.build_connector_meta(scheduler_output)
-        self._maybe_inject_offloaded_loads(meta, scheduler_output)
+        #self._maybe_inject_offloaded_loads(meta, scheduler_output)
         return meta
 
     def _maybe_inject_offloaded_loads(
@@ -366,7 +366,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 + block_ids_t.reshape(-1, 1) * block_size
             ).flatten()
             slot_mapping = torch.zeros(n_load, dtype=torch.long)
-            slot_mapping[:scratch_cap] = real_slots[:scratch_cap]
+            copy_n = min(n_load, scratch_cap)
+            slot_mapping[:copy_n] = real_slots[:copy_n]
             load_spec = LoadSpec(
                 vllm_cached_tokens=0,
                 lmcache_cached_tokens=n_load,

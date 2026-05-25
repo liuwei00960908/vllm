@@ -1764,6 +1764,9 @@ class Scheduler(SchedulerInterface):
                 model_runner_output.sparse_new_value_features,
             )
         trace_mark("sparse_post_decode_rebalance")
+
+        start = time.perf_counter()
+
         prefill_done_ids: set[str] = set()
         if model_runner_output.sparse_block_features:
             vfeat_map = model_runner_output.sparse_block_value_features or {}
@@ -1799,6 +1802,10 @@ class Scheduler(SchedulerInterface):
         if prefill_done_ids and self.connector is not None and sparse_mgr is not None:
             for rid in prefill_done_ids:
                 sparse_mgr.free_prefill_blocks_after_save(rid)
+
+        end = time.perf_counter()
+        logger.info(f"[sha] prefill after save {(end - start) * 1000 }")
+
         trace_mark("sparse_free_prefill_after_save")
         if model_runner_output.sparse_query_vectors:
             self.kv_cache_manager.sparse_update_query_vectors(

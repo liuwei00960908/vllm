@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
+import time
+
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.vllm import VllmConfig
@@ -394,6 +396,9 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
+
+        start = time.perf_counter()
+
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
         output_dtype = query.dtype
@@ -467,7 +472,9 @@ class Attention(nn.Module, AttentionLayerBase):
                     self.layer_name,
                     kv_cache_dummy_dep=kv_cache_dummy_dep,
                 )
-            return output.view(-1, hidden_size)
+            ret = output.view(-1, hidden_size)
+            logger.info(f"forward inside {(time.perf_counter() - start) * 1000}")
+            return ret
         else:
             assert self.attn_backend.forward_includes_kv_cache_update, (
                 "Split KV cache update not supported when output tensor not provided."
@@ -475,9 +482,11 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.use_direct_call:
                 return unified_attention(query, key, value, self.layer_name)
             else:
-                return torch.ops.vllm.unified_attention(
+                ret = torch.ops.vllm.unified_attention(
                     query, key, value, self.layer_name
                 )
+                logger.info(f"forward inside {(time.perf_counter() - start) * 1000}")
+                return ret
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -699,6 +708,7 @@ def unified_kv_cache_update(
     value: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
+    start = time.perf_counter()
     """
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
@@ -716,7 +726,9 @@ def unified_kv_cache_update(
             layer_slot_mapping,
         )
 
-    return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+    ret = torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+    logger.info(f"[sha] do kv cache update {(time.perf_counter() - start) * 1000}")
+    return ret
 
 
 def unified_kv_cache_update_fake(

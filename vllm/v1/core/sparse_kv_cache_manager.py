@@ -88,6 +88,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+import time
+
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -768,9 +770,10 @@ class SparseKVManager(FullAttentionManager):
         # bypassing the prefill branch even on their first decode step.
         if request_id in self._prefill_offloaded:
             req_blocks = self.req_to_blocks[request_id]
-            return self._allocate_new_blocks_offloaded(
+            ret = self._allocate_new_blocks_offloaded(
                 request_id, req_blocks, num_tokens_main_model
             )
+            return ret
 
         if request_id not in self.num_cached_block:
             # Prefill: allocate sequentially for all prompt tokens.
@@ -848,6 +851,7 @@ class SparseKVManager(FullAttentionManager):
         req_blocks: list[KVCacheBlock],
         num_tokens_main_model: int,
     ) -> list[KVCacheBlock]:
+        start = time.perf_counter()
         if request_id not in self._scratch_blocks:
             n = self._scratch_block_count()
             new = self.block_pool.get_new_blocks(n) if n > 0 else []
@@ -891,6 +895,7 @@ class SparseKVManager(FullAttentionManager):
         )
         self._last_num_tokens_main_model[request_id] = num_tokens_main_model
         self.num_cached_block[request_id] = 0
+        logger.info(f"[sha] allocate {(time.perf_counter() - start) * 1000}")
         return list(req_blocks)
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
@@ -921,12 +926,14 @@ class SparseKVManager(FullAttentionManager):
         self._decode_block_fill.pop(request_id, None)
         self._last_num_tokens_main_model.pop(request_id, None)
         self._prefill_offloaded.discard(request_id)
-        for b in self._scratch_blocks.pop(request_id, []):
-            if not b.is_null:
-                self.block_pool.free_blocks([b])
-        for b in self._decode_history_blocks.pop(request_id, []):
-            if not b.is_null:
-                self.block_pool.free_blocks([b])
+        scratch_blocks = self._scratch_blocks.pop(request_id, [])
+        history_blocks = self._decode_history_blocks.pop(request_id, [])
+        orphan_offload = [
+            b for b in (*scratch_blocks, *history_blocks)
+            if id(b) not in current_block_ids and not b.is_null
+        ]
+        if orphan_offload:
+            self.block_pool.free_blocks(reversed(orphan_offload))
 
         super().free(request_id)
         self._layer_states.pop(request_id, None)
