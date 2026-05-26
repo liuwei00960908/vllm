@@ -81,6 +81,7 @@ def main():
         max_tokens=context_length,  # 生成20个token，足够看完整流程
         temperature=0.0,  # 固定输出，方便调试
         top_p=1.0,
+        ignore_eos=test_speed,
     )
 
     print(f"=== 添加请求 {request_id} ===")
