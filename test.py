@@ -15,7 +15,7 @@ def main():
     ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
     context_length = 5000
     block_size = 16
-    test_speed = False
+    test_speed = True
     print_output = False
 
     # ====================== 1. 引擎配置（和server端完全一致） ======================
@@ -35,7 +35,7 @@ def main():
                 "cluster_granularity": "token",
                 "num_clusters": 32,
                 "n_segment": 1,
-                "nprobe": 16,
+                "nprobe": 32,
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,
