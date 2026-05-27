@@ -15,7 +15,7 @@ def main():
     ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
     context_length = 5000
     block_size = 16
-    test_speed = True
+    test_speed = False
     print_output = False
 
     # ====================== 1. 引擎配置（和server端完全一致） ======================
@@ -63,20 +63,12 @@ def main():
     # ====================== 3. 硬编码请求（模拟server收到HTTP请求） ======================
     request_id = "debug_req_001"  # 字符串类型，和你之前问的一致
     tokenizer = AutoTokenizer.from_pretrained(engine_args.model)
-    if test_speed:
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user",
-            "content": "请直接续写下面的文本，不要解释，不要停顿，不要加标点：\n你好你好你好你好你好你好你好你好你好你好"}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    else:
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user",
-            "content": "说明一下vllm是什么"}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user",
+        "content": "写一篇描写春天的小作文"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     sampling_params = SamplingParams(
         max_tokens=context_length,  # 生成20个token，足够看完整流程
         temperature=0.0,  # 固定输出，方便调试
