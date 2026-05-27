@@ -541,15 +541,11 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            start = time.perf_counter()
             scheduler_output = self.scheduler.schedule()
-            logger.info(f"[sha] schduler {(time.perf_counter() - start) * 1000}")
             with self.log_error_detail(scheduler_output):
-                start = time.perf_counter()
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
-                logger.info(f"[sha] execute_model {(time.perf_counter() - start) * 1000}")
 
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
@@ -609,11 +605,9 @@ class EngineCore:
         # during the model execution.
         self._process_aborts_queue()
 
-        start = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        logger.info(f"[sha] update_from_output {(time.perf_counter() - start) * 1000}")
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is

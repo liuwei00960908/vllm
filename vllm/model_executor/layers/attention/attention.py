@@ -397,8 +397,6 @@ class Attention(nn.Module, AttentionLayerBase):
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
 
-        start = time.perf_counter()
-
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
         output_dtype = query.dtype
@@ -473,7 +471,6 @@ class Attention(nn.Module, AttentionLayerBase):
                     kv_cache_dummy_dep=kv_cache_dummy_dep,
                 )
             ret = output.view(-1, hidden_size)
-            logger.info(f"forward inside {(time.perf_counter() - start) * 1000}")
             return ret
         else:
             assert self.attn_backend.forward_includes_kv_cache_update, (
@@ -485,7 +482,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 ret = torch.ops.vllm.unified_attention(
                     query, key, value, self.layer_name
                 )
-                logger.info(f"forward inside {(time.perf_counter() - start) * 1000}")
                 return ret
 
     def calc_kv_scales(self, query, key, value):
@@ -708,7 +704,6 @@ def unified_kv_cache_update(
     value: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    start = time.perf_counter()
     """
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
@@ -727,7 +722,6 @@ def unified_kv_cache_update(
         )
 
     ret = torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
-    logger.info(f"[sha] do kv cache update {(time.perf_counter() - start) * 1000}")
     return ret
 
 

@@ -126,6 +126,9 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.ops.sparse_select import (
+    batched_sparse_select_dynamic_only,
+)
 from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
@@ -4177,7 +4180,6 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            start = time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4185,7 +4187,6 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
-            logger.info(f"model_forward {(time.perf_counter() - start) * 1000}")
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -7002,14 +7003,11 @@ class GPUModelRunner(
                             )
                             return
 
-                        start = time.perf_counter()
                         q_head_gather = self._build_sparse_runtime_q_head_gather(
                             layer_name=name,
                             query=q,
                             spec=spec,
                         )
-                        end = time.perf_counter()
-                        logger.info(f"[sha] _build_sparse_runtime_q_head_gather = {(end - start) * 1000}")
                         setattr(
                             module,
                             "_vllm_sparse_runtime_q_head_gather",
@@ -7211,6 +7209,18 @@ class GPUModelRunner(
     ) -> dict[str, torch.Tensor] | None:
         """
             Build the per-query-head compact gather metadata for FA.
+
+            The hot path runs once per sparse layer per decode step.  We:
+
+            1. classify each request in the batch (skip prefill, hard-fail
+               on missing state, branch off the static-only edge case);
+            2. for the *dynamic* cluster-scoring path, batch all
+               surviving requests into a single CUDA kernel launch via
+               ``batched_sparse_select_dynamic_only`` -- replacing the
+               previous Python ``for`` loop that did one ``bmm`` /
+               ``topk`` / ``cumsum`` per request;
+            3. re-assemble the output lists in the original request
+               order so downstream code sees the same shape as before.
         """
 
         kv_cache_gid = self._sparse_layer_gid_by_name.get(layer_name)
@@ -7230,20 +7240,32 @@ class GPUModelRunner(
         if num_reqs <= 0:
             return None
 
-        # logger.info(f"[_build_sparse_runtime_q_head_gather] query.shape = {query.shape}")
         q_flat = (
             query.view(-1, num_heads, head_size)
             if query.dim() != 3 else query
         )
         budget = int(spec.sparse_selection_budget())
+        gqa_regular = bool(ctx.get("gqa_regular", False))
+        assert gqa_regular, (
+            "_build_sparse_runtime_q_head_gather requires regular GQA"
+        )
 
-        per_req_selected_ids: list[list[list[torch.Tensor]]] = []
+        per_req_selected_ids: list[torch.Tensor] = []
         per_req_actual_kv_len: list[int] = []
-        per_req_token_start_index: list[torch.Tensor] = []
+        per_req_token_start_index: list[int] = []
         per_req_cluster_start_index: list[torch.Tensor] = []
         per_req_cluster_meta: list[_SparseOnlineLayerState] = []
 
-        start_t = time.perf_counter()
+        # ----- Pass 1: classify each request -----------------------
+        # ``decoded`` holds, in original batch order, all requests
+        # that survived the per-request invariants.  For each entry
+        # we remember whether it must take the static-only path or
+        # the dynamic cluster-scoring path.
+        decoded: list[dict] = []
+        static_pat_start = int(spec.static_pattern_start)
+        static_pat_end = int(spec.static_pattern_end)
+        nprobe_spec = int(spec.nprobe)
+
         for req_idx in range(num_reqs):
             rid = self.input_batch.req_ids[req_idx]
             req_states = self._sparse_online_index.get(rid)
@@ -7258,7 +7280,7 @@ class GPUModelRunner(
             seq_len = int(self.seq_lens.np[req_idx])
             p_count = int(self.input_batch.num_prompt_tokens[req_idx])
             if seq_len <= p_count:
-                # still in prefill, continue
+                # still in prefill -- not emitted to the output lists
                 continue
             prompt_len = min(p_count, seq_len)
             out_before_step = self._sparse_output_tokens_before_step.get(
@@ -7270,31 +7292,112 @@ class GPUModelRunner(
             if tok_end <= 0:
                 return None
 
-            q_tok = q_flat[tok_end - 1]
+            head_n = min(static_pat_start, prompt_len)
+            tail_start = max(0, prompt_len - static_pat_end)
+            num_layer_clusters = int(layer_stats.cluster_centres.shape[1])
+            nprobe_r = min(nprobe_spec, num_layer_clusters)
 
-            gqa_regular = bool(ctx.get("gqa_regular", False))
-            assert gqa_regular
-            # Zero-kernel q split: slices share q_tok's storage.
-            # q_tok [num_q_heads, head_size]
+            is_static_only = (
+                head_n >= tail_start
+                or nprobe_r <= 0
+                or budget <= 0
+            )
+
+            decoded.append({
+                "req_idx": req_idx,
+                "tok_end": tok_end,
+                "layer_stats": layer_stats,
+                "prompt_len": prompt_len,
+                "head_n": head_n,
+                "tail_start": tail_start,
+                "tail_len": prompt_len - tail_start,
+                "is_static": is_static_only,
+            })
+
+        # No request survived (e.g. whole batch is still in prefill).
+        if not decoded:
+            return {
+                "per_req_selected_ids": per_req_selected_ids,
+                "per_req_actual_kv_len": per_req_actual_kv_len,
+                "per_req_token_start_index": per_req_token_start_index,
+                "per_req_cluster_start_index": per_req_cluster_start_index,
+                "retrieve_budget": budget,
+                "per_req_cluster_meta": per_req_cluster_meta,
+            }
+
+        # ----- Pass 2: batched CUDA call for dynamic requests ------
+        start_t = time.perf_counter()
+        dyn_local_indices = [
+            i for i, info in enumerate(decoded) if not info["is_static"]
+        ]
+        dyn_results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        if dyn_local_indices:
+            dyn_batch_indices = [
+                decoded[i]["req_idx"] for i in dyn_local_indices
+            ]
+            dyn_layer_stats = [
+                decoded[i]["layer_stats"] for i in dyn_local_indices
+            ]
+            dyn_centres = [s.cluster_centres for s in dyn_layer_stats]
+            dyn_sizes = [s.cluster_size for s in dyn_layer_stats]
+
+            full_qsl_gpu = self.query_start_loc.gpu[: num_reqs + 1]
+            dyn_idx_t = torch.as_tensor(
+                dyn_batch_indices, dtype=torch.int64, device=q_flat.device
+            )
+            top_clusters, csi_batch = batched_sparse_select_dynamic_only(
+                q_flat=q_flat,
+                full_query_start_loc_gpu=full_qsl_gpu,
+                active_batch_indices=dyn_idx_t,
+                per_req_centres=dyn_centres,
+                per_req_sizes=dyn_sizes,
+                nprobe=nprobe_spec,
+                group_size=num_queries_per_kv,
+            )
+            for j, i in enumerate(dyn_local_indices):
+                dyn_results[i] = (top_clusters[j], csi_batch[j])
+
+        # ----- Pass 3: handle static-only edge cases (rare) --------
+        static_results: dict[int, tuple[torch.Tensor, int, int, torch.Tensor | None]] = {}
+        for i, info in enumerate(decoded):
+            if not info["is_static"]:
+                continue
+            q_tok = q_flat[info["tok_end"] - 1]
             q_kv_head_wise = q_tok.view(num_kv_heads, num_queries_per_kv, -1)
-
-            selected_ids, actual_kv_len, token_start_index, cluster_start_index = self._sparse_select_tokens(
-                states=layer_stats,
+            sel_ids, actual_kv_len, tsi, csi = self._sparse_select_tokens(
+                states=info["layer_stats"],
                 q_kv_head_wise=q_kv_head_wise,
-                total_tokens=prompt_len,
+                total_tokens=info["prompt_len"],
                 spec=spec,
                 budget_override=budget,
             )
-            per_req_selected_ids.append(selected_ids)
-            per_req_actual_kv_len.append(actual_kv_len)
-            per_req_token_start_index.append(token_start_index)
-            per_req_cluster_start_index.append(cluster_start_index)
-            per_req_cluster_meta.append(layer_stats)
+            static_results[i] = (sel_ids, actual_kv_len, tsi, csi)
 
-            # TODO: construct static zone by appending all decode tokens
-            # pending_count = int(seq_len) - int(p_count)
-            # TODO: construct estimation zone by appending all unselected clusters' centroids
-        # logger.info(f"[_build_sparse_runtime_q_head_gather] Layer {layer_name}: select top-k for {num_reqs} requests costs {(time.perf_counter() - start_t) * 1000}ms")
+        # ----- Pass 4: assemble outputs in original order ----------
+        for i, info in enumerate(decoded):
+            if info["is_static"]:
+                sel_ids, actual_kv_len, tsi, csi = static_results[i]
+            else:
+                sel_ids, csi = dyn_results[i]
+                # Mirror the bookkeeping inside _sparse_select_tokens
+                actual_kv_len = info["head_n"] + info["tail_len"] + budget
+                tsi = 0
+            per_req_selected_ids.append(sel_ids)
+            per_req_actual_kv_len.append(actual_kv_len)
+            per_req_token_start_index.append(tsi)
+            per_req_cluster_start_index.append(csi)
+            per_req_cluster_meta.append(info["layer_stats"])
+
+        end_t = time.perf_counter()
+        logger.info(
+            "[_sparse_select_tokens] Layer %s: batched select for "
+            "num_reqs=%d (dynamic=%d, static_only=%d) costs %.3fms",
+            layer_name,
+            num_reqs,
+            len(dyn_local_indices),
+            len(static_results),
+            (end_t - start_t) * 1000.0,
+        )
 
         return {
             "per_req_selected_ids": per_req_selected_ids,
