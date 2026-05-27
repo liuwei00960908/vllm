@@ -22,6 +22,11 @@ extern "C" int build_sparse_block_table_launcher_raw(
     int32_t storage_dtype,
     const int32_t* d_free_block_ids,
     int32_t max_free_block,
+    const int32_t* d_steady_start_block_ids,
+    int32_t steady_start_blocks,
+    const int32_t* d_steady_end_block_ids,
+    int32_t steady_end_blocks,
+    const int32_t* d_steady_state,
     int32_t* d_out_block_table,
     int32_t* d_out_bt_len,
     int32_t* d_out_seqused_k,
@@ -119,6 +124,9 @@ static void build_sparse_block_table_cuda_impl(
     torch::Tensor temp_block_ids,
     torch::Tensor block_storage,
     torch::Tensor free_block_ids,
+    torch::Tensor steady_start_block_ids,
+    torch::Tensor steady_end_block_ids,
+    torch::Tensor steady_state,
     int64_t max_bt_len,
     torch::Tensor out_block_table,
     torch::Tensor out_bt_len,
@@ -137,6 +145,9 @@ static void build_sparse_block_table_cuda_impl(
     check_cuda_contiguous(temp_block_ids, "temp_block_ids");
     check_cuda_contiguous(block_storage, "block_storage");
     check_cuda_contiguous(free_block_ids, "free_block_ids");
+    check_cuda_contiguous(steady_start_block_ids, "steady_start_block_ids");
+    check_cuda_contiguous(steady_end_block_ids, "steady_end_block_ids");
+    check_cuda_contiguous(steady_state, "steady_state");
     check_cuda_contiguous(out_block_table, "out_block_table");
     check_cuda_contiguous(out_bt_len, "out_bt_len");
     check_cuda_contiguous(out_seqused_k, "out_seqused_k");
@@ -153,6 +164,12 @@ static void build_sparse_block_table_cuda_impl(
     TORCH_CHECK(cluster_total_kv_counts.scalar_type() == torch::kInt32, "cluster_total_kv_counts must be int32");
     TORCH_CHECK(temp_block_ids.scalar_type() == torch::kInt32, "temp_block_ids must be int32");
     TORCH_CHECK(free_block_ids.scalar_type() == torch::kInt32, "free_block_ids must be int32");
+    TORCH_CHECK(steady_start_block_ids.scalar_type() == torch::kInt32,
+                "steady_start_block_ids must be int32");
+    TORCH_CHECK(steady_end_block_ids.scalar_type() == torch::kInt32,
+                "steady_end_block_ids must be int32");
+    TORCH_CHECK(steady_state.scalar_type() == torch::kInt32,
+                "steady_state must be int32");
 
     TORCH_CHECK(top_clusters.dim() == 3, "top_clusters shape must be [NQ,Hq,nprobe]");
     TORCH_CHECK(cluster_compact_block_ids.dim() == 3, "cluster_compact_block_ids shape must be [Hkv,C,maxB]");
@@ -161,6 +178,12 @@ static void build_sparse_block_table_cuda_impl(
     TORCH_CHECK(temp_block_ids.dim() == 1, "temp_block_ids shape must be [max_temp_blocks]");
     TORCH_CHECK(block_storage.dim() == 4, "block_storage shape must be [2,total_blocks,block_size,dim]");
     TORCH_CHECK(free_block_ids.dim() == 1, "free_block_ids shape must be [max_free_block]");
+    TORCH_CHECK(steady_start_block_ids.dim() == 2,
+                "steady_start_block_ids shape must be [Hkv,start_blocks]");
+    TORCH_CHECK(steady_end_block_ids.dim() == 2,
+                "steady_end_block_ids shape must be [Hkv,end_blocks]");
+    TORCH_CHECK(steady_state.dim() == 1 && steady_state.numel() >= 4,
+                "steady_state shape must be [>=4]");
 
     TORCH_CHECK(max_bt_len > 0, "max_bt_len must be > 0");
     TORCH_CHECK(max_bt_len <= INT32_MAX, "max_bt_len too large: ", max_bt_len);
@@ -181,6 +204,10 @@ static void build_sparse_block_table_cuda_impl(
     TORCH_CHECK(cluster_total_kv_counts.size(0) == Hkv &&
                 cluster_total_kv_counts.size(1) == C,
                 "cluster_total_kv_counts shape mismatch");
+    TORCH_CHECK(steady_start_block_ids.size(0) == Hkv,
+                "steady_start_block_ids Hkv mismatch");
+    TORCH_CHECK(steady_end_block_ids.size(0) == Hkv,
+                "steady_end_block_ids Hkv mismatch");
 
     TORCH_CHECK(cluster_temp_kv_pos.size(0) == Hkv &&
                 cluster_temp_kv_pos.size(1) == C,
@@ -203,10 +230,13 @@ static void build_sparse_block_table_cuda_impl(
 
     const int max_free_block = static_cast<int>(free_block_ids.size(0));
     const int rows = NQ * Hq;
+    const int steady_blocks_per_head =
+        static_cast<int>(steady_start_block_ids.size(1) +
+                         steady_end_block_ids.size(1));
 
     const int64_t max_plan_count_64 =
         static_cast<int64_t>(rows) *
-        static_cast<int64_t>(nprobe) *
+        static_cast<int64_t>(nprobe + steady_blocks_per_head) *
         static_cast<int64_t>(std::max(block_size - 1, 0));
 
     TORCH_CHECK(max_plan_count_64 >= 0 && max_plan_count_64 <= INT32_MAX,
@@ -255,6 +285,11 @@ static void build_sparse_block_table_cuda_impl(
         map_storage_dtype(block_storage.scalar_type()),
         free_block_ids.data_ptr<int32_t>(),
         max_free_block,
+        steady_start_block_ids.data_ptr<int32_t>(),
+        static_cast<int32_t>(steady_start_block_ids.size(1)),
+        steady_end_block_ids.data_ptr<int32_t>(),
+        static_cast<int32_t>(steady_end_block_ids.size(1)),
+        steady_state.data_ptr<int32_t>(),
         out_block_table.data_ptr<int32_t>(),
         out_bt_len.data_ptr<int32_t>(),
         out_seqused_k.data_ptr<int32_t>(),
@@ -296,6 +331,9 @@ std::vector<torch::Tensor> build_sparse_block_table_cuda(
     auto out_block_table = torch::empty({rows, max_bt_len}, i32_opts);
     auto out_bt_len = torch::empty({rows}, i32_opts);
     auto out_seqused_k = torch::empty({rows}, i32_opts);
+    const int Hkv = static_cast<int>(cluster_compact_block_ids.size(0));
+    auto empty_steady_blocks = torch::empty({Hkv, 0}, i32_opts);
+    auto empty_steady_state = torch::zeros({4}, i32_opts);
     const int device_index = top_clusters.get_device();
     auto& ws = get_workspace(device_index, rows, plan_capacity_needed, i32_opts);
 
@@ -307,6 +345,9 @@ std::vector<torch::Tensor> build_sparse_block_table_cuda(
         temp_block_ids,
         block_storage,
         free_block_ids,
+        empty_steady_blocks,
+        empty_steady_blocks,
+        empty_steady_state,
         max_bt_len,
         out_block_table,
         out_bt_len,
@@ -336,6 +377,9 @@ std::vector<torch::Tensor> build_sparse_block_table_out_cuda(
     torch::Tensor temp_block_ids,
     torch::Tensor block_storage,
     torch::Tensor free_block_ids,
+    torch::Tensor steady_start_block_ids,
+    torch::Tensor steady_end_block_ids,
+    torch::Tensor steady_state,
     int64_t max_bt_len,
     torch::Tensor out_block_table,
     torch::Tensor out_bt_len,
@@ -356,6 +400,9 @@ std::vector<torch::Tensor> build_sparse_block_table_out_cuda(
         temp_block_ids,
         block_storage,
         free_block_ids,
+        steady_start_block_ids,
+        steady_end_block_ids,
+        steady_state,
         max_bt_len,
         out_block_table,
         out_bt_len,
@@ -394,6 +441,9 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
         "  Tensor temp_block_ids,"
         "  Tensor block_storage,"
         "  Tensor free_block_ids,"
+        "  Tensor steady_start_block_ids,"
+        "  Tensor steady_end_block_ids,"
+        "  Tensor steady_state,"
         "  int max_bt_len,"
         "  Tensor out_block_table,"
         "  Tensor out_bt_len,"

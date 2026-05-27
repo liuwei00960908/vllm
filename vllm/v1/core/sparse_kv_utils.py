@@ -99,13 +99,22 @@ class SparseBlockTableBuffers:
         temp_block_ids: torch.Tensor,
         block_storage: torch.Tensor,
         free_block_ids: torch.Tensor,
+        steady_start_block_ids: torch.Tensor,
+        steady_end_block_ids: torch.Tensor,
+        steady_state: torch.Tensor,
         max_bt_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from vllm._custom_ops import build_sparse_block_table_out
 
         rows = top_clusters.shape[0] * top_clusters.shape[1]
+        block_size = int(block_storage.shape[2])
+        steady_blocks = (
+            int(steady_start_block_ids.shape[1])
+            + int(steady_end_block_ids.shape[1])
+        )
         plan_capacity = max(
-            rows * top_clusters.shape[2] * max(int(block_storage.shape[2]) - 1, 0), 1
+            rows * (top_clusters.shape[2] + steady_blocks) * max(block_size - 1, 0),
+            1,
         )
         self.ensure_capacity(
             device=top_clusters.device,
@@ -130,6 +139,9 @@ class SparseBlockTableBuffers:
             temp_block_ids,
             block_storage,
             free_block_ids,
+            steady_start_block_ids,
+            steady_end_block_ids,
+            steady_state,
             max_bt_len,
             self.block_table,
             self.bt_len,
@@ -173,6 +185,7 @@ class SparseAppendBuffers:
         cluster_centers_T: torch.Tensor,
         mean: torch.Tensor,
         cluster_center_count: torch.Tensor,
+        input_token_count: torch.Tensor,
     ) -> torch.Tensor:
         from vllm._custom_ops import append_kv_to_clusters_by_centers_inplace
 
@@ -182,7 +195,7 @@ class SparseAppendBuffers:
         if counter is None:
             assert self.used_free_block_count is not None
             counter = self.used_free_block_count
-            counter.zero_()
+        counter.zero_()
         return append_kv_to_clusters_by_centers_inplace(
             block_storage,
             cluster_compact_block_ids,
@@ -199,6 +212,7 @@ class SparseAppendBuffers:
             cluster_centers_T,
             mean,
             cluster_center_count,
+            input_token_count,
         )
 
     def append_with_labels(
@@ -225,7 +239,7 @@ class SparseAppendBuffers:
         if counter is None:
             assert self.used_free_block_count is not None
             counter = self.used_free_block_count
-            counter.zero_()
+        counter.zero_()
         return append_kv_to_clusters_inplace(
             block_storage,
             cluster_compact_block_ids,
@@ -244,14 +258,91 @@ class SparseAppendBuffers:
 
 
 @dataclass
+class SparseSteadyBuffers:
+    evicted_key: torch.Tensor | None = None
+    evicted_value: torch.Tensor | None = None
+    evicted_count: torch.Tensor | None = None
+
+    def ensure_capacity(
+        self,
+        *,
+        capacity: int,
+        hkv: int,
+        dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        shape = (max(1, capacity), hkv, dim)
+        if (
+            self.evicted_key is None
+            or self.evicted_key.shape != shape
+            or self.evicted_key.dtype != dtype
+        ):
+            self.evicted_key = torch.empty(shape, dtype=dtype, device=device)
+        if (
+            self.evicted_value is None
+            or self.evicted_value.shape != shape
+            or self.evicted_value.dtype != dtype
+        ):
+            self.evicted_value = torch.empty(shape, dtype=dtype, device=device)
+        if self.evicted_count is None or self.evicted_count.numel() != 1:
+            self.evicted_count = torch.empty((1,), dtype=torch.int32, device=device)
+
+    def update(
+        self,
+        *,
+        block_storage: torch.Tensor,
+        steady_start_block_ids: torch.Tensor,
+        steady_end_block_ids: torch.Tensor,
+        steady_state: torch.Tensor,
+        steady_start_capacity: int,
+        steady_end_capacity: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        evicted_capacity: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from vllm._custom_ops import update_sparse_steady_kv_inplace
+
+        self.ensure_capacity(
+            capacity=evicted_capacity,
+            hkv=key.shape[1],
+            dim=key.shape[2],
+            dtype=key.dtype,
+            device=key.device,
+        )
+        assert self.evicted_key is not None
+        assert self.evicted_value is not None
+        assert self.evicted_count is not None
+        return update_sparse_steady_kv_inplace(
+            block_storage,
+            steady_start_block_ids,
+            steady_end_block_ids,
+            steady_state,
+            self.evicted_key,
+            self.evicted_value,
+            self.evicted_count,
+            key,
+            value,
+            int(steady_start_capacity),
+            int(steady_end_capacity),
+        )
+
+
+@dataclass
 class SparseManagerMetadata:
     temp_block_ids: torch.Tensor | None = None              # [max_temp_blocks]
     temp_block_kv_counts: torch.Tensor | None = None        # [1]
     temp_block_kv_owner: torch.Tensor | None = None         # [max_temp_blocks * cluster_block_size, 2]
 
-    # currently unused
-    steady_zone_head: torch.Tensor | None = None    # [Hkv, steady_zone_head_count]
-    steady_zone_tail: torch.Tensor | None = None    # [Hkv, steady_zone_tail_count]
+    steady_zone_head: torch.Tensor | None = None    # [Hkv, steady_zone_head_blocks]
+    steady_zone_tail: torch.Tensor | None = None    # [Hkv, steady_zone_tail_blocks]
+    steady_state: torch.Tensor | None = None        # [total_seen, start_count, tail_count, tail_start]
+    steady_start_capacity: int = 0
+    steady_end_capacity: int = 0
+    steady_total_token_count: int = 0
+    steady_start_count: int = 0
+    steady_end_count: int = 0
+    steady_end_start: int = 0
 
     INIT_CLUSTER_BLOCK_COUNT: ClassVar[int] = 1024
     cluster_compact_block_ids: torch.Tensor | None = None   # [Hkv, C, max_cluster_block_count]
@@ -263,7 +354,56 @@ class SparseManagerMetadata:
     cluster_center_count: torch.Tensor | None = None        # [1]
     block_table_buffers: SparseBlockTableBuffers | None = None
     append_buffers: SparseAppendBuffers | None = None
+    steady_buffers: SparseSteadyBuffers | None = None
     cu_seqlens_q_buffer: torch.Tensor | None = None
+
+    def reset_steady_state_from_python(self) -> None:
+        assert self.steady_state is not None
+        self.steady_state[0] = self.steady_total_token_count
+        self.steady_state[1] = self.steady_start_count
+        self.steady_state[2] = self.steady_end_count
+        self.steady_state[3] = self.steady_end_start
+
+    def count_steady_evictions(self, num_new_tokens: int) -> int:
+        if num_new_tokens <= 0:
+            return 0
+        total = self.steady_total_token_count
+        start_cap = self.steady_start_capacity
+        end_cap = self.steady_end_capacity
+        evicted = 0
+        for _ in range(num_new_tokens):
+            if total < start_cap:
+                pass
+            elif end_cap == 0:
+                evicted += 1
+            elif total < start_cap + end_cap:
+                pass
+            else:
+                evicted += 1
+            total += 1
+        return evicted
+
+    def advance_steady_python_state(self, num_new_tokens: int) -> int:
+        evicted = self.count_steady_evictions(num_new_tokens)
+        self.steady_total_token_count += num_new_tokens
+        self.steady_start_count = min(
+            self.steady_start_capacity,
+            self.steady_total_token_count,
+        )
+        after_start = max(
+            0,
+            self.steady_total_token_count - self.steady_start_capacity,
+        )
+        if self.steady_end_capacity > 0:
+            self.steady_end_count = min(self.steady_end_capacity, after_start)
+            if self.steady_end_count == self.steady_end_capacity:
+                self.steady_end_start = (
+                    self.steady_end_start + evicted
+                ) % self.steady_end_capacity
+        else:
+            self.steady_end_count = 0
+            self.steady_end_start = 0
+        return evicted
 
 @dataclass
 class RequestSparseClusterInfo:
@@ -275,8 +415,12 @@ class SparseClusterBlockInfo:
     temp_block_ids: torch.Tensor | None = None
     reusable_block_ids: torch.Tensor | None = None
     allocated_block_ids: torch.Tensor | None = None
+    steady_start_block_ids: torch.Tensor | None = None
+    steady_end_block_ids: torch.Tensor | None = None
     used_count: torch.Tensor | int = 0
     cluster_block_size: int = 0
+    steady_start_capacity: int = 0
+    steady_end_capacity: int = 0
     num_cluster: int = 0
     num_segment: int = 0
     nprobe: int = 0
@@ -285,6 +429,8 @@ class SparseClusterBlockInfo:
     temp_block_ids_gpu: torch.Tensor | None = None
     reusable_block_ids_gpu: torch.Tensor | None = None
     allocated_block_ids_gpu: torch.Tensor | None = None
+    steady_start_block_ids_gpu: torch.Tensor | None = None
+    steady_end_block_ids_gpu: torch.Tensor | None = None
     used_count_gpu: torch.Tensor | None = None
     packed_block_info_cpu: torch.Tensor | None = None
     packed_block_info_gpu: torch.Tensor | None = None

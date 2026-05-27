@@ -3532,6 +3532,9 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "build_sparse_block_table_
         temp_block_ids: torch.Tensor,
         block_storage: torch.Tensor,
         free_block_ids: torch.Tensor,
+        steady_start_block_ids: torch.Tensor,
+        steady_end_block_ids: torch.Tensor,
+        steady_state: torch.Tensor,
         max_bt_len: int,
         out_block_table: torch.Tensor,
         out_bt_len: torch.Tensor,
@@ -3554,6 +3557,9 @@ def build_sparse_block_table_out(
     temp_block_ids: torch.Tensor,
     block_storage: torch.Tensor,
     free_block_ids: torch.Tensor,
+    steady_start_block_ids: torch.Tensor,
+    steady_end_block_ids: torch.Tensor,
+    steady_state: torch.Tensor,
     max_bt_len: int,
     out_block_table: torch.Tensor,
     out_bt_len: torch.Tensor,
@@ -3573,6 +3579,9 @@ def build_sparse_block_table_out(
         temp_block_ids,
         block_storage,
         free_block_ids,
+        steady_start_block_ids,
+        steady_end_block_ids,
+        steady_state,
         int(max_bt_len),
         out_block_table,
         out_bt_len,
@@ -3584,6 +3593,54 @@ def build_sparse_block_table_out(
         workspace_plan_src_tb_idx,
         workspace_plan_src_tb_off,
     ))
+
+
+if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "update_sparse_steady_kv_inplace"):
+
+    @register_fake("_C::update_sparse_steady_kv_inplace")
+    def _update_sparse_steady_kv_inplace_fake(
+        block_storage: torch.Tensor,
+        steady_start_block_ids: torch.Tensor,
+        steady_end_block_ids: torch.Tensor,
+        steady_state: torch.Tensor,
+        evicted_key: torch.Tensor,
+        evicted_value: torch.Tensor,
+        evicted_count: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        steady_start_capacity: int,
+        steady_end_capacity: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return evicted_key, evicted_value, evicted_count
+
+
+def update_sparse_steady_kv_inplace(
+    block_storage: torch.Tensor,
+    steady_start_block_ids: torch.Tensor,
+    steady_end_block_ids: torch.Tensor,
+    steady_state: torch.Tensor,
+    evicted_key: torch.Tensor,
+    evicted_value: torch.Tensor,
+    evicted_count: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    steady_start_capacity: int,
+    steady_end_capacity: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return tuple(torch.ops._C.update_sparse_steady_kv_inplace(
+        block_storage,
+        steady_start_block_ids,
+        steady_end_block_ids,
+        steady_state,
+        evicted_key,
+        evicted_value,
+        evicted_count,
+        key,
+        value,
+        int(steady_start_capacity),
+        int(steady_end_capacity),
+    ))
+
 
 def append_kv_to_clusters(
     block_storage: torch.Tensor,
@@ -3694,6 +3751,7 @@ if hasattr(torch.ops, "_C") and hasattr(
         cluster_centers_T: torch.Tensor,
         mean: torch.Tensor,
         cluster_center_count: torch.Tensor,
+        input_token_count: torch.Tensor,
     ) -> torch.Tensor:
         return used_free_block_count
 
@@ -3762,6 +3820,7 @@ def append_kv_to_clusters_by_centers_inplace(
     cluster_centers_T: torch.Tensor,
     mean: torch.Tensor,
     cluster_center_count: torch.Tensor,
+    input_token_count: torch.Tensor,
 ) -> torch.Tensor:
     return torch.ops._C.append_kv_to_clusters_by_centers_inplace(
         block_storage,
@@ -3779,6 +3838,7 @@ def append_kv_to_clusters_by_centers_inplace(
         cluster_centers_T,
         mean,
         cluster_center_count,
+        input_token_count,
     )
 
 

@@ -48,6 +48,7 @@ __global__ void k_append_kv_to_clusters_persistent(
     T* __restrict__ cluster_centers_T,                // optional [Hkv, dim, C]
     const T* __restrict__ mean,                       // optional [Hkv, dim]
     int32_t* __restrict__ cluster_center_count,       // optional [1]
+    const int32_t* __restrict__ input_token_count,    // optional [1]
 
     const int32_t* __restrict__ temp_block_ids,       // [max_temp_blocks]
     const int32_t* __restrict__ free_block_ids,       // [max_free_block]
@@ -94,11 +95,21 @@ __global__ void k_append_kv_to_clusters_persistent(
     __shared__ int s_temp_count_before;
     __shared__ int s_tail_base;
     __shared__ int s_valid_centers;
+    __shared__ int s_effective_Nq;
     extern __shared__ float s_center_scores[];
 
     const int64_t pstride = plane_stride_elems(total_blocks, block_size, dim);
 
-    for (int q = 0; q < Nq; ++q) {
+    if (tid == 0) {
+        s_effective_Nq = Nq;
+        if (input_token_count != nullptr) {
+            const int requested = input_token_count[0];
+            s_effective_Nq = min(max(requested, 0), Nq);
+        }
+    }
+    __syncthreads();
+
+    for (int q = 0; q < s_effective_Nq; ++q) {
         if (label == nullptr) {
             if (tid == 0) {
                 if (cluster_center_count == nullptr) {
@@ -548,6 +559,155 @@ __global__ void k_append_kv_to_clusters_persistent(
     }
 }
 
+template <typename T, int MAX_HKV>
+__global__ void k_update_sparse_steady_kv(
+    T* __restrict__ block_storage,
+    const int32_t* __restrict__ steady_start_block_ids,
+    int steady_start_blocks,
+    const int32_t* __restrict__ steady_end_block_ids,
+    int steady_end_blocks,
+    int32_t* __restrict__ steady_state,
+    T* __restrict__ evicted_key,
+    T* __restrict__ evicted_value,
+    int32_t* __restrict__ evicted_count,
+    const T* __restrict__ key,
+    const T* __restrict__ value,
+    int64_t key_stride0,
+    int64_t key_stride1,
+    int64_t key_stride2,
+    int64_t value_stride0,
+    int64_t value_stride1,
+    int64_t value_stride2,
+    int Nq, int Hkv,
+    int total_blocks, int block_size, int dim,
+    int steady_start_capacity,
+    int steady_end_capacity,
+    int evicted_capacity,
+    int32_t* __restrict__ error_code) {
+    if (blockIdx.x != 0) return;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp = tid / WARP_SIZE;
+
+    __shared__ int s_action;
+    __shared__ int s_pos;
+    __shared__ int s_evict_idx;
+
+    const int64_t pstride = plane_stride_elems(total_blocks, block_size, dim);
+
+    if (tid == 0) {
+        evicted_count[0] = 0;
+        error_code[0] = ERR_OK;
+    }
+    __syncthreads();
+
+    for (int q = 0; q < Nq; ++q) {
+        if (tid == 0) {
+            const int total_seen = steady_state[0];
+            const int end_count = steady_state[2];
+            const int end_start = steady_state[3];
+            s_action = 0;  // 0=start, 1=end, 2=evict-old-end, 3=cluster-direct
+            s_pos = total_seen;
+            s_evict_idx = -1;
+
+            if (total_seen < steady_start_capacity) {
+                steady_state[1] = total_seen + 1;
+            } else if (steady_end_capacity <= 0) {
+                s_action = 3;
+                s_pos = -1;
+                s_evict_idx = evicted_count[0]++;
+            } else if (end_count < steady_end_capacity) {
+                s_action = 1;
+                s_pos = end_count;
+                steady_state[2] = end_count + 1;
+            } else {
+                s_action = 2;
+                s_pos = end_start;
+                s_evict_idx = evicted_count[0]++;
+                steady_state[3] = (end_start + 1) % steady_end_capacity;
+            }
+            steady_state[0] = total_seen + 1;
+            if (s_evict_idx >= evicted_capacity) {
+                atomicCAS(error_code, 0, ERR_NO_FREE_BLOCK);
+            }
+        }
+        __syncthreads();
+        if (error_code[0] != ERR_OK) return;
+
+        if (warp < Hkv) {
+            const int h = warp;
+            const int action = s_action;
+            const int pos = s_pos;
+            const int evict_idx = s_evict_idx;
+            const int64_t src_k_base =
+                (int64_t)q * key_stride0 + (int64_t)h * key_stride1;
+            const int64_t src_v_base =
+                (int64_t)q * value_stride0 + (int64_t)h * value_stride1;
+            const T* src_k = key + src_k_base;
+            const T* src_v = value + src_v_base;
+
+            if (action == 2) {
+                const int block_idx = pos / block_size;
+                const int off = pos - block_idx * block_size;
+                if (block_idx < 0 || block_idx >= steady_end_blocks) {
+                    if (lane == 0) atomicCAS(error_code, 0, ERR_BAD_PARAM);
+                } else {
+                    const int bid =
+                        steady_end_block_ids[(int64_t)h * steady_end_blocks + block_idx];
+                    if (bid < 0 || bid >= total_blocks) {
+                        if (lane == 0) atomicCAS(error_code, 0, ERR_BAD_PARAM);
+                    } else {
+                        const int64_t old_elem =
+                            block_elem_offset(bid, off, block_size, dim);
+                        const T* old_k = block_storage + old_elem;
+                        const T* old_v = block_storage + pstride + old_elem;
+                        T* ev_k = evicted_key + ((int64_t)evict_idx * Hkv + h) * dim;
+                        T* ev_v = evicted_value + ((int64_t)evict_idx * Hkv + h) * dim;
+                        strided_copy_vec(ev_k, old_k, dim, lane, WARP_SIZE);
+                        strided_copy_vec(ev_v, old_v, dim, lane, WARP_SIZE);
+
+                        T* dst_k = block_storage + old_elem;
+                        T* dst_v = block_storage + pstride + old_elem;
+                        strided_copy_vec(dst_k, src_k, dim, lane, WARP_SIZE, key_stride2);
+                        strided_copy_vec(dst_v, src_v, dim, lane, WARP_SIZE, value_stride2);
+                    }
+                }
+            } else if (action == 3) {
+                T* ev_k = evicted_key + ((int64_t)evict_idx * Hkv + h) * dim;
+                T* ev_v = evicted_value + ((int64_t)evict_idx * Hkv + h) * dim;
+                strided_copy_vec(ev_k, src_k, dim, lane, WARP_SIZE, key_stride2);
+                strided_copy_vec(ev_v, src_v, dim, lane, WARP_SIZE, value_stride2);
+            } else {
+                const bool to_start = action == 0;
+                const int block_idx = pos / block_size;
+                const int off = pos - block_idx * block_size;
+                const int num_blocks =
+                    to_start ? steady_start_blocks : steady_end_blocks;
+                const int32_t* block_ids =
+                    to_start ? steady_start_block_ids : steady_end_block_ids;
+                if (block_idx < 0 || block_idx >= num_blocks) {
+                    if (lane == 0) atomicCAS(error_code, 0, ERR_BAD_PARAM);
+                } else {
+                    const int bid = block_ids[(int64_t)h * num_blocks + block_idx];
+                    if (bid < 0 || bid >= total_blocks) {
+                        if (lane == 0) atomicCAS(error_code, 0, ERR_BAD_PARAM);
+                    } else {
+                        const int64_t dst_elem =
+                            block_elem_offset(bid, off, block_size, dim);
+                        T* dst_k = block_storage + dst_elem;
+                        T* dst_v = block_storage + pstride + dst_elem;
+                        strided_copy_vec(dst_k, src_k, dim, lane, WARP_SIZE, key_stride2);
+                        strided_copy_vec(dst_v, src_v, dim, lane, WARP_SIZE, value_stride2);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (error_code[0] != ERR_OK) return;
+    }
+}
+
 static int pick_warps(int rows) {
     if (rows <= 1) return 1;
     if (rows <= 2) return 2;
@@ -569,6 +729,7 @@ extern "C" int append_kv_to_clusters_launcher_raw(
     void* d_cluster_centers_T,
     const void* d_mean,
     int32_t* d_cluster_center_count,
+    const int32_t* d_input_token_count,
     const int32_t* d_temp_block_ids,
     int32_t* d_temp_block_kv_counts,
     int32_t* d_temp_block_kv_owner,
@@ -623,6 +784,7 @@ extern "C" int append_kv_to_clusters_launcher_raw(
                 (float*)d_cluster_centers_T,
                 (const float*)d_mean,
                 d_cluster_center_count,
+                d_input_token_count,
                 d_temp_block_ids,
                 d_free_block_ids,
                 (float*)d_block_storage,
@@ -651,6 +813,7 @@ extern "C" int append_kv_to_clusters_launcher_raw(
                 (__half*)d_cluster_centers_T,
                 (const __half*)d_mean,
                 d_cluster_center_count,
+                d_input_token_count,
                 d_temp_block_ids,
                 d_free_block_ids,
                 (__half*)d_block_storage,
@@ -679,6 +842,7 @@ extern "C" int append_kv_to_clusters_launcher_raw(
                 (__nv_bfloat16*)d_cluster_centers_T,
                 (const __nv_bfloat16*)d_mean,
                 d_cluster_center_count,
+                d_input_token_count,
                 d_temp_block_ids,
                 d_free_block_ids,
                 (__nv_bfloat16*)d_block_storage,
@@ -702,6 +866,108 @@ extern "C" int append_kv_to_clusters_launcher_raw(
         return ERR_UNSUPPORTED_DTYPE;
     }
 
+    if (cudaGetLastError() != cudaSuccess) return ERR_LAUNCH;
+    return ERR_OK;
+}
+
+extern "C" int update_sparse_steady_kv_launcher_raw(
+    void* d_block_storage,
+    int32_t storage_dtype,
+    const int32_t* d_steady_start_block_ids,
+    int32_t steady_start_blocks,
+    const int32_t* d_steady_end_block_ids,
+    int32_t steady_end_blocks,
+    int32_t* d_steady_state,
+    void* d_evicted_key,
+    void* d_evicted_value,
+    int32_t* d_evicted_count,
+    const void* d_key,
+    const void* d_value,
+    int64_t key_stride0,
+    int64_t key_stride1,
+    int64_t key_stride2,
+    int64_t value_stride0,
+    int64_t value_stride1,
+    int64_t value_stride2,
+    int Nq, int Hkv,
+    int total_blocks, int block_size, int dim,
+    int steady_start_capacity,
+    int steady_end_capacity,
+    int evicted_capacity,
+    int32_t* d_error_code,
+    cudaStream_t stream) {
+    if (Nq <= 0 || Hkv <= 0 || Hkv > 8 ||
+        total_blocks <= 0 || block_size <= 0 || dim <= 0 ||
+        steady_start_capacity < 0 || steady_end_capacity < 0 ||
+        evicted_capacity <= 0) {
+        return ERR_BAD_PARAM;
+    }
+    if (steady_start_capacity > 0 && steady_start_blocks <= 0) {
+        return ERR_BAD_PARAM;
+    }
+    if (steady_end_capacity > 0 && steady_end_blocks <= 0) {
+        return ERR_BAD_PARAM;
+    }
+
+    constexpr int MAX_HKV = 8;
+    const int threads = MAX_HKV * WARP_SIZE;
+    if (storage_dtype == DTYPE_FP32) {
+        k_update_sparse_steady_kv<float, MAX_HKV><<<1, threads, 0, stream>>>(
+            (float*)d_block_storage,
+            d_steady_start_block_ids,
+            steady_start_blocks,
+            d_steady_end_block_ids,
+            steady_end_blocks,
+            d_steady_state,
+            (float*)d_evicted_key,
+            (float*)d_evicted_value,
+            d_evicted_count,
+            (const float*)d_key,
+            (const float*)d_value,
+            key_stride0, key_stride1, key_stride2,
+            value_stride0, value_stride1, value_stride2,
+            Nq, Hkv, total_blocks, block_size, dim,
+            steady_start_capacity, steady_end_capacity,
+            evicted_capacity, d_error_code);
+    } else if (storage_dtype == DTYPE_FP16) {
+        k_update_sparse_steady_kv<__half, MAX_HKV><<<1, threads, 0, stream>>>(
+            (__half*)d_block_storage,
+            d_steady_start_block_ids,
+            steady_start_blocks,
+            d_steady_end_block_ids,
+            steady_end_blocks,
+            d_steady_state,
+            (__half*)d_evicted_key,
+            (__half*)d_evicted_value,
+            d_evicted_count,
+            (const __half*)d_key,
+            (const __half*)d_value,
+            key_stride0, key_stride1, key_stride2,
+            value_stride0, value_stride1, value_stride2,
+            Nq, Hkv, total_blocks, block_size, dim,
+            steady_start_capacity, steady_end_capacity,
+            evicted_capacity, d_error_code);
+    } else if (storage_dtype == DTYPE_BF16) {
+        k_update_sparse_steady_kv<__nv_bfloat16, MAX_HKV><<<1, threads, 0, stream>>>(
+            (__nv_bfloat16*)d_block_storage,
+            d_steady_start_block_ids,
+            steady_start_blocks,
+            d_steady_end_block_ids,
+            steady_end_blocks,
+            d_steady_state,
+            (__nv_bfloat16*)d_evicted_key,
+            (__nv_bfloat16*)d_evicted_value,
+            d_evicted_count,
+            (const __nv_bfloat16*)d_key,
+            (const __nv_bfloat16*)d_value,
+            key_stride0, key_stride1, key_stride2,
+            value_stride0, value_stride1, value_stride2,
+            Nq, Hkv, total_blocks, block_size, dim,
+            steady_start_capacity, steady_end_capacity,
+            evicted_capacity, d_error_code);
+    } else {
+        return ERR_UNSUPPORTED_DTYPE;
+    }
     if (cudaGetLastError() != cudaSuccess) return ERR_LAUNCH;
     return ERR_OK;
 }

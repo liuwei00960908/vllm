@@ -20,6 +20,7 @@ extern "C" int append_kv_to_clusters_launcher_raw(
     void* d_cluster_centers_T,
     const void* d_mean,
     int32_t* d_cluster_center_count,
+    const int32_t* d_input_token_count,
     const int32_t* d_temp_block_ids,
     int32_t* d_temp_block_kv_counts,
     int32_t* d_temp_block_kv_owner,
@@ -52,6 +53,33 @@ extern "C" int sparse_select_topk_clusters_launcher_raw(
     int C,
     int dim,
     int nprobe,
+    cudaStream_t stream);
+
+extern "C" int update_sparse_steady_kv_launcher_raw(
+    void* d_block_storage,
+    int32_t storage_dtype,
+    const int32_t* d_steady_start_block_ids,
+    int32_t steady_start_blocks,
+    const int32_t* d_steady_end_block_ids,
+    int32_t steady_end_blocks,
+    int32_t* d_steady_state,
+    void* d_evicted_key,
+    void* d_evicted_value,
+    int32_t* d_evicted_count,
+    const void* d_key,
+    const void* d_value,
+    int64_t key_stride0,
+    int64_t key_stride1,
+    int64_t key_stride2,
+    int64_t value_stride0,
+    int64_t value_stride1,
+    int64_t value_stride2,
+    int Nq, int Hkv,
+    int total_blocks, int block_size, int dim,
+    int steady_start_capacity,
+    int steady_end_capacity,
+    int evicted_capacity,
+    int32_t* d_error_code,
     cudaStream_t stream);
 
 static inline int32_t map_storage_dtype(torch::ScalarType t) {
@@ -193,6 +221,7 @@ torch::Tensor append_kv_to_clusters_cuda(
         nullptr,
         nullptr,
         nullptr,
+        nullptr,
         temp_block_ids.data_ptr<int32_t>(),
         temp_block_kv_counts.data_ptr<int32_t>(),
         temp_block_kv_owner.data_ptr<int32_t>(),
@@ -290,6 +319,7 @@ torch::Tensor append_kv_to_clusters_inplace_cuda(
         nullptr,
         nullptr,
         nullptr,
+        nullptr,
         temp_block_ids.data_ptr<int32_t>(),
         temp_block_kv_counts.data_ptr<int32_t>(),
         temp_block_kv_owner.data_ptr<int32_t>(),
@@ -325,7 +355,8 @@ torch::Tensor append_kv_to_clusters_by_centers_inplace_cuda(
     torch::Tensor value,
     torch::Tensor cluster_centers_T,
     torch::Tensor mean,
-    torch::Tensor cluster_center_count
+    torch::Tensor cluster_center_count,
+    torch::Tensor input_token_count
 ) {
     check_cuda_contig(block_storage, "block_storage");
     check_cuda_contig(cluster_compact_block_ids, "cluster_compact_block_ids");
@@ -342,6 +373,7 @@ torch::Tensor append_kv_to_clusters_by_centers_inplace_cuda(
     check_cuda_contig(cluster_centers_T, "cluster_centers_T");
     check_cuda_contig(mean, "mean");
     check_cuda_contig(cluster_center_count, "cluster_center_count");
+    check_cuda_contig(input_token_count, "input_token_count");
 
     TORCH_CHECK(used_free_block_count.scalar_type() == torch::kInt32,
                 "used_free_block_count must be int32");
@@ -355,6 +387,10 @@ torch::Tensor append_kv_to_clusters_by_centers_inplace_cuda(
                 "cluster_center_count must be int32");
     TORCH_CHECK(cluster_center_count.numel() == 1,
                 "cluster_center_count must be [1]");
+    TORCH_CHECK(input_token_count.scalar_type() == torch::kInt32,
+                "input_token_count must be int32");
+    TORCH_CHECK(input_token_count.numel() == 1,
+                "input_token_count must be [1]");
     TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
                 "key/value must be [Nq,Hkv,dim]");
     TORCH_CHECK(key.scalar_type() == block_storage.scalar_type(),
@@ -406,6 +442,7 @@ torch::Tensor append_kv_to_clusters_by_centers_inplace_cuda(
         cluster_centers_T.data_ptr(),
         mean.data_ptr(),
         cluster_center_count.data_ptr<int32_t>(),
+        input_token_count.data_ptr<int32_t>(),
         temp_block_ids.data_ptr<int32_t>(),
         temp_block_kv_counts.data_ptr<int32_t>(),
         temp_block_kv_owner.data_ptr<int32_t>(),
@@ -425,6 +462,119 @@ torch::Tensor append_kv_to_clusters_by_centers_inplace_cuda(
     TORCH_CHECK(rc == ERR_OK,
                 "append_kv_to_clusters_by_centers launcher failed, rc=", rc);
     return used_free_block_count;
+}
+
+std::vector<torch::Tensor> update_sparse_steady_kv_inplace_cuda(
+    torch::Tensor block_storage,
+    torch::Tensor steady_start_block_ids,
+    torch::Tensor steady_end_block_ids,
+    torch::Tensor steady_state,
+    torch::Tensor evicted_key,
+    torch::Tensor evicted_value,
+    torch::Tensor evicted_count,
+    torch::Tensor key,
+    torch::Tensor value,
+    int64_t steady_start_capacity,
+    int64_t steady_end_capacity
+) {
+    check_cuda_contig(block_storage, "block_storage");
+    check_cuda_contig(steady_start_block_ids, "steady_start_block_ids");
+    check_cuda_contig(steady_end_block_ids, "steady_end_block_ids");
+    check_cuda_contig(steady_state, "steady_state");
+    check_cuda_contig(evicted_key, "evicted_key");
+    check_cuda_contig(evicted_value, "evicted_value");
+    check_cuda_contig(evicted_count, "evicted_count");
+    check_cuda(key, "key");
+    check_cuda(value, "value");
+
+    TORCH_CHECK(steady_start_block_ids.scalar_type() == torch::kInt32,
+                "steady_start_block_ids must be int32");
+    TORCH_CHECK(steady_end_block_ids.scalar_type() == torch::kInt32,
+                "steady_end_block_ids must be int32");
+    TORCH_CHECK(steady_state.scalar_type() == torch::kInt32,
+                "steady_state must be int32");
+    TORCH_CHECK(evicted_count.scalar_type() == torch::kInt32,
+                "evicted_count must be int32");
+    TORCH_CHECK(evicted_count.numel() == 1, "evicted_count must be [1]");
+
+    TORCH_CHECK(block_storage.dim() == 4 && block_storage.size(0) == 2,
+                "block_storage must be [2,total_blocks,block_size,dim]");
+    TORCH_CHECK(steady_start_block_ids.dim() == 2,
+                "steady_start_block_ids must be [Hkv,start_blocks]");
+    TORCH_CHECK(steady_end_block_ids.dim() == 2,
+                "steady_end_block_ids must be [Hkv,end_blocks]");
+    TORCH_CHECK(steady_state.dim() == 1 && steady_state.numel() >= 4,
+                "steady_state must be [>=4]");
+    TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+                "key/value must be [Nq,Hkv,dim]");
+    TORCH_CHECK(evicted_key.dim() == 3 && evicted_value.dim() == 3,
+                "evicted_key/evicted_value must be [cap,Hkv,dim]");
+
+    TORCH_CHECK(key.scalar_type() == block_storage.scalar_type(),
+                "key dtype must equal block_storage dtype");
+    TORCH_CHECK(value.scalar_type() == block_storage.scalar_type(),
+                "value dtype must equal block_storage dtype");
+    TORCH_CHECK(evicted_key.scalar_type() == block_storage.scalar_type(),
+                "evicted_key dtype must equal block_storage dtype");
+    TORCH_CHECK(evicted_value.scalar_type() == block_storage.scalar_type(),
+                "evicted_value dtype must equal block_storage dtype");
+    TORCH_CHECK(key.sizes() == value.sizes(), "key/value shape mismatch");
+    TORCH_CHECK(evicted_key.sizes() == evicted_value.sizes(),
+                "evicted_key/evicted_value shape mismatch");
+    TORCH_CHECK(key.stride(0) >= 0 && key.stride(1) >= 0 && key.stride(2) >= 0,
+                "key strides must be non-negative");
+    TORCH_CHECK(value.stride(0) >= 0 && value.stride(1) >= 0 && value.stride(2) >= 0,
+                "value strides must be non-negative");
+
+    const int Nq = static_cast<int>(key.size(0));
+    const int Hkv = static_cast<int>(key.size(1));
+    const int dim = static_cast<int>(key.size(2));
+
+    TORCH_CHECK(static_cast<int>(value.size(1)) == Hkv &&
+                static_cast<int>(value.size(2)) == dim,
+                "value shape mismatch");
+    TORCH_CHECK(steady_start_block_ids.size(0) == Hkv,
+                "steady_start_block_ids Hkv mismatch");
+    TORCH_CHECK(steady_end_block_ids.size(0) == Hkv,
+                "steady_end_block_ids Hkv mismatch");
+    TORCH_CHECK(evicted_key.size(1) == Hkv && evicted_key.size(2) == dim,
+                "evicted key shape mismatch");
+
+    auto error_code = torch::empty({1}, steady_state.options());
+    const int total_blocks = static_cast<int>(block_storage.size(1));
+    const int block_size = static_cast<int>(block_storage.size(2));
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(block_storage));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    int rc = update_sparse_steady_kv_launcher_raw(
+        block_storage.data_ptr(),
+        map_storage_dtype(block_storage.scalar_type()),
+        steady_start_block_ids.data_ptr<int32_t>(),
+        static_cast<int32_t>(steady_start_block_ids.size(1)),
+        steady_end_block_ids.data_ptr<int32_t>(),
+        static_cast<int32_t>(steady_end_block_ids.size(1)),
+        steady_state.data_ptr<int32_t>(),
+        evicted_key.data_ptr(),
+        evicted_value.data_ptr(),
+        evicted_count.data_ptr<int32_t>(),
+        key.data_ptr(),
+        value.data_ptr(),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        Nq, Hkv,
+        total_blocks, block_size, dim,
+        static_cast<int>(steady_start_capacity),
+        static_cast<int>(steady_end_capacity),
+        static_cast<int>(evicted_key.size(0)),
+        error_code.data_ptr<int32_t>(),
+        stream);
+    TORCH_CHECK(rc == ERR_OK,
+                "update_sparse_steady_kv launcher failed, rc=", rc);
+    return {evicted_key, evicted_value, evicted_count};
 }
 
 torch::Tensor sparse_select_topk_clusters_out_cuda(
@@ -552,8 +702,23 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
         "  Tensor value,"
         "  Tensor cluster_centers_T,"
         "  Tensor mean,"
-        "  Tensor cluster_center_count"
+        "  Tensor cluster_center_count,"
+        "  Tensor input_token_count"
         ") -> Tensor");
+    ops.def(
+        "update_sparse_steady_kv_inplace("
+        "  Tensor block_storage,"
+        "  Tensor steady_start_block_ids,"
+        "  Tensor steady_end_block_ids,"
+        "  Tensor steady_state,"
+        "  Tensor evicted_key,"
+        "  Tensor evicted_value,"
+        "  Tensor evicted_count,"
+        "  Tensor key,"
+        "  Tensor value,"
+        "  int steady_start_capacity,"
+        "  int steady_end_capacity"
+        ") -> Tensor[]");
     ops.def(
         "sparse_select_topk_clusters_out("
         "  Tensor query,"
@@ -570,6 +735,8 @@ TORCH_LIBRARY_IMPL(_C, CUDA, m) {
     m.impl("append_kv_to_clusters_inplace", &append_kv_to_clusters_inplace_cuda);
     m.impl("append_kv_to_clusters_by_centers_inplace",
            &append_kv_to_clusters_by_centers_inplace_cuda);
+    m.impl("update_sparse_steady_kv_inplace",
+           &update_sparse_steady_kv_inplace_cuda);
     m.impl("sparse_select_topk_clusters_out",
            &sparse_select_topk_clusters_out_cuda);
 }

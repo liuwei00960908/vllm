@@ -44,6 +44,8 @@ class SparseManagerExtraInfo:
     num_segment: int = 1
     nprobe: int = 0
     cluster_block_size: int = 0
+    steady_start_capacity: int = 0
+    steady_end_capacity: int = 0
 
 
 @dataclass
@@ -310,7 +312,11 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
         )
         free_block_ids = cluster_allocated_block_info.reusable_block_ids_gpu
         assert free_block_ids is not None
-        required_free_blocks = num_queries * hq * nprobe
+        assert smm.steady_zone_head is not None
+        assert smm.steady_zone_tail is not None
+        assert smm.steady_state is not None
+        steady_blocks = smm.steady_zone_head.shape[1] + smm.steady_zone_tail.shape[1]
+        required_free_blocks = num_queries * hq * (nprobe + steady_blocks)
         assert free_block_ids.numel() >= required_free_blocks, (
             "Sparse reusable scratch pool is undersized: "
             f"have {free_block_ids.numel()}, need at least "
@@ -324,6 +330,9 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             temp_block_ids=smm.temp_block_ids,
             block_storage=cluster_storage,
             free_block_ids=free_block_ids,
+            steady_start_block_ids=smm.steady_zone_head,
+            steady_end_block_ids=smm.steady_zone_tail,
+            steady_state=smm.steady_state,
             max_bt_len=max_blocks,
         )
 
@@ -441,8 +450,49 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 smm.cluster_total_kv_counts = torch.zeros(
                     size=(hkv, num_clusters), dtype=torch.int32, device=device
                 )
+            if smm.steady_state is None:
+                smm.steady_state = torch.zeros(
+                    (4,), dtype=torch.int32, device=key.device
+                )
+            smm.steady_start_capacity = int(
+                attn_metadata.extra_sparse_manager_info.steady_start_capacity
+            )
+            smm.steady_end_capacity = int(
+                attn_metadata.extra_sparse_manager_info.steady_end_capacity
+            )
+            if smm.steady_buffers is None:
+                from vllm.v1.core.sparse_kv_utils import SparseSteadyBuffers
+
+                smm.steady_buffers = SparseSteadyBuffers()
+            assert smm.steady_zone_head is not None
+            assert smm.steady_zone_tail is not None
+            assert smm.steady_state is not None
+            assert smm.steady_buffers is not None
+            evicted_key, evicted_value, evicted_count = smm.steady_buffers.update(
+                block_storage=cluster_storage,
+                steady_start_block_ids=smm.steady_zone_head,
+                steady_end_block_ids=smm.steady_zone_tail,
+                steady_state=smm.steady_state,
+                steady_start_capacity=smm.steady_start_capacity,
+                steady_end_capacity=smm.steady_end_capacity,
+                key=key_actual,
+                value=value_actual,
+                evicted_capacity=max(num_actual_tokens, 1),
+            )
+            smm.advance_steady_python_state(num_actual_tokens)
+            if smm.append_buffers is None:
+                smm.append_buffers = SparseAppendBuffers()
+            assert smm.append_buffers is not None
+            if is_prefill:
+                evicted_count_i = int(evicted_count.item())
+                if evicted_count_i == 0:
+                    assert free_blocks_info.used_count_gpu is not None
+                    free_blocks_info.used_count_gpu.zero_()
+                    return
+                cluster_key = evicted_key[:evicted_count_i]
+                cluster_value = evicted_value[:evicted_count_i]
                 res = prefill_cluster_meta_from_features_torch_batched(
-                    key_actual.transpose(0, 1),
+                    cluster_key.transpose(0, 1),
                     num_clusters,
                     attn_metadata.extra_sparse_manager_info.num_segment,
                     granularity="token",
@@ -460,11 +510,7 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 ].transpose(1, 2)
                 smm.mean = res["mean_key"].to(dtype=key.dtype)
                 smm.cluster_center_count.fill_(valid_len)
-            if smm.append_buffers is None:
-                smm.append_buffers = SparseAppendBuffers()
-            assert smm.append_buffers is not None
-            if is_prefill:
-                used_free_blocks = smm.append_buffers.append_with_labels(
+                smm.append_buffers.append_with_labels(
                     block_storage=cluster_storage,
                     cluster_compact_block_ids=smm.cluster_compact_block_ids,
                     cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
@@ -474,13 +520,12 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                     temp_block_kv_owner=smm.temp_block_kv_owner,
                     free_block_ids=free_blocks_info.allocated_block_ids_gpu,
                     used_free_block_count=free_blocks_info.used_count_gpu,
-                    key=key_actual,
-                    value=value_actual,
+                    key=cluster_key,
+                    value=cluster_value,
                     label=labels,
                 )
             else:
-                assert key_actual.shape[0] == 1
-                used_free_blocks = smm.append_buffers.append(
+                smm.append_buffers.append(
                     block_storage=cluster_storage,
                     cluster_compact_block_ids=smm.cluster_compact_block_ids,
                     cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
@@ -490,11 +535,12 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                     temp_block_kv_owner=smm.temp_block_kv_owner,
                     free_block_ids=free_blocks_info.allocated_block_ids_gpu,
                     used_free_block_count=free_blocks_info.used_count_gpu,
-                    key=key_actual,
-                    value=value_actual,
+                    key=evicted_key,
+                    value=evicted_value,
                     cluster_centers_T=smm.cluster_centers_T,
                     mean=smm.mean,
                     cluster_center_count=smm.cluster_center_count,
+                    input_token_count=evicted_count,
                 )
             return
 
