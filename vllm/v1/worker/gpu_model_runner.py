@@ -3082,6 +3082,21 @@ class GPUModelRunner(
             graph_smm.advance_steady_python_state(layer_attn.num_actual_tokens)
             req_sparse_info.layers[layer_name] = graph_smm
 
+    def _sync_sparse_cudagraph_used_counts(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        if not self._has_sparse_attn or not scheduler_output.cluster_info:
+            return
+        for cluster_info in scheduler_output.cluster_info.values():
+            for kv_cache_gid, info in enumerate(cluster_info):
+                if info is None:
+                    continue
+                graph_info = self._sparse_cudagraph_cluster_info.get(kv_cache_gid)
+                if graph_info is None or graph_info.used_count_gpu is None:
+                    continue
+                info.used_count_gpu = graph_info.used_count_gpu
+
     def _compute_cascade_attn_prefix_lens(
         self,
         num_scheduled_tokens: np.ndarray,
@@ -4795,6 +4810,7 @@ class GPUModelRunner(
             )
         if cudagraph_mode == CUDAGraphMode.FULL:
             self._sync_sparse_cudagraph_metadata(attn_metadata)
+            self._sync_sparse_cudagraph_used_counts(scheduler_output)
         cluster_info = self._start_sparse_cluster_info_copy(scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):

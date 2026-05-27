@@ -32,6 +32,13 @@ extern "C" int append_kv_to_clusters_launcher_raw(
     int32_t max_free_block,
     int32_t* d_used_free_block_count,
     int32_t* d_error_code,
+    const int32_t* d_steady_start_block_ids,
+    int32_t steady_start_blocks,
+    const int32_t* d_steady_end_block_ids,
+    int32_t steady_end_blocks,
+    int32_t* d_steady_state,
+    int32_t steady_start_capacity,
+    int32_t steady_end_capacity,
     int Nq, int Hkv, int C, int maxB,
     int total_blocks, int block_size, int dim,
     int max_temp_blocks,
@@ -233,6 +240,13 @@ torch::Tensor append_kv_to_clusters_cuda(
         max_free_block,
         used_free_block_count.data_ptr<int32_t>(),
         error_code.data_ptr<int32_t>(),
+        nullptr,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        0,
+        0,
         Nq, Hkv, C, maxB,
         total_blocks, block_size, dim,
         max_temp_blocks,
@@ -331,6 +345,13 @@ torch::Tensor append_kv_to_clusters_inplace_cuda(
         max_free_block,
         used_free_block_count.data_ptr<int32_t>(),
         error_code.data_ptr<int32_t>(),
+        nullptr,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        0,
+        0,
         Nq, Hkv, C, maxB,
         total_blocks, block_size, dim,
         max_temp_blocks,
@@ -454,6 +475,13 @@ torch::Tensor append_kv_to_clusters_by_centers_inplace_cuda(
         max_free_block,
         used_free_block_count.data_ptr<int32_t>(),
         error_code.data_ptr<int32_t>(),
+        nullptr,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        0,
+        0,
         Nq, Hkv, C, maxB,
         total_blocks, block_size, dim,
         max_temp_blocks,
@@ -461,6 +489,155 @@ torch::Tensor append_kv_to_clusters_by_centers_inplace_cuda(
 
     TORCH_CHECK(rc == ERR_OK,
                 "append_kv_to_clusters_by_centers launcher failed, rc=", rc);
+    return used_free_block_count;
+}
+
+torch::Tensor append_kv_to_clusters_by_centers_with_steady_inplace_cuda(
+    torch::Tensor block_storage,
+    torch::Tensor cluster_compact_block_ids,
+    torch::Tensor cluster_temp_kv_pos,
+    torch::Tensor cluster_total_kv_counts,
+    torch::Tensor temp_block_ids,
+    torch::Tensor temp_block_kv_counts,
+    torch::Tensor temp_block_kv_owner,
+    torch::Tensor free_block_ids,
+    torch::Tensor used_free_block_count,
+    torch::Tensor error_code,
+    torch::Tensor steady_start_block_ids,
+    torch::Tensor steady_end_block_ids,
+    torch::Tensor steady_state,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor cluster_centers_T,
+    torch::Tensor mean,
+    torch::Tensor cluster_center_count,
+    int64_t steady_start_capacity,
+    int64_t steady_end_capacity
+) {
+    check_cuda_contig(block_storage, "block_storage");
+    check_cuda_contig(cluster_compact_block_ids, "cluster_compact_block_ids");
+    check_cuda_contig(cluster_temp_kv_pos, "cluster_temp_kv_pos");
+    check_cuda_contig(cluster_total_kv_counts, "cluster_total_kv_counts");
+    check_cuda_contig(temp_block_ids, "temp_block_ids");
+    check_cuda_contig(temp_block_kv_counts, "temp_block_kv_counts");
+    check_cuda_contig(temp_block_kv_owner, "temp_block_kv_owner");
+    check_cuda_contig(free_block_ids, "free_block_ids");
+    check_cuda_contig(used_free_block_count, "used_free_block_count");
+    check_cuda_contig(error_code, "error_code");
+    check_cuda_contig(steady_start_block_ids, "steady_start_block_ids");
+    check_cuda_contig(steady_end_block_ids, "steady_end_block_ids");
+    check_cuda_contig(steady_state, "steady_state");
+    check_cuda(key, "key");
+    check_cuda(value, "value");
+    check_cuda_contig(cluster_centers_T, "cluster_centers_T");
+    check_cuda_contig(mean, "mean");
+    check_cuda_contig(cluster_center_count, "cluster_center_count");
+
+    TORCH_CHECK(used_free_block_count.scalar_type() == torch::kInt32,
+                "used_free_block_count must be int32");
+    TORCH_CHECK(error_code.scalar_type() == torch::kInt32,
+                "error_code must be int32");
+    TORCH_CHECK(steady_start_block_ids.scalar_type() == torch::kInt32,
+                "steady_start_block_ids must be int32");
+    TORCH_CHECK(steady_end_block_ids.scalar_type() == torch::kInt32,
+                "steady_end_block_ids must be int32");
+    TORCH_CHECK(steady_state.scalar_type() == torch::kInt32,
+                "steady_state must be int32");
+    TORCH_CHECK(used_free_block_count.numel() == 1,
+                "used_free_block_count must be [1]");
+    TORCH_CHECK(error_code.numel() == 1,
+                "error_code must be [1]");
+    TORCH_CHECK(cluster_center_count.scalar_type() == torch::kInt32,
+                "cluster_center_count must be int32");
+    TORCH_CHECK(cluster_center_count.numel() == 1,
+                "cluster_center_count must be [1]");
+    TORCH_CHECK(steady_state.dim() == 1 && steady_state.numel() >= 4,
+                "steady_state must be [>=4]");
+    TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+                "key/value must be [Nq,Hkv,dim]");
+    TORCH_CHECK(key.scalar_type() == block_storage.scalar_type(),
+                "key dtype must equal block_storage dtype");
+    TORCH_CHECK(value.scalar_type() == block_storage.scalar_type(),
+                "value dtype must equal block_storage dtype");
+    TORCH_CHECK(cluster_centers_T.scalar_type() == block_storage.scalar_type(),
+                "cluster_centers_T dtype must equal block_storage dtype");
+    TORCH_CHECK(mean.scalar_type() == block_storage.scalar_type(),
+                "mean dtype must equal block_storage dtype");
+    TORCH_CHECK(key.sizes() == value.sizes(), "key/value shape mismatch");
+    TORCH_CHECK(key.stride(0) >= 0 && key.stride(1) >= 0 && key.stride(2) >= 0,
+                "key strides must be non-negative");
+    TORCH_CHECK(value.stride(0) >= 0 && value.stride(1) >= 0 &&
+                    value.stride(2) >= 0,
+                "value strides must be non-negative");
+
+    const int Nq = static_cast<int>(key.size(0));
+    const int Hkv = static_cast<int>(key.size(1));
+    const int dim = static_cast<int>(key.size(2));
+    const int C = static_cast<int>(cluster_compact_block_ids.size(1));
+    const int maxB = static_cast<int>(cluster_compact_block_ids.size(2));
+    const int total_blocks = static_cast<int>(block_storage.size(1));
+    const int block_size = static_cast<int>(block_storage.size(2));
+    const int max_temp_blocks = static_cast<int>(temp_block_ids.size(0));
+    const int max_free_block = static_cast<int>(free_block_ids.size(0));
+
+    TORCH_CHECK(cluster_centers_T.dim() == 3,
+                "cluster_centers_T must be [Hkv,dim,C]");
+    TORCH_CHECK(cluster_centers_T.size(0) == Hkv &&
+                    cluster_centers_T.size(1) == dim &&
+                    cluster_centers_T.size(2) == C,
+                "cluster_centers_T shape mismatch");
+    TORCH_CHECK(mean.dim() == 2 && mean.size(0) == Hkv && mean.size(1) == dim,
+                "mean must be [Hkv,dim]");
+    TORCH_CHECK(steady_start_block_ids.dim() == 2 &&
+                    steady_start_block_ids.size(0) == Hkv,
+                "steady_start_block_ids must be [Hkv,start_blocks]");
+    TORCH_CHECK(steady_end_block_ids.dim() == 2 &&
+                    steady_end_block_ids.size(0) == Hkv,
+                "steady_end_block_ids must be [Hkv,end_blocks]");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(block_storage));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int rc = append_kv_to_clusters_launcher_raw(
+        key.data_ptr(),
+        value.data_ptr(),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        map_storage_dtype(block_storage.scalar_type()),
+        nullptr,
+        cluster_centers_T.data_ptr(),
+        mean.data_ptr(),
+        cluster_center_count.data_ptr<int32_t>(),
+        nullptr,
+        temp_block_ids.data_ptr<int32_t>(),
+        temp_block_kv_counts.data_ptr<int32_t>(),
+        temp_block_kv_owner.data_ptr<int32_t>(),
+        block_storage.data_ptr(),
+        cluster_compact_block_ids.data_ptr<int32_t>(),
+        cluster_temp_kv_pos.data_ptr<int32_t>(),
+        cluster_total_kv_counts.data_ptr<int32_t>(),
+        free_block_ids.data_ptr<int32_t>(),
+        max_free_block,
+        used_free_block_count.data_ptr<int32_t>(),
+        error_code.data_ptr<int32_t>(),
+        steady_start_block_ids.data_ptr<int32_t>(),
+        static_cast<int32_t>(steady_start_block_ids.size(1)),
+        steady_end_block_ids.data_ptr<int32_t>(),
+        static_cast<int32_t>(steady_end_block_ids.size(1)),
+        steady_state.data_ptr<int32_t>(),
+        static_cast<int32_t>(steady_start_capacity),
+        static_cast<int32_t>(steady_end_capacity),
+        Nq, Hkv, C, maxB,
+        total_blocks, block_size, dim,
+        max_temp_blocks,
+        stream);
+
+    TORCH_CHECK(rc == ERR_OK,
+                "append_kv_to_clusters_by_centers_with_steady launcher failed, rc=", rc);
     return used_free_block_count;
 }
 
@@ -706,6 +883,29 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
         "  Tensor input_token_count"
         ") -> Tensor");
     ops.def(
+        "append_kv_to_clusters_by_centers_with_steady_inplace("
+        "  Tensor block_storage,"
+        "  Tensor cluster_compact_block_ids,"
+        "  Tensor cluster_temp_kv_pos,"
+        "  Tensor cluster_total_kv_counts,"
+        "  Tensor temp_block_ids,"
+        "  Tensor temp_block_kv_counts,"
+        "  Tensor temp_block_kv_owner,"
+        "  Tensor free_block_ids,"
+        "  Tensor used_free_block_count,"
+        "  Tensor error_code,"
+        "  Tensor steady_start_block_ids,"
+        "  Tensor steady_end_block_ids,"
+        "  Tensor steady_state,"
+        "  Tensor key,"
+        "  Tensor value,"
+        "  Tensor cluster_centers_T,"
+        "  Tensor mean,"
+        "  Tensor cluster_center_count,"
+        "  int steady_start_capacity,"
+        "  int steady_end_capacity"
+        ") -> Tensor");
+    ops.def(
         "update_sparse_steady_kv_inplace("
         "  Tensor block_storage,"
         "  Tensor steady_start_block_ids,"
@@ -735,6 +935,8 @@ TORCH_LIBRARY_IMPL(_C, CUDA, m) {
     m.impl("append_kv_to_clusters_inplace", &append_kv_to_clusters_inplace_cuda);
     m.impl("append_kv_to_clusters_by_centers_inplace",
            &append_kv_to_clusters_by_centers_inplace_cuda);
+    m.impl("append_kv_to_clusters_by_centers_with_steady_inplace",
+           &append_kv_to_clusters_by_centers_with_steady_inplace_cuda);
     m.impl("update_sparse_steady_kv_inplace",
            &update_sparse_steady_kv_inplace_cuda);
     m.impl("sparse_select_topk_clusters_out",

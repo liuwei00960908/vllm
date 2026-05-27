@@ -131,7 +131,7 @@ class SparseBlockTableBuffers:
         assert self.workspace_plan_row is not None
         assert self.workspace_plan_src_tb_idx is not None
         assert self.workspace_plan_src_tb_off is not None
-        return build_sparse_block_table_out(
+        out = build_sparse_block_table_out(
             top_clusters,
             cluster_compact_block_ids,
             cluster_temp_kv_pos,
@@ -153,6 +153,7 @@ class SparseBlockTableBuffers:
             self.workspace_plan_src_tb_idx,
             self.workspace_plan_src_tb_off,
         )
+        return out
 
 
 @dataclass
@@ -214,6 +215,64 @@ class SparseAppendBuffers:
             cluster_center_count,
             input_token_count,
         )
+
+    def append_with_steady(
+        self,
+        *,
+        block_storage: torch.Tensor,
+        cluster_compact_block_ids: torch.Tensor,
+        cluster_temp_kv_pos: torch.Tensor,
+        cluster_total_kv_counts: torch.Tensor,
+        temp_block_ids: torch.Tensor,
+        temp_block_kv_counts: torch.Tensor,
+        temp_block_kv_owner: torch.Tensor,
+        free_block_ids: torch.Tensor,
+        used_free_block_count: torch.Tensor | None,
+        steady_start_block_ids: torch.Tensor,
+        steady_end_block_ids: torch.Tensor,
+        steady_state: torch.Tensor,
+        steady_start_capacity: int,
+        steady_end_capacity: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cluster_centers_T: torch.Tensor,
+        mean: torch.Tensor,
+        cluster_center_count: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm._custom_ops import (
+            append_kv_to_clusters_by_centers_with_steady_inplace,
+        )
+
+        self.ensure_capacity(device=key.device)
+        assert self.error_code is not None
+        counter = used_free_block_count
+        if counter is None:
+            assert self.used_free_block_count is not None
+            counter = self.used_free_block_count
+        counter.zero_()
+        out = append_kv_to_clusters_by_centers_with_steady_inplace(
+            block_storage,
+            cluster_compact_block_ids,
+            cluster_temp_kv_pos,
+            cluster_total_kv_counts,
+            temp_block_ids,
+            temp_block_kv_counts,
+            temp_block_kv_owner,
+            free_block_ids,
+            counter,
+            self.error_code,
+            steady_start_block_ids,
+            steady_end_block_ids,
+            steady_state,
+            key,
+            value,
+            cluster_centers_T,
+            mean,
+            cluster_center_count,
+            int(steady_start_capacity),
+            int(steady_end_capacity),
+        )
+        return out
 
     def append_with_labels(
         self,

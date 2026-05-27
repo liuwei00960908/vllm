@@ -1,13 +1,16 @@
 import os
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
+import time
+
+import torch
 import vllm
+from transformers import AutoTokenizer
+from vllm import EngineArgs, LLMEngine, SamplingParams
+
 print(vllm.__file__)
 
-import time
-from vllm import EngineArgs, LLMEngine, SamplingParams
-import torch
-from transformers import AutoTokenizer
 
 def main():
     USE_SPARSE_ATTENTION = os.environ.get("TEST_USE_SPARSE_ATTENTION", "1") != "0"
@@ -35,11 +38,11 @@ def main():
                 "cluster_granularity": "token",
                 "num_clusters": 32,
                 "n_segment": 1,
-                "nprobe": 32,
+                "nprobe": 16,
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,
-            }
+            },
         )
     else:
         engine_args = EngineArgs(
@@ -64,13 +67,12 @@ def main():
     request_id = "debug_req_001"  # 字符串类型，和你之前问的一致
     tokenizer = AutoTokenizer.from_pretrained(engine_args.model)
     prompt = tokenizer.apply_chat_template(
-        [{"role": "user",
-        "content": "写一篇描写春天的小作文"}],
+        [{"role": "user", "content": "写一篇描写春天的小作文"}],
         tokenize=False,
         add_generation_prompt=True,
     )
     sampling_params = SamplingParams(
-        max_tokens=context_length,  # 生成20个token，足够看完整流程
+        max_tokens=context_length,
         temperature=0.0,  # 固定输出，方便调试
         top_p=1.0,
         ignore_eos=test_speed,
@@ -141,14 +143,11 @@ def main():
         decode_end_time = time.perf_counter()
 
     loop_elapsed = decode_end_time - loop_start_time
-    generated_tokens = len(
-        tokenizer.encode(generated_text, add_special_tokens=False)
-    )
+    generated_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
     prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
     decode_tokens = max(0, generated_tokens - 1) if step_count > 1 else 0
     decode_elapsed = (
-        decode_end_time - decode_start_time
-        if decode_start_time is not None else 0.0
+        decode_end_time - decode_start_time if decode_start_time is not None else 0.0
     )
     prefill_tokens_per_second = (
         prompt_tokens / prefill_elapsed if prefill_elapsed > 0 else 0.0
@@ -170,6 +169,7 @@ def main():
     print(f"decode token数: {decode_tokens}")
     print(f"decode耗时: {decode_elapsed:.3f}s")
     print(f"decode tokens/s: {decode_tokens_per_second:.3f}")
+
 
 if __name__ == "__main__":
     main()

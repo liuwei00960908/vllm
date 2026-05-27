@@ -3757,6 +3757,36 @@ if hasattr(torch.ops, "_C") and hasattr(
 
 
 if hasattr(torch.ops, "_C") and hasattr(
+    torch.ops._C, "append_kv_to_clusters_by_centers_with_steady_inplace"
+):
+
+    @register_fake("_C::append_kv_to_clusters_by_centers_with_steady_inplace")
+    def _append_kv_to_clusters_by_centers_with_steady_inplace_fake(
+        block_storage: torch.Tensor,
+        cluster_compact_block_ids: torch.Tensor,
+        cluster_temp_kv_pos: torch.Tensor,
+        cluster_total_kv_counts: torch.Tensor,
+        temp_block_ids: torch.Tensor,
+        temp_block_kv_counts: torch.Tensor,
+        temp_block_kv_owner: torch.Tensor,
+        free_block_ids: torch.Tensor,
+        used_free_block_count: torch.Tensor,
+        error_code: torch.Tensor,
+        steady_start_block_ids: torch.Tensor,
+        steady_end_block_ids: torch.Tensor,
+        steady_state: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cluster_centers_T: torch.Tensor,
+        mean: torch.Tensor,
+        cluster_center_count: torch.Tensor,
+        steady_start_capacity: int,
+        steady_end_capacity: int,
+    ) -> torch.Tensor:
+        return used_free_block_count
+
+
+if hasattr(torch.ops, "_C") and hasattr(
     torch.ops._C, "sparse_select_topk_clusters_out"
 ):
 
@@ -3839,6 +3869,52 @@ def append_kv_to_clusters_by_centers_inplace(
         mean,
         cluster_center_count,
         input_token_count,
+    )
+
+
+def append_kv_to_clusters_by_centers_with_steady_inplace(
+    block_storage: torch.Tensor,
+    cluster_compact_block_ids: torch.Tensor,
+    cluster_temp_kv_pos: torch.Tensor,
+    cluster_total_kv_counts: torch.Tensor,
+    temp_block_ids: torch.Tensor,
+    temp_block_kv_counts: torch.Tensor,
+    temp_block_kv_owner: torch.Tensor,
+    free_block_ids: torch.Tensor,
+    used_free_block_count: torch.Tensor,
+    error_code: torch.Tensor,
+    steady_start_block_ids: torch.Tensor,
+    steady_end_block_ids: torch.Tensor,
+    steady_state: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cluster_centers_T: torch.Tensor,
+    mean: torch.Tensor,
+    cluster_center_count: torch.Tensor,
+    steady_start_capacity: int,
+    steady_end_capacity: int,
+) -> torch.Tensor:
+    return torch.ops._C.append_kv_to_clusters_by_centers_with_steady_inplace(
+        block_storage,
+        cluster_compact_block_ids,
+        cluster_temp_kv_pos,
+        cluster_total_kv_counts,
+        temp_block_ids,
+        temp_block_kv_counts,
+        temp_block_kv_owner,
+        free_block_ids,
+        used_free_block_count,
+        error_code,
+        steady_start_block_ids,
+        steady_end_block_ids,
+        steady_state,
+        key,
+        value,
+        cluster_centers_T,
+        mean,
+        cluster_center_count,
+        int(steady_start_capacity),
+        int(steady_end_capacity),
     )
 
 

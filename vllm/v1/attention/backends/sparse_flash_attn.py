@@ -460,30 +460,30 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             smm.steady_end_capacity = int(
                 attn_metadata.extra_sparse_manager_info.steady_end_capacity
             )
-            if smm.steady_buffers is None:
-                from vllm.v1.core.sparse_kv_utils import SparseSteadyBuffers
-
-                smm.steady_buffers = SparseSteadyBuffers()
             assert smm.steady_zone_head is not None
             assert smm.steady_zone_tail is not None
             assert smm.steady_state is not None
-            assert smm.steady_buffers is not None
-            evicted_key, evicted_value, evicted_count = smm.steady_buffers.update(
-                block_storage=cluster_storage,
-                steady_start_block_ids=smm.steady_zone_head,
-                steady_end_block_ids=smm.steady_zone_tail,
-                steady_state=smm.steady_state,
-                steady_start_capacity=smm.steady_start_capacity,
-                steady_end_capacity=smm.steady_end_capacity,
-                key=key_actual,
-                value=value_actual,
-                evicted_capacity=max(num_actual_tokens, 1),
-            )
-            smm.advance_steady_python_state(num_actual_tokens)
             if smm.append_buffers is None:
                 smm.append_buffers = SparseAppendBuffers()
             assert smm.append_buffers is not None
             if is_prefill:
+                if smm.steady_buffers is None:
+                    from vllm.v1.core.sparse_kv_utils import SparseSteadyBuffers
+
+                    smm.steady_buffers = SparseSteadyBuffers()
+                assert smm.steady_buffers is not None
+                evicted_key, evicted_value, evicted_count = smm.steady_buffers.update(
+                    block_storage=cluster_storage,
+                    steady_start_block_ids=smm.steady_zone_head,
+                    steady_end_block_ids=smm.steady_zone_tail,
+                    steady_state=smm.steady_state,
+                    steady_start_capacity=smm.steady_start_capacity,
+                    steady_end_capacity=smm.steady_end_capacity,
+                    key=key_actual,
+                    value=value_actual,
+                    evicted_capacity=max(num_actual_tokens, 1),
+                )
+                smm.advance_steady_python_state(num_actual_tokens)
                 evicted_count_i = int(evicted_count.item())
                 if evicted_count_i == 0:
                     assert free_blocks_info.used_count_gpu is not None
@@ -525,7 +525,7 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                     label=labels,
                 )
             else:
-                smm.append_buffers.append(
+                smm.append_buffers.append_with_steady(
                     block_storage=cluster_storage,
                     cluster_compact_block_ids=smm.cluster_compact_block_ids,
                     cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
@@ -535,13 +535,18 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                     temp_block_kv_owner=smm.temp_block_kv_owner,
                     free_block_ids=free_blocks_info.allocated_block_ids_gpu,
                     used_free_block_count=free_blocks_info.used_count_gpu,
-                    key=evicted_key,
-                    value=evicted_value,
+                    steady_start_block_ids=smm.steady_zone_head,
+                    steady_end_block_ids=smm.steady_zone_tail,
+                    steady_state=smm.steady_state,
+                    steady_start_capacity=smm.steady_start_capacity,
+                    steady_end_capacity=smm.steady_end_capacity,
+                    key=key_actual,
+                    value=value_actual,
                     cluster_centers_T=smm.cluster_centers_T,
                     mean=smm.mean,
                     cluster_center_count=smm.cluster_center_count,
-                    input_token_count=evicted_count,
                 )
+                smm.advance_steady_python_state(num_actual_tokens)
             return
 
         return super().do_kv_cache_update(
