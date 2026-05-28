@@ -163,11 +163,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
-        torch.cuda.synchronize()
-        start_time = time.time()
         self._lmcache_engine.wait_for_layer_load(layer_name, selected_tokens, cluster_meta, token_start_index, cluster_start_index, retrieve_budget)
-        end_time = time.time()
-        logger.info(f"wait_for_layer_load {layer_name} took {(end_time - start_time)*1000} seconds")
 
     def get_prefill_saved(self) -> set[str] | None:
         fn = getattr(self._lmcache_engine, "get_prefill_saved", None)

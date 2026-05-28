@@ -206,6 +206,31 @@ struct VecLoadToFloat<__half, 8> {
 // STAGE 1: per-(req, head, group) softmax with atomic group-sum reduction
 // =============================================================================
 
+// =============================================================================
+// Stage-1 kernel: dual-q (Q-PAIR) fused block.
+//
+// Each block now handles *two* consecutive query-in-group indices (q_a =
+// 2 * q_pair_idx and q_b = q_a + 1) that share the SAME centroid matrix
+// K[r, h, :, :].  K is loaded once per block into thread-local registers
+// and reused for both dot products, halving the L2 traffic for K vs.
+// the previous "one q per block" design (4 K reads / (R,H) instead of
+// 7 for G=7).
+//
+// SMEM is kept tight (~9 KB) by packing the per-cluster raw scores for
+// q_a and q_b into a single ``bf16x2`` slot per cluster -- this preserves
+// the previous 8 blocks/SM occupancy (warp-limited, not SMEM-limited).
+// The fp32->bf16 quantization of intermediate scores is invisible to the
+// downstream consumer (the kernel returns the *softmaxed* probabilities
+// at full fp32 precision, and softmax is invariant to ULP-level noise in
+// the scores except at exact ties).
+//
+// For odd ``group_size`` the last block in the (R, H) row covers only
+// q_a (``has_b = false``); the q_b code path is gated.  ``__launch_bounds__``
+// + the ``has_b`` bool being identical across all 256 threads in the block
+// means the compiler eliminates the q_b dead code via branch prediction
+// rather than warp divergence.
+// =============================================================================
+
 template <typename scalar_t, int HEAD_DIM, int BLOCK_THREADS>
 __global__ __launch_bounds__(BLOCK_THREADS) void sparse_cluster_score_kernel(
     const scalar_t* __restrict__ Q,             // [T, num_q_heads, head_dim]
@@ -227,64 +252,77 @@ __global__ __launch_bounds__(BLOCK_THREADS) void sparse_cluster_score_kernel(
   constexpr int N_WARPS = BLOCK_THREADS / WARP_SIZE;
   constexpr int D_PER_THREAD = HEAD_DIM / WARP_SIZE;
 
-  // NB: grid is launched as ``(group_size, num_kv_heads, num_reqs)`` so
-  // that the GQA-group dim varies fastest in the scheduler.  The 7 (or
-  // however many) blocks that share the same K matrix get issued back-
-  // to-back, hitting in L2 (the same K is ~4 MB; L2 is 40 MB) instead
-  // of being scattered across waves -- this is the difference between
-  // ~13% and ~30%+ of peak HBM bandwidth for the stage-1 kernel.
-  const int q_in_group = blockIdx.x;
+  // NB: grid is launched as ``(ceil(group_size/2), num_kv_heads, num_reqs)``.
+  // The q-pair dim varies fastest so the (up to 4 for G=7) blocks sharing a
+  // single K matrix are scheduled back-to-back, maximizing L2 reuse for K.
+  const int q_pair_idx = blockIdx.x;
   const int kv_head_id = blockIdx.y;
   const int req_id     = blockIdx.z;
   const int tid        = threadIdx.x;
   const int lane       = tid & 31;
   const int warp_id    = tid >> 5;
 
+  const int q_in_group_a = q_pair_idx * 2;
+  const int q_in_group_b = q_pair_idx * 2 + 1;
+  const bool has_b       = (q_in_group_b < group_size);
+
   // ------------------- shared memory layout -------------------
-  //  s_q      : [HEAD_DIM]      fp32 query vector       (~512 B @ HEAD_DIM=128)
-  //  s_scores : [num_clusters]  fp32 raw dot scores     (~8 KB @ C=2048)
-  //  s_ml     : [N_WARPS * 2]   fp32 per-warp (m, l)    (~64 B  @ N_WARPS=8)
-  extern __shared__ float smem[];
-  float* s_q      = smem;
-  float* s_scores = s_q + HEAD_DIM;
-  float* s_ml     = s_scores + num_clusters;
+  //  s_q_a    : [HEAD_DIM]      fp32 q vector for q_a   (~512 B)
+  //  s_q_b    : [HEAD_DIM]      fp32 q vector for q_b   (~512 B; unused if !has_b)
+  //  s_scores : [num_clusters]  bf16x2 packed (q_a, q_b) raw scores (~8 KB @ C=2048)
+  //  s_ml     : [4 * N_WARPS]   fp32 per-warp (m_a, l_a, m_b, l_b) (~128 B @ N_WARPS=8)
+  // Total at HEAD_DIM=128, C=2048, BLOCK_THREADS=256: ~9.1 KB -- still
+  // warp-limited at 8 blocks/SM (vs SMEM-limited).
+  extern __shared__ unsigned char smem_raw[];
+  float* s_q_a = reinterpret_cast<float*>(smem_raw);
+  float* s_q_b = s_q_a + HEAD_DIM;
+  __nv_bfloat162* s_scores =
+      reinterpret_cast<__nv_bfloat162*>(s_q_b + HEAD_DIM);
+  float* s_ml = reinterpret_cast<float*>(s_scores + num_clusters);
 
   // ---------- 1. Resolve indices from query_start_loc ----------
-  const int tok_end    = QSL[req_id + 1];
-  const int token_idx  = tok_end - 1;
-  const int q_head_idx = kv_head_id * group_size + q_in_group;
+  const int tok_end      = QSL[req_id + 1];
+  const int token_idx    = tok_end - 1;
+  const int q_head_idx_a = kv_head_id * group_size + q_in_group_a;
+  // For has_b=false we still need a valid pointer for the unconditional
+  // load below; using q_head_idx_a keeps the load safe (the q_b results
+  // will simply be ignored).
+  const int q_head_idx_b =
+      has_b ? (kv_head_id * group_size + q_in_group_b) : q_head_idx_a;
 
-  // ---------- 2. Load q into shared memory ----------
-  const scalar_t* q_ptr = Q
-      + static_cast<int64_t>(token_idx) * stride_q_tok
-      + static_cast<int64_t>(q_head_idx) * stride_q_h;
+  // ---------- 2. Load q_a and q_b into shared memory ----------
+  const scalar_t* q_a_ptr = Q
+      + static_cast<int64_t>(token_idx)    * stride_q_tok
+      + static_cast<int64_t>(q_head_idx_a) * stride_q_h;
+  const scalar_t* q_b_ptr = Q
+      + static_cast<int64_t>(token_idx)    * stride_q_tok
+      + static_cast<int64_t>(q_head_idx_b) * stride_q_h;
 #pragma unroll
   for (int d = tid; d < HEAD_DIM; d += BLOCK_THREADS) {
-    s_q[d] = to_float<scalar_t>(q_ptr[d]);
+    s_q_a[d] = to_float<scalar_t>(q_a_ptr[d]);
+    s_q_b[d] = to_float<scalar_t>(q_b_ptr[d]);
   }
   __syncthreads();
 
-  // ---------- 3. Cache the lane's slice of q in registers ----------
-  float q_reg[D_PER_THREAD];
+  // ---------- 3. Cache the lane's slice of both q's in registers ----------
+  float q_a_reg[D_PER_THREAD];
+  float q_b_reg[D_PER_THREAD];
   const int d_offset = lane * D_PER_THREAD;
 #pragma unroll
   for (int i = 0; i < D_PER_THREAD; ++i) {
-    q_reg[i] = s_q[d_offset + i];
+    q_a_reg[i] = s_q_a[d_offset + i];
+    q_b_reg[i] = s_q_b[d_offset + i];
   }
 
-  // ---------- 4. Dot product + online (m, l) softmax accumulation ----------
-  // Each warp owns the clusters {warp_id, warp_id + N_WARPS, ...} and lane 0
-  // of each warp maintains the running max ``m_warp`` and partial denominator
-  // ``l_warp = sum exp(score - m_warp)`` over its assigned clusters.  This
-  // collapses the previous two-pass softmax (block-reduce-max + block-reduce-
-  // sum-of-exp over all 2048 entries of s_scores) into a single forward pass
-  // plus a tiny N_WARPS-wide combine, saving ~16 KB of SMEM ops per block.
+  // ---------- 4. Dot products + dual online softmax ----------
+  // K[c] is loaded ONCE into ``k_reg`` and consumed for both dot products
+  // in registers -- saving 50% of L2 traffic for K vs. the single-q design.
   const scalar_t* c_base = reinterpret_cast<const scalar_t*>(
       Centres_ptrs[req_id]
   ) + static_cast<int64_t>(kv_head_id) * stride_c_h;
 
-  float m_warp = -CUDART_INF_F;  // only meaningful on lane 0
-  float l_warp = 0.0f;            // only meaningful on lane 0
+  float m_a_warp = -CUDART_INF_F, l_a_warp = 0.0f;  // valid on lane 0
+  float m_b_warp = -CUDART_INF_F, l_b_warp = 0.0f;  // valid on lane 0
 
   for (int c_round = 0; c_round < num_clusters; c_round += N_WARPS) {
     const int c = c_round + warp_id;
@@ -293,75 +331,120 @@ __global__ __launch_bounds__(BLOCK_THREADS) void sparse_cluster_score_kernel(
         + static_cast<int64_t>(c) * stride_c_c
         + d_offset;
 
-    // Single vector load + conversion (8 B for bf16/fp16, 16 B for fp32 at
-    // HEAD_DIM=128) instead of D_PER_THREAD scalar loads.  Guarantees a
-    // single coalesced ld.global.nc.v{2,4}.b32 per lane per cluster.
     float k_reg[D_PER_THREAD];
     VecLoadToFloat<scalar_t, D_PER_THREAD>::load(k_ptr, k_reg);
 
-    float acc = 0.0f;
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
 #pragma unroll
     for (int i = 0; i < D_PER_THREAD; ++i) {
-      acc += q_reg[i] * k_reg[i];
+      acc_a += q_a_reg[i] * k_reg[i];
+      acc_b += q_b_reg[i] * k_reg[i];  // dead code eliminated when !has_b
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-      acc += __shfl_xor_sync(0xffffffff, acc, off);
+      acc_a += __shfl_xor_sync(0xffffffff, acc_a, off);
+      acc_b += __shfl_xor_sync(0xffffffff, acc_b, off);
     }
 
-    const float s = acc * scale;
     if (lane == 0) {
-      s_scores[c] = s;
-      // Online softmax update: (m, l) <- merge((m, l), (s, 1))
-      if (s > m_warp) {
-        l_warp = l_warp * __expf(m_warp - s) + 1.0f;
-        m_warp = s;
+      const float s_a = acc_a * scale;
+      const float s_b = has_b ? (acc_b * scale) : 0.0f;
+      s_scores[c] = __floats2bfloat162_rn(s_a, s_b);
+
+      // Online softmax update for q_a.
+      if (s_a > m_a_warp) {
+        l_a_warp = l_a_warp * __expf(m_a_warp - s_a) + 1.0f;
+        m_a_warp = s_a;
       } else {
-        l_warp += __expf(s - m_warp);
+        l_a_warp += __expf(s_a - m_a_warp);
+      }
+      if (has_b) {
+        if (s_b > m_b_warp) {
+          l_b_warp = l_b_warp * __expf(m_b_warp - s_b) + 1.0f;
+          m_b_warp = s_b;
+        } else {
+          l_b_warp += __expf(s_b - m_b_warp);
+        }
       }
     }
   }
 
-  // ---------- 5. Block-wide combine of the N_WARPS (m, l) pairs ----------
+  // ---------- 5. Block combine of the N_WARPS (m, l) pairs for a AND b ----------
   if (lane == 0) {
-    s_ml[warp_id * 2]     = m_warp;
-    s_ml[warp_id * 2 + 1] = l_warp;
+    s_ml[warp_id * 4 + 0] = m_a_warp;
+    s_ml[warp_id * 4 + 1] = l_a_warp;
+    s_ml[warp_id * 4 + 2] = m_b_warp;
+    s_ml[warp_id * 4 + 3] = l_b_warp;
   }
   __syncthreads();
 
-  // A single warp combines the N_WARPS pairs into a global (m, 1/l).
+  // One warp combines both (m, l) pairs in parallel: lanes 0..N_WARPS-1
+  // pull a's pair, lanes N_WARPS..2*N_WARPS-1 pull b's pair.
   if (warp_id == 0) {
-    const float m_lane =
-        (lane < N_WARPS) ? s_ml[lane * 2]     : -CUDART_INF_F;
-    const float l_lane =
-        (lane < N_WARPS) ? s_ml[lane * 2 + 1] : 0.0f;
+    const bool is_b_lane = (lane >= N_WARPS) && (lane < 2 * N_WARPS);
+    const int sub_lane   = is_b_lane ? (lane - N_WARPS) : lane;
+    const bool active    = (sub_lane < N_WARPS);
+
+    const float m_lane = active
+        ? s_ml[sub_lane * 4 + (is_b_lane ? 2 : 0)]
+        : -CUDART_INF_F;
+    const float l_lane = active
+        ? s_ml[sub_lane * 4 + (is_b_lane ? 3 : 1)]
+        : 0.0f;
+
+    // Restrict the shuffle to within a's group (0..N_WARPS-1) and within
+    // b's group (N_WARPS..2*N_WARPS-1) by using a half-warp mask.
+    // N_WARPS = 8 means each "sub-warp" is half a real warp; we use the
+    // ``__shfl_*_sync`` ``width`` argument to confine the reductions.
+    constexpr int WIDTH = N_WARPS;  // each sub-reduce spans WIDTH lanes
 
     float m = m_lane;
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+    for (int off = WIDTH / 2; off > 0; off >>= 1) {
+      m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off, WIDTH));
     }
-    float l_scaled = (lane < N_WARPS) ? l_lane * __expf(m_lane - m) : 0.0f;
+    float l_scaled = active ? (l_lane * __expf(m_lane - m)) : 0.0f;
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      l_scaled += __shfl_xor_sync(0xffffffff, l_scaled, off);
+    for (int off = WIDTH / 2; off > 0; off >>= 1) {
+      l_scaled += __shfl_xor_sync(0xffffffff, l_scaled, off, WIDTH);
     }
-    if (lane == 0) {
-      s_ml[0] = m;
-      s_ml[1] = 1.0f / l_scaled;
+
+    if (sub_lane == 0) {
+      if (is_b_lane) {
+        s_ml[2] = m;
+        s_ml[3] = (l_scaled > 0.0f) ? (1.0f / l_scaled) : 0.0f;
+      } else {
+        s_ml[0] = m;
+        s_ml[1] = (l_scaled > 0.0f) ? (1.0f / l_scaled) : 0.0f;
+      }
     }
   }
   __syncthreads();
 
-  const float m_global = s_ml[0];
-  const float inv_l    = s_ml[1];
+  const float m_a_global = s_ml[0];
+  const float inv_l_a    = s_ml[1];
+  const float m_b_global = s_ml[2];
+  const float inv_l_b    = s_ml[3];
 
-  // ---------- 6. AtomicAdd normalized probs to [R, H, C] -------
+  // ---------- 6. AtomicAdd normalized probs to [R, H, C] -----------
+  // Two streaming writes through the packed s_scores: each cluster's
+  // bf162 unpacks to (s_a, s_b), each contributes one atomic add.
   float* out_base = Out
       + static_cast<int64_t>(req_id)     * stride_o_r
       + static_cast<int64_t>(kv_head_id) * stride_o_h;
-  for (int c = tid; c < num_clusters; c += BLOCK_THREADS) {
-    atomicAdd(out_base + c, __expf(s_scores[c] - m_global) * inv_l);
+
+  if (has_b) {
+    for (int c = tid; c < num_clusters; c += BLOCK_THREADS) {
+      const float2 pair = __bfloat1622float2(s_scores[c]);
+      atomicAdd(out_base + c, __expf(pair.x - m_a_global) * inv_l_a);
+      atomicAdd(out_base + c, __expf(pair.y - m_b_global) * inv_l_b);
+    }
+  } else {
+    for (int c = tid; c < num_clusters; c += BLOCK_THREADS) {
+      const float2 pair = __bfloat1622float2(s_scores[c]);
+      atomicAdd(out_base + c, __expf(pair.x - m_a_global) * inv_l_a);
+    }
   }
 }
 
@@ -391,15 +474,21 @@ void launch_sparse_cluster_score(
   constexpr int BLOCK_THREADS = 256;
   constexpr int N_WARPS = BLOCK_THREADS / 32;
 
+  // Dual-Q kernel: each block handles 2 consecutive q_in_group slots
+  // sharing the same K matrix.  Grid x-dim is ceil(group_size / 2);
+  // SMEM holds two q vectors + one bf16x2-packed (q_a, q_b) score array
+  // + 4 fp32 (m, l) slots per warp.
+  const int q_pair_blocks = (group_size + 1) / 2;
   const size_t smem_bytes =
-      sizeof(float) * static_cast<size_t>(HEAD_DIM)         // s_q
-    + sizeof(float) * static_cast<size_t>(num_clusters)     // s_scores
-    + sizeof(float) * static_cast<size_t>(2 * N_WARPS);     // s_ml
+      sizeof(float)          * static_cast<size_t>(HEAD_DIM)        // s_q_a
+    + sizeof(float)          * static_cast<size_t>(HEAD_DIM)        // s_q_b
+    + sizeof(__nv_bfloat162) * static_cast<size_t>(num_clusters)    // s_scores
+    + sizeof(float)          * static_cast<size_t>(4 * N_WARPS);    // s_ml
 
-  // ``group_size`` is the FASTEST-varying grid dim so the 7-block group
-  // sharing a single K matrix is scheduled together -- see the comment
-  // inside ``sparse_cluster_score_kernel``.
-  dim3 grid(group_size, num_kv_heads, num_reqs);
+  // ``q_pair`` is the FASTEST-varying grid dim so the (up to 4 for G=7)
+  // blocks sharing a single K matrix are scheduled back-to-back, hitting
+  // in L2 instead of being scattered across waves.
+  dim3 grid(q_pair_blocks, num_kv_heads, num_reqs);
   dim3 block(BLOCK_THREADS);
 
   sparse_cluster_score_kernel<scalar_t, HEAD_DIM, BLOCK_THREADS>
