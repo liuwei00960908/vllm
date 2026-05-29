@@ -16,29 +16,34 @@ def main():
     USE_SPARSE_ATTENTION = os.environ.get("TEST_USE_SPARSE_ATTENTION", "1") != "0"
     PROFILE_DECODE_ONLY = os.environ.get("TEST_PROFILE_DECODE_ONLY", "0") == "1"
     ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
-    context_length = 5000
+    model = "Qwen/Qwen2.5-7B-Instruct"
+    context_length = int(os.environ.get("TEST_CONTEXT_LENGTH", "5000"))
     block_size = 16
-    test_speed = False
+    test_speed = os.environ.get("TEST_IGNORE_EOS", "1") == "1"
+    enforce_eager = os.environ.get("TEST_ENFORCE_EAGER", "0") == "1"
+    gpu_memory_utilization = float(
+        os.environ.get("TEST_GPU_MEMORY_UTILIZATION", "0.5")
+    )
     print_output = False
 
     # ====================== 1. 引擎配置（和server端完全一致） ======================
     if USE_SPARSE_ATTENTION:
         engine_args = EngineArgs(
             # 用最小的模型调试，速度快，显存占用小
-            model="Qwen/Qwen2-0.5B-Instruct",
+            model=model,
             tensor_parallel_size=1,
             dtype="bfloat16",
             max_model_len=context_length,
             block_size=block_size,
             max_num_seqs=1,
-            enforce_eager=False,
-            gpu_memory_utilization=0.5,
+            enforce_eager=enforce_eager,
+            gpu_memory_utilization=gpu_memory_utilization,
             async_scheduling=ASYNC_SCHEDULING,
             sparse_attention={
                 "cluster_granularity": "token",
-                "num_clusters": 32,
+                "num_clusters": 64,
                 "n_segment": 1,
-                "nprobe": 16,
+                "nprobe": 5,
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,
@@ -47,14 +52,14 @@ def main():
     else:
         engine_args = EngineArgs(
             # 用最小的模型调试，速度快，显存占用小
-            model="Qwen/Qwen2-0.5B-Instruct",
+            model=model,
             tensor_parallel_size=1,
             dtype="bfloat16",
             max_model_len=context_length,
             block_size=block_size,
             max_num_seqs=1,
-            enforce_eager=False,
-            gpu_memory_utilization=0.5,
+            enforce_eager=enforce_eager,
+            gpu_memory_utilization=gpu_memory_utilization,
             async_scheduling=ASYNC_SCHEDULING,
         )
 
