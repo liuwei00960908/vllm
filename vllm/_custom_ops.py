@@ -3802,6 +3802,20 @@ if hasattr(torch.ops, "_C") and hasattr(
         return out_top_clusters
 
 
+if hasattr(torch.ops, "_C") and hasattr(
+    torch.ops._C, "union_topk_clusters_by_kv_group_out"
+):
+
+    @register_fake("_C::union_topk_clusters_by_kv_group_out")
+    def _union_topk_clusters_by_kv_group_out_fake(
+        top_clusters: torch.Tensor,
+        hkv: int,
+        num_clusters: int,
+        out_top_clusters: torch.Tensor,
+    ) -> torch.Tensor:
+        return out_top_clusters
+
+
 def append_kv_to_clusters_inplace(
     block_storage: torch.Tensor,
     cluster_compact_block_ids: torch.Tensor,
@@ -3932,5 +3946,19 @@ def sparse_select_topk_clusters_out(
         mean,
         cluster_center_count,
         int(nprobe),
+        out_top_clusters,
+    )
+
+
+def union_topk_clusters_by_kv_group_out(
+    top_clusters: torch.Tensor,
+    hkv: int,
+    num_clusters: int,
+    out_top_clusters: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.union_topk_clusters_by_kv_group_out(
+        top_clusters,
+        int(hkv),
+        int(num_clusters),
         out_top_clusters,
     )

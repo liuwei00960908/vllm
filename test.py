@@ -17,7 +17,7 @@ def main():
     PROFILE_DECODE_ONLY = os.environ.get("TEST_PROFILE_DECODE_ONLY", "0") == "1"
     ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
     model = "Qwen/Qwen2.5-7B-Instruct"
-    context_length = int(os.environ.get("TEST_CONTEXT_LENGTH", "5000"))
+    context_length = int(os.environ.get("TEST_CONTEXT_LENGTH", "15000"))
     block_size = 16
     test_speed = os.environ.get("TEST_IGNORE_EOS", "1") == "1"
     enforce_eager = os.environ.get("TEST_ENFORCE_EAGER", "0") == "1"

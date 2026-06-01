@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Sparse FlashAttention backend and implementation."""
 
+import atexit
+from collections import Counter
 from dataclasses import dataclass, field, fields
+import os
 from typing import ClassVar
 
 import torch
@@ -34,6 +37,27 @@ from vllm.v1.core.sparse_kv_utils import (
 )
 
 logger = init_logger(__name__)
+
+_sparse_union_cluster_hist: Counter[int] = Counter()
+
+
+def _print_sparse_union_cluster_hist() -> None:
+    if not _sparse_union_cluster_hist:
+        return
+    total = sum(_sparse_union_cluster_hist.values())
+    weighted = sum(k * v for k, v in _sparse_union_cluster_hist.items())
+    items = ",".join(
+        f"{k}:{_sparse_union_cluster_hist[k]}"
+        for k in sorted(_sparse_union_cluster_hist)
+    )
+    print(
+        "SPARSE_UNION_CLUSTER_HIST "
+        f"total={total} mean={weighted / total:.3f} hist={items}",
+        flush=True,
+    )
+
+
+atexit.register(_print_sparse_union_cluster_hist)
 
 
 @dataclass
@@ -294,6 +318,9 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
         cluster_block_size = cluster_storage.shape[2]
         num_queries = num_actual_tokens
         hq = query.shape[1]
+        hkv = key.shape[1]
+        assert hq % hkv == 0, "query heads must be divisible by kv heads"
+        q_per_kv = hq // hkv
         max_blocks = block_table.shape[-1]
         nprobe = attn_metadata.extra_sparse_manager_info.nprobe
 
@@ -316,14 +343,98 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
         assert smm.steady_zone_tail is not None
         assert smm.steady_state is not None
         steady_blocks = smm.steady_zone_head.shape[1] + smm.steady_zone_tail.shape[1]
-        required_free_blocks = num_queries * hq * (nprobe + steady_blocks)
+        use_grouped_sparse_fa = os.environ.get("TEST_SPARSE_GROUPED_FA", "1") != "0"
+        if not use_grouped_sparse_fa:
+            required_free_blocks = num_queries * hq * (nprobe + steady_blocks)
+            assert free_block_ids.numel() >= required_free_blocks, (
+                "Sparse reusable scratch pool is undersized: "
+                f"have {free_block_ids.numel()}, need at least "
+                f"{required_free_blocks}"
+            )
+            block_table, _, seqused_k = smm.block_table_buffers.build(
+                top_clusters=top_clusters,
+                cluster_compact_block_ids=smm.cluster_compact_block_ids,
+                cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
+                cluster_total_kv_counts=smm.cluster_total_kv_counts,
+                temp_block_ids=smm.temp_block_ids,
+                block_storage=cluster_storage,
+                free_block_ids=free_block_ids,
+                steady_start_block_ids=smm.steady_zone_head,
+                steady_end_block_ids=smm.steady_zone_tail,
+                steady_state=smm.steady_state,
+                max_bt_len=max_blocks,
+            )
+
+            num_rows = num_queries * hq
+            device = query.device
+            q_flat = query_actual.reshape(num_rows, 1, -1)
+            out_flat = output_actual.reshape(num_rows, 1, -1)
+            seqused_k_flat = seqused_k.reshape(num_rows)
+            block_table_flat = block_table.reshape(num_rows, -1)
+            if (
+                smm.cu_seqlens_q_buffer is None
+                or smm.cu_seqlens_q_buffer.shape[0] < num_rows + 1
+                or smm.cu_seqlens_q_buffer.dtype != cu_seqlens_q.dtype
+                or smm.cu_seqlens_q_step != 1
+            ):
+                smm.cu_seqlens_q_buffer = torch.arange(
+                    num_rows + 1,
+                    device=device,
+                    dtype=cu_seqlens_q.dtype,
+                )
+                smm.cu_seqlens_q_step = 1
+            cu_seqlens_q_batch = smm.cu_seqlens_q_buffer[: num_rows + 1]
+
+            flash_attn_varlen_func(
+                q=q_flat,
+                k=cluster_storage[0, :, :, None, :],
+                v=cluster_storage[1, :, :, None, :],
+                out=out_flat,
+                cu_seqlens_q=cu_seqlens_q_batch,
+                max_seqlen_q=1,
+                seqused_k=seqused_k_flat,
+                max_seqlen_k=max_blocks * cluster_block_size,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=block_table_flat,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=None,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=self.sinks,
+            )
+            return output
+
+        union_nprobe = min(cluster_centers_t.shape[2], nprobe * q_per_kv)
+        grouped_top_clusters = smm.block_table_buffers.union_top_clusters_by_kv_group(
+            top_clusters=top_clusters,
+            hkv=hkv,
+            num_clusters=cluster_centers_t.shape[2],
+            union_nprobe=union_nprobe,
+        )
+        if os.environ.get("TEST_SPARSE_UNION_STATS", "0") != "0":
+            counts = (
+                (grouped_top_clusters >= 0)
+                .sum(dim=-1)
+                .detach()
+                .to(device="cpu")
+                .reshape(-1)
+                .tolist()
+            )
+            _sparse_union_cluster_hist.update(int(count) for count in counts)
+        required_free_blocks = num_queries * hkv * (union_nprobe + steady_blocks)
         assert free_block_ids.numel() >= required_free_blocks, (
             "Sparse reusable scratch pool is undersized: "
             f"have {free_block_ids.numel()}, need at least "
             f"{required_free_blocks}"
         )
         block_table, _, seqused_k = smm.block_table_buffers.build(
-            top_clusters=top_clusters,
+            top_clusters=grouped_top_clusters,
             cluster_compact_block_ids=smm.cluster_compact_block_ids,
             cluster_temp_kv_pos=smm.cluster_temp_kv_pos,
             cluster_total_kv_counts=smm.cluster_total_kv_counts,
@@ -336,22 +447,28 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             max_bt_len=max_blocks,
         )
 
-        num_rows = num_queries * hq
+        num_rows = num_queries * hkv
         device = query.device
-        q_flat = query_actual.reshape(num_rows, 1, -1)
-        out_flat = output_actual.reshape(num_rows, 1, -1)
+        q_flat = query_actual.reshape(num_queries, hkv, q_per_kv, -1).reshape(
+            num_rows, q_per_kv, -1
+        )
+        out_flat = output_actual.reshape(num_queries, hkv, q_per_kv, -1).reshape(
+            num_rows, q_per_kv, -1
+        )
         seqused_k_flat = seqused_k.reshape(num_rows)
         block_table_flat = block_table.reshape(num_rows, -1)
         if (
             smm.cu_seqlens_q_buffer is None
             or smm.cu_seqlens_q_buffer.shape[0] < num_rows + 1
             or smm.cu_seqlens_q_buffer.dtype != cu_seqlens_q.dtype
+            or smm.cu_seqlens_q_step != 1
         ):
             smm.cu_seqlens_q_buffer = torch.arange(
                 num_rows + 1,
                 device=device,
                 dtype=cu_seqlens_q.dtype,
             )
+            smm.cu_seqlens_q_step = 1
         cu_seqlens_q_batch = smm.cu_seqlens_q_buffer[: num_rows + 1]
 
         flash_attn_varlen_func(

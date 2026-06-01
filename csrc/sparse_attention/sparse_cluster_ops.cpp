@@ -62,6 +62,17 @@ extern "C" int sparse_select_topk_clusters_launcher_raw(
     int nprobe,
     cudaStream_t stream);
 
+extern "C" int union_topk_clusters_by_kv_group_launcher_raw(
+    const int32_t* d_top_clusters,
+    int32_t* d_out_top_clusters,
+    int Nq,
+    int Hq,
+    int Hkv,
+    int num_clusters,
+    int nprobe,
+    int union_nprobe,
+    cudaStream_t stream);
+
 extern "C" int update_sparse_steady_kv_launcher_raw(
     void* d_block_storage,
     int32_t storage_dtype,
@@ -832,6 +843,59 @@ torch::Tensor sparse_select_topk_clusters_out_cuda(
     return out_top_clusters;
 }
 
+torch::Tensor union_topk_clusters_by_kv_group_out_cuda(
+    torch::Tensor top_clusters,
+    int64_t hkv,
+    int64_t num_clusters,
+    torch::Tensor out_top_clusters
+) {
+    check_cuda_contig(top_clusters, "top_clusters");
+    check_cuda_contig(out_top_clusters, "out_top_clusters");
+
+    TORCH_CHECK(top_clusters.scalar_type() == torch::kInt32,
+                "top_clusters must be int32");
+    TORCH_CHECK(out_top_clusters.scalar_type() == torch::kInt32,
+                "out_top_clusters must be int32");
+    TORCH_CHECK(top_clusters.dim() == 3,
+                "top_clusters must be [Nq,Hq,nprobe]");
+    TORCH_CHECK(out_top_clusters.dim() == 3,
+                "out_top_clusters must be [Nq,Hkv,union_nprobe]");
+
+    const int Nq = static_cast<int>(top_clusters.size(0));
+    const int Hq = static_cast<int>(top_clusters.size(1));
+    const int nprobe = static_cast<int>(top_clusters.size(2));
+    const int Hkv = static_cast<int>(hkv);
+    const int C = static_cast<int>(num_clusters);
+    const int union_nprobe = static_cast<int>(out_top_clusters.size(2));
+
+    TORCH_CHECK(Hkv > 0 && Hq % Hkv == 0, "Hq must be divisible by Hkv");
+    TORCH_CHECK(C > 0, "num_clusters must be positive");
+    TORCH_CHECK(nprobe > 0, "nprobe must be positive");
+    TORCH_CHECK(union_nprobe > 0 && union_nprobe <= C,
+                "union_nprobe must be in (0, num_clusters]");
+    TORCH_CHECK(out_top_clusters.size(0) == Nq &&
+                    out_top_clusters.size(1) == Hkv,
+                "out_top_clusters shape mismatch");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(top_clusters));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int rc = union_topk_clusters_by_kv_group_launcher_raw(
+        top_clusters.data_ptr<int32_t>(),
+        out_top_clusters.data_ptr<int32_t>(),
+        Nq,
+        Hq,
+        Hkv,
+        C,
+        nprobe,
+        union_nprobe,
+        stream);
+
+    TORCH_CHECK(rc == ERR_OK,
+                "union_topk_clusters_by_kv_group launcher failed, rc=", rc);
+    return out_top_clusters;
+}
+
 TORCH_LIBRARY_FRAGMENT(_C, ops) {
     ops.def(
         "append_kv_to_clusters("
@@ -928,6 +992,13 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
         "  int nprobe,"
         "  Tensor out_top_clusters"
         ") -> Tensor");
+    ops.def(
+        "union_topk_clusters_by_kv_group_out("
+        "  Tensor top_clusters,"
+        "  int hkv,"
+        "  int num_clusters,"
+        "  Tensor out_top_clusters"
+        ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
@@ -941,4 +1012,6 @@ TORCH_LIBRARY_IMPL(_C, CUDA, m) {
            &update_sparse_steady_kv_inplace_cuda);
     m.impl("sparse_select_topk_clusters_out",
            &sparse_select_topk_clusters_out_cuda);
+    m.impl("union_topk_clusters_by_kv_group_out",
+           &union_topk_clusters_by_kv_group_out_cuda);
 }

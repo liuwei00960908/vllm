@@ -179,60 +179,60 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
     const int steady_full_len = steady_start_full + steady_end_full;
     const int steady_tail_sum = steady_start_tail + steady_end_tail;
 
-    int my_full_nb = 0;
-    int my_tail = 0;
-    int my_seq = 0;
-    int my_cid = -1;
-
-    if (lane < nprobe) {
-        my_cid = top_clusters[top_base + lane];
-        if (my_cid >= 0 && my_cid < C) {
-            const int total_cnt = cluster_total_kv_counts[total_base_h + my_cid];
-            if (total_cnt > 0) {
-                my_seq = total_cnt;
-                my_full_nb = total_cnt / block_size;
-                my_tail = total_cnt % block_size;
-
-                if (my_full_nb > maxB) {
-                    printf("\n===========\nmaxB=%d, my_full_nb=%d, cluster_total_kv_counts=%d, block_size=%d\n==========\n", 
-                        maxB, my_full_nb, total_cnt, block_size);
-                    warp_set_error_and_trap(error_code, ERR_NB_OVERFLOW, lane);
-                    return;
-                }
-            }
-        } else {
-            my_cid = -1;
-        }
-    }
-
-    int scan_full = my_full_nb;
-    int scan_tail = my_tail;
-    int scan_seq = my_seq;
-
-    #pragma unroll
-    for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-        const int y_full = __shfl_up_sync(FULL_MASK, scan_full, offset);
-        const int y_tail = __shfl_up_sync(FULL_MASK, scan_tail, offset);
-        const int y_seq = __shfl_up_sync(FULL_MASK, scan_seq, offset);
-
-        if (lane >= offset) {
-            scan_full += y_full;
-            scan_tail += y_tail;
-            scan_seq += y_seq;
-        }
-    }
-
-    const int my_write_base = scan_full - my_full_nb;
-    const int my_tail_prefix = scan_tail - my_tail;
-
     int compact_len = 0;
     int temp_sum = 0;
     int seq_sum = 0;
 
-    if (nprobe > 0) {
-        compact_len = __shfl_sync(FULL_MASK, scan_full, nprobe - 1);
-        temp_sum = __shfl_sync(FULL_MASK, scan_tail, nprobe - 1);
-        seq_sum = __shfl_sync(FULL_MASK, scan_seq, nprobe - 1);
+    for (int chunk_start = 0; chunk_start < nprobe; chunk_start += WARP_SIZE) {
+        const int active = min(WARP_SIZE, nprobe - chunk_start);
+        int my_full_nb = 0;
+        int my_tail = 0;
+        int my_seq = 0;
+        int my_cid = -1;
+
+        if (lane < active) {
+            my_cid = top_clusters[top_base + chunk_start + lane];
+            if (my_cid >= 0 && my_cid < C) {
+                const int total_cnt =
+                    cluster_total_kv_counts[total_base_h + my_cid];
+                if (total_cnt > 0) {
+                    my_seq = total_cnt;
+                    my_full_nb = total_cnt / block_size;
+                    my_tail = total_cnt % block_size;
+
+                    if (my_full_nb > maxB) {
+                        printf("\n===========\nmaxB=%d, my_full_nb=%d, cluster_total_kv_counts=%d, block_size=%d\n==========\n",
+                            maxB, my_full_nb, total_cnt, block_size);
+                        warp_set_error_and_trap(
+                            error_code, ERR_NB_OVERFLOW, lane);
+                        return;
+                    }
+                }
+            } else {
+                my_cid = -1;
+            }
+        }
+
+        int scan_full = my_full_nb;
+        int scan_tail = my_tail;
+        int scan_seq = my_seq;
+
+        #pragma unroll
+        for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+            const int y_full = __shfl_up_sync(FULL_MASK, scan_full, offset);
+            const int y_tail = __shfl_up_sync(FULL_MASK, scan_tail, offset);
+            const int y_seq = __shfl_up_sync(FULL_MASK, scan_seq, offset);
+
+            if (lane >= offset) {
+                scan_full += y_full;
+                scan_tail += y_tail;
+                scan_seq += y_seq;
+            }
+        }
+
+        compact_len += __shfl_sync(FULL_MASK, scan_full, active - 1);
+        temp_sum += __shfl_sync(FULL_MASK, scan_tail, active - 1);
+        seq_sum += __shfl_sync(FULL_MASK, scan_seq, active - 1);
     }
 
     int free_base = 0;
@@ -311,10 +311,6 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
         return;
     }
 
-    const int lanes_per_cluster_raw = WARP_SIZE / nprobe;
-    const int lanes_per_cluster = lanes_per_cluster_raw > 0 ? lanes_per_cluster_raw : 1;
-    const int covered_lanes = lanes_per_cluster * nprobe;
-
     if (steady_start_tail > 0) {
         const int bid = steady_start_block_ids[
             (int64_t)hkv * steady_start_blocks + steady_start_full];
@@ -348,73 +344,129 @@ __global__ void k_build_sparse_block_table_metadata_and_plan(
 
     // Generate the per-token copy plan. Do this even when compact_len == 0,
     // because a row can have only tail tokens and no compact full blocks.
-    if (lane < covered_lanes) {
-        const int cluster_idx = lane / lanes_per_cluster;
-        const int lane_in_cluster = lane - cluster_idx * lanes_per_cluster;
+    int tail_prefix = 0;
+    int write_base = 0;
 
-        const int cid = __shfl_sync(FULL_MASK, my_cid, cluster_idx);
-        const int tail = __shfl_sync(FULL_MASK, my_tail, cluster_idx);
-        const int tail_prefix = __shfl_sync(FULL_MASK, my_tail_prefix, cluster_idx);
+    for (int chunk_start = 0; chunk_start < nprobe; chunk_start += WARP_SIZE) {
+        const int active = min(WARP_SIZE, nprobe - chunk_start);
+        int my_full_nb = 0;
+        int my_tail = 0;
+        int my_cid = -1;
 
-        if (cid >= 0 && tail > 0) {
-            const int64_t temp_pos_base =
-                temp_pos_base_h + (int64_t)cid * block_size * 2;
-
-            const int plan_base = base_plan + steady_tail_sum + tail_prefix;
-
-            for (int slot = lane_in_cluster; slot < tail; slot += lanes_per_cluster) {
-                const int tb_idx =
-                    cluster_temp_kv_pos[temp_pos_base + (int64_t)slot * 2 + 0];
-                const int tb_off =
-                    cluster_temp_kv_pos[temp_pos_base + (int64_t)slot * 2 + 1];
-
-                if (tb_idx < 0 || tb_off < 0 || tb_off >= block_size) {
-                    warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
-                    return;
+        if (lane < active) {
+            my_cid = top_clusters[top_base + chunk_start + lane];
+            if (my_cid >= 0 && my_cid < C) {
+                const int total_cnt =
+                    cluster_total_kv_counts[total_base_h + my_cid];
+                if (total_cnt > 0) {
+                    my_full_nb = total_cnt / block_size;
+                    my_tail = total_cnt % block_size;
                 }
-
-                const int src_bid = temp_block_ids[tb_idx];
-                if (src_bid < 0 || src_bid >= total_blocks) {
-                    warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
-                    return;
-                }
-
-                const int p = plan_base + slot;
-                plan_row[p] = row;
-                plan_src_tb_idx[p] = src_bid;
-                plan_src_tb_off[p] = tb_off;
+            } else {
+                my_cid = -1;
             }
         }
-    }
 
-    // Write compact full blocks into the beginning of block_table.
-    if (compact_len > 0 && lane < covered_lanes) {
-        const int cluster_idx = lane / lanes_per_cluster;
-        const int lane_in_cluster = lane - cluster_idx * lanes_per_cluster;
+        int scan_full = my_full_nb;
+        int scan_tail = my_tail;
 
-        const int cid = __shfl_sync(FULL_MASK, my_cid, cluster_idx);
-        const int full_nb = __shfl_sync(FULL_MASK, my_full_nb, cluster_idx);
-        const int write_base = __shfl_sync(FULL_MASK, my_write_base, cluster_idx);
+        #pragma unroll
+        for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+            const int y_full = __shfl_up_sync(FULL_MASK, scan_full, offset);
+            const int y_tail = __shfl_up_sync(FULL_MASK, scan_tail, offset);
 
-        if (cid >= 0 && full_nb > 0) {
-            const int64_t compact_base = compact_base_h + (int64_t)cid * maxB;
-
-            for (int bi = lane_in_cluster; bi < full_nb; bi += lanes_per_cluster) {
-                const int bid = cluster_compact_block_ids[compact_base + bi];
-                if (bid < 0 || bid >= total_blocks) {
-                    warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
-                    return;
-                }
-                out_block_table[row_base + steady_full_len + write_base + bi] =
-                    bid;
+            if (lane >= offset) {
+                scan_full += y_full;
+                scan_tail += y_tail;
             }
         }
+
+        const int my_write_base = write_base + scan_full - my_full_nb;
+        const int my_tail_prefix = tail_prefix + scan_tail - my_tail;
+        const int lanes_per_cluster_raw = WARP_SIZE / active;
+        const int lanes_per_cluster =
+            lanes_per_cluster_raw > 0 ? lanes_per_cluster_raw : 1;
+        const int covered_lanes = lanes_per_cluster * active;
+
+        if (lane < covered_lanes) {
+            const int cluster_idx = lane / lanes_per_cluster;
+            const int lane_in_cluster = lane - cluster_idx * lanes_per_cluster;
+
+            const int cid = __shfl_sync(FULL_MASK, my_cid, cluster_idx);
+            const int tail = __shfl_sync(FULL_MASK, my_tail, cluster_idx);
+            const int tail_prefix_i =
+                __shfl_sync(FULL_MASK, my_tail_prefix, cluster_idx);
+
+            if (cid >= 0 && tail > 0) {
+                const int64_t temp_pos_base =
+                    temp_pos_base_h + (int64_t)cid * block_size * 2;
+
+                const int plan_base =
+                    base_plan + steady_tail_sum + tail_prefix_i;
+
+                for (int slot = lane_in_cluster; slot < tail;
+                     slot += lanes_per_cluster) {
+                    const int tb_idx =
+                        cluster_temp_kv_pos[temp_pos_base +
+                                            (int64_t)slot * 2 + 0];
+                    const int tb_off =
+                        cluster_temp_kv_pos[temp_pos_base +
+                                            (int64_t)slot * 2 + 1];
+
+                    if (tb_idx < 0 || tb_off < 0 || tb_off >= block_size) {
+                        warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
+                        return;
+                    }
+
+                    const int src_bid = temp_block_ids[tb_idx];
+                    if (src_bid < 0 || src_bid >= total_blocks) {
+                        warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
+                        return;
+                    }
+
+                    const int p = plan_base + slot;
+                    plan_row[p] = row;
+                    plan_src_tb_idx[p] = src_bid;
+                    plan_src_tb_off[p] = tb_off;
+                }
+            }
+        }
+
+        // Write compact full blocks into the beginning of block_table.
+        if (compact_len > 0 && lane < covered_lanes) {
+            const int cluster_idx = lane / lanes_per_cluster;
+            const int lane_in_cluster = lane - cluster_idx * lanes_per_cluster;
+
+            const int cid = __shfl_sync(FULL_MASK, my_cid, cluster_idx);
+            const int full_nb = __shfl_sync(FULL_MASK, my_full_nb, cluster_idx);
+            const int write_base_i =
+                __shfl_sync(FULL_MASK, my_write_base, cluster_idx);
+
+            if (cid >= 0 && full_nb > 0) {
+                const int64_t compact_base = compact_base_h + (int64_t)cid * maxB;
+
+                for (int bi = lane_in_cluster; bi < full_nb;
+                     bi += lanes_per_cluster) {
+                    const int bid = cluster_compact_block_ids[compact_base + bi];
+                    if (bid < 0 || bid >= total_blocks) {
+                        warp_set_error_and_trap(error_code, ERR_BAD_PARAM, lane);
+                        return;
+                    }
+                    out_block_table[row_base + steady_full_len + write_base_i + bi] =
+                        bid;
+                }
+            }
+        }
+
+        tail_prefix += __shfl_sync(FULL_MASK, scan_tail, active - 1);
+        write_base += __shfl_sync(FULL_MASK, scan_full, active - 1);
     }
 }
 
 template <typename T>
 __global__ void k_build_sparse_block_table_copy_from_plan_src_only(
     const int32_t* __restrict__ total_plan_count_ptr,
+    const int32_t* __restrict__ error_code,
     const int32_t* __restrict__ plan_row,
     const int32_t* __restrict__ plan_src_tb_idx,
     const int32_t* __restrict__ plan_src_tb_off,
@@ -433,6 +485,8 @@ __global__ void k_build_sparse_block_table_copy_from_plan_src_only(
 
     const int global_warp_id = blockIdx.x * warps_per_block + warp_id_in_block;
     const int warp_stride = gridDim.x * warps_per_block;
+
+    if (error_code[0] != ERR_OK) return;
 
     const int total_plan_count = total_plan_count_ptr[0];
 
@@ -495,7 +549,6 @@ extern "C" int build_sparse_block_table_launcher_raw(
     }
 
     if (Hq % Hkv != 0) return ERR_HQ_HKV_MISMATCH;
-    if (nprobe > WARP_SIZE) return ERR_BAD_PARAM;
 
     const int rows = NQ * Hq;
 
@@ -570,6 +623,7 @@ extern "C" int build_sparse_block_table_launcher_raw(
         if (storage_dtype == DTYPE_FP32) {
             k_build_sparse_block_table_copy_from_plan_src_only<float><<<blocks, threads, 0, stream>>>(
                 d_total_plan_count,
+                d_error_code,
                 d_plan_row,
                 d_plan_src_tb_idx,
                 d_plan_src_tb_off,
@@ -584,6 +638,7 @@ extern "C" int build_sparse_block_table_launcher_raw(
         } else if (storage_dtype == DTYPE_FP16) {
             k_build_sparse_block_table_copy_from_plan_src_only<__half><<<blocks, threads, 0, stream>>>(
                 d_total_plan_count,
+                d_error_code,
                 d_plan_row,
                 d_plan_src_tb_idx,
                 d_plan_src_tb_off,
@@ -598,6 +653,7 @@ extern "C" int build_sparse_block_table_launcher_raw(
         } else if (storage_dtype == DTYPE_BF16) {
             k_build_sparse_block_table_copy_from_plan_src_only<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
                 d_total_plan_count,
+                d_error_code,
                 d_plan_row,
                 d_plan_src_tb_idx,
                 d_plan_src_tb_off,

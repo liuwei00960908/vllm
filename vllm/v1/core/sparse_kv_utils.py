@@ -6,6 +6,7 @@ import torch
 @dataclass
 class SparseBlockTableBuffers:
     top_clusters: torch.Tensor | None = None
+    grouped_top_clusters: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
     bt_len: torch.Tensor | None = None
     seqused_k: torch.Tensor | None = None
@@ -87,6 +88,31 @@ class SparseBlockTableBuffers:
             cluster_center_count,
             nprobe,
             self.top_clusters,
+        )
+
+    def union_top_clusters_by_kv_group(
+        self,
+        *,
+        top_clusters: torch.Tensor,
+        hkv: int,
+        num_clusters: int,
+        union_nprobe: int,
+    ) -> torch.Tensor:
+        from vllm._custom_ops import union_topk_clusters_by_kv_group_out
+
+        out_shape = (top_clusters.shape[0], hkv, union_nprobe)
+        if (
+            self.grouped_top_clusters is None
+            or self.grouped_top_clusters.shape != out_shape
+        ):
+            self.grouped_top_clusters = torch.empty(
+                out_shape, dtype=torch.int32, device=top_clusters.device
+            )
+        return union_topk_clusters_by_kv_group_out(
+            top_clusters,
+            hkv,
+            num_clusters,
+            self.grouped_top_clusters,
         )
 
     def build(
@@ -415,6 +441,7 @@ class SparseManagerMetadata:
     append_buffers: SparseAppendBuffers | None = None
     steady_buffers: SparseSteadyBuffers | None = None
     cu_seqlens_q_buffer: torch.Tensor | None = None
+    cu_seqlens_q_step: int | None = None
 
     def reset_steady_state_from_python(self) -> None:
         assert self.steady_state is not None

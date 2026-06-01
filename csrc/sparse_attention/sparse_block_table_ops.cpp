@@ -193,9 +193,8 @@ static void build_sparse_block_table_cuda_impl(
     const int nprobe = static_cast<int>(top_clusters.size(2));
 
     TORCH_CHECK(nprobe > 0, "nprobe must be > 0");
-    TORCH_CHECK(nprobe <= WARP_SIZE,
-                "nprobe must be <= WARP_SIZE, got nprobe=", nprobe,
-                ", WARP_SIZE=", WARP_SIZE);
+    TORCH_CHECK(nprobe <= 128,
+                "nprobe must be <= 128, got nprobe=", nprobe);
 
     const int Hkv = static_cast<int>(cluster_compact_block_ids.size(0));
     const int C = static_cast<int>(cluster_compact_block_ids.size(1));

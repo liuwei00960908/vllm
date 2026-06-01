@@ -1412,3 +1412,154 @@ extern "C" int sparse_select_topk_clusters_launcher_raw(
     }
     return ERR_OK;
 }
+
+__global__ void k_union_topk_clusters_by_kv_group(
+    const int32_t* __restrict__ top_clusters,  // [Nq,Hq,nprobe]
+    int32_t* __restrict__ out_top_clusters,    // [Nq,Hkv,union_nprobe]
+    int Nq,
+    int Hq,
+    int Hkv,
+    int num_clusters,
+    int nprobe,
+    int union_nprobe) {
+    constexpr int WORD_BITS = 32;
+
+    const int row = blockIdx.x;
+    const int rows = Nq * Hkv;
+    if (row >= rows) return;
+
+    const int tid = threadIdx.x;
+    const int q = row / Hkv;
+    const int hkv = row - q * Hkv;
+    const int q_per_kv = Hq / Hkv;
+    const int64_t out_base = (int64_t)row * union_nprobe;
+    const int words = (num_clusters + WORD_BITS - 1) / WORD_BITS;
+
+    extern __shared__ int32_t smem[];
+    uint32_t* cluster_mask = reinterpret_cast<uint32_t*>(smem);
+    int32_t* word_prefix = reinterpret_cast<int32_t*>(cluster_mask + words);
+    int scan_words = 1;
+    while (scan_words < words) {
+        scan_words <<= 1;
+    }
+
+    for (int i = tid; i < words; i += blockDim.x) {
+        cluster_mask[i] = 0;
+    }
+    for (int i = tid; i < union_nprobe; i += blockDim.x) {
+        out_top_clusters[out_base + i] = -1;
+    }
+    __syncthreads();
+
+    const int candidate_count = q_per_kv * nprobe;
+    for (int candidate = tid; candidate < candidate_count; candidate += blockDim.x) {
+        const int qo = candidate / nprobe;
+        const int k = candidate - qo * nprobe;
+        const int hq = hkv * q_per_kv + qo;
+        const int64_t in_base = ((int64_t)q * Hq + hq) * nprobe;
+        const int cid = top_clusters[in_base + k];
+        if (cid >= 0 && cid < num_clusters) {
+            atomicOr(&cluster_mask[cid / WORD_BITS], 1u << (cid % WORD_BITS));
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i < scan_words; i += blockDim.x) {
+        uint32_t mask = 0;
+        if (i < words) {
+            mask = cluster_mask[i];
+            if (i == words - 1) {
+                const int valid_bits = num_clusters - i * WORD_BITS;
+                if (valid_bits < WORD_BITS) {
+                    mask &= (1u << valid_bits) - 1u;
+                    cluster_mask[i] = mask;
+                }
+            }
+        }
+        word_prefix[i] = __popc(mask);
+    }
+    __syncthreads();
+
+    for (int offset = 1; offset < scan_words; offset <<= 1) {
+        const int stride = offset << 1;
+        const int pairs = scan_words / stride;
+        for (int pair = tid; pair < pairs; pair += blockDim.x) {
+            const int idx = (pair + 1) * stride - 1;
+            word_prefix[idx] += word_prefix[idx - offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        word_prefix[scan_words - 1] = 0;
+    }
+    __syncthreads();
+
+    for (int offset = scan_words >> 1; offset > 0; offset >>= 1) {
+        const int stride = offset << 1;
+        const int pairs = scan_words / stride;
+        for (int pair = tid; pair < pairs; pair += blockDim.x) {
+            const int idx = (pair + 1) * stride - 1;
+            const int t = word_prefix[idx - offset];
+            word_prefix[idx - offset] = word_prefix[idx];
+            word_prefix[idx] += t;
+        }
+        __syncthreads();
+    }
+
+    for (int cid = tid; cid < num_clusters; cid += blockDim.x) {
+        const int word = cid / WORD_BITS;
+        const int bit = cid - word * WORD_BITS;
+        const uint32_t mask = cluster_mask[word];
+        if (((mask >> bit) & 1u) != 0) {
+            const int word_base = word_prefix[word];
+            const uint32_t lower_mask = bit == 0 ? 0u : ((1u << bit) - 1u);
+            const int out_pos = word_base + __popc(mask & lower_mask);
+            if (out_pos < union_nprobe) {
+                out_top_clusters[out_base + out_pos] = cid;
+            }
+        }
+    }
+}
+
+extern "C" int union_topk_clusters_by_kv_group_launcher_raw(
+    const int32_t* d_top_clusters,
+    int32_t* d_out_top_clusters,
+    int Nq,
+    int Hq,
+    int Hkv,
+    int num_clusters,
+    int nprobe,
+    int union_nprobe,
+    cudaStream_t stream) {
+    if (d_top_clusters == nullptr || d_out_top_clusters == nullptr ||
+        Nq <= 0 || Hq <= 0 || Hkv <= 0 || Hq % Hkv != 0 ||
+        num_clusters <= 0 || nprobe <= 0 ||
+        union_nprobe <= 0 || union_nprobe > num_clusters) {
+        return ERR_BAD_PARAM;
+    }
+
+    const int rows = Nq * Hkv;
+    const int threads = 128;
+    const int words = (num_clusters + 31) / 32;
+    int scan_words = 1;
+    while (scan_words < words) {
+        scan_words <<= 1;
+    }
+    const size_t smem = words * sizeof(uint32_t) + scan_words * sizeof(int32_t);
+    k_union_topk_clusters_by_kv_group<<<rows, threads, smem, stream>>>(
+        d_top_clusters,
+        d_out_top_clusters,
+        Nq,
+        Hq,
+        Hkv,
+        num_clusters,
+        nprobe,
+        union_nprobe);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return ERR_LAUNCH;
+    }
+    return ERR_OK;
+}
