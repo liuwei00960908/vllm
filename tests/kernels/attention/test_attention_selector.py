@@ -388,6 +388,64 @@ def test_sparse_flash_attn_builder_disables_cudagraphs():
         )
 
 
+def test_sparse_attention_gqa_topk_mode_plumbing():
+    attention_config = AttentionConfig(backend=AttentionBackendEnum.SPARSE_FLASH_ATTN)
+    cache_config = CacheConfig(
+        block_size=16,
+        sparse_attention={
+            "num_clusters": 32,
+            "n_segment": 1,
+            "nprobe": 8,
+            "gqa_topk_mode": "group_avg",
+        },
+    )
+    vllm_config = VllmConfig(
+        attention_config=attention_config,
+        cache_config=cache_config,
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+    ):
+        attn = Attention(
+            num_heads=4,
+            head_size=64,
+            scale=1.0,
+            num_kv_heads=2,
+            cache_config=cache_config,
+        )
+
+    spec = attn.get_kv_cache_spec()
+    assert isinstance(spec, SparseAttentionSpec)
+    assert spec.gqa_topk_mode == "group_avg"
+
+
+def test_sparse_attention_invalid_gqa_topk_mode():
+    attention_config = AttentionConfig(backend=AttentionBackendEnum.SPARSE_FLASH_ATTN)
+    cache_config = CacheConfig(
+        block_size=16,
+        sparse_attention={"gqa_topk_mode": "bad_mode"},
+    )
+    vllm_config = VllmConfig(
+        attention_config=attention_config,
+        cache_config=cache_config,
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+    ):
+        with pytest.raises(ValueError, match="gqa_topk_mode"):
+            Attention(
+                num_heads=4,
+                head_size=64,
+                scale=1.0,
+                num_kv_heads=2,
+                cache_config=cache_config,
+            )
+
+
 @pytest.mark.parametrize("auto_value", ["auto", "AUTO", "Auto"])
 def test_auto_backend_string(auto_value: str):
     """Test that 'auto' string value triggers automatic backend selection."""

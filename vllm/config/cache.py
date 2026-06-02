@@ -177,6 +177,11 @@ class CacheConfig:
       and Top-K over mean-K per block vs per token; token mode uses
       ``max_selected_tokens`` (or ``max_selected_blocks * block_size``) as the
       per-layer token budget.
+    * ``gqa_topk_mode`` (str, ``"head_union"`` or ``"group_avg"``,
+      default ``"head_union"``) – grouped-query selection policy for grouped
+      sparse FlashAttention. ``head_union`` preserves the legacy per-head Top-K
+      then union behavior; ``group_avg`` averages per-head softmax cluster
+      scores within each KV group and then selects exactly ``nprobe`` clusters.
     * ``max_selected_tokens`` (int, optional) – token-budget override when
       ``cluster_granularity`` is ``"token"``.
     * ``update_threshold_tokens`` (int, default 1024) – buffered decode-token

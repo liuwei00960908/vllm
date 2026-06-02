@@ -2372,6 +2372,7 @@ class GPUModelRunner(
             for layer_name, layer_attn in attn_metadata.items():
                 if not isinstance(layer_attn, SparseFlashAttentionMetadata):
                     continue
+                layer_spec = self._sparse_layer_spec_by_name[layer_name]
 
                 layer_attn.extra_sparse_manager_info = SparseManagerExtraInfo(
                     req_id_list=self.input_batch.req_ids,
@@ -2379,6 +2380,7 @@ class GPUModelRunner(
                     num_cluster=num_cluster,
                     num_segment=num_segment,
                     nprobe=nprobe,
+                    gqa_topk_mode=layer_spec.gqa_topk_mode,
                     cluster_block_size=cluster_block_size,
                     steady_start_capacity=steady_start_capacity,
                     steady_end_capacity=steady_end_capacity,
@@ -3040,6 +3042,7 @@ class GPUModelRunner(
                 num_cluster=spec.num_clusters,
                 num_segment=spec.n_segment,
                 nprobe=spec.nprobe,
+                gqa_topk_mode=spec.gqa_topk_mode,
                 cluster_block_size=graph_info.cluster_block_size,
                 steady_start_capacity=graph_info.steady_start_capacity,
                 steady_end_capacity=graph_info.steady_end_capacity,

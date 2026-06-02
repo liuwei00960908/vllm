@@ -7,6 +7,7 @@ import torch
 class SparseBlockTableBuffers:
     top_clusters: torch.Tensor | None = None
     grouped_top_clusters: torch.Tensor | None = None
+    head_cluster_scores: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
     bt_len: torch.Tensor | None = None
     seqused_k: torch.Tensor | None = None
@@ -112,6 +113,48 @@ class SparseBlockTableBuffers:
             top_clusters,
             hkv,
             num_clusters,
+            self.grouped_top_clusters,
+        )
+
+    def group_avg_top_clusters_by_kv_group(
+        self,
+        *,
+        query: torch.Tensor,
+        cluster_centers_T: torch.Tensor,
+        mean: torch.Tensor,
+        cluster_center_count: torch.Tensor,
+        nprobe: int,
+        hkv: int,
+    ) -> torch.Tensor:
+        from vllm._custom_ops import group_avg_topk_clusters_by_kv_group_out
+
+        score_shape = (
+            query.shape[0],
+            query.shape[1],
+            cluster_centers_T.shape[2],
+        )
+        if (
+            self.head_cluster_scores is None
+            or self.head_cluster_scores.shape != score_shape
+        ):
+            self.head_cluster_scores = torch.empty(
+                score_shape, dtype=torch.float32, device=query.device
+            )
+        out_shape = (query.shape[0], hkv, nprobe)
+        if (
+            self.grouped_top_clusters is None
+            or self.grouped_top_clusters.shape != out_shape
+        ):
+            self.grouped_top_clusters = torch.empty(
+                out_shape, dtype=torch.int32, device=query.device
+            )
+        return group_avg_topk_clusters_by_kv_group_out(
+            query,
+            cluster_centers_T,
+            mean,
+            cluster_center_count,
+            nprobe,
+            self.head_cluster_scores,
             self.grouped_top_clusters,
         )
 

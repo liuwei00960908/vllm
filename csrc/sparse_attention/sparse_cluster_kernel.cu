@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <float.h>
+#include <math.h>
 #include <stdint.h>
 #include <limits.h>
 
@@ -38,6 +40,70 @@ __device__ __forceinline__ int64_t compact_block_index(int h, int c, int bid_pos
 
 __device__ __forceinline__ int64_t temp_pos_index(int h, int c, int slot, int C, int block_size, int xy) {
     return ((((int64_t)h * C + c) * block_size + slot) * 2 + xy);
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float value) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(FULL_MASK, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float warp_reduce_max(float value) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_down_sync(FULL_MASK, value, offset));
+    }
+    return value;
+}
+
+template <int MAX_WARPS = 8>
+__device__ __forceinline__ float block_reduce_sum(float value) {
+    __shared__ float warp_sums[MAX_WARPS];
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+
+    value = warp_reduce_sum(value);
+    if (lane == 0) {
+        warp_sums[warp] = value;
+    }
+    __syncthreads();
+
+    float block_sum = 0.f;
+    if (warp == 0) {
+        block_sum = lane < warps_per_block ? warp_sums[lane] : 0.f;
+        block_sum = warp_reduce_sum(block_sum);
+        if (lane == 0) {
+            warp_sums[0] = block_sum;
+        }
+    }
+    __syncthreads();
+    return warp_sums[0];
+}
+
+template <int MAX_WARPS = 8>
+__device__ __forceinline__ float block_reduce_max(float value) {
+    __shared__ float warp_maxes[MAX_WARPS];
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+
+    value = warp_reduce_max(value);
+    if (lane == 0) {
+        warp_maxes[warp] = value;
+    }
+    __syncthreads();
+
+    float block_max = -FLT_MAX;
+    if (warp == 0) {
+        block_max = lane < warps_per_block ? warp_maxes[lane] : -FLT_MAX;
+        block_max = warp_reduce_max(block_max);
+        if (lane == 0) {
+            warp_maxes[0] = block_max;
+        }
+    }
+    __syncthreads();
+    return warp_maxes[0];
 }
 
 template <typename T, int MAX_HKV, int MAX_REMOVED>
@@ -1405,6 +1471,286 @@ extern "C" int sparse_select_topk_clusters_launcher_raw(
     default:
         return ERR_UNSUPPORTED_DTYPE;
     }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return ERR_LAUNCH;
+    }
+    return ERR_OK;
+}
+
+template <typename T>
+__global__ void k_sparse_compute_head_cluster_softmax_scores(
+    const T* __restrict__ query,             // [Nq,Hq,dim] (strided)
+    const T* __restrict__ cluster_centers_T, // [Hkv,dim,C]
+    const T* __restrict__ mean,              // [Hkv,dim]
+    const int32_t* __restrict__ cluster_center_count, // [1]
+    float* __restrict__ head_scores,         // [Nq,Hq,C]
+    int64_t query_stride0,
+    int64_t query_stride1,
+    int64_t query_stride2,
+    int Nq,
+    int Hq,
+    int Hkv,
+    int C,
+    int dim) {
+    const int row = blockIdx.x;
+    const int rows = Nq * Hq;
+    if (row >= rows) return;
+
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+
+    extern __shared__ float scores[];
+
+    const int q = row / Hq;
+    const int hq = row - q * Hq;
+    const int group_size = Hq / Hkv;
+    const int hkv = hq / group_size;
+    const int valid_centers = min(max(cluster_center_count[0], 0), C);
+
+    const int64_t query_base =
+        (int64_t)q * query_stride0 + (int64_t)hq * query_stride1;
+    const int64_t mean_base = (int64_t)hkv * dim;
+    const int64_t center_base = (int64_t)hkv * dim * C;
+    const float score_scale = rsqrtf((float)dim);
+    const int64_t out_base = (int64_t)row * C;
+
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        scores[c] = -FLT_MAX;
+    }
+    __syncthreads();
+
+    for (int c = warp; c < valid_centers; c += warps_per_block) {
+        float score_f = 0.f;
+        for (int d = lane; d < dim; d += WARP_SIZE) {
+            const float q_v = (float)query[query_base + (int64_t)d * query_stride2];
+            const float mean_v = (float)mean[mean_base + d];
+            const float center_v =
+                (float)cluster_centers_T[center_base + (int64_t)d * C + c];
+            score_f += (q_v - mean_v) * center_v;
+        }
+        score_f = warp_reduce_sum(score_f);
+        if (lane == 0) {
+            scores[c] = score_f * score_scale;
+        }
+    }
+    __syncthreads();
+
+    if (valid_centers <= 0) {
+        for (int c = threadIdx.x; c < C; c += blockDim.x) {
+            head_scores[out_base + c] = 0.f;
+        }
+        return;
+    }
+
+    float local_max = -FLT_MAX;
+    for (int c = threadIdx.x; c < valid_centers; c += blockDim.x) {
+        local_max = fmaxf(local_max, scores[c]);
+    }
+    const float score_max = block_reduce_max(local_max);
+
+    float local_sum = 0.f;
+    for (int c = threadIdx.x; c < valid_centers; c += blockDim.x) {
+        const float prob = expf(scores[c] - score_max);
+        scores[c] = prob;
+        local_sum += prob;
+    }
+    const float score_sum = block_reduce_sum(local_sum);
+    const float inv_score_sum = score_sum > 0.f ? 1.f / score_sum : 0.f;
+
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        head_scores[out_base + c] =
+            c < valid_centers ? scores[c] * inv_score_sum : 0.f;
+    }
+}
+
+__global__ void k_group_avg_topk_clusters_by_kv_group(
+    const float* __restrict__ head_scores,   // [Nq,Hq,C]
+    const int32_t* __restrict__ cluster_center_count, // [1]
+    int32_t* __restrict__ out_top_clusters,  // [Nq,Hkv,nprobe]
+    int Nq,
+    int Hq,
+    int Hkv,
+    int C,
+    int nprobe) {
+    const int row = blockIdx.x;
+    const int rows = Nq * Hkv;
+    if (row >= rows) return;
+
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+
+    extern __shared__ float avg_scores[];
+
+    const int q = row / Hkv;
+    const int hkv = row - q * Hkv;
+    const int q_per_kv = Hq / Hkv;
+    const int valid_centers = min(max(cluster_center_count[0], 0), C);
+    const int64_t out_base = (int64_t)row * nprobe;
+
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        avg_scores[c] = -FLT_MAX;
+    }
+    for (int k = threadIdx.x; k < nprobe; k += blockDim.x) {
+        out_top_clusters[out_base + k] = -1;
+    }
+    __syncthreads();
+
+    for (int c = warp; c < valid_centers; c += warps_per_block) {
+        float group_score = 0.f;
+        for (int head_base = 0; head_base < q_per_kv; head_base += WARP_SIZE) {
+            const int qo = head_base + lane;
+            float score = 0.f;
+            if (qo < q_per_kv) {
+                const int hq = hkv * q_per_kv + qo;
+                score = head_scores[((int64_t)q * Hq + hq) * C + c];
+            }
+            score = warp_reduce_sum(score);
+            if (lane == 0) {
+                group_score += score;
+            }
+        }
+        if (lane == 0) {
+            avg_scores[c] = group_score / (float)q_per_kv;
+        }
+    }
+    __syncthreads();
+
+    if (warp != 0) return;
+
+    const int emit = min(nprobe, valid_centers);
+    for (int k = 0; k < nprobe; ++k) {
+        float best_score = -FLT_MAX;
+        int best_c = INT_MAX;
+        if (k < emit) {
+            for (int c = lane; c < valid_centers; c += WARP_SIZE) {
+                const float score = avg_scores[c];
+                if (score > best_score ||
+                    (score == best_score && c < best_c)) {
+                    best_score = score;
+                    best_c = c;
+                }
+            }
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                const float other_score =
+                    __shfl_down_sync(FULL_MASK, best_score, offset);
+                const int other_c =
+                    __shfl_down_sync(FULL_MASK, best_c, offset);
+                if (other_score > best_score ||
+                    (other_score == best_score && other_c < best_c)) {
+                    best_score = other_score;
+                    best_c = other_c;
+                }
+            }
+        }
+        if (lane == 0 && k < emit && best_c != INT_MAX) {
+            out_top_clusters[out_base + k] = best_c;
+            avg_scores[best_c] = -FLT_MAX;
+        }
+        __syncwarp();
+    }
+}
+
+extern "C" int group_avg_topk_clusters_by_kv_group_launcher_raw(
+    const void* d_query,
+    const void* d_cluster_centers_T,
+    const void* d_mean,
+    const int32_t* d_cluster_center_count,
+    float* d_head_scores,
+    int32_t* d_out_top_clusters,
+    int64_t query_stride0,
+    int64_t query_stride1,
+    int64_t query_stride2,
+    int32_t storage_dtype,
+    int Nq,
+    int Hq,
+    int Hkv,
+    int C,
+    int dim,
+    int nprobe,
+    cudaStream_t stream) {
+    if (d_query == nullptr || d_cluster_centers_T == nullptr ||
+        d_mean == nullptr || d_cluster_center_count == nullptr ||
+        d_head_scores == nullptr || d_out_top_clusters == nullptr ||
+        Nq <= 0 || Hq <= 0 || Hkv <= 0 || C <= 0 || dim <= 0 ||
+        nprobe <= 0 || Hq % Hkv != 0 || nprobe > WARP_SIZE) {
+        return ERR_BAD_PARAM;
+    }
+
+    const int score_rows = Nq * Hq;
+    const int grouped_rows = Nq * Hkv;
+    const int threads = 256;
+    const size_t smem = (size_t)C * sizeof(float);
+
+    switch (storage_dtype) {
+    case DTYPE_FP32:
+        k_sparse_compute_head_cluster_softmax_scores<float>
+            <<<score_rows, threads, smem, stream>>>(
+                static_cast<const float*>(d_query),
+                static_cast<const float*>(d_cluster_centers_T),
+                static_cast<const float*>(d_mean),
+                d_cluster_center_count,
+                d_head_scores,
+                query_stride0,
+                query_stride1,
+                query_stride2,
+                Nq,
+                Hq,
+                Hkv,
+                C,
+                dim);
+        break;
+    case DTYPE_FP16:
+        k_sparse_compute_head_cluster_softmax_scores<__half>
+            <<<score_rows, threads, smem, stream>>>(
+                static_cast<const __half*>(d_query),
+                static_cast<const __half*>(d_cluster_centers_T),
+                static_cast<const __half*>(d_mean),
+                d_cluster_center_count,
+                d_head_scores,
+                query_stride0,
+                query_stride1,
+                query_stride2,
+                Nq,
+                Hq,
+                Hkv,
+                C,
+                dim);
+        break;
+    case DTYPE_BF16:
+        k_sparse_compute_head_cluster_softmax_scores<__nv_bfloat16>
+            <<<score_rows, threads, smem, stream>>>(
+                static_cast<const __nv_bfloat16*>(d_query),
+                static_cast<const __nv_bfloat16*>(d_cluster_centers_T),
+                static_cast<const __nv_bfloat16*>(d_mean),
+                d_cluster_center_count,
+                d_head_scores,
+                query_stride0,
+                query_stride1,
+                query_stride2,
+                Nq,
+                Hq,
+                Hkv,
+                C,
+                dim);
+        break;
+    default:
+        return ERR_UNSUPPORTED_DTYPE;
+    }
+
+    k_group_avg_topk_clusters_by_kv_group
+        <<<grouped_rows, threads, smem, stream>>>(
+            d_head_scores,
+            d_cluster_center_count,
+            d_out_top_clusters,
+            Nq,
+            Hq,
+            Hkv,
+            C,
+            nprobe);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

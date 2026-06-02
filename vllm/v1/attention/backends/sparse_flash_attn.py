@@ -67,6 +67,7 @@ class SparseManagerExtraInfo:
     num_cluster: int = 0
     num_segment: int = 1
     nprobe: int = 0
+    gqa_topk_mode: str = "head_union"
     cluster_block_size: int = 0
     steady_start_capacity: int = 0
     steady_end_capacity: int = 0
@@ -330,13 +331,7 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
         if smm.block_table_buffers is None:
             smm.block_table_buffers = SparseBlockTableBuffers()
         assert smm.block_table_buffers is not None
-        top_clusters = smm.block_table_buffers.select_top_clusters(
-            query=query_actual,
-            cluster_centers_T=cluster_centers_t,
-            mean=smm.mean,
-            cluster_center_count=smm.cluster_center_count,
-            nprobe=nprobe,
-        )
+        gqa_topk_mode = attn_metadata.extra_sparse_manager_info.gqa_topk_mode
         free_block_ids = cluster_allocated_block_info.reusable_block_ids_gpu
         assert free_block_ids is not None
         assert smm.steady_zone_head is not None
@@ -345,6 +340,13 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
         steady_blocks = smm.steady_zone_head.shape[1] + smm.steady_zone_tail.shape[1]
         use_grouped_sparse_fa = os.environ.get("TEST_SPARSE_GROUPED_FA", "1") != "0"
         if not use_grouped_sparse_fa:
+            top_clusters = smm.block_table_buffers.select_top_clusters(
+                query=query_actual,
+                cluster_centers_T=cluster_centers_t,
+                mean=smm.mean,
+                cluster_center_count=smm.cluster_center_count,
+                nprobe=nprobe,
+            )
             required_free_blocks = num_queries * hq * (nprobe + steady_blocks)
             assert free_block_ids.numel() >= required_free_blocks, (
                 "Sparse reusable scratch pool is undersized: "
@@ -410,24 +412,47 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             )
             return output
 
-        union_nprobe = min(cluster_centers_t.shape[2], nprobe * q_per_kv)
-        grouped_top_clusters = smm.block_table_buffers.union_top_clusters_by_kv_group(
-            top_clusters=top_clusters,
-            hkv=hkv,
-            num_clusters=cluster_centers_t.shape[2],
-            union_nprobe=union_nprobe,
-        )
-        if os.environ.get("TEST_SPARSE_UNION_STATS", "0") != "0":
-            counts = (
-                (grouped_top_clusters >= 0)
-                .sum(dim=-1)
-                .detach()
-                .to(device="cpu")
-                .reshape(-1)
-                .tolist()
+        if gqa_topk_mode == "group_avg":
+            grouped_top_clusters = (
+                smm.block_table_buffers.group_avg_top_clusters_by_kv_group(
+                    query=query_actual,
+                    cluster_centers_T=cluster_centers_t,
+                    mean=smm.mean,
+                    cluster_center_count=smm.cluster_center_count,
+                    nprobe=nprobe,
+                    hkv=hkv,
+                )
             )
-            _sparse_union_cluster_hist.update(int(count) for count in counts)
-        required_free_blocks = num_queries * hkv * (union_nprobe + steady_blocks)
+        else:
+            top_clusters = smm.block_table_buffers.select_top_clusters(
+                query=query_actual,
+                cluster_centers_T=cluster_centers_t,
+                mean=smm.mean,
+                cluster_center_count=smm.cluster_center_count,
+                nprobe=nprobe,
+            )
+            union_nprobe = min(cluster_centers_t.shape[2], nprobe * q_per_kv)
+            grouped_top_clusters = (
+                smm.block_table_buffers.union_top_clusters_by_kv_group(
+                    top_clusters=top_clusters,
+                    hkv=hkv,
+                    num_clusters=cluster_centers_t.shape[2],
+                    union_nprobe=union_nprobe,
+                )
+            )
+            if os.environ.get("TEST_SPARSE_UNION_STATS", "0") != "0":
+                counts = (
+                    (grouped_top_clusters >= 0)
+                    .sum(dim=-1)
+                    .detach()
+                    .to(device="cpu")
+                    .reshape(-1)
+                    .tolist()
+                )
+                _sparse_union_cluster_hist.update(int(count) for count in counts)
+        required_free_blocks = (
+            num_queries * hkv * (grouped_top_clusters.shape[2] + steady_blocks)
+        )
         assert free_block_ids.numel() >= required_free_blocks, (
             "Sparse reusable scratch pool is undersized: "
             f"have {free_block_ids.numel()}, need at least "

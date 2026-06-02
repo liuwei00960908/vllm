@@ -73,6 +73,25 @@ extern "C" int union_topk_clusters_by_kv_group_launcher_raw(
     int union_nprobe,
     cudaStream_t stream);
 
+extern "C" int group_avg_topk_clusters_by_kv_group_launcher_raw(
+    const void* d_query,
+    const void* d_cluster_centers_T,
+    const void* d_mean,
+    const int32_t* d_cluster_center_count,
+    float* d_head_scores,
+    int32_t* d_out_top_clusters,
+    int64_t query_stride0,
+    int64_t query_stride1,
+    int64_t query_stride2,
+    int32_t storage_dtype,
+    int Nq,
+    int Hq,
+    int Hkv,
+    int C,
+    int dim,
+    int nprobe,
+    cudaStream_t stream);
+
 extern "C" int update_sparse_steady_kv_launcher_raw(
     void* d_block_storage,
     int32_t storage_dtype,
@@ -843,6 +862,94 @@ torch::Tensor sparse_select_topk_clusters_out_cuda(
     return out_top_clusters;
 }
 
+torch::Tensor group_avg_topk_clusters_by_kv_group_out_cuda(
+    torch::Tensor query,
+    torch::Tensor cluster_centers_T,
+    torch::Tensor mean,
+    torch::Tensor cluster_center_count,
+    int64_t nprobe,
+    torch::Tensor head_scores,
+    torch::Tensor out_top_clusters
+) {
+    check_cuda(query, "query");
+    check_cuda_contig(cluster_centers_T, "cluster_centers_T");
+    check_cuda_contig(mean, "mean");
+    check_cuda_contig(cluster_center_count, "cluster_center_count");
+    check_cuda_contig(head_scores, "head_scores");
+    check_cuda_contig(out_top_clusters, "out_top_clusters");
+
+    TORCH_CHECK(query.dim() == 3, "query must be [Nq,Hq,dim]");
+    TORCH_CHECK(cluster_centers_T.dim() == 3,
+                "cluster_centers_T must be [Hkv,dim,C]");
+    TORCH_CHECK(mean.dim() == 2, "mean must be [Hkv,dim]");
+    TORCH_CHECK(cluster_center_count.scalar_type() == torch::kInt32,
+                "cluster_center_count must be int32");
+    TORCH_CHECK(cluster_center_count.numel() == 1,
+                "cluster_center_count must be [1]");
+    TORCH_CHECK(head_scores.scalar_type() == torch::kFloat32,
+                "head_scores must be float32");
+    TORCH_CHECK(out_top_clusters.scalar_type() == torch::kInt32,
+                "out_top_clusters must be int32");
+
+    TORCH_CHECK(query.scalar_type() == cluster_centers_T.scalar_type(),
+                "query dtype must equal cluster_centers_T dtype");
+    TORCH_CHECK(mean.scalar_type() == query.scalar_type(),
+                "mean dtype must equal query dtype");
+    TORCH_CHECK(query.stride(0) >= 0 && query.stride(1) >= 0 &&
+                query.stride(2) >= 0, "query strides must be non-negative");
+
+    const int Nq = static_cast<int>(query.size(0));
+    const int Hq = static_cast<int>(query.size(1));
+    const int dim = static_cast<int>(query.size(2));
+    const int Hkv = static_cast<int>(cluster_centers_T.size(0));
+    const int C = static_cast<int>(cluster_centers_T.size(2));
+    const int nprobe_i = static_cast<int>(nprobe);
+
+    TORCH_CHECK(cluster_centers_T.size(1) == dim,
+                "cluster_centers_T dim mismatch");
+    TORCH_CHECK(mean.size(0) == Hkv && mean.size(1) == dim,
+                "mean shape mismatch");
+    TORCH_CHECK(Hkv > 0 && Hq % Hkv == 0, "Hq must be divisible by Hkv");
+    TORCH_CHECK(nprobe_i > 0 && nprobe_i <= C && nprobe_i <= 32,
+                "nprobe must be in (0, min(C, 32)]");
+    TORCH_CHECK(head_scores.dim() == 3 &&
+                head_scores.size(0) == Nq &&
+                head_scores.size(1) == Hq &&
+                head_scores.size(2) == C,
+                "head_scores must be [Nq,Hq,C]");
+    TORCH_CHECK(out_top_clusters.dim() == 3 &&
+                out_top_clusters.size(0) == Nq &&
+                out_top_clusters.size(1) == Hkv &&
+                out_top_clusters.size(2) == nprobe_i,
+                "out_top_clusters must be [Nq,Hkv,nprobe]");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int rc = group_avg_topk_clusters_by_kv_group_launcher_raw(
+        query.data_ptr(),
+        cluster_centers_T.data_ptr(),
+        mean.data_ptr(),
+        cluster_center_count.data_ptr<int32_t>(),
+        head_scores.data_ptr<float>(),
+        out_top_clusters.data_ptr<int32_t>(),
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        map_storage_dtype(query.scalar_type()),
+        Nq,
+        Hq,
+        Hkv,
+        C,
+        dim,
+        nprobe_i,
+        stream);
+
+    TORCH_CHECK(rc == ERR_OK,
+                "group_avg_topk_clusters_by_kv_group launcher failed, rc=", rc);
+    return out_top_clusters;
+}
+
 torch::Tensor union_topk_clusters_by_kv_group_out_cuda(
     torch::Tensor top_clusters,
     int64_t hkv,
@@ -999,6 +1106,16 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
         "  int num_clusters,"
         "  Tensor out_top_clusters"
         ") -> Tensor");
+    ops.def(
+        "group_avg_topk_clusters_by_kv_group_out("
+        "  Tensor query,"
+        "  Tensor cluster_centers_T,"
+        "  Tensor mean,"
+        "  Tensor cluster_center_count,"
+        "  int nprobe,"
+        "  Tensor head_scores,"
+        "  Tensor out_top_clusters"
+        ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
@@ -1014,4 +1131,6 @@ TORCH_LIBRARY_IMPL(_C, CUDA, m) {
            &sparse_select_topk_clusters_out_cuda);
     m.impl("union_topk_clusters_by_kv_group_out",
            &union_topk_clusters_by_kv_group_out_cuda);
+    m.impl("group_avg_topk_clusters_by_kv_group_out",
+           &group_avg_topk_clusters_by_kv_group_out_cuda);
 }

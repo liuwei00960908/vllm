@@ -539,6 +539,12 @@ class Attention(nn.Module, AttentionLayerBase):
                     "cache_config.sparse_attention['cluster_granularity'] must be "
                     f"'block' or 'token', got {_cg!r}"
                 )
+            _gqa_topk_mode = str(sparse_cfg.get("gqa_topk_mode", "head_union"))
+            if _gqa_topk_mode not in ("head_union", "group_avg"):
+                raise ValueError(
+                    "cache_config.sparse_attention['gqa_topk_mode'] must be "
+                    f"'head_union' or 'group_avg', got {_gqa_topk_mode!r}"
+                )
             return SparseAttentionSpec(
                 num_layer=vllm_config.model_config.hf_config.num_hidden_layers,
                 num_query_heads=self.num_heads,
@@ -569,6 +575,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     sparse_cfg.get("max_selected_blocks", 64)
                 ),
                 cluster_granularity=_cg,  # type: ignore[arg-type]
+                gqa_topk_mode=_gqa_topk_mode,  # type: ignore[arg-type]
                 max_selected_tokens=(
                     None
                     if sparse_cfg.get("max_selected_tokens") is None

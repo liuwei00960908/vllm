@@ -4,12 +4,38 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import time
 
+from huggingface_hub import snapshot_download, try_to_load_from_cache
+from huggingface_hub.errors import LocalEntryNotFoundError
 import torch
 import vllm
 from transformers import AutoTokenizer
 from vllm import EngineArgs, LLMEngine, SamplingParams
 
 print(vllm.__file__)
+
+
+def resolve_model_path(model_name: str) -> tuple[str, bool]:
+    if os.path.isdir(model_name):
+        return model_name, True
+
+    cached_config = try_to_load_from_cache(
+        repo_id=model_name,
+        filename="config.json",
+    )
+    if not isinstance(cached_config, str):
+        return model_name, False
+
+    try:
+        local_model_path = snapshot_download(
+            repo_id=model_name,
+            local_files_only=True,
+        )
+    except LocalEntryNotFoundError:
+        return model_name, False
+
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    print(f"Using cached model from: {local_model_path}")
+    return local_model_path, True
 
 
 def main():
@@ -25,12 +51,13 @@ def main():
         os.environ.get("TEST_GPU_MEMORY_UTILIZATION", "0.5")
     )
     print_output = False
+    model_path, using_local_cache = resolve_model_path(model)
 
     # ====================== 1. 引擎配置（和server端完全一致） ======================
     if USE_SPARSE_ATTENTION:
         engine_args = EngineArgs(
             # 用最小的模型调试，速度快，显存占用小
-            model=model,
+            model=model_path,
             tensor_parallel_size=1,
             dtype="bfloat16",
             max_model_len=context_length,
@@ -52,7 +79,7 @@ def main():
     else:
         engine_args = EngineArgs(
             # 用最小的模型调试，速度快，显存占用小
-            model=model,
+            model=model_path,
             tensor_parallel_size=1,
             dtype="bfloat16",
             max_model_len=context_length,
@@ -70,7 +97,10 @@ def main():
 
     # ====================== 3. 硬编码请求（模拟server收到HTTP请求） ======================
     request_id = "debug_req_001"  # 字符串类型，和你之前问的一致
-    tokenizer = AutoTokenizer.from_pretrained(engine_args.model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        engine_args.model,
+        local_files_only=using_local_cache,
+    )
     prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": "写一篇描写春天的小作文"}],
         tokenize=False,

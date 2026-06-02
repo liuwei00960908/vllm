@@ -452,6 +452,14 @@ class SparseAttentionSpec(FullAttentionSpec):
     loaded block unless a future mask path is added.
     """
 
+    gqa_topk_mode: Literal["head_union", "group_avg"] = "head_union"
+    """
+    ``head_union`` – legacy GQA path: each query head selects ``nprobe``
+    clusters and the KV group uses the union of those selections.
+    ``group_avg`` – compute per-head cluster softmax scores, average them
+    within each KV group, and select exactly ``nprobe`` clusters per group.
+    """
+
     max_selected_tokens: int | None = None
     """
     When ``cluster_granularity == "token"``, caps selected tokens per layer
@@ -533,6 +541,7 @@ class SparseAttentionSpec(FullAttentionSpec):
             update_threshold_blocks=specs[0].update_threshold_blocks,
             max_selected_blocks=specs[0].max_selected_blocks,
             cluster_granularity=specs[0].cluster_granularity,
+            gqa_topk_mode=specs[0].gqa_topk_mode,
             max_selected_tokens=specs[0].max_selected_tokens,
             update_threshold_tokens=specs[0].update_threshold_tokens,
             use_compact_kv_gather=specs[0].use_compact_kv_gather,
@@ -643,6 +652,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 == one_spec.refresh_topk_each_decode
                 and spec.update_threshold_blocks == one_spec.update_threshold_blocks
                 and spec.cluster_granularity == one_spec.cluster_granularity
+                and spec.gqa_topk_mode == one_spec.gqa_topk_mode
                 and spec.max_selected_tokens == one_spec.max_selected_tokens
                 and spec.update_threshold_tokens == one_spec.update_threshold_tokens
                 and spec.use_compact_kv_gather == one_spec.use_compact_kv_gather
