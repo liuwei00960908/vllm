@@ -42,7 +42,7 @@ def main():
     USE_SPARSE_ATTENTION = os.environ.get("TEST_USE_SPARSE_ATTENTION", "1") != "0"
     PROFILE_DECODE_ONLY = os.environ.get("TEST_PROFILE_DECODE_ONLY", "0") == "1"
     ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
-    gqa_topk_mode = os.environ.get("TEST_GQA_TOPK_MODE", "head_union")
+    gqa_topk_mode = os.environ.get("TEST_GQA_TOPK_MODE", "group_avg")
     model = "Qwen/Qwen2.5-7B-Instruct"
     context_length = int(os.environ.get("TEST_CONTEXT_LENGTH", "15000"))
     block_size = 16
