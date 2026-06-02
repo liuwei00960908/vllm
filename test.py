@@ -42,6 +42,7 @@ def main():
     USE_SPARSE_ATTENTION = os.environ.get("TEST_USE_SPARSE_ATTENTION", "1") != "0"
     PROFILE_DECODE_ONLY = os.environ.get("TEST_PROFILE_DECODE_ONLY", "0") == "1"
     ASYNC_SCHEDULING = os.environ.get("TEST_ASYNC_SCHEDULING", "1") == "1"
+    gqa_topk_mode = os.environ.get("TEST_GQA_TOPK_MODE", "head_union")
     model = "Qwen/Qwen2.5-7B-Instruct"
     context_length = int(os.environ.get("TEST_CONTEXT_LENGTH", "15000"))
     block_size = 16
@@ -52,6 +53,10 @@ def main():
     )
     print_output = False
     model_path, using_local_cache = resolve_model_path(model)
+    if gqa_topk_mode not in ("head_union", "group_avg"):
+        raise ValueError(
+            f"TEST_GQA_TOPK_MODE must be 'head_union' or 'group_avg', got {gqa_topk_mode!r}"
+        )
 
     # ====================== 1. 引擎配置（和server端完全一致） ======================
     if USE_SPARSE_ATTENTION:
@@ -74,6 +79,7 @@ def main():
                 "max_selected_tokens": 128,
                 "static_pattern_end": 16,
                 "static_pattern_start": 8,
+                "gqa_topk_mode": gqa_topk_mode,
             },
         )
     else:
