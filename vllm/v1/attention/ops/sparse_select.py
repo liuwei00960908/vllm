@@ -264,6 +264,8 @@ def batched_sparse_select_dynamic_only(
     per_req_sizes: List[torch.Tensor],
     nprobe: int,
     group_size: int,
+    centres_ptrs: torch.Tensor | None = None,
+    sizes_ptrs: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Integration-friendly wrapper for ``GPUModelRunner``.
 
@@ -281,6 +283,11 @@ def batched_sparse_select_dynamic_only(
       ``layer_stats.cluster_centres`` / ``cluster_size`` tensors.  They
       are consumed *without* a ``torch.stack`` copy -- the centres are
       passed by pointer to the kernel.
+    * ``centres_ptrs`` / ``sizes_ptrs`` optionally supply the int64
+      ``[num_active]`` device pointer tables directly.  When provided
+      (the caller has cached them across decode steps), the two blocking
+      ``torch.tensor(list, device=cuda)`` host->device copies are skipped.
+      The per-request tensors are still used for shape/stride metadata.
 
     Returns ``(top_clusters, cluster_start_index)`` with shapes
     ``[num_active, num_kv_heads, nprobe]`` (int64) and
@@ -318,7 +325,10 @@ def batched_sparse_select_dynamic_only(
 
     # Build the pointer table from the per-request centres list -- no
     # ``torch.stack`` copy (~170 us savings at batch=64 vs. stacking).
-    centres_ptrs = _ptr_table_from_list(per_req_centres)
+    # The caller may pass a cached table to skip this blocking H2D copy
+    # entirely (the centres tensors are stable across a request's decode).
+    if centres_ptrs is None:
+        centres_ptrs = _ptr_table_from_list(per_req_centres)
 
     first_c = per_req_centres[0]
     num_kv_heads, num_clusters, head_dim = first_c.shape
@@ -349,7 +359,8 @@ def batched_sparse_select_dynamic_only(
     assert first_s.stride(1) == 1, (
         "per_req_sizes elements must be contiguous along the clusters dim"
     )
-    sizes_ptrs = _ptr_table_from_list(per_req_sizes)
+    if sizes_ptrs is None:
+        sizes_ptrs = _ptr_table_from_list(per_req_sizes)
     return fused_topk_cumsum(
         group_scores,
         sizes_ptrs,

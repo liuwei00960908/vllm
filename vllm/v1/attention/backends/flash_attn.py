@@ -26,7 +26,6 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -902,7 +901,7 @@ class FlashAttentionImpl(AttentionImpl):
                 if runtime_q_head_gather is not None:
                     per_req_actual_kv_len = runtime_q_head_gather["per_req_actual_kv_len"]
                     seqused_k = torch.tensor(per_req_actual_kv_len, dtype=torch.int32, device=seqused_k.device)
-                # start_t = time.perf_counter()
+
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -926,7 +925,6 @@ class FlashAttentionImpl(AttentionImpl):
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
-                # logger.info(f"[forward] flash_attn_varlen_func cost {1000 * (time.perf_counter() - start_t)}ms")
                 if runtime_q_head_gather is not None:
                     layer._vllm_sparse_runtime_q_head_gather = None
                 return output

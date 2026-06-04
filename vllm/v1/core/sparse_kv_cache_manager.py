@@ -851,7 +851,6 @@ class SparseKVManager(FullAttentionManager):
         req_blocks: list[KVCacheBlock],
         num_tokens_main_model: int,
     ) -> list[KVCacheBlock]:
-        start = time.perf_counter()
         if request_id not in self._scratch_blocks:
             n = self._scratch_block_count()
             new = self.block_pool.get_new_blocks(n) if n > 0 else []
@@ -883,6 +882,12 @@ class SparseKVManager(FullAttentionManager):
             fill = 0
             allocated_new_decode = True
 
+        # Tail layout: LMCache-loaded scratch (selected prompt KV, block-aligned
+        # and filled) occupies the FRONT of the row, the resident decode region
+        # (history + active decode block) follows it.  This matches LMCache's
+        # append-order block tracking (token_start_index=0) so no block-order
+        # surgery is needed; ``seqused_k = n_scratch_tokens + D'`` then covers
+        # [scratch | decode] contiguously and the decode tokens enter FA.
         req_blocks.clear()
         req_blocks.extend(scratch)
         req_blocks.extend(history)
@@ -895,7 +900,6 @@ class SparseKVManager(FullAttentionManager):
         )
         self._last_num_tokens_main_model[request_id] = num_tokens_main_model
         self.num_cached_block[request_id] = 0
-        logger.info(f"[sha] allocate {(time.perf_counter() - start) * 1000}")
         return list(req_blocks)
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
@@ -982,17 +986,18 @@ class SparseKVManager(FullAttentionManager):
         return request_id in self._prefill_offloaded
 
     def _scratch_block_count(self) -> int:
-        # Scratch must hold the full per-step selection footprint:
-        # head_n (static prefix) + max_selected_tokens (dynamic) + tail_len
-        # (static suffix). Sizing only for max_selected_tokens leaves the
-        # static-zone tokens reading past the end of the row.
+        # Scratch holds exactly what LMCache's clustered transfer loads:
+        # ``effective_max_selected_tokens`` (= budget) dynamic cluster tokens
+        # at slots [0, budget).  Static head/tail are NOT separately loaded
+        # (budget is "steady + retrieve").  Sizing the scratch to budget --
+        # which is block-aligned for the usual block sizes -- makes the
+        # resident decode region start on a block boundary in PROPER decode
+        # blocks (right after the loaded scratch).  Over-sizing to
+        # static+budget leaves slack scratch blocks that the decode region
+        # then "borrows", mis-aligning the manager's decode-block accounting
+        # against the runner's decode slot_mapping and corrupting decode KV.
         spec = self._spec
-        return cdiv(
-            spec.effective_max_selected_tokens
-            + int(spec.static_pattern_start)
-            + int(spec.static_pattern_end),
-            self.block_size,
-        )
+        return cdiv(spec.effective_max_selected_tokens, self.block_size)
 
     def get_scratch_blocks(self, request_id: str) -> list[KVCacheBlock]:
         return self._scratch_blocks.get(request_id, [])

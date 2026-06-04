@@ -560,11 +560,9 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
-                    start = time.perf_counter()
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
-                    logger.info(f"[sha] sample_tokens {(time.perf_counter() - start) * 1000}")
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
