@@ -476,6 +476,7 @@ class SparseManagerMetadata:
     cluster_compact_block_ids: torch.Tensor | None = None   # [Hkv, C, max_cluster_block_count]
     cluster_temp_kv_pos: torch.Tensor | None = None         # [Hkv, C, cluster_block_size, 2], 0 = temp block id, 1 = offset
     cluster_total_kv_counts: torch.Tensor | None = None     # [Hkv, C]
+    clustered_token_count: int = 0
 
     cluster_centers_T: torch.Tensor | None = None           # [Hkv, dim, C]
     mean: torch.Tensor | None = None                        # [Hkv, dim]
@@ -485,6 +486,14 @@ class SparseManagerMetadata:
     steady_buffers: SparseSteadyBuffers | None = None
     cu_seqlens_q_buffer: torch.Tensor | None = None
     cu_seqlens_q_step: int | None = None
+    active_top_clusters: torch.Tensor | None = None
+    active_grouped_top_clusters: torch.Tensor | None = None
+    pending_compact_store_specs: list["SparseCompactStoreSpec"] = field(
+        default_factory=list
+    )
+    pending_compact_load_specs: list["SparseCompactLoadSpec"] = field(
+        default_factory=list
+    )
 
     def reset_steady_state_from_python(self) -> None:
         assert self.steady_state is not None
@@ -537,6 +546,22 @@ class SparseManagerMetadata:
 @dataclass
 class RequestSparseClusterInfo:
     layers: dict[str, SparseManagerMetadata] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SparseCompactStoreSpec:
+    kv_head_idx: int
+    cluster_idx: int
+    block_idx: int
+    src_block_id: int
+
+
+@dataclass(frozen=True)
+class SparseCompactLoadSpec:
+    kv_head_idx: int
+    cluster_idx: int
+    block_idx: int
+    dst_block_id: int
 
 
 @dataclass

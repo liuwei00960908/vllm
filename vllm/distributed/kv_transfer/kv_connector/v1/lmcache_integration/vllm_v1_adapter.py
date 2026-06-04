@@ -4,30 +4,30 @@
 import inspect
 import os
 import uuid
+import hashlib
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
 from lmcache import utils
-from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.utils import EngineType, _lmcache_nvtx_annotate
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.compute.blend import LMCBlenderBuilder
-from lmcache.v1.config import LMCacheEngineConfig, _validate_and_set_config_value
-from lmcache.v1.gpu_connector import (
-    VLLMBufferLayerwiseGPUConnector,
-    VLLMPagedMemGPUConnectorV2,
-    VLLMPagedMemLayerwiseGPUConnector,
-)
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.config_base import validate_and_set_config_value
+from lmcache.v1.gpu_connector import CreateGPUConnector
 from lmcache.v1.internal_api_server.api_server import InternalAPIServer
 from lmcache.v1.lookup_client import LookupClientFactory
 from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
     LMCacheAsyncLookupServer,
 )
+from lmcache.v1.memory_management import MemoryFormat
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
+from lmcache.v1.storage_backend.abstract_backend import CacheEngineKey
 
 try:
     from lmcache.v1.plugin.runtime_plugin_launcher import RuntimePluginLauncher
@@ -56,8 +56,17 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sparse_kv_cache_manager import parse_sparse_qh_key
+from vllm.v1.core.sparse_kv_utils import (
+    SparseCompactLoadSpec,
+    SparseCompactStoreSpec,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.version import __version__ as VLLM_VERSION
+
+try:
+    from lmcache.config import LMCacheEngineMetadata
+except ImportError:
+    LMCacheEngineMetadata = LMCacheMetadata  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -189,6 +198,26 @@ def _with_per_head_token_by_layer_kw(
     except (TypeError, ValueError):
         out["per_head_token_indices_by_layer"] = m
     return _filter_callable_kwargs(fn, out)
+
+
+def _stable_u63_hash(*parts: object) -> int:
+    h = hashlib.blake2b(digest_size=8)
+    for part in parts:
+        h.update(str(part).encode("utf-8"))
+        h.update(b"\0")
+    return int.from_bytes(h.digest(), byteorder="big", signed=False) & ((1 << 63) - 1)
+
+
+def _build_compact_slot_mapping(
+    block_ids: list[int],
+    cluster_block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if not block_ids:
+        return torch.empty((0,), dtype=torch.int64, device=device)
+    block_ids_t = torch.as_tensor(block_ids, dtype=torch.int64, device=device)
+    offsets = torch.arange(cluster_block_size, dtype=torch.int64, device=device)
+    return (block_ids_t[:, None] * cluster_block_size + offsets).reshape(-1)
 
 
 @dataclass
@@ -635,59 +664,31 @@ def _init_lmcache_engine(
     num_gpus = torch.accelerator.device_count()
     local_rank = parallel_config.rank % num_gpus
     torch.accelerator.set_device_index(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
     metadata = LMCacheEngineMetadata(
-        model_config.model,
-        parallel_config.world_size,
-        parallel_config.rank,
-        "vllm",
-        kv_dtype,
-        kv_shape,
-        use_mla,
-    )
-
-    use_gpu = need_gpu_interim_buffer(lmcache_config)
-    vllm_gpu_connector: (
-        VLLMBufferLayerwiseGPUConnector
-        | VLLMPagedMemGPUConnectorV2
-        | VLLMPagedMemLayerwiseGPUConnector
+        model_name=model_config.model,
+        world_size=parallel_config.world_size,
+        local_world_size=getattr(
+            parallel_config,
+            "tensor_parallel_size",
+            parallel_config.world_size,
+        ),
+        worker_id=parallel_config.rank,
+        local_worker_id=local_rank,
+        kv_dtype=kv_dtype,
+        kv_shape=kv_shape,
+        use_mla=use_mla,
+        role="vllm",
+        chunk_size=chunk_size,
     )
 
     if use_mla and lmcache_config.use_layerwise:
         raise ValueError("layerwise MLA connector is not supported yet")
-
-    # When use_mla is True, num_kv_head is 1
-    hidden_dim_size = num_kv_head * head_size
-    if lmcache_config.use_layerwise:
-        if lmcache_config.enable_blending:
-            # Use layerwise connector for blending
-            vllm_gpu_connector = VLLMBufferLayerwiseGPUConnector(
-                hidden_dim_size,
-                num_layer,
-                use_gpu=use_gpu,
-                chunk_size=chunk_size,
-                dtype=kv_dtype,
-                device=device,
-            )
-        else:
-            vllm_gpu_connector = VLLMPagedMemLayerwiseGPUConnector(
-                hidden_dim_size,
-                num_layer,
-                use_gpu=use_gpu,
-                chunk_size=chunk_size,
-                dtype=kv_dtype,
-                device=device,
-            )
-    else:
-        vllm_gpu_connector = VLLMPagedMemGPUConnectorV2(
-            hidden_dim_size,
-            num_layer,
-            use_gpu=use_gpu,
-            chunk_size=chunk_size,
-            dtype=kv_dtype,
-            device=device,
-            use_mla=use_mla,
-        )
+    vllm_gpu_connector = CreateGPUConnector(
+        lmcache_config,
+        metadata,
+        EngineType.VLLM,
+        layout_hints={"kv_layout": "HND"},
+    )
     tpg = get_tp_group()
     engine = LMCacheEngineBuilder.get_or_create(
         ENGINE_NAME,
@@ -741,7 +742,7 @@ class LMCacheConnectorV1Impl:
             for key, value in kv_connector_extra_config.items():
                 if key.startswith("lmcache."):
                     config_key = key[8:]  # Remove "lmcache." prefix
-                    if _validate_and_set_config_value(config, config_key, value):
+                    if validate_and_set_config_value(config, config_key, value):
                         logger.info(
                             "Updated config %s from vLLM extra config: %s",
                             config_key,
@@ -826,6 +827,12 @@ class LMCacheConnectorV1Impl:
             vllm_config.parallel_config
         )
         self.current_layer = 0
+        self._compact_gpu_connector = None
+        self._compact_gpu_connector_sig: tuple[int, int] | None = None
+        self._compact_kv_dtype = get_kv_cache_torch_dtype(
+            vllm_config.cache_config.cache_dtype,
+            vllm_config.model_config.dtype,
+        )
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
 
@@ -928,6 +935,202 @@ class LMCacheConnectorV1Impl:
 
             if layer_name not in self.kv_caches:
                 self.kv_caches[layer_name] = attn_layer.kv_cache[0]
+
+    def _get_compact_gpu_connector(
+        self,
+        kv_layer: torch.Tensor,
+        cluster_block_size: int,
+    ):
+        sig = (int(cluster_block_size), int(kv_layer.shape[-1]))
+        if self._compact_gpu_connector is not None and self._compact_gpu_connector_sig == sig:
+            return self._compact_gpu_connector
+
+        assert self.lmcache_engine is not None
+        meta = self.lmcache_engine.metadata
+        local_world_size = getattr(meta, "local_world_size", meta.world_size)
+        local_worker_id = getattr(meta, "local_worker_id", meta.worker_id)
+        compact_meta = LMCacheMetadata(
+            model_name=meta.model_name,
+            world_size=meta.world_size,
+            local_world_size=local_world_size,
+            worker_id=meta.worker_id,
+            local_worker_id=local_worker_id,
+            kv_dtype=self._compact_kv_dtype,
+            kv_shape=(1, 2, int(cluster_block_size), 1, int(kv_layer.shape[-1])),
+            use_mla=False,
+            role=getattr(meta, "role", None),
+            served_model_name=getattr(meta, "served_model_name", None),
+            chunk_size=int(cluster_block_size),
+            engine_id=getattr(meta, "engine_id", None),
+            kv_connector_extra_config=getattr(meta, "kv_connector_extra_config", None),
+        )
+        # Compact KV load/store already targets the final compact scratch blocks.
+        # Force the paged-memory connector to skip its GPU intermediate buffer so
+        # stores don't add an extra kv_cache -> tmp_gpu -> CPU hop.
+        try:
+            from lmcache.v1.gpu_connector.gpu_connectors import (
+                VLLMPagedMemGPUConnectorV2,
+                VLLMPagedMemGPUConnectorV3,
+            )
+
+            connector_cls = (
+                VLLMPagedMemGPUConnectorV3
+                if getattr(self.config, "use_gpu_connector_v3", False)
+                else VLLMPagedMemGPUConnectorV2
+            )
+            self._compact_gpu_connector = connector_cls.from_metadata(
+                compact_meta,
+                use_gpu=False,
+                device=kv_layer.device,
+                layout_hints={"kv_layout": "HND"},
+            )
+        except Exception:
+            self._compact_gpu_connector = CreateGPUConnector(
+                self.config,
+                compact_meta,
+                EngineType.VLLM,
+                layout_hints={"kv_layout": "HND"},
+            )
+        self._compact_gpu_connector_sig = sig
+        return self._compact_gpu_connector
+
+    def _make_compact_block_key(
+        self,
+        req_id: str,
+        layer_name: str,
+        spec: SparseCompactStoreSpec | SparseCompactLoadSpec,
+    ) -> CacheEngineKey:
+        assert self.lmcache_engine is not None
+        meta = self.lmcache_engine.metadata
+        return CacheEngineKey(
+            model_name=meta.model_name,
+            world_size=meta.world_size,
+            worker_id=meta.worker_id,
+            chunk_hash=_stable_u63_hash(
+                "compact",
+                req_id,
+                layer_name,
+                spec.kv_head_idx,
+                spec.cluster_idx,
+                spec.block_idx,
+            ),
+            dtype=self._compact_kv_dtype,
+        )
+
+    def _store_sparse_compact_blocks(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        sparse_md = getattr(attn_metadata, "sparse_manager_metadata", None)
+        extra_info = getattr(attn_metadata, "extra_sparse_manager_info", None)
+        if not sparse_md or extra_info is None:
+            return
+        smm = sparse_md[0]
+        specs = list(smm.pending_compact_store_specs)
+        if not specs:
+            return
+
+        assert self.lmcache_engine is not None
+        cluster_block_size = int(extra_info.cluster_block_size)
+        compact_view = kv_layer.reshape(
+            kv_layer.shape[0], kv_layer.shape[1], cluster_block_size, 1, kv_layer.shape[-1]
+        )
+        compact_connector = self._get_compact_gpu_connector(kv_layer, cluster_block_size)
+        storage_manager = self.lmcache_engine.storage_manager
+        assert storage_manager is not None
+
+        shape = compact_connector.get_shape(cluster_block_size)
+        memory_objs = storage_manager.batched_allocate(
+            shape,
+            self._compact_kv_dtype,
+            batch_size=len(specs),
+            fmt=MemoryFormat.KV_2LTD,
+        )
+        if memory_objs is None:
+            raise RuntimeError("Failed to allocate LMCache memory objects for compact blocks.")
+
+        src_block_ids = [spec.src_block_id for spec in specs]
+        slot_mapping = _build_compact_slot_mapping(
+            src_block_ids,
+            cluster_block_size,
+            kv_layer.device,
+        )
+        for idx, memory_obj in enumerate(memory_objs):
+            start = idx * cluster_block_size
+            end = start + cluster_block_size
+            compact_connector.from_gpu(
+                memory_obj,
+                start,
+                end,
+                kvcaches=[compact_view],
+                slot_mapping=slot_mapping,
+            )
+        storage_manager.batched_put(
+            [self._make_compact_block_key(extra_info.req_id_list[0], layer_name, spec) for spec in specs],
+            memory_objs,
+            location=self.lmcache_engine.store_location,
+        )
+        smm.pending_compact_store_specs.clear()
+
+    def _load_sparse_compact_blocks(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        sparse_md = getattr(attn_metadata, "sparse_manager_metadata", None)
+        extra_info = getattr(attn_metadata, "extra_sparse_manager_info", None)
+        if not sparse_md or extra_info is None:
+            return
+        smm = sparse_md[0]
+        specs = list(smm.pending_compact_load_specs)
+        if not specs:
+            return
+
+        assert self.lmcache_engine is not None
+        cluster_block_size = int(extra_info.cluster_block_size)
+        compact_view = kv_layer.reshape(
+            kv_layer.shape[0], kv_layer.shape[1], cluster_block_size, 1, kv_layer.shape[-1]
+        )
+        compact_connector = self._get_compact_gpu_connector(kv_layer, cluster_block_size)
+        storage_manager = self.lmcache_engine.storage_manager
+        assert storage_manager is not None
+        keys = [
+            self._make_compact_block_key(extra_info.req_id_list[0], layer_name, spec)
+            for spec in specs
+        ]
+        memory_objs = storage_manager.batched_get(keys)
+        if any(mo is None for mo in memory_objs):
+            missing = [
+                (spec.kv_head_idx, spec.cluster_idx, spec.block_idx)
+                for spec, mo in zip(specs, memory_objs, strict=False)
+                if mo is None
+            ]
+            raise RuntimeError(f"Missing compact LMCache blocks for {layer_name}: {missing}")
+
+        dst_block_ids = [spec.dst_block_id for spec in specs]
+        slot_mapping = _build_compact_slot_mapping(
+            dst_block_ids,
+            cluster_block_size,
+            kv_layer.device,
+        )
+        for idx, memory_obj in enumerate(memory_objs):
+            assert memory_obj is not None
+            start = idx * cluster_block_size
+            end = start + cluster_block_size
+            compact_connector.to_gpu(
+                memory_obj,
+                start,
+                end,
+                kvcaches=[compact_view],
+                slot_mapping=slot_mapping,
+            )
+            memory_obj.ref_count_down()
+            if memory_obj.is_pinned:
+                memory_obj.unpin()
+        smm.pending_compact_load_specs.clear()
 
     ####################
     # Worker side APIs
@@ -1159,7 +1362,7 @@ class LMCacheConnectorV1Impl:
                     )
 
     @_lmcache_nvtx_annotate
-    def wait_for_layer_load(self, layer_name: str) -> None:
+    def wait_for_layer_load(self, layer_name: str, **kwargs) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
 
@@ -1179,6 +1382,11 @@ class LMCacheConnectorV1Impl:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info("Retrieved %s tokens", num_retrieved_tokens)
+
+        kv_layer = kwargs.get("kv_layer")
+        attn_metadata = kwargs.get("attn_metadata")
+        if kv_layer is not None and attn_metadata is not None:
+            self._load_sparse_compact_blocks(layer_name, kv_layer, attn_metadata)
 
         return
 
@@ -1289,6 +1497,7 @@ class LMCacheConnectorV1Impl:
         for layerwise_storer in self.layerwise_storers:
             next(layerwise_storer)
 
+        self._store_sparse_compact_blocks(layer_name, kv_layer, attn_metadata)
         self.current_layer += 1
 
     @_lmcache_nvtx_annotate

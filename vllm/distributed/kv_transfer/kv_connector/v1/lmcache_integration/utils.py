@@ -18,6 +18,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 ENGINE_NAME = "vllm-instance"
 
+try:
+    from lmcache.config import LMCacheEngineMetadata
+except ImportError:
+    from lmcache.v1.metadata import LMCacheMetadata as LMCacheEngineMetadata
+
 # Thread-safe singleton storage
 _config_instance: V1Config | None = None
 _config_lock = threading.Lock()
@@ -117,10 +122,6 @@ def create_lmcache_metadata(
         cache_config (CacheConfig): Cache configuration (alternative to
                                     vllm_config)
     """
-    # Third Party
-    # First Party
-    from lmcache.config import LMCacheEngineMetadata
-
     from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 
     config = lmcache_get_or_create_config()
@@ -154,13 +155,16 @@ def create_lmcache_metadata(
 
     # Create metadata
     metadata = LMCacheEngineMetadata(
-        model_cfg.model,
-        parallel_cfg.world_size,
-        parallel_cfg.rank,
-        "vllm",
-        kv_dtype,
-        kv_shape,
-        use_mla,
+        model_name=model_cfg.model,
+        world_size=parallel_cfg.world_size,
+        local_world_size=getattr(parallel_cfg, "tensor_parallel_size", parallel_cfg.world_size),
+        worker_id=parallel_cfg.rank,
+        local_worker_id=getattr(parallel_cfg, "rank", 0),
+        kv_dtype=kv_dtype,
+        kv_shape=kv_shape,
+        use_mla=use_mla,
+        role="vllm",
+        chunk_size=config.chunk_size,
     )
 
     return metadata, config

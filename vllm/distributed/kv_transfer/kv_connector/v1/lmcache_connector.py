@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -70,6 +71,10 @@ class LMCacheKVEvents(KVConnectorKVEvents):
 
 
 class LMCacheConnectorV1(KVConnectorBase_V1):
+    @property
+    def supports_sparse_compact_kv_transfer(self) -> bool:
+        return True
+
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
@@ -78,7 +83,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         methods perform actual async synchronization that cannot be
         captured in CUDA graphs.
         """
-        return extra_config.get("use_layerwise", False)
+        return extra_config.get("use_layerwise", False) or extra_config.get(
+            "enable_sparse_attention",
+            False,
+        )
 
     def __init__(
         self,
@@ -150,7 +158,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
-    def wait_for_layer_load(self, layer_name: str) -> None:
+    def wait_for_layer_load(self, layer_name: str, **kwargs: Any) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
         paged buffer. This is called from within attention layer to ensure
@@ -161,7 +169,17 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
-        self._lmcache_engine.wait_for_layer_load(layer_name)
+        wait_fn = self._lmcache_engine.wait_for_layer_load
+        try:
+            sig = inspect.signature(wait_fn)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is not None and not any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        ):
+            kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        wait_fn(layer_name, **kwargs)
 
     def save_kv_layer(
         self,

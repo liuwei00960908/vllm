@@ -117,6 +117,8 @@ class _SparseBlockReservationState:
     steady_end_block_ids: torch.Tensor | None = None
     reusable_block_ids: torch.Tensor | None = None
     reusable_count: int = 0
+    scratch_block_ids: torch.Tensor | None = None
+    scratch_count: int = 0
     unused_block_ids: torch.Tensor | None = None
     unused_count: int = 0
     window_block_ids: torch.Tensor | None = None
@@ -636,6 +638,14 @@ class SparseKVManager(FullAttentionManager):
     def _get_decode_persistent_block_count(self, num_new_token: int) -> int:
         return max(0, num_new_token) * self._spec.num_layer * self._spec.num_kv_heads
 
+    def _get_required_compact_scratch_block_count(self, total_tokens: int) -> int:
+        cluster_block_size = self._get_cluster_block_size()
+        total_tokens = max(0, int(total_tokens))
+        return max(
+            1,
+            self._spec.num_kv_heads * cdiv(total_tokens, cluster_block_size),
+        )
+
     def _allocate_cluster_blocks(
         self, req_id: str, num_blocks: int
     ) -> list[KVCacheBlock]:
@@ -645,7 +655,12 @@ class SparseKVManager(FullAttentionManager):
         self._req_to_cluster_blocks.setdefault(req_id, []).extend(new_blocks)
         return new_blocks
 
-    def _allocate_blocks_for_cluster(self, req_id, num_new_token):
+    def _allocate_blocks_for_cluster(
+        self,
+        req_id,
+        num_new_token,
+        total_tokens: int | None = None,
+    ):
         state = self._req_to_block_reservation.setdefault(
             req_id, _SparseBlockReservationState()
         )
@@ -673,55 +688,30 @@ class SparseKVManager(FullAttentionManager):
         if req_id in self.num_cached_block:
             self._ensure_reusable_cluster_blocks(req_id, num_new_token)
 
-        num_required_blocks = (
-            self._get_decode_persistent_block_count(num_new_token)
-            if req_id in self.num_cached_block
-            else self._get_prefill_persistent_block_count(num_new_token)
+        num_required_blocks = self._get_required_compact_scratch_block_count(
+            num_new_token if total_tokens is None else total_tokens
         )
-        # append_kv_to_clusters requires a non-empty free_block_ids tensor even
-        # on steps where no compact block is ultimately consumed.
-        num_required_blocks = max(1, num_required_blocks)
-
-        num_reused = min(state.unused_count, num_required_blocks)
-        num_missing_blocks = num_required_blocks - num_reused
-        slot = self._reserve_window_slot(state, num_required_blocks)
-        assert state.window_block_ids is not None
-
-        if num_reused:
-            assert state.unused_block_ids is not None
-            reused_start = state.unused_count - num_reused
-            state.window_block_ids[slot, :num_reused].copy_(
-                state.unused_block_ids[reused_start:state.unused_count]
-            )
-            state.unused_count = reused_start
-
+        num_missing_blocks = max(0, num_required_blocks - state.scratch_count)
         if num_missing_blocks:
             new_blocks = self._allocate_cluster_blocks(req_id, num_missing_blocks)
-            self._fill_block_ids(state.window_block_ids[slot], num_reused, new_blocks)
+            new_count = state.scratch_count + num_missing_blocks
+            state.scratch_block_ids = self._ensure_1d_capacity(
+                state.scratch_block_ids,
+                state.scratch_count,
+                new_count,
+            )
+            assert state.scratch_block_ids is not None
+            self._fill_block_ids(
+                state.scratch_block_ids,
+                state.scratch_count,
+                new_blocks,
+            )
+            state.scratch_count = new_count
+        state.used_count.zero_()
         return None
 
     def _rollback_scheduled_cluster_blocks(self, req_id: str) -> None:
-        state = self._req_to_block_reservation.get(req_id)
-        if state is None or state.scheduled_slot < 0:
-            return
-
-        slot = state.scheduled_slot
-        state.scheduled_slot = -1
-        state.scheduled_seq = -1
-        if not state.inflight_window_slots or state.inflight_window_slots[-1] != slot:
-            raise AssertionError(
-                "Sparse cluster scheduled window rollback is out of order for "
-                f"request {req_id}."
-            )
-        state.inflight_window_slots.pop()
-
-        assert state.window_lens is not None
-        assert state.window_block_ids is not None
-        scheduled_len = int(state.window_lens[slot].item())
-        self._push_unused_block_ids(
-            state, state.window_block_ids[slot, :scheduled_len]
-        )
-        state.free_window_slots.append(slot)
+        return
 
     def _notify_blocks_for_cluster_used(
         self,
@@ -729,6 +719,8 @@ class SparseKVManager(FullAttentionManager):
         num_block_used: int,
         window_seq: int,
     ) -> bool:
+        if window_seq < 0:
+            return True
         state = self._req_to_block_reservation.get(req_id)
         if state is None or not state.inflight_window_slots:
             return True
@@ -768,6 +760,18 @@ class SparseKVManager(FullAttentionManager):
         state = self._req_to_block_reservation.setdefault(
             req_id, _SparseBlockReservationState()
         )
+        # Reusable blocks are decode-only scratch. Prefill should not allocate
+        # them based on prompt length, otherwise a long prompt can exhaust the
+        # block pool before decode even starts.
+        #
+        # One connector-specific edge case exists: after an external prompt hit,
+        # the first scheduled step can already be a cached/decode step with only
+        # one new token to generate, but sparse cache_blocks() has not run yet.
+        # Treat that one-token step as decode as well so the reusable scratch
+        # pool is prepared before sparse FA builds its block table.
+        is_decode_like_step = req_id in self.num_cached_block or num_new_token <= 1
+        if is_decode_like_step and state.reusable_count == 0:
+            self._ensure_reusable_cluster_blocks(req_id, max(1, num_new_token))
         temp_block_ids = (
             state.temp_block_ids
             if state.temp_block_ids is not None
@@ -778,16 +782,12 @@ class SparseKVManager(FullAttentionManager):
             if state.reusable_block_ids is not None
             else self._new_i32_tensor(0)
         )
-        allocated_block_ids = self._new_i32_tensor(0)
+        allocated_block_ids = (
+            state.scratch_block_ids[: state.scratch_count]
+            if state.scratch_block_ids is not None
+            else self._new_i32_tensor(0)
+        )
         window_seq = -1
-        if state.scheduled_slot >= 0:
-            assert state.window_lens is not None
-            assert state.window_block_ids is not None
-            scheduled_len = int(state.window_lens[state.scheduled_slot].item())
-            allocated_block_ids = state.window_block_ids[
-                state.scheduled_slot, :scheduled_len
-            ]
-            window_seq = state.scheduled_seq
         return SparseClusterBlockInfo(
             temp_block_ids=temp_block_ids,
             reusable_block_ids=reusable_block_ids,

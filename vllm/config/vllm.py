@@ -942,8 +942,16 @@ class VllmConfig:
                 connector_cls = KVConnectorFactory.get_connector_class(
                     self.kv_transfer_config
                 )
-                if connector_cls.requires_piecewise_for_cudagraph(
+                kv_connector_extra_config = dict(
                     self.kv_transfer_config.kv_connector_extra_config
+                )
+                if self.cache_config.sparse_attention is not None:
+                    kv_connector_extra_config.setdefault(
+                        "enable_sparse_attention",
+                        True,
+                    )
+                if connector_cls.requires_piecewise_for_cudagraph(
+                    kv_connector_extra_config
                 ):
                     logger.warning_once(
                         "KV connector %s requires PIECEWISE CUDA graph mode "

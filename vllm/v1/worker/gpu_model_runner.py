@@ -2541,10 +2541,18 @@ class GPUModelRunner(
         ) -> None:
             src_flat = src.reshape(-1)
             if src_flat.numel() > dst_len:
-                raise ValueError(
-                    "Sparse CUDA graph packed buffer is undersized for "
-                    f"{name}: dst={dst_len}, src={src_flat.numel()}"
-                )
+                if name == "reusable_block_ids":
+                    # The scheduler-side reusable scratch pool only grows and can
+                    # remain sized for earlier, wider prefill steps. Sparse decode
+                    # kernels only consume the prefix needed by the current graph,
+                    # so pack that prefix instead of requiring the full pool to fit
+                    # inside the cudagraph buffer sized for this decode shape.
+                    src_flat = src_flat[:dst_len]
+                else:
+                    raise ValueError(
+                        "Sparse CUDA graph packed buffer is undersized for "
+                        f"{name}: dst={dst_len}, src={src_flat.numel()}"
+                    )
             if src_flat.is_cuda:
                 if src_flat.numel() < dst_len:
                     packed_gpu[
@@ -2642,8 +2650,15 @@ class GPUModelRunner(
                 + steady_end_blocks_per_head
             ),
         )
+        # Sparse compact scratch grows with total context length, not just the
+        # current decode batch size. Size the cudagraph buffer against the
+        # request-length upper bound so late decode steps do not outgrow the
+        # packed buffer.
         allocated_blocks = max(
-            1, num_tokens_padded * spec.num_layer * spec.num_kv_heads
+            1,
+            num_tokens_padded * spec.num_layer * spec.num_kv_heads,
+            spec.num_kv_heads
+            * ((self.max_model_len + cluster_block_size - 1) // cluster_block_size),
         )
         steady_start_blocks = (
             spec.num_layer * spec.num_kv_heads * steady_start_blocks_per_head
@@ -2779,18 +2794,32 @@ class GPUModelRunner(
             )
         if (
             smm.cluster_compact_block_ids is None
-            or smm.cluster_compact_block_ids.shape
-            != (hkv, spec.num_clusters, SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT)
+            or smm.cluster_compact_block_ids.shape[0] != hkv
+            or smm.cluster_compact_block_ids.shape[1] != spec.num_clusters
+            or smm.cluster_compact_block_ids.shape[2]
+            < SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT
         ):
-            smm.cluster_compact_block_ids = torch.zeros(
+            old = smm.cluster_compact_block_ids
+            new_capacity = (
+                SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT
+                if old is None
+                else max(
+                    old.shape[2],
+                    SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT,
+                )
+            )
+            smm.cluster_compact_block_ids = torch.full(
                 (
                     hkv,
                     spec.num_clusters,
-                    SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT,
+                    new_capacity,
                 ),
+                fill_value=-1,
                 dtype=torch.int32,
                 device=self.device,
             )
+            if old is not None:
+                smm.cluster_compact_block_ids[:, :, : old.shape[2]].copy_(old)
         if (
             smm.cluster_temp_kv_pos is None
             or smm.cluster_temp_kv_pos.shape

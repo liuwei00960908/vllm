@@ -203,6 +203,11 @@ KVConnectorFactory.register_connector(
     "DecodeBenchConnector",
 )
 KVConnectorFactory.register_connector(
+    "NoopPiecewiseConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.noop_piecewise_connector",
+    "NoopPiecewiseConnector",
+)
+KVConnectorFactory.register_connector(
     "MooncakeConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",
     "MooncakeConnector",

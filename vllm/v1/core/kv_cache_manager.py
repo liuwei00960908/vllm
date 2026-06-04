@@ -341,7 +341,11 @@ class KVCacheManager:
 
         for kv_cache_manager in self.coordinator.single_type_managers:
             if isinstance(kv_cache_manager, SparseKVManager):
-                kv_cache_manager._allocate_blocks_for_cluster(request.request_id, num_new_tokens)
+                kv_cache_manager._allocate_blocks_for_cluster(
+                    request.request_id,
+                    num_new_tokens,
+                    total_tokens=num_tokens_main_model,
+                )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,

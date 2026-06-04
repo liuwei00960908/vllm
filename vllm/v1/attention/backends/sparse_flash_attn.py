@@ -12,6 +12,11 @@ import torch
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+    is_v1_kv_transfer_group,
+)
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
@@ -33,6 +38,8 @@ from vllm.v1.core.sparse_kv_utils import (
     SparseAppendBuffers,
     SparseBlockTableBuffers,
     SparseClusterBlockInfo,
+    SparseCompactLoadSpec,
+    SparseCompactStoreSpec,
     SparseManagerMetadata,
 )
 
@@ -183,6 +190,307 @@ class SparseFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
 
 
 class SparseFlashAttentionImpl(FlashAttentionImpl):
+    @staticmethod
+    def _ensure_cluster_compact_capacity(
+        smm: SparseManagerMetadata,
+        hkv: int,
+        num_clusters: int,
+        required_blocks: int,
+        device: torch.device,
+    ) -> None:
+        required_blocks = max(1, int(required_blocks))
+        if (
+            smm.cluster_compact_block_ids is not None
+            and smm.cluster_compact_block_ids.shape[0] == hkv
+            and smm.cluster_compact_block_ids.shape[1] == num_clusters
+            and smm.cluster_compact_block_ids.shape[2] >= required_blocks
+        ):
+            return
+        old = smm.cluster_compact_block_ids
+        old_cap = 0 if old is None else old.shape[2]
+        new_cap = max(required_blocks, max(old_cap * 2, SparseManagerMetadata.INIT_CLUSTER_BLOCK_COUNT))
+        new_tensor = torch.full(
+            (hkv, num_clusters, new_cap),
+            fill_value=-1,
+            dtype=torch.int32,
+            device=device,
+        )
+        if old is not None:
+            new_tensor[:, :, : old.shape[2]].copy_(old)
+        smm.cluster_compact_block_ids = new_tensor
+
+    @staticmethod
+    def _supports_sparse_compact_kv_transfer() -> bool:
+        if not has_kv_transfer_group():
+            return False
+        connector = get_kv_transfer_group()
+        return is_v1_kv_transfer_group(connector) and getattr(
+            connector,
+            "supports_sparse_compact_kv_transfer",
+            False,
+        )
+
+    def _append_pending_compact_store_specs(
+        self,
+        *,
+        smm: SparseManagerMetadata,
+        prev_full_block_counts: torch.Tensor,
+        new_full_block_counts: torch.Tensor,
+    ) -> None:
+        if not self._supports_sparse_compact_kv_transfer():
+            return
+        assert smm.cluster_compact_block_ids is not None
+        if prev_full_block_counts.numel() == 0:
+            return
+
+        block_deltas = new_full_block_counts - prev_full_block_counts
+        max_new_blocks = smm.cluster_compact_block_ids.shape[2]
+        if max_new_blocks <= 0:
+            return
+
+        block_offsets = torch.arange(
+            max_new_blocks,
+            device=block_deltas.device,
+            dtype=block_deltas.dtype,
+        ).view(1, 1, -1)
+        new_block_mask = block_offsets < block_deltas.unsqueeze(-1)
+        new_block_coords = new_block_mask.nonzero(as_tuple=False)
+        if new_block_coords.numel() == 0:
+            return
+
+        block_indices = (
+            prev_full_block_counts.unsqueeze(-1) + block_offsets
+        )[new_block_coords[:, 0], new_block_coords[:, 1], new_block_coords[:, 2]]
+        src_block_ids = smm.cluster_compact_block_ids[
+            new_block_coords[:, 0],
+            new_block_coords[:, 1],
+            block_indices.to(dtype=torch.long),
+        ]
+        spec_rows = torch.stack(
+            (
+                new_block_coords[:, 0].to(dtype=torch.int32),
+                new_block_coords[:, 1].to(dtype=torch.int32),
+                block_indices.to(dtype=torch.int32),
+                src_block_ids.to(dtype=torch.int32),
+            ),
+            dim=1,
+        ).to(device="cpu")
+        smm.pending_compact_store_specs.extend(
+            SparseCompactStoreSpec(
+                kv_head_idx=kv_head_idx,
+                cluster_idx=cluster_idx,
+                block_idx=block_idx,
+                src_block_id=src_block_id,
+            )
+            for kv_head_idx, cluster_idx, block_idx, src_block_id in spec_rows.tolist()
+        )
+
+    @staticmethod
+    def _max_cluster_full_blocks_upper_bound(
+        smm: SparseManagerMetadata,
+        cluster_block_size: int,
+        incoming_tokens: int = 0,
+    ) -> int:
+        clustered_token_count = smm.clustered_token_count
+        if incoming_tokens > 0:
+            clustered_token_count += smm.count_steady_evictions(incoming_tokens)
+        return clustered_token_count // cluster_block_size
+
+    def _select_grouped_top_clusters(
+        self,
+        *,
+        query: torch.Tensor,
+        attn_metadata: SparseFlashAttentionMetadata,
+        smm: SparseManagerMetadata,
+        hkv: int,
+    ) -> torch.Tensor:
+        assert smm.mean is not None
+        assert smm.cluster_centers_T is not None
+        assert smm.block_table_buffers is not None
+        cluster_centers_t = smm.cluster_centers_T
+        nprobe = min(
+            attn_metadata.extra_sparse_manager_info.nprobe,
+            cluster_centers_t.shape[2],
+        )
+        gqa_topk_mode = attn_metadata.extra_sparse_manager_info.gqa_topk_mode
+        if gqa_topk_mode == "group_avg":
+            return smm.block_table_buffers.group_avg_top_clusters_by_kv_group(
+                query=query,
+                cluster_centers_T=cluster_centers_t,
+                mean=smm.mean,
+                cluster_center_count=smm.cluster_center_count,
+                nprobe=nprobe,
+                hkv=hkv,
+            )
+
+        hq = query.shape[1]
+        q_per_kv = hq // hkv
+        top_clusters = smm.block_table_buffers.select_top_clusters(
+            query=query,
+            cluster_centers_T=cluster_centers_t,
+            mean=smm.mean,
+            cluster_center_count=smm.cluster_center_count,
+            nprobe=nprobe,
+        )
+        union_nprobe = min(cluster_centers_t.shape[2], nprobe * q_per_kv)
+        grouped_top_clusters = (
+            smm.block_table_buffers.union_top_clusters_by_kv_group(
+                top_clusters=top_clusters,
+                hkv=hkv,
+                num_clusters=cluster_centers_t.shape[2],
+                union_nprobe=union_nprobe,
+            )
+        )
+        if os.environ.get("TEST_SPARSE_UNION_STATS", "0") != "0":
+            counts = (
+                (grouped_top_clusters >= 0)
+                .sum(dim=-1)
+                .detach()
+                .to(device="cpu")
+                .reshape(-1)
+                .tolist()
+            )
+            _sparse_union_cluster_hist.update(int(count) for count in counts)
+        return grouped_top_clusters
+
+    def prepare_layer_for_load(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor | None,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata: SparseFlashAttentionMetadata,
+    ) -> None:
+        del layer, value
+        if query is None or key is None:
+            return
+        sparse_manager_metadata = attn_metadata.sparse_manager_metadata
+        cluster_allocated_block_info = attn_metadata.cluster_allocated_block_info
+        if (
+            sparse_manager_metadata is None
+            or not sparse_manager_metadata
+            or cluster_allocated_block_info is None
+            or not cluster_allocated_block_info
+        ):
+            return
+        smm = sparse_manager_metadata[0]
+        cluster_info = cluster_allocated_block_info[0][0]
+        if cluster_info is None or smm.mean is None:
+            return
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query_actual = query[:num_actual_tokens]
+        if attn_metadata.max_query_len == attn_metadata.max_seq_len:
+            smm.active_top_clusters = None
+            smm.active_grouped_top_clusters = None
+            smm.pending_compact_load_specs.clear()
+            return
+
+        hkv = key.shape[1]
+        if smm.block_table_buffers is None:
+            smm.block_table_buffers = SparseBlockTableBuffers()
+        grouped_top_clusters = self._select_grouped_top_clusters(
+            query=query_actual,
+            attn_metadata=attn_metadata,
+            smm=smm,
+            hkv=hkv,
+        )
+        smm.active_grouped_top_clusters = grouped_top_clusters
+
+        if not self._supports_sparse_compact_kv_transfer():
+            smm.pending_compact_load_specs.clear()
+            return
+
+        assert smm.cluster_total_kv_counts is not None
+        cluster_block_size = int(attn_metadata.extra_sparse_manager_info.cluster_block_size)
+        full_block_counts = torch.div(
+            smm.cluster_total_kv_counts,
+            cluster_block_size,
+            rounding_mode="floor",
+        )
+        max_full_blocks = self._max_cluster_full_blocks_upper_bound(
+            smm,
+            cluster_block_size,
+        )
+        self._ensure_cluster_compact_capacity(
+            smm,
+            hkv,
+            int(smm.cluster_total_kv_counts.shape[1]),
+            max_full_blocks,
+            query.device,
+        )
+        assert smm.cluster_compact_block_ids is not None
+
+        new_block_map = {
+            (spec.kv_head_idx, spec.cluster_idx, spec.block_idx): spec.src_block_id
+            for spec in smm.pending_compact_store_specs
+        }
+        load_specs: list[SparseCompactLoadSpec] = []
+        pending_block_updates: list[tuple[int, int, int, int]] = []
+        free_block_ids = cluster_info.allocated_block_ids_gpu
+        assert free_block_ids is not None
+        grouped_top_clusters_cpu = (
+            grouped_top_clusters.permute(1, 0, 2)
+            .contiguous()
+            .reshape(hkv, -1)
+            .to(device="cpu")
+        )
+        full_block_counts_cpu = full_block_counts.to(device="cpu")
+        free_block_ids_cpu = free_block_ids.to(device="cpu")
+        dst_cursor = len(smm.pending_compact_store_specs)
+        for kv_head_idx in range(hkv):
+            selected = {
+                cluster_idx
+                for cluster_idx in grouped_top_clusters_cpu[kv_head_idx].tolist()
+                if cluster_idx >= 0
+            }
+            for cluster_idx in selected:
+                full_count = int(full_block_counts_cpu[kv_head_idx, cluster_idx])
+                if full_count <= 0:
+                    continue
+                if full_count > smm.cluster_compact_block_ids.shape[2]:
+                    self._ensure_cluster_compact_capacity(
+                        smm,
+                        hkv,
+                        int(smm.cluster_total_kv_counts.shape[1]),
+                        full_count,
+                        query.device,
+                    )
+                for block_idx in range(full_count):
+                    block_key = (kv_head_idx, cluster_idx, block_idx)
+                    block_id = new_block_map.get(block_key)
+                    if block_id is None:
+                        if dst_cursor >= free_block_ids_cpu.numel():
+                            raise RuntimeError(
+                                "Sparse compact scratch pool is undersized for selected clusters."
+                            )
+                        block_id = int(free_block_ids_cpu[dst_cursor])
+                        load_specs.append(
+                            SparseCompactLoadSpec(
+                                kv_head_idx=kv_head_idx,
+                                cluster_idx=cluster_idx,
+                                block_idx=block_idx,
+                                dst_block_id=block_id,
+                            )
+                        )
+                        dst_cursor += 1
+                    pending_block_updates.append(
+                        (kv_head_idx, cluster_idx, block_idx, block_id)
+                    )
+        if pending_block_updates:
+            update_rows = torch.tensor(
+                pending_block_updates,
+                dtype=torch.int64,
+                device=query.device,
+            )
+            smm.cluster_compact_block_ids[
+                update_rows[:, 0],
+                update_rows[:, 1],
+                update_rows[:, 2],
+            ] = update_rows[:, 3].to(dtype=torch.int32)
+        smm.pending_compact_load_specs = load_specs
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -412,44 +720,14 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             )
             return output
 
-        if gqa_topk_mode == "group_avg":
-            grouped_top_clusters = (
-                smm.block_table_buffers.group_avg_top_clusters_by_kv_group(
-                    query=query_actual,
-                    cluster_centers_T=cluster_centers_t,
-                    mean=smm.mean,
-                    cluster_center_count=smm.cluster_center_count,
-                    nprobe=nprobe,
-                    hkv=hkv,
-                )
-            )
-        else:
-            top_clusters = smm.block_table_buffers.select_top_clusters(
+        grouped_top_clusters = smm.active_grouped_top_clusters
+        if grouped_top_clusters is None:
+            grouped_top_clusters = self._select_grouped_top_clusters(
                 query=query_actual,
-                cluster_centers_T=cluster_centers_t,
-                mean=smm.mean,
-                cluster_center_count=smm.cluster_center_count,
-                nprobe=nprobe,
+                attn_metadata=attn_metadata,
+                smm=smm,
+                hkv=hkv,
             )
-            union_nprobe = min(cluster_centers_t.shape[2], nprobe * q_per_kv)
-            grouped_top_clusters = (
-                smm.block_table_buffers.union_top_clusters_by_kv_group(
-                    top_clusters=top_clusters,
-                    hkv=hkv,
-                    num_clusters=cluster_centers_t.shape[2],
-                    union_nprobe=union_nprobe,
-                )
-            )
-            if os.environ.get("TEST_SPARSE_UNION_STATS", "0") != "0":
-                counts = (
-                    (grouped_top_clusters >= 0)
-                    .sum(dim=-1)
-                    .detach()
-                    .to(device="cpu")
-                    .reshape(-1)
-                    .tolist()
-                )
-                _sparse_union_cluster_hist.update(int(count) for count in counts)
         required_free_blocks = (
             num_queries * hkv * (grouped_top_clusters.shape[2] + steady_blocks)
         )
@@ -592,10 +870,15 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                 smm.cluster_total_kv_counts = torch.zeros(
                     size=(hkv, num_clusters), dtype=torch.int32, device=device
                 )
+                smm.clustered_token_count = 0
             if smm.steady_state is None:
                 smm.steady_state = torch.zeros(
                     (4,), dtype=torch.int32, device=key.device
                 )
+            smm.active_top_clusters = None
+            smm.active_grouped_top_clusters = None
+            smm.pending_compact_load_specs.clear()
+            smm.pending_compact_store_specs.clear()
             smm.steady_start_capacity = int(
                 attn_metadata.extra_sparse_manager_info.steady_start_capacity
             )
@@ -608,13 +891,33 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
             if smm.append_buffers is None:
                 smm.append_buffers = SparseAppendBuffers()
             assert smm.append_buffers is not None
+            assert smm.cluster_total_kv_counts is not None
+            compact_transfer_enabled = self._supports_sparse_compact_kv_transfer()
+            prev_full_block_counts = torch.div(
+                smm.cluster_total_kv_counts,
+                cluster_block_size,
+                rounding_mode="floor",
+            )
+            if compact_transfer_enabled:
+                prev_full_block_counts = prev_full_block_counts.clone()
+            self._ensure_cluster_compact_capacity(
+                smm,
+                hkv,
+                num_clusters,
+                self._max_cluster_full_blocks_upper_bound(
+                    smm,
+                    cluster_block_size,
+                    num_actual_tokens,
+                ),
+                key.device,
+            )
             if is_prefill:
                 if smm.steady_buffers is None:
                     from vllm.v1.core.sparse_kv_utils import SparseSteadyBuffers
 
                     smm.steady_buffers = SparseSteadyBuffers()
                 assert smm.steady_buffers is not None
-                evicted_key, evicted_value, evicted_count = smm.steady_buffers.update(
+                evicted_key, evicted_value, _ = smm.steady_buffers.update(
                     block_storage=cluster_storage,
                     steady_start_block_ids=smm.steady_zone_head,
                     steady_end_block_ids=smm.steady_zone_tail,
@@ -625,8 +928,8 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                     value=value_actual,
                     evicted_capacity=max(num_actual_tokens, 1),
                 )
-                smm.advance_steady_python_state(num_actual_tokens)
-                evicted_count_i = int(evicted_count.item())
+                evicted_count_i = smm.advance_steady_python_state(num_actual_tokens)
+                smm.clustered_token_count += evicted_count_i
                 if evicted_count_i == 0:
                     assert free_blocks_info.used_count_gpu is not None
                     free_blocks_info.used_count_gpu.zero_()
@@ -688,7 +991,32 @@ class SparseFlashAttentionImpl(FlashAttentionImpl):
                     mean=smm.mean,
                     cluster_center_count=smm.cluster_center_count,
                 )
-                smm.advance_steady_python_state(num_actual_tokens)
+                smm.clustered_token_count += smm.advance_steady_python_state(
+                    num_actual_tokens
+                )
+            if compact_transfer_enabled:
+                assert smm.cluster_compact_block_ids is not None
+                new_full_block_counts = torch.div(
+                    smm.cluster_total_kv_counts,
+                    cluster_block_size,
+                    rounding_mode="floor",
+                )
+                num_clusters_i = int(smm.cluster_total_kv_counts.shape[1])
+                self._ensure_cluster_compact_capacity(
+                    smm,
+                    hkv,
+                    num_clusters_i,
+                    self._max_cluster_full_blocks_upper_bound(
+                        smm,
+                        cluster_block_size,
+                    ),
+                    key.device,
+                )
+                self._append_pending_compact_store_specs(
+                    smm=smm,
+                    prev_full_block_counts=prev_full_block_counts,
+                    new_full_block_counts=new_full_block_counts,
+                )
             return
 
         return super().do_kv_cache_update(

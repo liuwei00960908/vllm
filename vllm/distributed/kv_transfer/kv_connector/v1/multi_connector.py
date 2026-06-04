@@ -143,7 +143,9 @@ class MultiConnector(KVConnectorBase_V1):
         for conn_config in connectors_config:
             temp_ktc = KVTransferConfig(**conn_config)
             connector_cls = KVConnectorFactory.get_connector_class(temp_ktc)
-            child_extra_config = conn_config.get("kv_connector_extra_config", {})
+            child_extra_config = dict(conn_config.get("kv_connector_extra_config", {}))
+            if extra_config.get("enable_sparse_attention", False):
+                child_extra_config.setdefault("enable_sparse_attention", True)
             if connector_cls.requires_piecewise_for_cudagraph(child_extra_config):
                 return True
         return False

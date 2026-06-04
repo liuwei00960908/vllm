@@ -173,6 +173,11 @@ class KVConnectorBase_V1(ABC):
     """
 
     @property
+    def supports_sparse_compact_kv_transfer(self) -> bool:
+        """Whether the connector consumes sparse compact block metadata."""
+        return False
+
+    @property
     def prefer_cross_layer_blocks(self) -> bool:
         """
         Indicates whether this connector prefers KV blocks that hold KV data for all
