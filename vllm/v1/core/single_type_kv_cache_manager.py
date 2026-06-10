@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -21,6 +22,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowSpec,
+    dsa_shrink_stage,
+    dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
 
@@ -475,6 +478,45 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             else:
                 break
         return num_common_blocks
+
+
+class DSALatentManager(FullAttentionManager):
+    """DSA shrink-latent (stage 2): manager for the MLA latent group.
+
+    At the end of prefill (total computed >= prompt length) the request's
+    prefill latent has been offloaded to LMCache and decode reads only the
+    compact scratch (the FIRST `scratch_blocks` blocks) plus the in-place
+    decode-position tail blocks. So free the middle range
+    [scratch_blocks .. prompt_len // block_size) back to the latent pool,
+    replacing the entries with null_block (so request finish won't double-free).
+    """
+
+    scratch_blocks = int(os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", "16"))
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        if num_prompt_tokens is None or total_computed_tokens < num_prompt_tokens:
+            # still prefilling — full prefix latent must stay resident
+            return
+        blocks = self.req_to_blocks[request_id]
+        start = self.scratch_blocks
+        # never free the boundary block: with a non-multiple prompt length it
+        # also holds the first decode positions
+        end = min(num_prompt_tokens // self.block_size, len(blocks))
+        if end <= start or blocks[start] == self._null_block:
+            # nothing to free, or already shrunk (idempotent fast path)
+            return
+        removed_blocks: list[KVCacheBlock] = []
+        for i in range(end - 1, start - 1, -1):
+            if blocks[i] == self._null_block:
+                break
+            removed_blocks.append(blocks[i])
+            blocks[i] = self._null_block
+        self.block_pool.free_blocks(removed_blocks)
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
@@ -1120,6 +1162,16 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec, **kwargs
 ) -> SingleTypeKVCacheManager:
+    if (
+        dsa_two_groups_enabled()
+        and dsa_shrink_stage() == 2
+        and isinstance(kv_cache_spec, MLAAttentionSpec)
+        and kv_cache_spec.head_size >= 512
+    ):
+        # DSA two-group mode stage 2: the latent group (head 576) frees its
+        # prefill blocks at end of prefill; the indexer group (head 128) stays
+        # a plain FullAttentionManager.
+        return DSALatentManager(kv_cache_spec, **kwargs)
     manager_class = spec_manager_map[type(kv_cache_spec)]
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager

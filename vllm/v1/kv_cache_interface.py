@@ -29,6 +29,19 @@ def dsa_two_groups_enabled() -> bool:
     return os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0") == "1"
 
 
+def dsa_shrink_stage() -> int:
+    """DSA Step B staging (see vllm-ascend VLLM_ASCEND_DSA_SHRINK_LATENT).
+
+    0 = off; 1 = compact-scratch decode read (no freeing); 2 = additionally
+    FREE the latent blocks [scratch .. prompt) at end of prefill (B1);
+    3 = isolation diagnostic.
+    """
+    try:
+        return int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0"))
+    except ValueError:
+        return 0
+
+
 @dataclass(frozen=True)
 class KVCacheSpec:
     """
