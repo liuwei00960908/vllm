@@ -1416,6 +1416,19 @@ def _max_memory_usage_bytes_from_groups(
             for spec in per_layer_specs.values()
         )
 
+    # DSA two-group mode (per-group block pools, different page sizes): one
+    # max-length request needs blocks from EVERY group's pool. Per group:
+    # blocks = cdiv(per-layer bytes for max_len, page); bytes = layers * blocks * page.
+    if dsa_two_groups_enabled() and len(
+        {g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}
+    ) > 1:
+        total = 0
+        for group in kv_cache_groups:
+            page = group.kv_cache_spec.page_size_bytes
+            blocks = cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page)
+            total += len(group.layer_names) * blocks * page
+        return total
+
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
