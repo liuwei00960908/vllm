@@ -67,28 +67,30 @@ class KVCacheCoordinator(ABC):
             "DSA two-group mode (per-group block pools) does not support prefix "
             "caching yet; launch with --no-enable-prefix-caching."
         )
-        if self.use_per_group_block_pools:
-            logger.info(
-                "Per-group KV block pools: %d pools x %d blocks each.",
-                len(kv_cache_config.kv_cache_groups),
-                kv_cache_config.num_blocks,
-            )
         num_pools = (
             len(kv_cache_config.kv_cache_groups)
             if self.use_per_group_block_pools
             else 1
         )
+        pool_sizes = (
+            kv_cache_config.num_blocks_per_group
+            if self.use_per_group_block_pools
+            and kv_cache_config.num_blocks_per_group is not None
+            else [kv_cache_config.num_blocks] * num_pools
+        )
         self.block_pools = [
             BlockPool(
-                kv_cache_config.num_blocks,
+                pool_sizes[i],
                 enable_caching,
                 hash_block_size,
                 enable_kv_cache_events,
                 metrics_collector,
             )
-            for _ in range(num_pools)
+            for i in range(num_pools)
         ]
         self.block_pool = self.block_pools[0]
+        if self.use_per_group_block_pools:
+            logger.info("Per-group KV block pools: %s blocks.", pool_sizes)
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle

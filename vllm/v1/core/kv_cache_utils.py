@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    dsa_shrink_stage,
     dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
@@ -1149,24 +1150,67 @@ def get_kv_cache_config_from_groups(
         {group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}
     ) > 1:
         # DSA two-group mode: groups have different page sizes and each group is
-        # backed by its OWN block pool of `num_blocks` blocks (same N for every
-        # pool). Every layer gets its own tensor of num_blocks * its_own_page
-        # bytes — identical memory layout/accounting to the uniform-type case
-        # (bytes per block id across all layers = sum of all layers' pages).
+        # backed by its OWN block pool. Every layer gets its own tensor of
+        # group_num_blocks * its_own_page bytes.
         per_block_bytes = sum(
             len(group.layer_names) * group.kv_cache_spec.page_size_bytes
             for group in kv_cache_groups
         )
         num_blocks = available_memory // per_block_bytes
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        num_blocks_per_group = [num_blocks for _ in kv_cache_groups]
+
+        if dsa_shrink_stage() == 2 and len(kv_cache_groups) == 2:
+            # B4: with the latent freed at end of prefill, the latent pool only
+            # needs its working set; the indexer pool gets the rest (longer
+            # context / higher concurrency for the same memory).
+            sched = vllm_config.scheduler_config
+            block = kv_cache_groups[0].kv_cache_spec.block_size
+            blocks_per_req = cdiv(vllm_config.model_config.max_model_len, block)
+            scratch = int(os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", "16"))
+            prefill_conc = int(os.getenv("VLLM_ASCEND_DSA_PREFILL_CONCURRENCY", "4"))
+            decode_budget = int(os.getenv("VLLM_ASCEND_DSA_DECODE_BUDGET_TOKENS", "4096"))
+            latent_blocks = prefill_conc * blocks_per_req + sched.max_num_seqs * (
+                scratch + cdiv(decode_budget, block)
+            )
+            latent_blocks = min(latent_blocks, num_blocks)
+            latent_layers = len(kv_cache_groups[0].layer_names)
+            latent_page = kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            idx_layers = len(kv_cache_groups[1].layer_names)
+            idx_page = kv_cache_groups[1].kv_cache_spec.page_size_bytes
+            idx_block = kv_cache_groups[1].kv_cache_spec.block_size
+            idx_blocks = (
+                available_memory - latent_layers * latent_blocks * latent_page
+            ) // (idx_layers * idx_page)
+            # No point beyond max concurrency at full context.
+            idx_blocks = min(
+                idx_blocks,
+                sched.max_num_seqs
+                * cdiv(vllm_config.model_config.max_model_len, idx_block),
+            )
+            num_blocks_per_group = [latent_blocks, idx_blocks]
+            num_blocks = max(num_blocks_per_group)
+            logger.info(
+                "DSA B4 sizing: latent pool %d blocks (%d prefill x %d + %d seqs x %d), "
+                "indexer pool %d blocks.",
+                latent_blocks, prefill_conc, blocks_per_req, sched.max_num_seqs,
+                scratch + cdiv(decode_budget, block), idx_blocks,
+            )
+
         kv_cache_tensors = [
             KVCacheTensor(
-                size=group.kv_cache_spec.page_size_bytes * num_blocks,
+                size=group.kv_cache_spec.page_size_bytes * num_blocks_per_group[i],
                 shared_by=[layer_name],
             )
-            for group in kv_cache_groups
+            for i, group in enumerate(kv_cache_groups)
             for layer_name in group.layer_names
         ]
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            num_blocks_per_group=num_blocks_per_group,
+        )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from

@@ -527,6 +527,11 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
 
+    num_blocks_per_group: list[int] | None = None
+    """DSA two-group mode with per-group pools: pool size per group (latent
+    pool sized for its working set, indexer pool gets the rest). None means
+    every pool has num_blocks blocks."""
+
     @property
     def has_mamba_layers(self) -> bool:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
