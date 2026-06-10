@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
 
@@ -46,20 +47,45 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(
-            kv_cache_config.num_blocks,
-            enable_caching,
-            hash_block_size,
-            enable_kv_cache_events,
-            metrics_collector,
+        # DSA two-group mode: groups with different page sizes are backed by
+        # PER-GROUP block pools (each with num_blocks blocks), so one group's
+        # blocks (the MLA latent) can later be freed/resized independently of the
+        # other (the indexer). Default mode: one pool shared by all groups.
+        group_page_sizes = {
+            g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups
+        }
+        self.use_per_group_block_pools = (
+            dsa_two_groups_enabled()
+            and len(kv_cache_config.kv_cache_groups) > 1
+            and len(group_page_sizes) > 1
         )
+        assert not (self.use_per_group_block_pools and enable_caching), (
+            "DSA two-group mode (per-group block pools) does not support prefix "
+            "caching yet; launch with --no-enable-prefix-caching."
+        )
+        num_pools = (
+            len(kv_cache_config.kv_cache_groups)
+            if self.use_per_group_block_pools
+            else 1
+        )
+        self.block_pools = [
+            BlockPool(
+                kv_cache_config.num_blocks,
+                enable_caching,
+                hash_block_size,
+                enable_kv_cache_events,
+                metrics_collector,
+            )
+            for _ in range(num_pools)
+        ]
+        self.block_pool = self.block_pools[0]
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[i if self.use_per_group_block_pools else 0],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -96,23 +122,76 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        return sum(
+            self.get_num_blocks_to_allocate_per_group(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                num_encoder_tokens,
+                total_computed_tokens,
+                num_tokens_main_model,
+            )
+        )
+
+    def get_num_blocks_to_allocate_per_group(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> list[int]:
+        """Per-group variant of get_num_blocks_to_allocate (one entry per
+        kv cache group / single-type manager)."""
+        num_blocks_to_allocate = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id, num_encoder_tokens, [], 0, num_encoder_tokens
+                num_blocks_to_allocate.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id, num_encoder_tokens, [], 0, num_encoder_tokens
+                    )
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_tokens,
-                    new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_tokens_main_model,
+                num_blocks_to_allocate.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_tokens_main_model,
+                    )
                 )
         return num_blocks_to_allocate
+
+    def has_enough_free_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> bool:
+        """Whether the allocation can be satisfied. With per-group block pools,
+        EVERY group's demand must fit its own pool; with a single shared pool,
+        the summed demand must fit that pool."""
+        per_group = self.get_num_blocks_to_allocate_per_group(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            num_encoder_tokens,
+            total_computed_tokens,
+            num_tokens_main_model,
+        )
+        if self.use_per_group_block_pools:
+            return all(
+                needed <= manager.block_pool.get_num_free_blocks()
+                for needed, manager in zip(per_group, self.single_type_managers)
+            )
+        return sum(per_group) <= self.block_pool.get_num_free_blocks()
 
     def allocate_new_computed_blocks(
         self,

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import os
 from dataclasses import dataclass, fields, replace
 from math import prod
 
@@ -14,6 +15,18 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 
 logger = init_logger(__name__)
+
+
+def dsa_two_groups_enabled() -> bool:
+    """vllm-ascend DSA un-bundled latent/indexer (two-group mode).
+
+    When enabled, MLA specs with different head_size (latent 576 vs indexer 128)
+    are routed to SEPARATE KV cache groups backed by per-group block pools,
+    instead of one UniformTypeKVCacheSpecs group with a shared block table.
+    This is the prerequisite for freeing the latent blocks independently of the
+    indexer blocks at the end of prefill (DSA latent offload).
+    """
+    return os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -398,6 +411,17 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         """
         Whether all layers have the same type of KV cache spec.
         """
+        if dsa_two_groups_enabled():
+            # DSA un-bundle: MLA latent (576) and indexer (128) specs must form
+            # separate groups (per-group block pools) so the latent blocks can be
+            # freed independently. Do not collapse them into one uniform-type group.
+            head_sizes = {
+                spec.head_size
+                for spec in kv_cache_specs.values()
+                if isinstance(spec, MLAAttentionSpec)
+            }
+            if len(head_sizes) > 1:
+                return False
         block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.

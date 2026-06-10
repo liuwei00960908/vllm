@@ -24,8 +24,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
@@ -788,6 +790,16 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
         # Encoder-only models do not have KV cache, kv_cache_type can be
         # regarded as uniform.
         return True
+    if dsa_two_groups_enabled():
+        # DSA un-bundle: MLA latent (576) and indexer (128) must not merge into
+        # one spec/group — they form separate groups with per-group block pools.
+        head_sizes = {
+            spec.head_size
+            for spec in kv_cache_spec.values()
+            if isinstance(spec, MLAAttentionSpec)
+        }
+        if len(head_sizes) > 1:
+            return False
     try:
         kv_cache_spec_values = list(kv_cache_spec.values())
         _ = kv_cache_spec_values[0].merge(kv_cache_spec_values)
@@ -802,6 +814,20 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if dsa_two_groups_enabled() and len(
+        {g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups}
+    ) > 1:
+        # Per-group block pools: each pool has num_blocks blocks, and a request
+        # needs cdiv(max_model_len, block_size) blocks FROM EACH pool. Concurrency
+        # is limited by the pool needing the most blocks per request.
+        max_blocks_per_req = max(
+            cdiv(
+                vllm_config.model_config.max_model_len, g.kv_cache_spec.block_size
+            )
+            for g in kv_cache_config.kv_cache_groups
+        )
+        return kv_cache_config.num_blocks / max_blocks_per_req
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -1119,6 +1145,28 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
+    elif dsa_two_groups_enabled() and len(
+        {group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}
+    ) > 1:
+        # DSA two-group mode: groups have different page sizes and each group is
+        # backed by its OWN block pool of `num_blocks` blocks (same N for every
+        # pool). Every layer gets its own tensor of num_blocks * its_own_page
+        # bytes — identical memory layout/accounting to the uniform-type case
+        # (bytes per block id across all layers = sum of all layers' pages).
+        per_block_bytes = sum(
+            len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_groups
+        )
+        num_blocks = available_memory // per_block_bytes
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=group.kv_cache_spec.page_size_bytes * num_blocks,
+                shared_by=[layer_name],
+            )
+            for group in kv_cache_groups
+            for layer_name in group.layer_names
+        ]
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1248,6 +1296,16 @@ def get_kv_cache_groups(
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
 
+    if dsa_two_groups_enabled() and not is_kv_cache_page_size_uniform(kv_cache_spec):
+        # DSA two-group mode: latent (page 147456) and indexer (page 32768) keep
+        # their true page sizes and are backed by per-group block pools, so no
+        # page-size unification is needed. Sort groups by descending page size so
+        # the latent group is group 0 (KV connectors that only handle the latent
+        # consume block_ids[0]).
+        groups = _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+        groups.sort(key=lambda g: -g.kv_cache_spec.page_size_bytes)
+        return groups
+
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
@@ -1296,11 +1354,19 @@ def _report_kv_cache_config(
     )
 
     # Log the KV cache size and maximum concurrency.
-    num_tokens = (
-        kv_cache_config.num_blocks
-        // len(kv_cache_config.kv_cache_groups)
-        * min_block_size
-    )
+    if dsa_two_groups_enabled() and len(
+        {g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups}
+    ) > 1:
+        # Per-group block pools: each pool independently holds num_blocks blocks,
+        # so the model supports num_blocks * block_size tokens (not divided by the
+        # number of groups).
+        num_tokens = kv_cache_config.num_blocks * min_block_size
+    else:
+        num_tokens = (
+            kv_cache_config.num_blocks
+            // len(kv_cache_config.kv_cache_groups)
+            * min_block_size
+        )
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     if pcp_size * dcp_size > 1:
