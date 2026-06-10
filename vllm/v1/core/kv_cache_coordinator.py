@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
 
+from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -24,6 +25,8 @@ from vllm.v1.kv_cache_interface import (
     dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class KVCacheCoordinator(ABC):
@@ -63,6 +66,12 @@ class KVCacheCoordinator(ABC):
             "DSA two-group mode (per-group block pools) does not support prefix "
             "caching yet; launch with --no-enable-prefix-caching."
         )
+        if self.use_per_group_block_pools:
+            logger.info(
+                "Per-group KV block pools: %d pools x %d blocks each.",
+                len(kv_cache_config.kv_cache_groups),
+                kv_cache_config.num_blocks,
+            )
         num_pools = (
             len(kv_cache_config.kv_cache_groups)
             if self.use_per_group_block_pools
