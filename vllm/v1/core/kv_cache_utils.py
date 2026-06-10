@@ -1212,6 +1212,19 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         kv_cache_spec: The kv cache spec of each attention layer in the model
     """
 
+    if dsa_two_groups_enabled():
+        head_sizes = {
+            spec.head_size
+            for spec in kv_cache_spec.values()
+            if isinstance(spec, MLAAttentionSpec)
+        }
+        if len(head_sizes) > 1:
+            # DSA two-group mode: latent and indexer INTENTIONALLY form two
+            # groups with per-group block pools, even though a KV connector
+            # disables the hybrid KV cache manager (the non-HMA connector only
+            # consumes the latent group, block_ids[0]). Leave the specs alone.
+            return
+
     if is_kv_cache_spec_uniform(
         kv_cache_spec
     ) or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):
