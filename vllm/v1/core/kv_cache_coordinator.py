@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
@@ -28,6 +29,9 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Throttle for the [KVSTARVE] admission-failure diagnostic (seconds).
+_last_starve_log = [0.0]
 
 
 class KVCacheCoordinator(ABC):
@@ -199,10 +203,28 @@ class KVCacheCoordinator(ABC):
             num_tokens_main_model,
         )
         if self.use_per_group_block_pools:
-            return all(
-                needed <= manager.block_pool.get_num_free_blocks()
-                for needed, manager in zip(per_group, self.single_type_managers)
-            )
+            frees = [m.block_pool.get_num_free_blocks() for m in self.single_type_managers]
+            ok = all(needed <= free for needed, free in zip(per_group, frees))
+            if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
+                # [KVSTARVE] one-per-second snapshot of WHICH group blocked an
+                # admission, with each group's demand vs free blocks. The group(s)
+                # marked <<BLOCKED are the binding constraint for decode batch.
+                _last_starve_log[0] = time.monotonic()
+                parts = []
+                for i, (needed, free, m) in enumerate(
+                    zip(per_group, frees, self.single_type_managers)
+                ):
+                    spec = getattr(m, "kv_cache_spec", None)
+                    page = getattr(spec, "page_size_bytes", "?")
+                    flag = " <<BLOCKED" if needed > free else ""
+                    parts.append(
+                        f"g{i}({type(m).__name__},page={page}): "
+                        f"need={needed} free={free}{flag}"
+                    )
+                logger.info(
+                    "[KVSTARVE] req=%s not admitted | %s", request_id, "  ".join(parts)
+                )
+            return ok
         return sum(per_group) <= self.block_pool.get_num_free_blocks()
 
     def allocate_new_computed_blocks(
