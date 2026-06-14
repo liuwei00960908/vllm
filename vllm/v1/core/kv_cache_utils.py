@@ -1735,12 +1735,21 @@ def get_kv_cache_configs(
     )
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
+        # Only shrink when this rank actually computed more blocks than the
+        # global min. When it already equals the min (always true for a single
+        # rank, e.g. TP=1), the body below is an identity no-op, and the
+        # per-tensor divisibility assert would wrongly fire for configs that
+        # carry per-group block counts (num_blocks_per_group), where a tensor's
+        # size is a multiple of its own group's count, not the scalar
+        # num_blocks. NOTE: heterogeneous multi-rank + per-group sizing still
+        # needs a per-group shrink here.
+        if num_blocks_old != min_num_blocks:
+            kv_cache_config.num_blocks = min_num_blocks
 
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            # Shrink tensor size proportionally
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
