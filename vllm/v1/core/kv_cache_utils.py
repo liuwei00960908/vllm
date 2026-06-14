@@ -1161,40 +1161,43 @@ def get_kv_cache_config_from_groups(
         num_blocks_per_group = [num_blocks for _ in kv_cache_groups]
 
         if dsa_shrink_stage() == 2 and len(kv_cache_groups) == 2:
-            # B4: with the latent freed at end of prefill, the latent pool only
-            # needs its working set; the indexer pool gets the rest (longer
-            # context / higher concurrency for the same memory).
-            sched = vllm_config.scheduler_config
+            # ===== TEST: indexer-priority pool sizing for a fixed target batch =====
+            # Size the two pools to support DSA_TEST_BATCH concurrent decoders at
+            # the actual request context, indexer-priority:
+            #   indexer = batch * ctx_blocks            (resident full context)
+            #   latent  = prefill_conc * ctx_blocks + batch * (scratch + gen_tail)
+            # No clamping — it sizes for the target so the case runs at that batch.
+            # Env knobs; revert after the experiment.
             block = kv_cache_groups[0].kv_cache_spec.block_size
-            blocks_per_req = cdiv(vllm_config.model_config.max_model_len, block)
             scratch = int(os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", "16"))
-            prefill_conc = int(os.getenv("VLLM_ASCEND_DSA_PREFILL_CONCURRENCY", "4"))
-            decode_budget = int(os.getenv("VLLM_ASCEND_DSA_DECODE_BUDGET_TOKENS", "4096"))
-            latent_blocks = prefill_conc * blocks_per_req + sched.max_num_seqs * (
-                scratch + cdiv(decode_budget, block)
-            )
-            latent_blocks = min(latent_blocks, num_blocks)
+            test_batch = int(os.getenv("DSA_TEST_BATCH", "11"))
+            ctx_blocks = int(
+                os.getenv("DSA_TEST_CTX_BLOCKS", str(cdiv(61056, block)))
+            )  # ~60k prompt + 1k gen
+            gen_blocks = cdiv(int(os.getenv("DSA_TEST_GEN_TOKENS", "1000")), block)
+            prefill_conc = int(os.getenv("DSA_TEST_PREFILL_CONC", "1"))
+
+            latent_blocks = prefill_conc * ctx_blocks + test_batch * (scratch + gen_blocks)
+            idx_blocks = test_batch * ctx_blocks
+            num_blocks_per_group = [latent_blocks, idx_blocks]
+            num_blocks = max(num_blocks_per_group)
+
             latent_layers = len(kv_cache_groups[0].layer_names)
             latent_page = kv_cache_groups[0].kv_cache_spec.page_size_bytes
             idx_layers = len(kv_cache_groups[1].layer_names)
             idx_page = kv_cache_groups[1].kv_cache_spec.page_size_bytes
-            idx_block = kv_cache_groups[1].kv_cache_spec.block_size
-            idx_blocks = (
-                available_memory - latent_layers * latent_blocks * latent_page
-            ) // (idx_layers * idx_page)
-            # No point beyond max concurrency at full context.
-            idx_blocks = min(
-                idx_blocks,
-                sched.max_num_seqs
-                * cdiv(vllm_config.model_config.max_model_len, idx_block),
+            need = (
+                latent_layers * latent_blocks * latent_page
+                + idx_layers * idx_blocks * idx_page
             )
-            num_blocks_per_group = [latent_blocks, idx_blocks]
-            num_blocks = max(num_blocks_per_group)
             logger.info(
-                "DSA B4 sizing: latent pool %d blocks (%d prefill x %d + %d seqs x %d), "
-                "indexer pool %d blocks.",
-                latent_blocks, prefill_conc, blocks_per_req, sched.max_num_seqs,
-                scratch + cdiv(decode_budget, block), idx_blocks,
+                "DSA TEST sizing: batch=%d ctx_blocks=%d -> latent=%d (%.2f GiB) "
+                "indexer=%d (%.2f GiB) | need=%.2f avail=%.2f GiB%s",
+                test_batch, ctx_blocks,
+                latent_blocks, latent_layers * latent_blocks * latent_page / 2**30,
+                idx_blocks, idx_layers * idx_blocks * idx_page / 2**30,
+                need / 2**30, available_memory / 2**30,
+                "" if need <= available_memory else "  [OVER BUDGET -> add --enforce-eager]",
             )
 
         kv_cache_tensors = [
