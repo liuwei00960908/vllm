@@ -1730,29 +1730,66 @@ def get_kv_cache_configs(
             )
         )
 
-    # Change the num_blocks of each rank to the smallest among all ranks.
-    # We also need to shrink the tensor size proportionally to avoid
-    # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    # Make the block count uniform across ranks (so block ids are consistent):
+    # take the cross-rank minimum and shrink the larger ranks' tensors to match.
+    #
+    # Two reconciliation modes:
+    #   * Per-group (e.g. DSA two-group): each KV cache group has its OWN block
+    #     count (num_blocks_per_group), and a tensor's byte size is a multiple of
+    #     ITS group's count, not the scalar num_blocks (= max across groups).
+    #     Each group must therefore be reconciled against its own cross-rank min,
+    #     and a tensor shrunk by its own group's count. Reconciling with the
+    #     scalar num_blocks would both mis-shrink and trip the divisibility
+    #     assert whenever the per-group counts don't align (a tensor sized for
+    #     latent_blocks is not a multiple of max(latent, indexer)).
+    #   * Scalar (default single-pool): every tensor uses the one num_blocks.
+    use_per_group = all(
+        kv_cache_config.num_blocks_per_group is not None
+        for kv_cache_config in kv_cache_configs
     )
-    for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        # Only shrink when this rank actually computed more blocks than the
-        # global min. When it already equals the min (always true for a single
-        # rank, e.g. TP=1), the body below is an identity no-op, and the
-        # per-tensor divisibility assert would wrongly fire for configs that
-        # carry per-group block counts (num_blocks_per_group), where a tensor's
-        # size is a multiple of its own group's count, not the scalar
-        # num_blocks. NOTE: heterogeneous multi-rank + per-group sizing still
-        # needs a per-group shrink here.
-        if num_blocks_old != min_num_blocks:
-            kv_cache_config.num_blocks = min_num_blocks
 
-            # Shrink tensor size proportionally
-            for tensor in kv_cache_config.kv_cache_tensors:
-                assert tensor.size % num_blocks_old == 0
-                tensor.size = tensor.size // num_blocks_old * min_num_blocks
+    if use_per_group:
+        num_groups = len(kv_cache_configs[0].num_blocks_per_group)
+        assert all(
+            len(c.num_blocks_per_group) == num_groups for c in kv_cache_configs
+        ), "All ranks must agree on the number of KV cache groups."
+        min_blocks_per_group = [
+            min(c.num_blocks_per_group[g] for c in kv_cache_configs)
+            for g in range(num_groups)
+        ]
+    else:
+        min_num_blocks = min(
+            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        )
+
+    for kv_cache_config in kv_cache_configs:
+        if use_per_group:
+            old_per_group = kv_cache_config.num_blocks_per_group
+            # Tensors are laid out group-by-group, one per layer in each group
+            # (see get_kv_cache_config_from_groups), so walking them in step with
+            # the groups gives each tensor its owning group's block count.
+            tensors = iter(kv_cache_config.kv_cache_tensors)
+            for g, group in enumerate(kv_cache_config.kv_cache_groups):
+                old_g = old_per_group[g]
+                new_g = min_blocks_per_group[g]
+                for _ in group.layer_names:
+                    tensor = next(tensors)
+                    assert tensor.size % old_g == 0
+                    if new_g != old_g:
+                        tensor.size = tensor.size // old_g * new_g
+            kv_cache_config.num_blocks_per_group = list(min_blocks_per_group)
+            kv_cache_config.num_blocks = max(min_blocks_per_group)
+        else:
+            num_blocks_old = kv_cache_config.num_blocks
+            # Only shrink when this rank actually computed more blocks than the
+            # global min (always equal for a single rank, e.g. TP=1).
+            if num_blocks_old != min_num_blocks:
+                kv_cache_config.num_blocks = min_num_blocks
+
+                # Shrink tensor size proportionally
+                for tensor in kv_cache_config.kv_cache_tensors:
+                    assert tensor.size % num_blocks_old == 0
+                    tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
