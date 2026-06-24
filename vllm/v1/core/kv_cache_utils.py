@@ -5,6 +5,7 @@
 import copy
 import hashlib
 import os
+from math import lcm
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -27,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    dsa_shared_pool_enabled,
     dsa_shrink_stage,
     dsa_two_groups_enabled,
 )
@@ -815,9 +817,17 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
-    if dsa_two_groups_enabled() and len(
-        {g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups}
-    ) > 1:
+    if (
+        dsa_two_groups_enabled()
+        and not dsa_shared_pool_enabled()
+        and len(
+            {
+                g.kv_cache_spec.page_size_bytes
+                for g in kv_cache_config.kv_cache_groups
+            }
+        )
+        > 1
+    ):
         # Per-group block pools: each pool has num_blocks blocks, and a request
         # needs cdiv(max_model_len, block_size) blocks FROM EACH pool. Concurrency
         # is limited by the pool needing the most blocks per request.
@@ -828,6 +838,33 @@ def get_max_concurrency_for_kv_cache_config(
             for g in kv_cache_config.kv_cache_groups
         )
         return kv_cache_config.num_blocks / max_blocks_per_req
+    if dsa_two_groups_enabled() and dsa_shared_pool_enabled() and len(
+        {g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups}
+    ) > 1:
+        latent_group = max(
+            kv_cache_config.kv_cache_groups,
+            key=lambda g: g.kv_cache_spec.page_size_bytes,
+        )
+        indexer_group = min(
+            kv_cache_config.kv_cache_groups,
+            key=lambda g: g.kv_cache_spec.page_size_bytes,
+        )
+        bundle_page = lcm(
+            latent_group.kv_cache_spec.page_size_bytes,
+            indexer_group.kv_cache_spec.page_size_bytes,
+        )
+        max_blocks_per_req = cdiv(
+            vllm_config.model_config.max_model_len,
+            latent_group.kv_cache_spec.block_size,
+        )
+        bundles_per_req = cdiv(
+            max_blocks_per_req,
+            bundle_page // latent_group.kv_cache_spec.page_size_bytes,
+        ) + cdiv(
+            max_blocks_per_req,
+            bundle_page // indexer_group.kv_cache_spec.page_size_bytes,
+        )
+        return kv_cache_config.num_blocks / bundles_per_req
 
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
@@ -1118,6 +1155,11 @@ def get_kv_cache_config_from_groups(
     Returns:
         The generated KVCacheConfig
     """
+    hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    if hf_config is None:
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    dsa_index_topk = getattr(hf_config, "index_topk", None)
+
     if len(kv_cache_groups) == 0:
         # Attention free models do not have KV cache.
         # Return num_blocks=1 as BlockPool always needs a null_block.
@@ -1125,6 +1167,7 @@ def get_kv_cache_config_from_groups(
             num_blocks=1,
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
+            dsa_index_topk=dsa_index_topk,
         )
 
     # Determine how model runners should initialize the KV cache tensors.
@@ -1149,6 +1192,67 @@ def get_kv_cache_config_from_groups(
     elif dsa_two_groups_enabled() and len(
         {group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}
     ) > 1:
+        if dsa_shared_pool_enabled():
+            if len(kv_cache_groups) != 2:
+                raise ValueError("DSA shared pool expects exactly two KV groups.")
+            latent_group = max(
+                kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
+            )
+            indexer_group = min(
+                kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
+            )
+            if len(latent_group.layer_names) != len(indexer_group.layer_names):
+                raise ValueError(
+                    "DSA shared pool expects one indexer layer per latent layer."
+                )
+
+            latent_page = latent_group.kv_cache_spec.page_size_bytes
+            indexer_page = indexer_group.kv_cache_spec.page_size_bytes
+            bundle_page = lcm(latent_page, indexer_page)
+            num_layer_pairs = len(latent_group.layer_names)
+            slot_count = available_memory // (num_layer_pairs * bundle_page)
+            num_bundles = slot_count - 1
+            if num_bundles <= 0:
+                raise ValueError(
+                    "No available memory for DSA shared pool after reserving "
+                    "bundle slot 0."
+                )
+            num_bundles = may_override_num_blocks(vllm_config, num_bundles)
+            tensor_size = (num_bundles + 1) * bundle_page
+
+            indexer_by_name = set(indexer_group.layer_names)
+            used_indexers: set[str] = set()
+            pairs: list[tuple[str, str]] = []
+            for latent_name in latent_group.layer_names:
+                sibling = latent_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+                if sibling in indexer_by_name:
+                    pairs.append((latent_name, sibling))
+                    used_indexers.add(sibling)
+            if len(pairs) != len(latent_group.layer_names):
+                pairs = list(zip(latent_group.layer_names, indexer_group.layer_names))
+                used_indexers = {indexer for _, indexer in pairs}
+            if used_indexers != indexer_by_name:
+                raise ValueError("DSA shared pool could not pair latent/indexer layers.")
+
+            logger.info(
+                "DSA shared pool sizing: bundles=%d, bundle_page=%.2f MiB, "
+                "layer_pairs=%d, tensor_slots_include_null=%d.",
+                num_bundles,
+                bundle_page / 2**20,
+                num_layer_pairs,
+                num_bundles + 1,
+            )
+            kv_cache_tensors = [
+                KVCacheTensor(size=tensor_size, shared_by=[latent, indexer])
+                for latent, indexer in pairs
+            ]
+            return KVCacheConfig(
+                num_blocks=num_bundles,
+                kv_cache_tensors=kv_cache_tensors,
+                kv_cache_groups=kv_cache_groups,
+                dsa_index_topk=dsa_index_topk,
+            )
+
         # DSA two-group mode: groups have different page sizes and each group is
         # backed by its OWN block pool. Every layer gets its own tensor of
         # group_num_blocks * its_own_page bytes.
@@ -1213,6 +1317,7 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors=kv_cache_tensors,
             kv_cache_groups=kv_cache_groups,
             num_blocks_per_group=num_blocks_per_group,
+            dsa_index_topk=dsa_index_topk,
         )
     else:
         # General case:
@@ -1246,6 +1351,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        dsa_index_topk=dsa_index_topk,
     )
 
 
@@ -1414,13 +1520,42 @@ def _report_kv_cache_config(
     )
 
     # Log the KV cache size and maximum concurrency.
-    if dsa_two_groups_enabled() and len(
-        {g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups}
-    ) > 1:
+    if (
+        dsa_two_groups_enabled()
+        and not dsa_shared_pool_enabled()
+        and len(
+            {
+                g.kv_cache_spec.page_size_bytes
+                for g in kv_cache_config.kv_cache_groups
+            }
+        )
+        > 1
+    ):
         # Per-group block pools: each pool independently holds num_blocks blocks,
         # so the model supports num_blocks * block_size tokens (not divided by the
         # number of groups).
         num_tokens = kv_cache_config.num_blocks * min_block_size
+    elif dsa_two_groups_enabled() and dsa_shared_pool_enabled() and len(
+        {g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups}
+    ) > 1:
+        latent_group = max(
+            kv_cache_config.kv_cache_groups,
+            key=lambda g: g.kv_cache_spec.page_size_bytes,
+        )
+        bundle_page = lcm(
+            *(
+                g.kv_cache_spec.page_size_bytes
+                for g in kv_cache_config.kv_cache_groups
+            )
+        )
+        latent_blocks_per_bundle = (
+            bundle_page // latent_group.kv_cache_spec.page_size_bytes
+        )
+        num_tokens = (
+            kv_cache_config.num_blocks
+            * latent_blocks_per_bundle
+            * min_block_size
+        )
     else:
         num_tokens = (
             kv_cache_config.num_blocks
@@ -1482,6 +1617,30 @@ def _max_memory_usage_bytes_from_groups(
     if dsa_two_groups_enabled() and len(
         {g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}
     ) > 1:
+        if dsa_shared_pool_enabled():
+            latent_group = max(
+                kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
+            )
+            indexer_group = min(
+                kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
+            )
+            bundle_page = lcm(
+                latent_group.kv_cache_spec.page_size_bytes,
+                indexer_group.kv_cache_spec.page_size_bytes,
+            )
+            blocks = cdiv(
+                latent_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                latent_group.kv_cache_spec.page_size_bytes,
+            )
+            bundles = cdiv(
+                blocks,
+                bundle_page // latent_group.kv_cache_spec.page_size_bytes,
+            ) + cdiv(
+                blocks,
+                bundle_page // indexer_group.kv_cache_spec.page_size_bytes,
+            )
+            return len(latent_group.layer_names) * (bundles + 1) * bundle_page
+
         total = 0
         for group in kv_cache_groups:
             page = group.kv_cache_spec.page_size_bytes
@@ -1742,8 +1901,23 @@ def get_kv_cache_configs(
     #     scalar num_blocks would both mis-shrink and trip the divisibility
     #     assert whenever the per-group counts don't align (a tensor sized for
     #     latent_blocks is not a multiple of max(latent, indexer)).
+    #   * DSA shared-bundle: tensor size is proportional to num_bundles + 1
+    #     because bundle slot 0 is reserved for block-table padding.
     #   * Scalar (default single-pool): every tensor uses the one num_blocks.
-    use_per_group = all(
+    use_dsa_shared = all(
+        dsa_two_groups_enabled()
+        and dsa_shared_pool_enabled()
+        and len(kv_cache_config.kv_cache_groups) == 2
+        and len(
+            {
+                g.kv_cache_spec.page_size_bytes
+                for g in kv_cache_config.kv_cache_groups
+            }
+        )
+        > 1
+        for kv_cache_config in kv_cache_configs
+    )
+    use_per_group = (not use_dsa_shared) and all(
         kv_cache_config.num_blocks_per_group is not None
         for kv_cache_config in kv_cache_configs
     )
@@ -1779,6 +1953,15 @@ def get_kv_cache_configs(
                         tensor.size = tensor.size // old_g * new_g
             kv_cache_config.num_blocks_per_group = list(min_blocks_per_group)
             kv_cache_config.num_blocks = max(min_blocks_per_group)
+        elif use_dsa_shared:
+            num_blocks_old = kv_cache_config.num_blocks
+            if num_blocks_old != min_num_blocks:
+                kv_cache_config.num_blocks = min_num_blocks
+                for tensor in kv_cache_config.kv_cache_tensors:
+                    assert tensor.size % (num_blocks_old + 1) == 0
+                    tensor.size = tensor.size // (num_blocks_old + 1) * (
+                        min_num_blocks + 1
+                    )
         else:
             num_blocks_old = kv_cache_config.num_blocks
             # Only shrink when this rank actually computed more blocks than the

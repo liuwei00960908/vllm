@@ -29,6 +29,11 @@ def dsa_two_groups_enabled() -> bool:
     return os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0") == "1"
 
 
+def dsa_shared_pool_enabled() -> bool:
+    """Share one physical DSA bundle pool between latent and indexer groups."""
+    return os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "0") == "1"
+
+
 def dsa_shrink_stage() -> int:
     """DSA Step B staging (see vllm-ascend VLLM_ASCEND_DSA_SHRINK_LATENT).
 
@@ -531,6 +536,10 @@ class KVCacheConfig:
     """DSA two-group mode with per-group pools: pool size per group (latent
     pool sized for its working set, indexer pool gets the rest). None means
     every pool has num_blocks blocks."""
+
+    dsa_index_topk: int | None = None
+    """DSA sparse-attention index_topk. Used to keep only enough latent blocks
+    for sparse decode after prefill when latent offload/shrink is enabled."""
 
     @property
     def has_mamba_layers(self) -> bool:

@@ -485,10 +485,11 @@ class DSALatentManager(FullAttentionManager):
 
     At the end of prefill (total computed >= prompt length) the request's
     prefill latent has been offloaded to LMCache and decode reads only the
-    compact scratch (the FIRST `scratch_blocks` blocks) plus the in-place
-    decode-position tail blocks. So free the middle range
-    [scratch_blocks .. prompt_len // block_size) back to the latent pool,
-    replacing the entries with null_block (so request finish won't double-free).
+    compact scratch (enough blocks for `index_topk`, installed as the instance
+    `scratch_blocks` by KVCacheCoordinator) plus the in-place decode-position
+    tail blocks. So free the middle range [scratch_blocks ..
+    prompt_len // block_size) back to the latent pool, replacing the entries
+    with null_block (so request finish won't double-free).
     """
 
     scratch_blocks = int(os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", "16"))
@@ -503,10 +504,12 @@ class DSALatentManager(FullAttentionManager):
             # still prefilling — full prefix latent must stay resident
             return
         blocks = self.req_to_blocks[request_id]
-        start = self.scratch_blocks
+        blocks_per_bundle = getattr(self.block_pool, "blocks_per_bundle", 1)
+        start = cdiv(self.scratch_blocks, blocks_per_bundle) * blocks_per_bundle
         # never free the boundary block: with a non-multiple prompt length it
         # also holds the first decode positions
         end = min(num_prompt_tokens // self.block_size, len(blocks))
+        end = (end // blocks_per_bundle) * blocks_per_bundle
         if end <= start or blocks[start] == self._null_block:
             # nothing to free, or already shrunk (idempotent fast path)
             return
