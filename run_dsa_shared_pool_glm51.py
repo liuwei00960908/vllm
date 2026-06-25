@@ -16,26 +16,49 @@ will automatically prepend ../vllm-ascend to sys.path. You can also set:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
 
+DEFAULT_MODEL = "/workspace/models/GLM-5.1-w4a8"
+DEFAULT_DATASET_PATH = "/workspace/dataset/custom_32_context_64k.jsonl"
+DEFAULT_DATASET_NAME = "custom"
+DEFAULT_ENDPOINT = "/v1/completions"
+
 DSA_ENV_DEFAULTS = {
     "VLLM_USE_V1": "1",
-    "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": "1",
+    "VLLM_LOG_STATS_INTERVAL": "1",
     "VLLM_ASCEND_DSA_UNBUNDLE": "1",
     "VLLM_ASCEND_DSA_TWO_GROUPS": "1",
-    "VLLM_ASCEND_DSA_SHARED_POOL": "1",
+    # Match the user's baseline serve command by default. Set this to 1
+    # explicitly when testing the shared bundle pool path.
+    "VLLM_ASCEND_DSA_SHARED_POOL": "0",
     "VLLM_ASCEND_DSA_SHRINK_LATENT": "2",
-    # Stage prefill latent outside NPU memory in this smoke test.
-    "VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE": "cpu",
     # Prefix caching is not supported by DSA two-group/shared-pool mode.
     "VLLM_ENABLE_PREFIX_CACHING": "0",
 }
+
+LMCACHE_ENV_DEFAULTS = {
+    "LMCACHE_MAX_LOCAL_CPU_SIZE": "50",
+    "LMCACHE_ENABLE_SPARSE_ATTENTION": "true",
+    "LMCACHE_SAVE_UNFULL_CHUNK": "true",
+    "LMCACHE_CHUNK_SIZE": "256",
+    "LMCACHE_USE_LAYERWISE": "true",
+}
+
+DEFAULT_HF_OVERRIDES = '{"num_hidden_layers": 8}'
+DEFAULT_KV_TRANSFER_CONFIG = (
+    '{"kv_connector":"LMCacheAscendConnectorV1Dynamic",'
+    '"kv_role":"kv_both",'
+    '"kv_connector_module_path":"lmcache_ascend.integration.vllm.'
+    'lmcache_ascend_connector_v1"}'
+)
 
 
 @dataclass
@@ -44,14 +67,24 @@ class RunConfig:
     tp: int
     max_model_len: int
     max_num_seqs: int
+    max_num_batched_tokens: int
+    num_prompts: int
+    dataset_name: str
+    dataset_path: str | None
+    endpoint: str
+    apply_chat_template: bool
     prompt_tokens: int
     max_tokens: int
+    ignore_eos: bool
     temperature: float
     gpu_memory_utilization: float
     dtype: str
     quantization: str | None
+    load_format: str
+    hf_overrides: dict[str, Any]
+    kv_transfer_config: dict[str, Any] | None
     enforce_eager: bool
-    backend_device: str
+    backend_device: str | None
     simulate_cpu: bool
     simulate_index_topk: int
 
@@ -69,30 +102,116 @@ def maybe_add_vllm_ascend_repo() -> None:
             return
 
 
+def parse_json_dict(raw: str | None, name: str) -> dict[str, Any]:
+    if raw is None or raw == "":
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"{name} must be valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError(f"{name} must decode to a JSON object.")
+    return value
+
+
 def parse_args() -> RunConfig:
     parser = argparse.ArgumentParser(
         description="Run GLM5.1 once with DSA shared KV pool enabled."
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("GLM51_MODEL"),
+        default=os.getenv("GLM51_MODEL", DEFAULT_MODEL),
         help="GLM5.1 model path or HF id. Can also be set by GLM51_MODEL.",
     )
     parser.add_argument("--tp", type=int, default=int(os.getenv("TP_SIZE", "1")))
-    parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--max-num-seqs", type=int, default=2)
+    parser.add_argument(
+        "--max-model-len", "--max_model_len", type=int, default=70000
+    )
+    parser.add_argument("--max-num-seqs", "--max_num_seqs", type=int, default=64)
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        "--max_num_batched_tokens",
+        type=int,
+        default=16384,
+    )
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=8,
+        help="Number of prompts submitted by this offline smoke test.",
+    )
+    parser.add_argument(
+        "--dataset-name",
+        default=DEFAULT_DATASET_NAME,
+        help="Benchmark dataset name. Only custom JSONL is consumed directly.",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        default=os.getenv("VLLM_BENCH_DATASET_PATH", DEFAULT_DATASET_PATH),
+        help="Custom JSONL dataset path used by the benchmark command.",
+    )
+    parser.add_argument(
+        "--endpoint",
+        default=DEFAULT_ENDPOINT,
+        help="Benchmark endpoint being mirrored; informational for this offline run.",
+    )
+    parser.add_argument(
+        "--skip-chat-template",
+        action="store_true",
+        help="Match vllm bench serve --skip-chat-template when needed.",
+    )
     parser.add_argument(
         "--prompt-tokens",
         type=int,
-        default=2304,
-        help="Approximate minimum tokenizer length per prompt. Keep this above "
-        "index_topk to exercise prefill shrink.",
+        default=65536,
+        help="Fallback synthetic prompt length when --dataset-path is unavailable.",
     )
-    parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument("--max-tokens", "--output-len", type=int, default=1000)
+    parser.add_argument(
+        "--ignore-eos",
+        dest="ignore_eos",
+        action="store_true",
+        default=True,
+        help="Match vllm bench serve --ignore-eos. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-ignore-eos",
+        dest="ignore_eos",
+        action="store_false",
+        help="Allow EOS to stop generation.",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.54,
+    )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--quantization", default=os.getenv("VLLM_QUANTIZATION"))
+    parser.add_argument(
+        "--load-format",
+        "--load_format",
+        default=os.getenv("VLLM_LOAD_FORMAT", "dummy"),
+        help="Default is dummy so the smoke test reaches KV/cache paths on one NPU.",
+    )
+    parser.add_argument(
+        "--hf-overrides",
+        "--hf_overrides",
+        default=os.getenv("VLLM_HF_OVERRIDES", DEFAULT_HF_OVERRIDES),
+        help="JSON object passed to vLLM hf_overrides.",
+    )
+    parser.add_argument(
+        "--kv-transfer-config",
+        "--kv_transfer_config",
+        default=os.getenv("VLLM_KV_TRANSFER_CONFIG", DEFAULT_KV_TRANSFER_CONFIG),
+        help="JSON object passed to vLLM kv_transfer_config.",
+    )
+    parser.add_argument(
+        "--no-kv-transfer-config",
+        action="store_true",
+        help="Disable the default LMCache kv_transfer_config.",
+    )
     parser.add_argument(
         "--no-enforce-eager",
         action="store_true",
@@ -101,8 +220,8 @@ def parse_args() -> RunConfig:
     parser.add_argument(
         "--backend-device",
         choices=("cpu", "npu"),
-        default=os.getenv("VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE", "cpu"),
-        help="Where the reference LMCache stand-in stores prefill latent.",
+        default=os.getenv("VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE"),
+        help="Optional reference offload backend device. Unset by default.",
     )
     parser.add_argument(
         "--simulate-cpu",
@@ -118,17 +237,33 @@ def parse_args() -> RunConfig:
     args = parser.parse_args()
     if not args.model and not args.simulate_cpu:
         parser.error("missing --model or GLM51_MODEL")
+    hf_overrides = parse_json_dict(args.hf_overrides, "--hf-overrides")
+    kv_transfer_config = None
+    if not args.no_kv_transfer_config:
+        kv_transfer_config = parse_json_dict(
+            args.kv_transfer_config, "--kv-transfer-config"
+        )
     return RunConfig(
         model=args.model,
         tp=args.tp,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        num_prompts=args.num_prompts,
+        dataset_name=args.dataset_name,
+        dataset_path=args.dataset_path,
+        endpoint=args.endpoint,
+        apply_chat_template=not args.skip_chat_template,
         prompt_tokens=args.prompt_tokens,
         max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
         temperature=args.temperature,
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype,
         quantization=args.quantization,
+        load_format=args.load_format,
+        hf_overrides=hf_overrides,
+        kv_transfer_config=kv_transfer_config,
         enforce_eager=not args.no_enforce_eager,
         backend_device=args.backend_device,
         simulate_cpu=args.simulate_cpu,
@@ -139,7 +274,10 @@ def parse_args() -> RunConfig:
 def apply_env(config: RunConfig) -> None:
     for key, value in DSA_ENV_DEFAULTS.items():
         os.environ.setdefault(key, value)
-    os.environ["VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE"] = config.backend_device
+    for key, value in LMCACHE_ENV_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+    if config.backend_device is not None:
+        os.environ["VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE"] = config.backend_device
 
 
 def require_npu() -> None:
@@ -178,7 +316,52 @@ def get_simulated_index_topk(config: RunConfig) -> int:
     return config.simulate_index_topk
 
 
-def make_prompts(model: str, target_tokens: int, batch_size: int) -> list[str]:
+def load_custom_dataset_prompts(
+    model: str,
+    dataset_path: str | None,
+    batch_size: int,
+    apply_chat_template: bool,
+) -> list[str] | None:
+    if not dataset_path:
+        return None
+    path = Path(dataset_path)
+    if not path.is_file():
+        return None
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    prompts: list[str] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if len(prompts) >= batch_size:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            prompt = item.get("prompt")
+            if not isinstance(prompt, str):
+                raise RuntimeError(
+                    f"Custom dataset row in {dataset_path} does not contain "
+                    "a string 'prompt' field."
+                )
+            if apply_chat_template:
+                prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            prompts.append(prompt)
+    if len(prompts) < batch_size:
+        raise RuntimeError(
+            f"Dataset {dataset_path} only has {len(prompts)} usable prompts, "
+            f"but --num-prompts={batch_size}."
+        )
+    return prompts
+
+
+def make_synthetic_prompts(model: str, target_tokens: int, batch_size: int) -> list[str]:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
@@ -196,10 +379,40 @@ def make_prompts(model: str, target_tokens: int, batch_size: int) -> list[str]:
     return [prompt for _ in range(batch_size)]
 
 
+def make_prompts(config: RunConfig) -> list[str]:
+    assert config.model is not None
+    if config.dataset_name == "custom":
+        prompts = load_custom_dataset_prompts(
+            config.model,
+            config.dataset_path,
+            config.num_prompts,
+            config.apply_chat_template,
+        )
+        if prompts is not None:
+            return prompts
+        print(
+            "[DSA-SHARED-E2E] dataset not found; using synthetic prompts: "
+            f"{config.dataset_path}"
+        )
+    elif config.dataset_path:
+        raise RuntimeError(
+            f"Unsupported --dataset-name={config.dataset_name!r}; this script "
+            "only reads custom JSONL directly."
+        )
+    return make_synthetic_prompts(
+        config.model, config.prompt_tokens, config.num_prompts
+    )
+
+
 def run_generation(config: RunConfig) -> None:
     require_npu()
     assert config.model is not None
     index_topk = get_index_topk(config.model)
+    if config.num_prompts > config.max_num_seqs:
+        raise RuntimeError(
+            f"--num-prompts={config.num_prompts} must be <= "
+            f"--max-num-seqs={config.max_num_seqs}."
+        )
     if config.prompt_tokens <= index_topk:
         raise RuntimeError(
             f"--prompt-tokens={config.prompt_tokens} must be > index_topk={index_topk} "
@@ -213,10 +426,11 @@ def run_generation(config: RunConfig) -> None:
 
     from vllm import LLM, SamplingParams
 
-    prompts = make_prompts(config.model, config.prompt_tokens, config.max_num_seqs)
+    prompts = make_prompts(config)
     sampling = SamplingParams(
         temperature=config.temperature,
         max_tokens=config.max_tokens,
+        ignore_eos=config.ignore_eos,
     )
     llm_kwargs = {
         "model": config.model,
@@ -224,21 +438,40 @@ def run_generation(config: RunConfig) -> None:
         "tensor_parallel_size": config.tp,
         "max_model_len": config.max_model_len,
         "max_num_seqs": config.max_num_seqs,
+        "max_num_batched_tokens": config.max_num_batched_tokens,
         "gpu_memory_utilization": config.gpu_memory_utilization,
         "dtype": config.dtype,
+        "load_format": config.load_format,
+        "hf_overrides": config.hf_overrides,
         "enforce_eager": config.enforce_eager,
         "enable_prefix_caching": False,
     }
     if config.quantization:
         llm_kwargs["quantization"] = config.quantization
+    if config.kv_transfer_config:
+        llm_kwargs["kv_transfer_config"] = config.kv_transfer_config
 
     print("[DSA-SHARED-E2E] config:")
     print(f"  model={config.model}")
     print(f"  tp={config.tp}")
+    print(f"  load_format={config.load_format}")
+    print(f"  hf_overrides={config.hf_overrides}")
+    print(f"  kv_transfer_config={config.kv_transfer_config}")
+    print(f"  max_model_len={config.max_model_len}")
+    print(f"  max_num_seqs={config.max_num_seqs}")
+    print(f"  max_num_batched_tokens={config.max_num_batched_tokens}")
+    print(f"  num_prompts={config.num_prompts}")
+    print(f"  dataset_name={config.dataset_name}")
+    print(f"  dataset_path={config.dataset_path}")
+    print(f"  endpoint={config.endpoint}")
     print(f"  index_topk={index_topk}")
-    print(f"  prompt_tokens_target={config.prompt_tokens}")
+    print(f"  fallback_prompt_tokens={config.prompt_tokens}")
+    print(f"  max_tokens={config.max_tokens}")
+    print(f"  ignore_eos={config.ignore_eos}")
     print(f"  backend_device={config.backend_device}")
     for key in sorted(DSA_ENV_DEFAULTS):
+        print(f"  {key}={os.environ.get(key)}")
+    for key in sorted(LMCACHE_ENV_DEFAULTS):
         print(f"  {key}={os.environ.get(key)}")
 
     llm = LLM(**llm_kwargs)
@@ -287,21 +520,20 @@ def run_cpu_simulation(config: RunConfig) -> None:
     # Use a larger prompt for CPU simulation so the shrink/free/reuse path moves
     # multiple bundles, not just one tail bundle.
     sim_prompt_tokens = max(config.prompt_tokens, index_topk + 16 * block_size)
-    sim_batch = max(config.max_num_seqs, 4)
+    sim_batch = max(config.num_prompts, 4)
     prompt_blocks = _ceil_div(sim_prompt_tokens, block_size)
     scratch_blocks = dsa_scratch_blocks_for_topk(index_topk, block_size)
+    latent_prefill_bundles = _ceil_div(prompt_blocks, 2)
+    indexer_prefill_bundles = _ceil_div(prompt_blocks, 9)
+    capacity_bundles = latent_prefill_bundles + indexer_prefill_bundles
 
     layout = DSASharedBlockLayout(
         latent_page_size_bytes=latent_page,
         indexer_page_size_bytes=indexer_page,
-        capacity_bundles=256,
+        capacity_bundles=capacity_bundles,
     )
-    latent_prefill_bundles = _ceil_div(
-        prompt_blocks, layout.latent_blocks_per_bundle
-    )
-    indexer_prefill_bundles = _ceil_div(
-        prompt_blocks, layout.indexer_blocks_per_bundle
-    )
+    latent_prefill_bundles = _ceil_div(prompt_blocks, layout.latent_blocks_per_bundle)
+    indexer_prefill_bundles = _ceil_div(prompt_blocks, layout.indexer_blocks_per_bundle)
     keep_latent_blocks = _align_up(
         scratch_blocks, layout.latent_blocks_per_bundle
     )
