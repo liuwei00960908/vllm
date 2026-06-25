@@ -21,6 +21,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 
 DSA_ENV_DEFAULTS = {
     "VLLM_USE_V1": "1",
@@ -38,7 +40,7 @@ DSA_ENV_DEFAULTS = {
 
 @dataclass
 class RunConfig:
-    model: str
+    model: str | None
     tp: int
     max_model_len: int
     max_num_seqs: int
@@ -50,6 +52,8 @@ class RunConfig:
     quantization: str | None
     enforce_eager: bool
     backend_device: str
+    simulate_cpu: bool
+    simulate_index_topk: int
 
 
 def maybe_add_vllm_ascend_repo() -> None:
@@ -100,8 +104,19 @@ def parse_args() -> RunConfig:
         default=os.getenv("VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE", "cpu"),
         help="Where the reference LMCache stand-in stores prefill latent.",
     )
+    parser.add_argument(
+        "--simulate-cpu",
+        action="store_true",
+        help="Run a CPU-only shared-pool simulation instead of loading GLM5.1.",
+    )
+    parser.add_argument(
+        "--simulate-index-topk",
+        type=int,
+        default=2048,
+        help="index_topk used by --simulate-cpu when --model is not provided.",
+    )
     args = parser.parse_args()
-    if not args.model:
+    if not args.model and not args.simulate_cpu:
         parser.error("missing --model or GLM51_MODEL")
     return RunConfig(
         model=args.model,
@@ -116,6 +131,8 @@ def parse_args() -> RunConfig:
         quantization=args.quantization,
         enforce_eager=not args.no_enforce_eager,
         backend_device=args.backend_device,
+        simulate_cpu=args.simulate_cpu,
+        simulate_index_topk=args.simulate_index_topk,
     )
 
 
@@ -149,6 +166,18 @@ def get_index_topk(model: str) -> int:
     return int(index_topk)
 
 
+def get_simulated_index_topk(config: RunConfig) -> int:
+    if config.model:
+        try:
+            return get_index_topk(config.model)
+        except Exception as exc:
+            print(
+                "[DSA-SHARED-SIM] could not read model config; "
+                f"falling back to --simulate-index-topk={config.simulate_index_topk}: {exc}"
+            )
+    return config.simulate_index_topk
+
+
 def make_prompts(model: str, target_tokens: int, batch_size: int) -> list[str]:
     from transformers import AutoTokenizer
 
@@ -169,6 +198,7 @@ def make_prompts(model: str, target_tokens: int, batch_size: int) -> list[str]:
 
 def run_generation(config: RunConfig) -> None:
     require_npu()
+    assert config.model is not None
     index_topk = get_index_topk(config.model)
     if config.prompt_tokens <= index_topk:
         raise RuntimeError(
@@ -229,12 +259,472 @@ def run_generation(config: RunConfig) -> None:
     print("[DSA-SHARED-E2E] PASS")
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return _ceil_div(value, alignment) * alignment
+
+
+def run_cpu_simulation(config: RunConfig) -> None:
+    import torch
+
+    from vllm.v1.core.dsa_shared_pool import (
+        DSASharedBlockLayout,
+        DSASharedBlockOwner,
+        DSASharedBundleAllocator,
+        dsa_scratch_blocks_for_topk,
+    )
+
+    index_topk = get_simulated_index_topk(config)
+    block_size = 128
+    dtype_bytes = 2
+    latent_dim = 576
+    indexer_dim = 128
+    latent_page = block_size * latent_dim * dtype_bytes
+    indexer_page = block_size * indexer_dim * dtype_bytes
+    # Use a larger prompt for CPU simulation so the shrink/free/reuse path moves
+    # multiple bundles, not just one tail bundle.
+    sim_prompt_tokens = max(config.prompt_tokens, index_topk + 16 * block_size)
+    sim_batch = max(config.max_num_seqs, 4)
+    prompt_blocks = _ceil_div(sim_prompt_tokens, block_size)
+    scratch_blocks = dsa_scratch_blocks_for_topk(index_topk, block_size)
+
+    layout = DSASharedBlockLayout(
+        latent_page_size_bytes=latent_page,
+        indexer_page_size_bytes=indexer_page,
+        capacity_bundles=256,
+    )
+    latent_prefill_bundles = _ceil_div(
+        prompt_blocks, layout.latent_blocks_per_bundle
+    )
+    indexer_prefill_bundles = _ceil_div(
+        prompt_blocks, layout.indexer_blocks_per_bundle
+    )
+    keep_latent_blocks = _align_up(
+        scratch_blocks, layout.latent_blocks_per_bundle
+    )
+    keep_latent_bundles = _ceil_div(
+        keep_latent_blocks, layout.latent_blocks_per_bundle
+    )
+
+    allocator = DSASharedBundleAllocator(layout)
+    latent_bundles = allocator.allocate(
+        DSASharedBlockOwner.LATENT, latent_prefill_bundles
+    )
+    indexer_bundles = allocator.allocate(
+        DSASharedBlockOwner.INDEXER, indexer_prefill_bundles
+    )
+    freed_latent_bundles = latent_bundles[keep_latent_bundles:]
+    pinned_latent_bundles = set(latent_bundles[:keep_latent_bundles])
+    allocator.free(DSASharedBlockOwner.LATENT, freed_latent_bundles)
+    reused_by_indexer = allocator.allocate(
+        DSASharedBlockOwner.INDEXER, min(4, len(freed_latent_bundles))
+    )
+
+    latent_block_table = [
+        block_id
+        for bundle_id in latent_bundles[:keep_latent_bundles]
+        for block_id in layout.block_ids_for_bundle(
+            DSASharedBlockOwner.LATENT, bundle_id
+        )
+    ]
+    pinned_latent_blocks = {
+        block_id
+        for bundle_id in pinned_latent_bundles
+        for block_id in layout.block_ids_for_bundle(
+            DSASharedBlockOwner.LATENT, bundle_id
+        )
+    }
+    indexer_block_table = [
+        block_id
+        for bundle_id in indexer_bundles + reused_by_indexer
+        for block_id in layout.block_ids_for_bundle(
+            DSASharedBlockOwner.INDEXER, bundle_id
+        )
+    ]
+
+    print("[DSA-SHARED-SIM] config:")
+    print(f"  model={config.model or '<none; fake config>'}")
+    print(f"  index_topk={index_topk}")
+    print(f"  prompt_tokens={sim_prompt_tokens}")
+    print(f"  batch={sim_batch}")
+    print(f"  prompt_blocks={prompt_blocks}")
+    print(f"  scratch_blocks={scratch_blocks}")
+    print(f"  keep_latent_blocks={keep_latent_blocks}")
+    print(f"  latent_blocks_per_bundle={layout.latent_blocks_per_bundle}")
+    print(f"  indexer_blocks_per_bundle={layout.indexer_blocks_per_bundle}")
+    print(f"  latent_prefill_bundles={latent_bundles}")
+    print(f"  indexer_prefill_bundles={indexer_bundles}")
+    print(f"  freed_latent_bundles={freed_latent_bundles}")
+    print(f"  reused_by_indexer={reused_by_indexer}")
+    print(f"  pinned_latent_bundles={tuple(sorted(pinned_latent_bundles))}")
+    print(f"  latent_block_table_prefix={latent_block_table[:12]}")
+    print(f"  indexer_block_table_prefix={indexer_block_table[:18]}")
+
+    if not freed_latent_bundles:
+        raise RuntimeError("simulation did not free any latent bundle")
+    if reused_by_indexer != freed_latent_bundles[: len(reused_by_indexer)]:
+        raise RuntimeError("indexer did not reuse the freed latent bundles first")
+    if not set(latent_block_table).issubset(pinned_latent_blocks):
+        raise RuntimeError("latent block table contains an unpinned/freed latent block")
+
+    try:
+        from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
+
+        raw = torch.empty(
+            layout.slot_count * layout.bundle_page_size_bytes,
+            dtype=torch.int8,
+        )
+        k_nope, k_pe = reshape_dsa_shared_pool_raw(
+            raw,
+            torch.float16,
+            block_size,
+            1,
+            512,
+            64,
+            indexer_dim,
+            is_indexer=False,
+        )
+        (indexer,) = reshape_dsa_shared_pool_raw(
+            raw,
+            torch.float16,
+            block_size,
+            1,
+            512,
+            64,
+            indexer_dim,
+            is_indexer=True,
+        )
+        if k_nope.untyped_storage().data_ptr() != raw.untyped_storage().data_ptr():
+            raise RuntimeError("k_nope does not alias the raw shared slab")
+        if k_pe.untyped_storage().data_ptr() != raw.untyped_storage().data_ptr():
+            raise RuntimeError("k_pe does not alias the raw shared slab")
+        if indexer.untyped_storage().data_ptr() != raw.untyped_storage().data_ptr():
+            raise RuntimeError("indexer does not alias the raw shared slab")
+        print(f"  k_nope_shape={tuple(k_nope.shape)}")
+        print(f"  k_pe_shape={tuple(k_pe.shape)}")
+        print(f"  indexer_shape={tuple(indexer.shape)}")
+    except ImportError as exc:
+        print(f"[DSA-SHARED-SIM] skip vllm-ascend view check: {exc}")
+
+    run_cpu_lmcache_gather_simulation(
+        batch_size=sim_batch,
+        prompt_tokens=sim_prompt_tokens,
+        index_topk=index_topk,
+        block_size=block_size,
+    )
+
+    print("[DSA-SHARED-SIM] PASS")
+
+
+class _TrackingInMemoryBackend:
+    def __init__(self, device: str = "cpu") -> None:
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.offload_backend import (
+            InMemoryLatentOffloadBackend,
+        )
+
+        self.impl = InMemoryLatentOffloadBackend(device=device)
+        self.saved: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        self.load_calls: list[tuple[str, torch.Tensor, list[int], list[str]]] = []
+        self._req_ids: list[str] = []
+
+    def register_load_buffer(self, load_buffer: torch.Tensor) -> None:
+        self.impl.register_load_buffer(load_buffer)
+
+    def save_layer(
+        self,
+        layer_name: str,
+        req_id: str,
+        token_positions: torch.Tensor,
+        latent: torch.Tensor,
+    ) -> None:
+        self.saved[(req_id, layer_name)] = (
+            token_positions.detach().cpu().clone(),
+            latent.detach().cpu().clone(),
+        )
+        self.impl.save_layer(layer_name, req_id, token_positions, latent)
+
+    def wait_for_layer_load(
+        self,
+        layer_name: str,
+        selected_tokens: torch.Tensor,
+        token_start_index: list[int],
+    ) -> None:
+        self.load_calls.append(
+            (
+                layer_name,
+                selected_tokens.detach().cpu().clone(),
+                list(token_start_index),
+                list(self._req_ids),
+            )
+        )
+        self.impl.wait_for_layer_load(layer_name, selected_tokens, token_start_index)
+
+    def set_load_req_ids(self, req_ids: list[str]) -> None:
+        self._req_ids = list(req_ids)
+        self.impl.set_load_req_ids(req_ids)
+
+    def free_request(self, req_id: str) -> None:
+        self.impl.free_request(req_id)
+
+
+def _make_latent_rows(
+    req_idx: int,
+    positions: torch.Tensor,
+    width: int,
+    *,
+    salt: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    pos = positions.to(torch.float32).unsqueeze(1)
+    cols = torch.arange(width, dtype=torch.float32).unsqueeze(0)
+    # Keep values small enough to be represented exactly after fp16 conversion.
+    values = (req_idx + 1) * 17 + (pos % 97) + (cols % 13) + salt
+    return values.to(dtype)
+
+
+def run_cpu_lmcache_gather_simulation(
+    *,
+    batch_size: int,
+    prompt_tokens: int,
+    index_topk: int,
+    block_size: int,
+) -> None:
+    from vllm_ascend.distributed.kv_transfer.sparse_offload.decode_latent_pool import (
+        GrowingDecodeLatentPool,
+    )
+    from vllm_ascend.distributed.kv_transfer.sparse_offload.offload_manager import (
+        SparseLatentOffloadManager,
+        SparseOffloadConfig,
+        build_gather_plan,
+        resolve_scratch_gather,
+    )
+    from vllm_ascend.distributed.kv_transfer.sparse_offload.paged_latent_pool import (
+        PagedLatentPool,
+    )
+
+    dtype = torch.float16
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    layer_name = "model.layers.0.self_attn.attn"
+    req_ids = [f"req-{idx}" for idx in range(batch_size)]
+    prompt_lens = torch.tensor(
+        [prompt_tokens + idx * block_size for idx in range(batch_size)],
+        dtype=torch.long,
+    )
+    max_prompt = int(prompt_lens.max().item())
+    decode_count = min(64, max(1, index_topk // 16))
+    prefill_count = index_topk - decode_count
+    topk_rows = []
+    backend = _TrackingInMemoryBackend(device="cpu")
+    config = SparseOffloadConfig(
+        num_layers=1,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        max_num_seqs=batch_size,
+        topk_tokens=index_topk,
+        dtype=dtype,
+        device=torch.device("cpu"),
+        pool_num_blocks=batch_size * (_ceil_div(max_prompt + decode_count, block_size) + 2),
+    )
+    scratch_knope = torch.zeros(
+        (
+            config.scratch_num_blocks,
+            block_size,
+            1,
+            kv_lora_rank,
+        ),
+        dtype=dtype,
+    )
+    scratch_kpe = torch.zeros(
+        (
+            config.scratch_num_blocks,
+            block_size,
+            1,
+            qk_rope_head_dim,
+        ),
+        dtype=dtype,
+    )
+    load_buffer = torch.zeros(
+        (batch_size * index_topk, config.latent_dim),
+        dtype=dtype,
+    )
+    manager = SparseLatentOffloadManager(
+        config=config,
+        backend=backend,
+        layer_names=[layer_name],
+        scratch_knope=scratch_knope,
+        scratch_kpe=scratch_kpe,
+        load_buffer=load_buffer,
+        decode_pool=GrowingDecodeLatentPool(
+            num_layers=1,
+            block_size=block_size,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            dtype=dtype,
+            device="cpu",
+        ),
+        paged_latent_pool=PagedLatentPool(
+            num_layers=1,
+            num_blocks=config.pool_num_blocks,
+            block_size=block_size,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            dtype=dtype,
+            device="cpu",
+        ),
+    )
+
+    expected_by_req: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    for req_idx, req_id in enumerate(req_ids):
+        plen = int(prompt_lens[req_idx].item())
+        prompt_pos = torch.arange(plen, dtype=torch.long)
+        k_nope = _make_latent_rows(
+            req_idx, prompt_pos, kv_lora_rank, salt=0, dtype=dtype
+        )
+        k_pe = _make_latent_rows(
+            req_idx, prompt_pos, qk_rope_head_dim, salt=3, dtype=dtype
+        )
+        manager.store_prefill_layer(req_id, layer_name, prompt_pos, k_nope, k_pe)
+
+        decode_pos = torch.arange(plen, plen + decode_count, dtype=torch.long)
+        decode_k_nope = _make_latent_rows(
+            req_idx, decode_pos, kv_lora_rank, salt=7, dtype=dtype
+        )
+        decode_k_pe = _make_latent_rows(
+            req_idx, decode_pos, qk_rope_head_dim, salt=11, dtype=dtype
+        )
+        manager._paged_latent_pool.store(
+            req_id,
+            0,
+            decode_pos,
+            decode_k_nope,
+            decode_k_pe,
+        )
+
+        step = max(1, plen // prefill_count)
+        prefill_topk = (torch.arange(prefill_count, dtype=torch.long) * step) % plen
+        topk_row = torch.cat([prefill_topk, decode_pos])
+        topk_rows.append(topk_row)
+        expected_by_req[req_id] = (
+            torch.cat([k_nope.index_select(0, prefill_topk), decode_k_nope]),
+            torch.cat([k_pe.index_select(0, prefill_topk), decode_k_pe]),
+            topk_row,
+        )
+
+    topk_indices = torch.stack(topk_rows)
+    plan = build_gather_plan(
+        topk_indices,
+        prompt_lens,
+        block_size,
+        config.scratch_blocks_per_req,
+    )
+    is_pref = plan.prefill_positions != -1
+    expected_flat_selected = plan.prefill_positions[is_pref].cpu()
+    expected_starts = (
+        torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long),
+                is_pref.sum(dim=1).cumsum(0)[:-1].cpu(),
+            ]
+        )
+        .to(torch.long)
+        .tolist()
+    )
+    (
+        scratch_knope_out,
+        scratch_kpe_out,
+        sparse_indices,
+        scratch_block_table,
+        seq_lens_kv,
+    ) = manager.gather_decode_layer(layer_name, req_ids, plan)
+
+    if len(backend.load_calls) != 1:
+        raise RuntimeError(f"expected one LMCache load call, got {len(backend.load_calls)}")
+    load_layer, selected_tokens, token_start_index, load_req_ids = backend.load_calls[0]
+    if load_layer != layer_name:
+        raise RuntimeError("LMCache load used the wrong layer")
+    if load_req_ids != req_ids:
+        raise RuntimeError("LMCache load used the wrong request ids")
+    if token_start_index != expected_starts:
+        raise RuntimeError(
+            f"LMCache token_start_index mismatch: {token_start_index} vs {expected_starts}"
+        )
+    if not torch.equal(selected_tokens, expected_flat_selected):
+        raise RuntimeError("LMCache selected_tokens did not match prefill topk positions")
+
+    expected_prefill_latent = []
+    starts = token_start_index + [int(expected_flat_selected.numel())]
+    for req_idx, req_id in enumerate(req_ids):
+        positions, latent = backend.saved[(req_id, layer_name)]
+        if not torch.equal(positions, torch.arange(int(prompt_lens[req_idx]))):
+            raise RuntimeError(f"saved LMCache positions are wrong for {req_id}")
+        lo, hi = starts[req_idx], starts[req_idx + 1]
+        expected_prefill_latent.append(
+            latent.index_select(0, selected_tokens[lo:hi].to(torch.long))
+        )
+    expected_prefill_latent_tensor = torch.cat(expected_prefill_latent)
+    loaded = manager._load_buffer[: expected_prefill_latent_tensor.shape[0]].cpu()
+    if not torch.equal(loaded, expected_prefill_latent_tensor):
+        raise RuntimeError("LMCache-loaded data in load_buffer does not match saved latent")
+
+    # This mirrors the KV rows npu_sparse_flash_attention will read from
+    # (scratch_knope/scratch_kpe, sparse_indices, scratch_block_table).
+    resolved = resolve_scratch_gather(
+        scratch_knope_out,
+        scratch_kpe_out,
+        sparse_indices,
+        scratch_block_table,
+        block_size,
+        seq_lens_kv,
+    )
+    scratch_blocks_per_req = config.scratch_blocks_per_req
+    for req_idx, req_id in enumerate(req_ids):
+        expected_knope, expected_kpe, expected_topk = expected_by_req[req_id]
+        actual_knope, actual_kpe = resolved[req_idx]
+        if not torch.equal(actual_knope.cpu(), expected_knope):
+            raise RuntimeError(f"kernel-resolved k_nope data mismatch for {req_id}")
+        if not torch.equal(actual_kpe.cpu(), expected_kpe):
+            raise RuntimeError(f"kernel-resolved k_pe data mismatch for {req_id}")
+        if not torch.equal(topk_indices[req_idx], expected_topk):
+            raise RuntimeError(f"topk row mutated for {req_id}")
+
+        valid_local = sparse_indices[req_idx, : int(seq_lens_kv[req_idx])].to(torch.long)
+        phys = (
+            scratch_block_table[req_idx][valid_local // block_size].to(torch.long)
+            * block_size
+            + valid_local % block_size
+        )
+        lo = req_idx * scratch_blocks_per_req * block_size
+        hi = (req_idx + 1) * scratch_blocks_per_req * block_size
+        if int(phys.min()) < lo or int(phys.max()) >= hi:
+            raise RuntimeError(
+                f"sparse attention block table for {req_id} points outside its pinned latent scratch region"
+            )
+
+    print("[DSA-SHARED-SIM] lmcache/control-plane data check:")
+    print(f"  topk_shape={tuple(topk_indices.shape)}")
+    print(f"  prefill_selected={int(expected_flat_selected.numel())}")
+    print(f"  decode_selected={batch_size * decode_count}")
+    print(f"  scratch_block_table_shape={tuple(scratch_block_table.shape)}")
+    print("  lmcache_selected_tokens_match=True")
+    print("  lmcache_loaded_data_match=True")
+    print("  sparse_attention_block_table_points_to_pinned_latent=True")
+    print("  sparse_attention_resolved_data_match=True")
+
+
 def main() -> int:
     maybe_add_vllm_ascend_repo()
     config = parse_args()
     apply_env(config)
     try:
-        run_generation(config)
+        if config.simulate_cpu:
+            run_cpu_simulation(config)
+        else:
+            run_generation(config)
     except Exception as exc:
         print(f"[DSA-SHARED-E2E] FAIL: {exc}", file=sys.stderr)
         return 1
