@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -26,6 +27,8 @@ from vllm.v1.kv_cache_interface import (
     dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -520,6 +523,15 @@ class DSALatentManager(FullAttentionManager):
             removed_blocks.append(blocks[i])
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
+        if removed_blocks:
+            logger.info(
+                "[DSA_SHRINK] req=%s freed_latent_blocks=%d keep_blocks=%d "
+                "prompt_blocks=%d",
+                request_id,
+                len(removed_blocks),
+                start,
+                end,
+            )
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):

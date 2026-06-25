@@ -1209,15 +1209,117 @@ def get_kv_cache_config_from_groups(
             latent_page = latent_group.kv_cache_spec.page_size_bytes
             indexer_page = indexer_group.kv_cache_spec.page_size_bytes
             bundle_page = lcm(latent_page, indexer_page)
+            latent_blocks_per_bundle = bundle_page // latent_page
+            indexer_blocks_per_bundle = bundle_page // indexer_page
             num_layer_pairs = len(latent_group.layer_names)
             slot_count = available_memory // (num_layer_pairs * bundle_page)
-            num_bundles = slot_count - 1
-            if num_bundles <= 0:
+            natural_bundles = slot_count - 1
+            if natural_bundles <= 0:
                 raise ValueError(
                     "No available memory for DSA shared pool after reserving "
                     "bundle slot 0."
                 )
+            gpu_mem_util = getattr(
+                vllm_config.cache_config, "gpu_memory_utilization", None
+            )
+            kv_mem_override = getattr(
+                vllm_config.cache_config, "kv_cache_memory_bytes", None
+            )
+            nonshared_per_block_bytes = (
+                len(latent_group.layer_names) * latent_page
+                + len(indexer_group.layer_names) * indexer_page
+            )
+            natural_nonshared_blocks = (
+                available_memory // nonshared_per_block_bytes
+                if nonshared_per_block_bytes
+                else 0
+            )
+            logger.info(
+                "DSA shared sizing debug: gpu_memory_utilization=%s "
+                "kv_cache_memory_bytes=%s available_kv=%.2f GiB "
+                "latent_page=%.2f MiB indexer_page=%.2f MiB "
+                "bundle_page=%.2f MiB latent_blocks_per_bundle=%d "
+                "indexer_blocks_per_bundle=%d layer_pairs=%d "
+                "natural_shared_bundles=%d natural_nonshared_blocks_per_group=%d.",
+                gpu_mem_util,
+                kv_mem_override,
+                available_memory / 2**30,
+                latent_page / 2**20,
+                indexer_page / 2**20,
+                bundle_page / 2**20,
+                latent_blocks_per_bundle,
+                indexer_blocks_per_bundle,
+                num_layer_pairs,
+                natural_bundles,
+                natural_nonshared_blocks,
+            )
+            num_bundles = natural_bundles
             num_bundles = may_override_num_blocks(vllm_config, num_bundles)
+
+            if dsa_shrink_stage() == 2:
+                # Keep the shared-pool smoke test comparable with the existing
+                # non-shared DSA TEST sizing below. During chunked prefill the
+                # latent cannot be freed until the full prompt has been computed,
+                # so the pool must be large enough for one full prefill resident
+                # plus the target number of decode/indexer-resident requests.
+                block = latent_group.kv_cache_spec.block_size
+                default_scratch = (
+                    cdiv(int(dsa_index_topk), block)
+                    if dsa_index_topk is not None
+                    else 16
+                )
+                scratch = int(
+                    os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", str(default_scratch))
+                )
+                test_batch = int(os.getenv("DSA_TEST_BATCH", "11"))
+                ctx_blocks = int(
+                    os.getenv("DSA_TEST_CTX_BLOCKS", str(cdiv(61056, block)))
+                )
+                gen_blocks = cdiv(
+                    int(os.getenv("DSA_TEST_GEN_TOKENS", "1000")), block
+                )
+                prefill_conc = int(os.getenv("DSA_TEST_PREFILL_CONC", "1"))
+
+                latent_blocks = (
+                    prefill_conc * ctx_blocks
+                    + test_batch * (scratch + gen_blocks)
+                )
+                indexer_blocks = test_batch * ctx_blocks
+                test_bundles = (
+                    cdiv(latent_blocks, latent_blocks_per_bundle)
+                    + cdiv(indexer_blocks, indexer_blocks_per_bundle)
+                )
+                logger.info(
+                    "DSA shared sizing debug: test_batch=%d ctx_blocks=%d "
+                    "gen_blocks=%d scratch_blocks=%d prefill_conc=%d | "
+                    "nonshared_test_blocks latent=%d indexer=%d | "
+                    "shared_required_bundles=%d "
+                    "(latent_part=%d indexer_part=%d) natural_shared_bundles=%d.",
+                    test_batch,
+                    ctx_blocks,
+                    gen_blocks,
+                    scratch,
+                    prefill_conc,
+                    latent_blocks,
+                    indexer_blocks,
+                    test_bundles,
+                    cdiv(latent_blocks, latent_blocks_per_bundle),
+                    cdiv(indexer_blocks, indexer_blocks_per_bundle),
+                    natural_bundles,
+                )
+                if test_bundles > num_bundles:
+                    logger.info(
+                        "DSA shared TEST sizing raises bundles from %d to %d "
+                        "(batch=%d ctx_blocks=%d latent_blocks=%d "
+                        "indexer_blocks=%d).",
+                        num_bundles,
+                        test_bundles,
+                        test_batch,
+                        ctx_blocks,
+                        latent_blocks,
+                        indexer_blocks,
+                    )
+                    num_bundles = test_bundles
             tensor_size = (num_bundles + 1) * bundle_page
 
             indexer_by_name = set(indexer_group.layer_names)
@@ -1260,9 +1362,26 @@ def get_kv_cache_config_from_groups(
             len(group.layer_names) * group.kv_cache_spec.page_size_bytes
             for group in kv_cache_groups
         )
-        num_blocks = available_memory // per_block_bytes
+        natural_num_blocks = available_memory // per_block_bytes
+        num_blocks = natural_num_blocks
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         num_blocks_per_group = [num_blocks for _ in kv_cache_groups]
+        gpu_mem_util = getattr(
+            vllm_config.cache_config, "gpu_memory_utilization", None
+        )
+        kv_mem_override = getattr(
+            vllm_config.cache_config, "kv_cache_memory_bytes", None
+        )
+        logger.info(
+            "DSA nonshared sizing debug: gpu_memory_utilization=%s "
+            "kv_cache_memory_bytes=%s available_kv=%.2f GiB "
+            "per_block_bytes=%.2f MiB natural_blocks_per_group=%d.",
+            gpu_mem_util,
+            kv_mem_override,
+            available_memory / 2**30,
+            per_block_bytes / 2**20,
+            natural_num_blocks,
+        )
 
         if dsa_shrink_stage() == 2 and len(kv_cache_groups) == 2:
             # ===== TEST: indexer-priority pool sizing for a fixed target batch =====
