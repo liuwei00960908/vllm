@@ -185,7 +185,7 @@ def parse_args() -> RunConfig:
         "--gpu-memory-utilization",
         "--gpu_memory_utilization",
         type=float,
-        default=0.54,
+        default=0.9,
     )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--quantization", default=os.getenv("VLLM_QUANTIZATION"))
