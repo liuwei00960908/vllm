@@ -625,6 +625,23 @@ class Scheduler(SchedulerInterface):
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
+                        if num_external_computed_tokens > 0:
+                            logger.info(
+                                "[KV_EXT_HIT] req=%s status=%s tokens=%d "
+                                "prompt=%d computed_before=%d cached_before=%d "
+                                "local_hit=%d external_hit=%d load_async=%s "
+                                "preemptions=%d",
+                                request_id,
+                                request.status.name,
+                                request.num_tokens,
+                                request.num_prompt_tokens,
+                                request.num_computed_tokens,
+                                request.num_cached_tokens,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                                load_kv_async,
+                                request.num_preemptions,
+                            )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -1430,6 +1447,38 @@ class Scheduler(SchedulerInterface):
                 or kv_transfer_params
                 or stopped
             ):
+                if request.num_external_computed_tokens > 0:
+                    recomputed = (
+                        1
+                        if request.num_cached_tokens + 1
+                        == request.num_prompt_tokens
+                        else 0
+                    )
+                    local_cache_hit = (
+                        request.num_cached_tokens
+                        + recomputed
+                        - request.num_external_computed_tokens
+                    )
+                    if local_cache_hit < 0:
+                        logger.error(
+                            "[KV_STATS_BAD] req=%s status=%s prompt=%d "
+                            "tokens=%d computed=%d cached=%d external=%d "
+                            "recomputed=%d local_cache_hit=%d new_tokens=%d "
+                            "stopped=%s kv_transfer=%s preemptions=%d",
+                            req_id,
+                            request.status.name,
+                            request.num_prompt_tokens,
+                            request.num_tokens,
+                            request.num_computed_tokens,
+                            request.num_cached_tokens,
+                            request.num_external_computed_tokens,
+                            recomputed,
+                            local_cache_hit,
+                            len(new_token_ids),
+                            stopped,
+                            kv_transfer_params is not None,
+                            request.num_preemptions,
+                        )
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -2026,7 +2075,8 @@ class Scheduler(SchedulerInterface):
         """
         assert self.connector is not None
 
-        if request.request_id in self.failed_recving_kv_req_ids:
+        failed_recv = request.request_id in self.failed_recving_kv_req_ids
+        if failed_recv:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
@@ -2051,6 +2101,22 @@ class Scheduler(SchedulerInterface):
             # Count the number of prefix cached tokens.
             if request.num_cached_tokens < 0:
                 request.num_cached_tokens = request.num_computed_tokens
+
+        if request.num_external_computed_tokens > 0:
+            logger.info(
+                "[KV_EXT_RECV_DONE] req=%s status=%s tokens=%d prompt=%d "
+                "computed=%d cached=%d external=%d failed_recv=%s "
+                "preemptions=%d",
+                request.request_id,
+                request.status.name,
+                request.num_tokens,
+                request.num_prompt_tokens,
+                request.num_computed_tokens,
+                request.num_cached_tokens,
+                request.num_external_computed_tokens,
+                failed_recv,
+                request.num_preemptions,
+            )
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
