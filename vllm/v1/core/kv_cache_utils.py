@@ -1255,72 +1255,66 @@ def get_kv_cache_config_from_groups(
             )
             num_bundles = natural_bundles
             num_bundles = may_override_num_blocks(vllm_config, num_bundles)
-
-            if dsa_shrink_stage() == 2:
-                # Keep the shared-pool smoke test comparable with the existing
-                # non-shared DSA TEST sizing below. During chunked prefill the
-                # latent cannot be freed until the full prompt has been computed,
-                # so the pool must be large enough for one full prefill resident
-                # plus the target number of decode/indexer-resident requests.
-                block = latent_group.kv_cache_spec.block_size
-                default_scratch = (
-                    cdiv(int(dsa_index_topk), block)
-                    if dsa_index_topk is not None
-                    else 16
-                )
-                scratch = int(
-                    os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", str(default_scratch))
-                )
-                test_batch = int(os.getenv("DSA_TEST_BATCH", "11"))
-                ctx_blocks = int(
-                    os.getenv("DSA_TEST_CTX_BLOCKS", str(cdiv(61056, block)))
-                )
-                gen_blocks = cdiv(
-                    int(os.getenv("DSA_TEST_GEN_TOKENS", "1000")), block
-                )
-                prefill_conc = int(os.getenv("DSA_TEST_PREFILL_CONC", "1"))
-
-                latent_blocks = (
-                    prefill_conc * ctx_blocks
-                    + test_batch * (scratch + gen_blocks)
-                )
-                indexer_blocks = test_batch * ctx_blocks
-                test_bundles = (
-                    cdiv(latent_blocks, latent_blocks_per_bundle)
-                    + cdiv(indexer_blocks, indexer_blocks_per_bundle)
-                )
-                logger.info(
-                    "DSA shared sizing debug: test_batch=%d ctx_blocks=%d "
-                    "gen_blocks=%d scratch_blocks=%d prefill_conc=%d | "
-                    "nonshared_test_blocks latent=%d indexer=%d | "
-                    "shared_required_bundles=%d "
-                    "(latent_part=%d indexer_part=%d) natural_shared_bundles=%d.",
-                    test_batch,
-                    ctx_blocks,
-                    gen_blocks,
-                    scratch,
-                    prefill_conc,
-                    latent_blocks,
-                    indexer_blocks,
-                    test_bundles,
-                    cdiv(latent_blocks, latent_blocks_per_bundle),
-                    cdiv(indexer_blocks, indexer_blocks_per_bundle),
-                    natural_bundles,
-                )
-                if test_bundles > num_bundles:
-                    logger.info(
-                        "DSA shared TEST sizing raises bundles from %d to %d "
-                        "(batch=%d ctx_blocks=%d latent_blocks=%d "
-                        "indexer_blocks=%d).",
-                        num_bundles,
-                        test_bundles,
-                        test_batch,
-                        ctx_blocks,
-                        latent_blocks,
-                        indexer_blocks,
-                    )
-                    num_bundles = test_bundles
             tensor_size = (num_bundles + 1) * bundle_page
+            shared_pool_bytes = num_layer_pairs * tensor_size
+            max_model_len = vllm_config.model_config.max_model_len
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            latent_ctx_blocks = cdiv(
+                max_model_len, latent_group.kv_cache_spec.block_size
+            )
+            indexer_ctx_blocks = cdiv(
+                max_model_len, indexer_group.kv_cache_spec.block_size
+            )
+            scratch_blocks = (
+                cdiv(int(dsa_index_topk), latent_group.kv_cache_spec.block_size)
+                if dsa_index_topk is not None
+                else 0
+            )
+            full_context_bundles = cdiv(
+                latent_ctx_blocks, latent_blocks_per_bundle
+            ) + cdiv(indexer_ctx_blocks, indexer_blocks_per_bundle)
+            sparse_decode_bundles = cdiv(
+                scratch_blocks, latent_blocks_per_bundle
+            ) + cdiv(indexer_ctx_blocks, indexer_blocks_per_bundle)
+            full_context_capacity = (
+                num_bundles // full_context_bundles
+                if full_context_bundles
+                else 0
+            )
+            sparse_decode_capacity = (
+                num_bundles // sparse_decode_bundles
+                if sparse_decode_bundles
+                else 0
+            )
+            logger.info(
+                "DSA shared pool budget: gpu_memory_utilization=%s "
+                "kv_cache_memory_bytes=%s available_kv=%.2f GiB "
+                "allocated=%.2f GiB fits_budget=%s bundles=%d "
+                "bundle_page=%.2f MiB layer_pairs=%d.",
+                gpu_mem_util,
+                kv_mem_override,
+                available_memory / 2**30,
+                shared_pool_bytes / 2**30,
+                shared_pool_bytes <= available_memory,
+                num_bundles,
+                bundle_page / 2**20,
+                num_layer_pairs,
+            )
+            logger.info(
+                "DSA shared pool capacity: max_model_len=%d max_num_seqs=%d "
+                "index_topk=%s scratch_blocks=%d full_context_bundles_per_seq=%d "
+                "full_context_capacity=%d sparse_decode_bundles_per_seq=%d "
+                "sparse_decode_capacity=%d sparse_decode_enough_for_max_seqs=%s.",
+                max_model_len,
+                max_num_seqs,
+                dsa_index_topk,
+                scratch_blocks,
+                full_context_bundles,
+                full_context_capacity,
+                sparse_decode_bundles,
+                sparse_decode_capacity,
+                sparse_decode_capacity >= max_num_seqs,
+            )
 
             indexer_by_name = set(indexer_group.layer_names)
             used_indexers: set[str] = set()
@@ -1422,6 +1416,24 @@ def get_kv_cache_config_from_groups(
                 need / 2**30, available_memory / 2**30,
                 "" if need <= available_memory else "  [OVER BUDGET -> add --enforce-eager]",
             )
+
+        nonshared_group_bytes = [
+            len(group.layer_names)
+            * group.kv_cache_spec.page_size_bytes
+            * num_blocks_per_group[i]
+            for i, group in enumerate(kv_cache_groups)
+        ]
+        nonshared_total_bytes = sum(nonshared_group_bytes)
+        logger.info(
+            "DSA nonshared actual pool usage: blocks_per_group=%s "
+            "group_allocated_gib=%s total_allocated=%.2f GiB "
+            "available_kv=%.2f GiB fits_budget=%s.",
+            num_blocks_per_group,
+            [round(bytes_ / 2**30, 4) for bytes_ in nonshared_group_bytes],
+            nonshared_total_bytes / 2**30,
+            available_memory / 2**30,
+            nonshared_total_bytes <= available_memory,
+        )
 
         kv_cache_tensors = [
             KVCacheTensor(
