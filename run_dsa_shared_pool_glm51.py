@@ -36,9 +36,7 @@ DSA_ENV_DEFAULTS = {
     "VLLM_LOG_STATS_INTERVAL": "1",
     "VLLM_ASCEND_DSA_UNBUNDLE": "1",
     "VLLM_ASCEND_DSA_TWO_GROUPS": "1",
-    # Match the user's baseline serve command by default. Set this to 1
-    # explicitly when testing the shared bundle pool path.
-    "VLLM_ASCEND_DSA_SHARED_POOL": "0",
+    "VLLM_ASCEND_DSA_SHARED_POOL": "1",
     "VLLM_ASCEND_DSA_SHRINK_LATENT": "2",
     # Prefix caching is not supported by DSA two-group/shared-pool mode.
     "VLLM_ENABLE_PREFIX_CACHING": "0",

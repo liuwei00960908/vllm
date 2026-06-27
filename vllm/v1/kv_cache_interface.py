@@ -31,7 +31,7 @@ def dsa_two_groups_enabled() -> bool:
 
 def dsa_shared_pool_enabled() -> bool:
     """Share one physical DSA bundle pool between latent and indexer groups."""
-    return os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "0") == "1"
+    return os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1") == "1"
 
 
 def dsa_shrink_stage() -> int:
