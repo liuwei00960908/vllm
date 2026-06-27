@@ -935,6 +935,12 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self.kv_cache_manager.maybe_log_dsa_shared_pool_usage(
+            requests=self.requests,
+            running_count=len(self.running),
+            waiting_count=len(self.waiting) + len(self.skipped_waiting),
+            max_running_count=self.max_num_running_reqs,
+        )
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:

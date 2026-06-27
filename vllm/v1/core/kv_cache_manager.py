@@ -515,6 +515,20 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
+    def maybe_log_dsa_shared_pool_usage(
+        self,
+        requests: dict[str, Request],
+        running_count: int,
+        waiting_count: int,
+        max_running_count: int,
+    ) -> None:
+        self.coordinator.maybe_log_dsa_shared_pool_usage(
+            requests=requests,
+            running_count=running_count,
+            waiting_count=waiting_count,
+            max_running_count=max_running_count,
+        )
+
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()

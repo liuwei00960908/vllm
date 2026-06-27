@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -43,6 +44,18 @@ logger = init_logger(__name__)
 _last_starve_log = [0.0]
 
 
+def _get_dsa_pool_log_interval() -> float:
+    raw = os.getenv("VLLM_ASCEND_DSA_POOL_LOG_INTERVAL", "5")
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        logger.warning(
+            "Invalid VLLM_ASCEND_DSA_POOL_LOG_INTERVAL=%r; using 5 seconds.",
+            raw,
+        )
+        return 5.0
+
+
 class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
@@ -63,6 +76,9 @@ class KVCacheCoordinator(ABC):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self._dsa_pool_last_log = 0.0
+        self._dsa_pool_log_interval = _get_dsa_pool_log_interval()
+        self._dsa_last_starve: tuple[str, int, int, list[int]] | None = None
 
         # DSA two-group mode has two variants:
         # 1. legacy: one real BlockPool per group;
@@ -107,6 +123,7 @@ class KVCacheCoordinator(ABC):
                 capacity_bundles=kv_cache_config.num_blocks,
             )
             self.dsa_shared_allocator = DSASharedBundleAllocator(layout)
+            self.dsa_shared_num_layer_pairs = len(latent_group.layer_names)
             self.block_pools = []
             for group in kv_cache_config.kv_cache_groups:
                 owner = (
@@ -301,6 +318,13 @@ class KVCacheCoordinator(ABC):
                 for manager, needed in zip(self.single_type_managers, per_group)
             )
             ok = needed_bundles <= self.dsa_shared_allocator.free_bundle_count
+            if not ok:
+                self._dsa_last_starve = (
+                    request_id,
+                    needed_bundles,
+                    self.dsa_shared_allocator.free_bundle_count,
+                    per_group,
+                )
             if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
                 _last_starve_log[0] = time.monotonic()
                 logger.info(
@@ -310,9 +334,150 @@ class KVCacheCoordinator(ABC):
                     needed_bundles,
                     self.dsa_shared_allocator.free_bundle_count,
                     per_group,
-                )
+            )
             return ok
         return sum(per_group) <= self.block_pool.get_num_free_blocks()
+
+    def maybe_log_dsa_shared_pool_usage(
+        self,
+        requests: dict[str, Request],
+        running_count: int,
+        waiting_count: int,
+        max_running_count: int,
+    ) -> None:
+        if not self.use_dsa_shared_block_pool:
+            return
+        if self._dsa_pool_log_interval <= 0:
+            return
+
+        now = time.monotonic()
+        if now - self._dsa_pool_last_log < self._dsa_pool_log_interval:
+            return
+        self._dsa_pool_last_log = now
+
+        allocator = self.dsa_shared_allocator
+        layout = allocator.layout
+        capacity = layout.capacity_bundles
+        free = allocator.free_bundle_count
+        used = capacity - free
+        owner_counts = allocator.owner_bundle_counts()
+        latent_owner_bundles = owner_counts.get(DSASharedBlockOwner.LATENT, 0)
+        indexer_owner_bundles = owner_counts.get(DSASharedBlockOwner.INDEXER, 0)
+
+        latent_mgr = None
+        indexer_mgr = None
+        for manager in self.single_type_managers:
+            owner = getattr(manager.block_pool, "owner", None)
+            if owner == DSASharedBlockOwner.LATENT:
+                latent_mgr = manager
+            elif owner == DSASharedBlockOwner.INDEXER:
+                indexer_mgr = manager
+
+        latent_prefill_blocks = 0
+        latent_prefill_bundles: set[int] = set()
+        latent_postprefill_blocks = 0
+        latent_postprefill_bundles: set[int] = set()
+        latent_unknown_blocks = 0
+        latent_unknown_bundles: set[int] = set()
+        reqs_with_blocks: set[str] = set()
+
+        if latent_mgr is not None:
+            for request_id, blocks in latent_mgr.req_to_blocks.items():
+                reqs_with_blocks.add(request_id)
+                block_count = 0
+                bundle_ids: set[int] = set()
+                for block in blocks:
+                    if block.is_null:
+                        continue
+                    block_count += 1
+                    bundle_ids.add(
+                        layout.bundle_id_for_block(
+                            DSASharedBlockOwner.LATENT, block.block_id
+                        )
+                    )
+                request = requests.get(request_id)
+                if request is None:
+                    latent_unknown_blocks += block_count
+                    latent_unknown_bundles.update(bundle_ids)
+                elif request.num_computed_tokens < request.num_prompt_tokens:
+                    latent_prefill_blocks += block_count
+                    latent_prefill_bundles.update(bundle_ids)
+                else:
+                    latent_postprefill_blocks += block_count
+                    latent_postprefill_bundles.update(bundle_ids)
+
+        indexer_blocks = 0
+        indexer_bundles: set[int] = set()
+        if indexer_mgr is not None:
+            for request_id, blocks in indexer_mgr.req_to_blocks.items():
+                reqs_with_blocks.add(request_id)
+                for block in blocks:
+                    if block.is_null:
+                        continue
+                    indexer_blocks += 1
+                    indexer_bundles.add(
+                        layout.bundle_id_for_block(
+                            DSASharedBlockOwner.INDEXER, block.block_id
+                        )
+                    )
+
+        bundle_bytes = (
+            layout.bundle_page_size_bytes
+            * getattr(self, "dsa_shared_num_layer_pairs", 1)
+        )
+        used_gib = used * bundle_bytes / 2**30
+        total_gib = capacity * bundle_bytes / 2**30
+
+        starve_req = "-"
+        starve_need = 0
+        starve_free = free
+        starve_deficit = 0
+        starve_per_group: list[int] = []
+        if self._dsa_last_starve is not None:
+            starve_req, starve_need, starve_free, starve_per_group = (
+                self._dsa_last_starve
+            )
+            starve_deficit = max(starve_need - starve_free, 0)
+
+        logger.info(
+            "[DSA_POOL] bundles used=%d/%d free=%d usage=%.1f%% "
+            "owner_latent=%d owner_indexer=%d free_ranges=%d largest_free=%d "
+            "bytes_used=%.2f/%.2f GiB running=%d/%d waiting=%d reqs_with_blocks=%d "
+            "latent_prefill_blocks=%d latent_prefill_bundles=%d "
+            "latent_after_prefill_blocks=%d latent_after_prefill_bundles=%d "
+            "latent_unknown_blocks=%d latent_unknown_bundles=%d "
+            "indexer_blocks=%d indexer_bundles=%d "
+            "last_starve_req=%s last_starve_need=%d "
+            "last_starve_free=%d last_starve_deficit=%d "
+            "last_starve_per_group_blocks=%s",
+            used,
+            capacity,
+            free,
+            100.0 * used / capacity if capacity else 0.0,
+            latent_owner_bundles,
+            indexer_owner_bundles,
+            allocator.free_range_count,
+            allocator.largest_free_range,
+            used_gib,
+            total_gib,
+            running_count,
+            max_running_count,
+            waiting_count,
+            len(reqs_with_blocks),
+            latent_prefill_blocks,
+            len(latent_prefill_bundles),
+            latent_postprefill_blocks,
+            len(latent_postprefill_bundles),
+            latent_unknown_blocks,
+            len(latent_unknown_bundles),
+            indexer_blocks,
+            len(indexer_bundles),
+            starve_req,
+            starve_need,
+            starve_free,
+            starve_deficit,
+            starve_per_group,
+        )
 
     def allocate_new_computed_blocks(
         self,

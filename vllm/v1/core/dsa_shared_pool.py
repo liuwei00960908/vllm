@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -167,6 +168,19 @@ class DSASharedBundleAllocator:
     @property
     def free_bundle_count(self) -> int:
         return sum(end - start + 1 for start, end in self._free_ranges)
+
+    @property
+    def free_range_count(self) -> int:
+        return len(self._free_ranges)
+
+    @property
+    def largest_free_range(self) -> int:
+        if not self._free_ranges:
+            return 0
+        return max(end - start + 1 for start, end in self._free_ranges)
+
+    def owner_bundle_counts(self) -> Counter[DSASharedBlockOwner]:
+        return Counter(self._owners.values())
 
     def bundle_count_for_blocks(
         self,
