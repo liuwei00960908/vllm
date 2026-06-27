@@ -85,6 +85,7 @@ class RunConfig:
     backend_device: str | None
     simulate_cpu: bool
     simulate_index_topk: int
+    correctness_baseline: bool
 
 
 def maybe_add_vllm_ascend_repo() -> None:
@@ -232,12 +233,34 @@ def parse_args() -> RunConfig:
         default=2048,
         help="index_topk used by --simulate-cpu when --model is not provided.",
     )
+    parser.add_argument(
+        "--correctness-baseline",
+        action="store_true",
+        help=(
+            "Run a no-LMCache semantic baseline: real weights by default, no "
+            "hf layer truncation, no kv_transfer_config, and no latent shrink."
+        ),
+    )
     args = parser.parse_args()
     if not args.model and not args.simulate_cpu:
         parser.error("missing --model or GLM51_MODEL")
-    hf_overrides = parse_json_dict(args.hf_overrides, "--hf-overrides")
+
+    argv = sys.argv[1:]
+
+    def _arg_was_set(*names: str) -> bool:
+        return any(arg == name or arg.startswith(f"{name}=") for arg in argv for name in names)
+
+    load_format = args.load_format
+    hf_overrides_raw = args.hf_overrides
+    if args.correctness_baseline:
+        if not _arg_was_set("--load-format", "--load_format") and "VLLM_LOAD_FORMAT" not in os.environ:
+            load_format = "auto"
+        if not _arg_was_set("--hf-overrides", "--hf_overrides") and "VLLM_HF_OVERRIDES" not in os.environ:
+            hf_overrides_raw = "{}"
+
+    hf_overrides = parse_json_dict(hf_overrides_raw, "--hf-overrides")
     kv_transfer_config = None
-    if not args.no_kv_transfer_config:
+    if not args.no_kv_transfer_config and not args.correctness_baseline:
         kv_transfer_config = parse_json_dict(
             args.kv_transfer_config, "--kv-transfer-config"
         )
@@ -259,21 +282,27 @@ def parse_args() -> RunConfig:
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype,
         quantization=args.quantization,
-        load_format=args.load_format,
+        load_format=load_format,
         hf_overrides=hf_overrides,
         kv_transfer_config=kv_transfer_config,
         enforce_eager=not args.no_enforce_eager,
         backend_device=args.backend_device,
         simulate_cpu=args.simulate_cpu,
         simulate_index_topk=args.simulate_index_topk,
+        correctness_baseline=args.correctness_baseline,
     )
 
 
 def apply_env(config: RunConfig) -> None:
     for key, value in DSA_ENV_DEFAULTS.items():
         os.environ.setdefault(key, value)
-    for key, value in LMCACHE_ENV_DEFAULTS.items():
-        os.environ.setdefault(key, value)
+    if config.correctness_baseline:
+        # A no-LMCache correctness baseline must keep full latent resident.
+        # Otherwise shrink/remap makes the output depend on LMCache being present.
+        os.environ["VLLM_ASCEND_DSA_SHRINK_LATENT"] = "0"
+    else:
+        for key, value in LMCACHE_ENV_DEFAULTS.items():
+            os.environ.setdefault(key, value)
     if config.backend_device is not None:
         os.environ["VLLM_ASCEND_DSA_OFFLOAD_BACKEND_DEVICE"] = config.backend_device
 
@@ -411,12 +440,13 @@ def run_generation(config: RunConfig) -> None:
             f"--num-prompts={config.num_prompts} must be <= "
             f"--max-num-seqs={config.max_num_seqs}."
         )
-    if config.prompt_tokens <= index_topk:
+    shrink_enabled = os.environ.get("VLLM_ASCEND_DSA_SHRINK_LATENT", "0") != "0"
+    if shrink_enabled and config.prompt_tokens <= index_topk:
         raise RuntimeError(
             f"--prompt-tokens={config.prompt_tokens} must be > index_topk={index_topk} "
             "to exercise DSA latent shrink."
         )
-    if config.max_model_len <= config.prompt_tokens + config.max_tokens:
+    if shrink_enabled and config.max_model_len <= config.prompt_tokens + config.max_tokens:
         raise RuntimeError(
             "--max-model-len must exceed prompt_tokens + max_tokens "
             f"({config.prompt_tokens + config.max_tokens})."
@@ -451,6 +481,7 @@ def run_generation(config: RunConfig) -> None:
 
     print("[DSA-SHARED-E2E] config:")
     print(f"  model={config.model}")
+    print(f"  correctness_baseline={config.correctness_baseline}")
     print(f"  tp={config.tp}")
     print(f"  load_format={config.load_format}")
     print(f"  hf_overrides={config.hf_overrides}")
@@ -471,6 +502,16 @@ def run_generation(config: RunConfig) -> None:
         print(f"  {key}={os.environ.get(key)}")
     for key in sorted(LMCACHE_ENV_DEFAULTS):
         print(f"  {key}={os.environ.get(key)}")
+    if config.load_format == "dummy" or "num_hidden_layers" in config.hf_overrides:
+        print(
+            "[DSA-SHARED-E2E] WARNING: this is not a semantic correctness run "
+            "(dummy weights and/or truncated num_hidden_layers are enabled)."
+        )
+    if config.correctness_baseline:
+        print(
+            "[DSA-SHARED-E2E] correctness baseline: LMCache disabled, "
+            "latent shrink disabled, using resident KV path."
+        )
 
     llm = LLM(**llm_kwargs)
     outputs = llm.generate(prompts, sampling, use_tqdm=False)
