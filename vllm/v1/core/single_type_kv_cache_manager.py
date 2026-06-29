@@ -489,13 +489,57 @@ class DSALatentManager(FullAttentionManager):
     At the end of prefill (total computed >= prompt length) the request's
     prefill latent has been offloaded to LMCache and decode reads only the
     compact scratch (enough blocks for `index_topk`, installed as the instance
-    `scratch_blocks` by KVCacheCoordinator) plus the in-place decode-position
-    tail blocks. So free the middle range [scratch_blocks ..
-    prompt_len // block_size) back to the latent pool, replacing the entries
-    with null_block (so request finish won't double-free).
+    `scratch_blocks` by KVCacheCoordinator) plus a bounded live decode window.
+    So free the middle range [scratch_blocks .. prompt_len // block_size) back
+    to the latent pool, replacing the entries with null_block (so request finish
+    won't double-free). Decode block allocation then grows only until
+    `decode_window_tokens` tokens are resident and reuses that tail window.
     """
 
     scratch_blocks = int(os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", "16"))
+    decode_window_tokens = int(
+        os.getenv("VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS", "1024")
+    )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._dsa_prompt_lens: dict[str, int] = {}
+
+    def _cap_decode_tokens(self, request_id: str, num_tokens: int) -> int:
+        prompt_len = self._dsa_prompt_lens.get(request_id)
+        if (
+            prompt_len is None
+            or self.decode_window_tokens <= 0
+            or num_tokens <= prompt_len
+        ):
+            return num_tokens
+        decoded_tokens = min(num_tokens - prompt_len, self.decode_window_tokens)
+        return prompt_len + decoded_tokens
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> int:
+        return super().get_num_blocks_to_allocate(
+            request_id,
+            self._cap_decode_tokens(request_id, num_tokens),
+            new_computed_blocks,
+            total_computed_tokens,
+            self._cap_decode_tokens(request_id, num_tokens_main_model),
+        )
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        return super().allocate_new_blocks(
+            request_id,
+            self._cap_decode_tokens(request_id, num_tokens),
+            self._cap_decode_tokens(request_id, num_tokens_main_model),
+        )
 
     def remove_skipped_blocks(
         self,
@@ -506,6 +550,7 @@ class DSALatentManager(FullAttentionManager):
         if num_prompt_tokens is None or total_computed_tokens < num_prompt_tokens:
             # still prefilling — full prefix latent must stay resident
             return
+        self._dsa_prompt_lens[request_id] = num_prompt_tokens
         blocks = self.req_to_blocks[request_id]
         blocks_per_bundle = getattr(self.block_pool, "blocks_per_bundle", 1)
         start = cdiv(self.scratch_blocks, blocks_per_bundle) * blocks_per_bundle
@@ -526,12 +571,17 @@ class DSALatentManager(FullAttentionManager):
         if removed_blocks:
             logger.info(
                 "[DSA_SHRINK] req=%s freed_latent_blocks=%d keep_blocks=%d "
-                "prompt_blocks=%d",
+                "prompt_blocks=%d decode_window_tokens=%d",
                 request_id,
                 len(removed_blocks),
                 start,
                 end,
+                self.decode_window_tokens,
             )
+
+    def free(self, request_id: str) -> None:
+        self._dsa_prompt_lens.pop(request_id, None)
+        super().free(request_id)
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):

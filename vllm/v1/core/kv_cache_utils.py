@@ -1270,11 +1270,22 @@ def get_kv_cache_config_from_groups(
                 if dsa_index_topk is not None
                 else 0
             )
+            decode_window_tokens = int(
+                os.getenv("VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS", "1024")
+            )
+            decode_window_blocks = (
+                cdiv(
+                    decode_window_tokens + latent_group.kv_cache_spec.block_size - 1,
+                    latent_group.kv_cache_spec.block_size,
+                )
+                if decode_window_tokens > 0
+                else latent_ctx_blocks
+            )
             full_context_bundles = cdiv(
                 latent_ctx_blocks, latent_blocks_per_bundle
             ) + cdiv(indexer_ctx_blocks, indexer_blocks_per_bundle)
             sparse_decode_bundles = cdiv(
-                scratch_blocks, latent_blocks_per_bundle
+                scratch_blocks + decode_window_blocks, latent_blocks_per_bundle
             ) + cdiv(indexer_ctx_blocks, indexer_blocks_per_bundle)
             full_context_capacity = (
                 num_bundles // full_context_bundles
@@ -1302,13 +1313,16 @@ def get_kv_cache_config_from_groups(
             )
             logger.info(
                 "DSA shared pool capacity: max_model_len=%d max_num_seqs=%d "
-                "index_topk=%s scratch_blocks=%d full_context_bundles_per_seq=%d "
+                "index_topk=%s scratch_blocks=%d decode_window_tokens=%d "
+                "decode_window_blocks=%d full_context_bundles_per_seq=%d "
                 "full_context_capacity=%d sparse_decode_bundles_per_seq=%d "
                 "sparse_decode_capacity=%d sparse_decode_enough_for_max_seqs=%s.",
                 max_model_len,
                 max_num_seqs,
                 dsa_index_topk,
                 scratch_blocks,
+                decode_window_tokens,
+                decode_window_blocks,
                 full_context_bundles,
                 full_context_capacity,
                 sparse_decode_bundles,
@@ -1382,7 +1396,7 @@ def get_kv_cache_config_from_groups(
             # Size the two pools to support DSA_TEST_BATCH concurrent decoders at
             # the actual request context, indexer-priority:
             #   indexer = batch * ctx_blocks            (resident full context)
-            #   latent  = prefill_conc * ctx_blocks + batch * (scratch + gen_tail)
+            #   latent  = prefill_conc * ctx_blocks + batch * (scratch + live_window)
             # No clamping — it sizes for the target so the case runs at that batch.
             # Env knobs; revert after the experiment.
             block = kv_cache_groups[0].kv_cache_spec.block_size
@@ -1391,10 +1405,20 @@ def get_kv_cache_config_from_groups(
             ctx_blocks = int(
                 os.getenv("DSA_TEST_CTX_BLOCKS", str(cdiv(61056, block)))
             )  # ~60k prompt + 1k gen
-            gen_blocks = cdiv(int(os.getenv("DSA_TEST_GEN_TOKENS", "1000")), block)
+            window_tokens = int(
+                os.getenv(
+                    "VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS",
+                    os.getenv("DSA_TEST_GEN_TOKENS", "1024"),
+                )
+            )
+            window_blocks = (
+                cdiv(window_tokens + block - 1, block)
+                if window_tokens > 0
+                else cdiv(int(os.getenv("DSA_TEST_GEN_TOKENS", "1000")), block)
+            )
             prefill_conc = int(os.getenv("DSA_TEST_PREFILL_CONC", "1"))
 
-            latent_blocks = prefill_conc * ctx_blocks + test_batch * (scratch + gen_blocks)
+            latent_blocks = prefill_conc * ctx_blocks + test_batch * (scratch + window_blocks)
             idx_blocks = test_batch * ctx_blocks
             num_blocks_per_group = [latent_blocks, idx_blocks]
             num_blocks = max(num_blocks_per_group)
@@ -1408,9 +1432,12 @@ def get_kv_cache_config_from_groups(
                 + idx_layers * idx_blocks * idx_page
             )
             logger.info(
-                "DSA TEST sizing: batch=%d ctx_blocks=%d -> latent=%d (%.2f GiB) "
-                "indexer=%d (%.2f GiB) | need=%.2f avail=%.2f GiB%s",
+                "DSA TEST sizing: batch=%d ctx_blocks=%d window_tokens=%d "
+                "window_blocks=%d -> latent=%d (%.2f GiB) indexer=%d "
+                "(%.2f GiB) | need=%.2f avail=%.2f GiB%s",
                 test_batch, ctx_blocks,
+                window_tokens,
+                window_blocks,
                 latent_blocks, latent_layers * latent_blocks * latent_page / 2**30,
                 idx_blocks, idx_layers * idx_blocks * idx_page / 2**30,
                 need / 2**30, available_memory / 2**30,
