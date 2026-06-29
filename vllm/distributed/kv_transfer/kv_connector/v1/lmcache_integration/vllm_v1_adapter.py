@@ -409,7 +409,7 @@ def _calculate_mtp_layers(vllm_config, model_config):
             "vllm_config.speculative_config: %s", vllm_config.speculative_config
         )
         # TODO(baoloongmao): Support other MTP methods
-        if vllm_config.speculative_config.method == "deepseek_mtp":
+        if vllm_config.speculative_config.method in ("deepseek_mtp", "mtp"):
             num_mtp_layers = getattr(
                 model_config.hf_config, "num_nextn_predict_layers", 0
             )
