@@ -127,12 +127,19 @@ class KVConnectorModelRunnerMixin:
             forward_context = get_forward_context()
             logger.warning(
                 "[DSA_LOAD_DBG] worker_kv_connector bind_start "
-                "connector=%s metadata=%s num_requests=%s "
-                "attn_metadata=%s defer_finalize=%s wait_for_save=%s",
+                "connector=%s connector_id=%s metadata=%s metadata_id=%s "
+                "num_requests=%s forward_context_id=%s attn_metadata=%s "
+                "attn_metadata_id=%s defer_finalize=%s wait_for_save=%s",
                 kv_connector.__class__.__name__,
+                id(kv_connector),
                 scheduler_output.kv_connector_metadata.__class__.__name__,
+                id(scheduler_output.kv_connector_metadata),
                 _dsa_metadata_request_count(scheduler_output.kv_connector_metadata),
+                id(forward_context),
                 forward_context.attn_metadata.__class__.__name__
+                if forward_context.attn_metadata is not None
+                else None,
+                id(forward_context.attn_metadata)
                 if forward_context.attn_metadata is not None
                 else None,
                 defer_finalize,
