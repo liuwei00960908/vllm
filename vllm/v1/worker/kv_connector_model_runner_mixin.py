@@ -5,6 +5,7 @@ Define KV connector functionality mixin for model runners.
 """
 
 import copy
+import os
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -34,6 +35,25 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
+
+
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_metadata_request_count(metadata: object) -> int | None:
+    requests = getattr(metadata, "requests", None)
+    if requests is None:
+        return None
+    try:
+        return len(requests)
+    except TypeError:
+        return None
 
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
@@ -103,18 +123,57 @@ class KVConnectorModelRunnerMixin:
         kv_connector = get_kv_transfer_group()
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
+        if _dsa_debug_enabled():
+            forward_context = get_forward_context()
+            logger.warning(
+                "[DSA_LOAD_DBG] worker_kv_connector bind_start "
+                "connector=%s metadata=%s num_requests=%s "
+                "attn_metadata=%s defer_finalize=%s wait_for_save=%s",
+                kv_connector.__class__.__name__,
+                scheduler_output.kv_connector_metadata.__class__.__name__,
+                _dsa_metadata_request_count(scheduler_output.kv_connector_metadata),
+                forward_context.attn_metadata.__class__.__name__
+                if forward_context.attn_metadata is not None
+                else None,
+                defer_finalize,
+                wait_for_save,
+            )
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
 
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_LOAD_DBG] worker_kv_connector start_load_enter "
+                "connector=%s",
+                kv_connector.__class__.__name__,
+            )
         kv_connector.start_load_kv(get_forward_context())
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_LOAD_DBG] worker_kv_connector start_load_return "
+                "connector=%s",
+                kv_connector.__class__.__name__,
+            )
         try:
             yield output
         finally:
             if wait_for_save and not defer_finalize:
+                if _dsa_debug_enabled():
+                    logger.warning(
+                        "[DSA_LOAD_DBG] worker_kv_connector wait_for_save_enter "
+                        "connector=%s",
+                        kv_connector.__class__.__name__,
+                    )
                 kv_connector.wait_for_save()
+                if _dsa_debug_enabled():
+                    logger.warning(
+                        "[DSA_LOAD_DBG] worker_kv_connector wait_for_save_return "
+                        "connector=%s",
+                        kv_connector.__class__.__name__,
+                    )
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
