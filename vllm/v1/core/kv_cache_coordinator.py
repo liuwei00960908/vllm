@@ -190,11 +190,26 @@ class KVCacheCoordinator(ABC):
         if (
             self.use_per_group_block_pools or self.use_dsa_shared_block_pool
         ) and self.kv_cache_config.dsa_index_topk is not None:
+            dsa_scratch_rows = self.kv_cache_config.dsa_num_speculative_tokens + 1
             for manager in self.single_type_managers:
                 if isinstance(manager, DSALatentManager):
-                    manager.scratch_blocks = dsa_scratch_blocks_for_topk(
+                    scratch_blocks = dsa_scratch_blocks_for_topk(
                         self.kv_cache_config.dsa_index_topk,
                         manager.block_size,
+                        dsa_scratch_rows,
+                    )
+                    scratch_blocks_env = os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS")
+                    if scratch_blocks_env is not None:
+                        scratch_blocks = max(scratch_blocks, int(scratch_blocks_env))
+                    manager.scratch_blocks = scratch_blocks
+                    logger.info(
+                        "DSA latent scratch blocks: topk=%d spec_tokens=%d "
+                        "rows=%d block_size=%d scratch_blocks=%d.",
+                        self.kv_cache_config.dsa_index_topk,
+                        self.kv_cache_config.dsa_num_speculative_tokens,
+                        dsa_scratch_rows,
+                        manager.block_size,
+                        manager.scratch_blocks,
                     )
 
     def get_num_blocks_to_allocate(

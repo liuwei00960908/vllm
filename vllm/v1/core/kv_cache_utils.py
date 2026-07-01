@@ -1159,6 +1159,10 @@ def get_kv_cache_config_from_groups(
     if hf_config is None:
         hf_config = getattr(vllm_config.model_config, "hf_config", None)
     dsa_index_topk = getattr(hf_config, "index_topk", None)
+    dsa_num_speculative_tokens = max(
+        int(getattr(vllm_config, "num_speculative_tokens", 0)), 0
+    )
+    dsa_sparse_rows = dsa_num_speculative_tokens + 1
 
     if len(kv_cache_groups) == 0:
         # Attention free models do not have KV cache.
@@ -1168,6 +1172,7 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
             dsa_index_topk=dsa_index_topk,
+            dsa_num_speculative_tokens=dsa_num_speculative_tokens,
         )
 
     # Determine how model runners should initialize the KV cache tensors.
@@ -1266,10 +1271,16 @@ def get_kv_cache_config_from_groups(
                 max_model_len, indexer_group.kv_cache_spec.block_size
             )
             scratch_blocks = (
-                cdiv(int(dsa_index_topk), latent_group.kv_cache_spec.block_size)
+                cdiv(
+                    int(dsa_index_topk) * dsa_sparse_rows,
+                    latent_group.kv_cache_spec.block_size,
+                )
                 if dsa_index_topk is not None
                 else 0
             )
+            scratch_blocks_env = os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS")
+            if scratch_blocks_env is not None:
+                scratch_blocks = max(scratch_blocks, int(scratch_blocks_env))
             decode_window_tokens = int(
                 os.getenv("VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS", "1024")
             )
@@ -1313,13 +1324,16 @@ def get_kv_cache_config_from_groups(
             )
             logger.info(
                 "DSA shared pool capacity: max_model_len=%d max_num_seqs=%d "
-                "index_topk=%s scratch_blocks=%d decode_window_tokens=%d "
+                "index_topk=%s spec_tokens=%d scratch_rows=%d "
+                "scratch_blocks=%d decode_window_tokens=%d "
                 "decode_window_blocks=%d full_context_bundles_per_seq=%d "
                 "full_context_capacity=%d sparse_decode_bundles_per_seq=%d "
                 "sparse_decode_capacity=%d sparse_decode_enough_for_max_seqs=%s.",
                 max_model_len,
                 max_num_seqs,
                 dsa_index_topk,
+                dsa_num_speculative_tokens,
+                dsa_sparse_rows,
                 scratch_blocks,
                 decode_window_tokens,
                 decode_window_blocks,
@@ -1361,6 +1375,7 @@ def get_kv_cache_config_from_groups(
                 kv_cache_tensors=kv_cache_tensors,
                 kv_cache_groups=kv_cache_groups,
                 dsa_index_topk=dsa_index_topk,
+                dsa_num_speculative_tokens=dsa_num_speculative_tokens,
             )
 
         # DSA two-group mode: groups have different page sizes and each group is
@@ -1400,7 +1415,17 @@ def get_kv_cache_config_from_groups(
             # No clamping — it sizes for the target so the case runs at that batch.
             # Env knobs; revert after the experiment.
             block = kv_cache_groups[0].kv_cache_spec.block_size
-            scratch = int(os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", "16"))
+            default_scratch = (
+                cdiv(int(dsa_index_topk) * dsa_sparse_rows, block)
+                if dsa_index_topk is not None
+                else 16
+            )
+            scratch_env = os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS")
+            scratch = (
+                max(default_scratch, int(scratch_env))
+                if scratch_env is not None
+                else default_scratch
+            )
             test_batch = int(os.getenv("DSA_TEST_BATCH", "11"))
             ctx_blocks = int(
                 os.getenv("DSA_TEST_CTX_BLOCKS", str(cdiv(61056, block)))
@@ -1476,6 +1501,7 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
             num_blocks_per_group=num_blocks_per_group,
             dsa_index_topk=dsa_index_topk,
+            dsa_num_speculative_tokens=dsa_num_speculative_tokens,
         )
     else:
         # General case:
@@ -1510,6 +1536,7 @@ def get_kv_cache_config_from_groups(
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
         dsa_index_topk=dsa_index_topk,
+        dsa_num_speculative_tokens=dsa_num_speculative_tokens,
     )
 
 

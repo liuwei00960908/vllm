@@ -28,14 +28,20 @@ def dsa_block_pool_index(
     return 0
 
 
-def dsa_scratch_blocks_for_topk(index_topk: int, block_size: int) -> int:
-    """Number of latent blocks needed to hold one sparse decode top-k set."""
+def dsa_scratch_blocks_for_topk(
+    index_topk: int,
+    block_size: int,
+    num_rows: int = 1,
+) -> int:
+    """Number of latent blocks needed to hold sparse decode top-k rows."""
 
     if index_topk <= 0:
         raise ValueError("index_topk must be positive")
     if block_size <= 0:
         raise ValueError("block_size must be positive")
-    return _cdiv(index_topk, block_size)
+    if num_rows <= 0:
+        raise ValueError("num_rows must be positive")
+    return _cdiv(index_topk * num_rows, block_size)
 
 
 class DSASharedBlockOwner(str, Enum):
