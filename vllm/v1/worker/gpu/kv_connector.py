@@ -92,6 +92,13 @@ class ActiveKVConnector(KVConnector):
             self.kv_connector.get_finished(scheduler_output.finished_req_ids)
         )
         output.invalid_block_ids = self.kv_connector.get_block_ids_with_load_errors()
+        get_completed_decode_window_saves = getattr(
+            self.kv_connector, "get_completed_decode_window_saves", None
+        )
+        if get_completed_decode_window_saves is not None:
+            output.completed_decode_window_saves = (
+                get_completed_decode_window_saves()
+            )
         output.kv_connector_stats = self.kv_connector.get_kv_connector_stats()
         output.kv_cache_events = self.kv_connector.get_kv_connector_kv_cache_events()
         if clear_metadata:

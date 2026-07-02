@@ -620,6 +620,19 @@ class KVCacheCoordinator(ABC):
             else:
                 manager.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def remove_saved_decode_window_blocks(
+        self,
+        request_id: str,
+        saved_end: int,
+    ) -> int:
+        removed_blocks = 0
+        for manager in self.single_type_managers:
+            if isinstance(manager, DSALatentManager):
+                removed_blocks += manager.remove_saved_decode_window_blocks(
+                    request_id, saved_end
+                )
+        return removed_blocks
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.

@@ -31,6 +31,14 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+def _decode_window_save_window_size() -> int:
+    raw = os.getenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return 0
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -503,6 +511,11 @@ class DSALatentManager(FullAttentionManager):
         total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
+        if _decode_window_save_window_size() > 0:
+            # The prefill tail belongs to the first saved decode window. In
+            # decode-window mode, only free latent blocks after LMCache reports
+            # that a window save has completed.
+            return
         if num_prompt_tokens is None or total_computed_tokens < num_prompt_tokens:
             # still prefilling — full prefix latent must stay resident
             return
@@ -532,6 +545,43 @@ class DSALatentManager(FullAttentionManager):
                 start,
                 end,
             )
+
+    def remove_saved_decode_window_blocks(
+        self,
+        request_id: str,
+        saved_end: int,
+    ) -> int:
+        if saved_end <= 0:
+            return 0
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return 0
+
+        blocks_per_bundle = getattr(self.block_pool, "blocks_per_bundle", 1)
+        start = cdiv(self.scratch_blocks, blocks_per_bundle) * blocks_per_bundle
+        end = min(saved_end // self.block_size, len(blocks))
+        end = (end // blocks_per_bundle) * blocks_per_bundle
+        if end <= start:
+            return 0
+
+        removed_blocks: list[KVCacheBlock] = []
+        for i in range(end - 1, start - 1, -1):
+            if blocks[i] == self._null_block:
+                break
+            removed_blocks.append(blocks[i])
+            blocks[i] = self._null_block
+        self.block_pool.free_blocks(removed_blocks)
+        if removed_blocks:
+            logger.info(
+                "[DECODE_WINDOW_RELEASE] req=%s saved_end=%d "
+                "freed_latent_blocks=%d keep_blocks=%d release_blocks=%d",
+                request_id,
+                saved_end,
+                len(removed_blocks),
+                start,
+                end,
+            )
+        return len(removed_blocks)
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):

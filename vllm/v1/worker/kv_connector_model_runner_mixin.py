@@ -78,7 +78,7 @@ class KVConnectorModelRunnerMixin:
         )
 
     @staticmethod
-    def finalize_kv_connector() -> None:
+    def finalize_kv_connector() -> dict[str, int]:
         """Finalize the KV connector: wait_for_save and clear metadata.
 
         Call after draft model forward when defer_finalize=True was used.
@@ -86,7 +86,17 @@ class KVConnectorModelRunnerMixin:
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
             kv_connector.wait_for_save()
+            get_completed_decode_window_saves = getattr(
+                kv_connector, "get_completed_decode_window_saves", None
+            )
+            completed_decode_window_saves = (
+                get_completed_decode_window_saves()
+                if get_completed_decode_window_saves is not None
+                else {}
+            )
             kv_connector.clear_connector_metadata()
+            return completed_decode_window_saves
+        return {}
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
@@ -120,6 +130,13 @@ class KVConnectorModelRunnerMixin:
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
             )
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+            get_completed_decode_window_saves = getattr(
+                kv_connector, "get_completed_decode_window_saves", None
+            )
+            if get_completed_decode_window_saves is not None:
+                output.completed_decode_window_saves = (
+                    get_completed_decode_window_saves()
+                )
 
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
