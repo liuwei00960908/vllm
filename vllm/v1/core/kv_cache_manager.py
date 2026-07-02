@@ -412,6 +412,16 @@ class KVCacheManager:
         """
         self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def remove_saved_decode_window_blocks(
+        self,
+        request_id: str,
+        saved_end: int,
+    ) -> int:
+        """Free DSA latent blocks covered by a completed decode-window save."""
+        return self.coordinator.remove_saved_decode_window_blocks(
+            request_id, saved_end
+        )
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 

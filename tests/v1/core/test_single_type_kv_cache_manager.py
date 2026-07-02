@@ -14,9 +14,14 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    DSALatentManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
+    MLAAttentionSpec,
+    SlidingWindowSpec,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -35,6 +40,15 @@ def get_chunked_local_attention_manager(
 ):
     return ChunkedLocalAttentionManager(
         chunked_local_attention_spec,
+        block_pool=block_pool,
+        enable_caching=enable_caching,
+        kv_cache_group_id=0,
+    )
+
+
+def get_dsa_latent_manager(attention_spec, block_pool, enable_caching=True):
+    return DSALatentManager(
+        attention_spec,
         block_pool=block_pool,
         enable_caching=enable_caching,
         kv_cache_group_id=0,
@@ -320,6 +334,52 @@ def test_sliding_window_remove_skipped_blocks():
     # of removed blocks should be [1003, 1002].
     manager.remove_skipped_blocks("test", 11)
     assert_block_id(block_table, [null_block_id] * 4 + original_block_ids[4:])
+
+
+def test_dsa_latent_decode_window_release_waits_for_completed_save(monkeypatch):
+    attention_spec = MLAAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(num_gpu_blocks=2000, enable_caching=True, hash_block_size=2)
+    manager = get_dsa_latent_manager(attention_spec, block_pool)
+    manager.scratch_blocks = 2
+
+    null_block_id = block_pool.null_block.block_id
+
+    def id_to_block_table(ids) -> list[KVCacheBlock]:
+        return [
+            KVCacheBlock(id_) if id_ != null_block_id else block_pool.null_block
+            for id_ in ids
+        ]
+
+    def assert_block_id(block_table: list[KVCacheBlock], ids: list[int]):
+        for block, id_ in zip(block_table, ids):
+            if id_ == null_block_id:
+                assert block == block_pool.null_block
+            else:
+                assert block.block_id == id_
+
+    original_block_ids = [1000, 1001, 1002, 1003, 1004, 1005]
+    block_table = id_to_block_table(original_block_ids)
+    manager.req_to_blocks["test"] = block_table
+
+    monkeypatch.setenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "4")
+    manager.remove_skipped_blocks("test", total_computed_tokens=6, num_prompt_tokens=4)
+    assert_block_id(block_table, original_block_ids)
+
+    assert manager.remove_saved_decode_window_blocks("test", saved_end=4) == 0
+    assert_block_id(block_table, original_block_ids)
+
+    assert manager.remove_saved_decode_window_blocks("test", saved_end=8) == 2
+    assert_block_id(
+        block_table,
+        original_block_ids[:2]
+        + [null_block_id, null_block_id]
+        + original_block_ids[4:],
+    )
 
 
 def test_get_num_blocks_to_allocate():
