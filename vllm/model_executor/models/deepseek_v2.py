@@ -1461,9 +1461,20 @@ class DeepseekV2ForCausalLM(
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        skip_extra_layer_weights = getattr(
+            self.config, "vllm_skip_extra_layer_weights", False
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            if skip_extra_layer_weights:
+                layer_idx = get_layer_idx_from_weight_name(name)
+                if (
+                    layer_idx is not None
+                    and layer_idx >= self.config.num_hidden_layers
+                ):
+                    continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
@@ -1616,6 +1627,9 @@ class DeepseekV2ForCausalLM(
                         if is_pp_missing_parameter(name, self):
                             continue
 
+                        if name not in params_dict and skip_extra_layer_weights:
+                            continue
+
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
@@ -1637,6 +1651,18 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     pass
+
+
+def get_layer_idx_from_weight_name(weight_name: str) -> int | None:
+    for prefix in ("model.layers.", "layers."):
+        if weight_name.startswith(prefix):
+            rest = weight_name[len(prefix):]
+            layer_idx_str = rest.split(".", 1)[0]
+            try:
+                return int(layer_idx_str)
+            except ValueError:
+                return None
+    return None
 
 
 # Compatibility with
