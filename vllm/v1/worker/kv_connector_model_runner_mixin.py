@@ -5,6 +5,7 @@ Define KV connector functionality mixin for model runners.
 """
 
 import copy
+import os
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -34,6 +35,15 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
+
+
+def _decode_window_save_debug_enabled() -> bool:
+    return os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
@@ -123,8 +133,31 @@ class KVConnectorModelRunnerMixin:
         try:
             yield output
         finally:
+            decode_window_debug = _decode_window_save_debug_enabled()
+            if decode_window_debug:
+                metadata = scheduler_output.kv_connector_metadata
+                requests = getattr(metadata, "requests", None)
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] vllm_kv_finalize "
+                    "wait_for_save=%s defer_finalize=%s connector=%s requests=%s",
+                    wait_for_save,
+                    defer_finalize,
+                    type(kv_connector).__name__,
+                    len(requests) if requests is not None else None,
+                )
             if wait_for_save and not defer_finalize:
+                if decode_window_debug:
+                    logger.warning("[DECODE_WINDOW_SAVE] vllm_wait_for_save begin")
                 kv_connector.wait_for_save()
+                if decode_window_debug:
+                    logger.warning("[DECODE_WINDOW_SAVE] vllm_wait_for_save done")
+            elif decode_window_debug:
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] vllm_wait_for_save skipped "
+                    "wait_for_save=%s defer_finalize=%s",
+                    wait_for_save,
+                    defer_finalize,
+                )
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
