@@ -39,6 +39,11 @@ def _decode_window_save_window_size() -> int:
         return 0
 
 
+def _decode_window_release_disabled() -> bool:
+    raw = os.getenv("LMCACHE_DECODE_WINDOW_RELEASE_DISABLED", "1")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -562,6 +567,25 @@ class DSALatentManager(FullAttentionManager):
         end = min(saved_end // self.block_size, len(blocks))
         end = (end // blocks_per_bundle) * blocks_per_bundle
         if end <= start:
+            return 0
+
+        if _decode_window_release_disabled():
+            would_free = 0
+            for i in range(end - 1, start - 1, -1):
+                if blocks[i] == self._null_block:
+                    break
+                would_free += 1
+            if would_free:
+                logger.info(
+                    "[DECODE_WINDOW_RELEASE] disabled req=%s saved_end=%d "
+                    "would_free_latent_blocks=%d keep_blocks=%d "
+                    "release_blocks=%d",
+                    request_id,
+                    saved_end,
+                    would_free,
+                    start,
+                    end,
+                )
             return 0
 
         removed_blocks: list[KVCacheBlock] = []
