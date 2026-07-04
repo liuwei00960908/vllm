@@ -46,6 +46,13 @@ def _decode_window_save_debug_enabled() -> bool:
     )
 
 
+def _metadata_has_decode_window_save(metadata: object) -> bool:
+    requests = getattr(metadata, "requests", None)
+    if requests is None:
+        return False
+    return any(getattr(request, "is_decode_window_save", False) for request in requests)
+
+
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
 class KVConnectorModelRunnerMixin:
     @staticmethod
@@ -133,9 +140,12 @@ class KVConnectorModelRunnerMixin:
         try:
             yield output
         finally:
-            decode_window_debug = _decode_window_save_debug_enabled()
+            metadata = scheduler_output.kv_connector_metadata
+            decode_window_debug = (
+                _decode_window_save_debug_enabled()
+                and _metadata_has_decode_window_save(metadata)
+            )
             if decode_window_debug:
-                metadata = scheduler_output.kv_connector_metadata
                 requests = getattr(metadata, "requests", None)
                 logger.warning(
                     "[DECODE_WINDOW_SAVE] vllm_kv_finalize "
