@@ -5,6 +5,8 @@ Define KV connector functionality mixin for model runners.
 """
 
 import copy
+import os
+import time
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -124,7 +126,16 @@ class KVConnectorModelRunnerMixin:
             yield output
         finally:
             if wait_for_save and not defer_finalize:
+                if os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1":
+                    _t0 = time.perf_counter()
                 kv_connector.wait_for_save()
+                if os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1":
+                    _dt = (time.perf_counter() - _t0) * 1000.0
+                    if _dt > 0.1:
+                        print(
+                            f"[DSA_PROF] wait_for_save={_dt:.1f}ms",
+                            flush=True,
+                        )
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
