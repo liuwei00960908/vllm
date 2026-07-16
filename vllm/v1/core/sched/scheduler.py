@@ -1882,6 +1882,35 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        if _mtp_dw_diag_enabled():
+            finish_reason = request.get_finished_reason()
+            output_tokens = request.num_output_tokens
+            raw_max_tokens = getattr(request, "max_tokens", None)
+            max_tokens = (
+                int(raw_max_tokens) if raw_max_tokens is not None else None
+            )
+            status = request.status
+            _mtp_dw_event(
+                "step",
+                req=str(request.request_id),
+                event="request_finish",
+                frontier=int(request.num_tokens),
+                prompt_tokens=int(request.num_prompt_tokens),
+                output_tokens=int(output_tokens),
+                total_tokens=int(request.num_tokens),
+                num_computed_tokens=int(request.num_computed_tokens),
+                max_tokens=max_tokens,
+                reached_max_tokens=(
+                    output_tokens >= max_tokens if max_tokens is not None else None
+                ),
+                finish_reason=(
+                    str(finish_reason) if finish_reason is not None else None
+                ),
+                status=getattr(status, "name", str(status)),
+                stop_reason=request.stop_reason,
+                remaining_speculative_tokens=len(request.spec_token_ids),
+            )
+
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id

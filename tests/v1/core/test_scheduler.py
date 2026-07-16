@@ -24,6 +24,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched import scheduler as scheduler_module
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -60,6 +61,57 @@ def test_finish_request():
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         assert request.request_id not in scheduler.requests
         assert len(scheduler.waiting) == 9 - i
+
+
+def test_finish_request_emits_final_token_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    request.append_output_token_ids([11, 12])
+    request.num_computed_tokens = request.num_tokens - 1
+    request.spec_token_ids = [13, 14]
+    scheduler.add_request(request)
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        lambda stage, **fields: events.append((stage, fields)),
+    )
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+
+    stage, payload = events[-1]
+    assert stage == "step"
+    assert payload["event"] == "request_finish"
+    assert payload["req"] == request.request_id
+    assert payload["prompt_tokens"] == request.num_prompt_tokens
+    assert payload["output_tokens"] == 2
+    assert payload["total_tokens"] == request.num_prompt_tokens + 2
+    assert payload["num_computed_tokens"] == request.num_tokens - 1
+    assert payload["finish_reason"] == "stop"
+    assert payload["status"] == "FINISHED_STOPPED"
+    assert payload["remaining_speculative_tokens"] == 2
+
+
+def test_finish_request_does_not_build_diagnostics_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    del request.max_tokens
+    scheduler.add_request(request)
+    monkeypatch.delenv("VLLM_ASCEND_MTP_DW_DIAG", raising=False)
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        Mock(side_effect=AssertionError("diagnostic event must stay gated")),
+    )
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler.requests
 
 
 def test_get_num_unfinished_requests():
