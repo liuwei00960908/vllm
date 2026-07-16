@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -37,6 +38,14 @@ def _decode_window_save_window_size() -> int:
         return max(int(raw), 0)
     except ValueError:
         return 0
+
+
+def _mtp_dw_event(stage: str, **fields: object) -> None:
+    if os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0") != "1":
+        return
+    payload = {"schema": 1, "stage": stage, "owner": "vllm_kv_manager"}
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -561,7 +570,24 @@ class DSALatentManager(FullAttentionManager):
         start = cdiv(self.scratch_blocks, blocks_per_bundle) * blocks_per_bundle
         end = min(saved_end // self.block_size, len(blocks))
         end = (end // blocks_per_bundle) * blocks_per_bundle
+        window_size = _decode_window_save_window_size()
+        window_start = max(0, saved_end - window_size) if window_size else None
         if end <= start:
+            _mtp_dw_event(
+                "release",
+                req=request_id,
+                frontier=saved_end,
+                window_start=window_start,
+                window_end=saved_end,
+                saved_end=saved_end,
+                release_start_block=start,
+                release_end_block=end,
+                block_size=self.block_size,
+                scratch_blocks=self.scratch_blocks,
+                scratch_reserved_blocks=start,
+                release_gate="enabled",
+                freed_blocks=0,
+            )
             return 0
 
         removed_blocks: list[KVCacheBlock] = []
@@ -571,6 +597,34 @@ class DSALatentManager(FullAttentionManager):
             removed_blocks.append(blocks[i])
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
+        _mtp_dw_event(
+            "release",
+            req=request_id,
+            frontier=saved_end,
+            window_start=window_start,
+            window_end=saved_end,
+            saved_end=saved_end,
+            release_start_block=start,
+            release_end_block=end,
+            block_size=self.block_size,
+            scratch_blocks=self.scratch_blocks,
+            scratch_reserved_blocks=start,
+            release_gate="enabled",
+            freed_blocks=len(removed_blocks),
+        )
+        if end * self.block_size > saved_end or start < self.scratch_blocks:
+            _mtp_dw_event(
+                "fail",
+                req=request_id,
+                frontier=saved_end,
+                window_start=window_start,
+                window_end=saved_end,
+                invariant="release_range",
+                release_start_block=start,
+                release_end_block=end,
+                block_size=self.block_size,
+                scratch_blocks=self.scratch_blocks,
+            )
         if removed_blocks:
             logger.info(
                 "[DECODE_WINDOW_RELEASE] req=%s saved_end=%d "

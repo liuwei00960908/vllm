@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -66,6 +68,34 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _mtp_dw_diag_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
+
+
+def _mtp_dw_event(stage: str, **fields: Any) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    payload = {"schema": 1, "stage": stage, "owner": "vllm_scheduler"}
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+def _mtp_dw_sample_step(owner: Any, req_id: str, frontier: int) -> bool:
+    counts = getattr(owner, "_mtp_dw_diag_step_counts", None)
+    if counts is None:
+        counts = {}
+        owner._mtp_dw_diag_step_counts = counts
+    step = counts.get(req_id, 0)
+    counts[req_id] = step + 1
+    raw_window = os.getenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "256")
+    try:
+        window = max(int(raw_window), 1)
+    except ValueError:
+        window = 256
+    distance = min(frontier % window, (-frontier) % window)
+    return step < 3 or distance <= 4
 
 
 class Scheduler(SchedulerInterface):
@@ -1378,6 +1408,49 @@ class Scheduler(SchedulerInterface):
                     request_id=req_id,
                 )
 
+                if _mtp_dw_diag_enabled():
+                    accepted_frontier = len(request.all_token_ids) + len(
+                        generated_token_ids
+                    )
+                    generated_ok = len(generated_token_ids) == num_accepted + 1
+                    rejected_ok = (
+                        num_rejected == num_draft_tokens - num_accepted
+                    )
+                    if (
+                        _mtp_dw_sample_step(self, req_id, accepted_frontier)
+                        or not generated_ok
+                        or not rejected_ok
+                    ):
+                        _mtp_dw_event(
+                            "step",
+                            req=req_id,
+                            frontier=accepted_frontier,
+                            draft_count=num_draft_tokens,
+                            draft_ids=[
+                                int(token_id)
+                                for token_id in scheduled_spec_token_ids[:8]
+                            ],
+                            generated_count=len(generated_token_ids),
+                            generated_ids=[
+                                int(token_id)
+                                for token_id in generated_token_ids[:8]
+                            ],
+                            accepted_count=num_accepted,
+                            rejected_count=num_rejected,
+                            frontier_adjustment=-num_rejected,
+                        )
+                    if not generated_ok or not rejected_ok:
+                        _mtp_dw_event(
+                            "fail",
+                            req=req_id,
+                            frontier=accepted_frontier,
+                            invariant="mtp_acceptance_counts",
+                            generated_count=len(generated_token_ids),
+                            accepted_count=num_accepted,
+                            rejected_count=num_rejected,
+                            draft_count=num_draft_tokens,
+                        )
+
             stopped = False
             new_logprobs = None
             new_token_ids = generated_token_ids
@@ -2138,9 +2211,20 @@ class Scheduler(SchedulerInterface):
         ):
             if req_id not in self.requests:
                 continue
+            request = self.requests[req_id]
             removed_blocks = self.kv_cache_manager.remove_saved_decode_window_blocks(
                 req_id,
                 saved_end,
+            )
+            _mtp_dw_event(
+                "release",
+                req=req_id,
+                event="completed_save_consumed",
+                frontier=len(request.all_token_ids),
+                saved_end=saved_end,
+                speculative_reserved_tokens=len(request.spec_token_ids),
+                release_gate="enabled",
+                freed_blocks=removed_blocks,
             )
             if removed_blocks:
                 logger.debug(
