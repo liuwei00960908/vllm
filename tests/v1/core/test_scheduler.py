@@ -114,6 +114,223 @@ def test_finish_request_does_not_build_diagnostics_when_disabled(
     assert request.request_id not in scheduler.requests
 
 
+def test_deep_mtp_transition_requires_both_gates_and_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler(num_speculative_tokens=1)
+    request = create_requests(num_requests=1, num_tokens=254, max_tokens=16)[0]
+    request.num_computed_tokens = request.num_tokens
+    request.status = RequestStatus.RUNNING
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 2},
+        total_num_scheduled_tokens=2,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[10, 11]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        lambda stage, **fields: events.append((stage, fields)),
+    )
+
+    assert not scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, request.request_id, 254, 256
+    )
+    assert not hasattr(scheduler, "_mtp_dw_deep_transition_counts")
+
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    deep_events = [fields for stage, fields in events if stage == "deep"]
+    assert len(deep_events) == 1
+    payload = deep_events[0]
+    assert payload["event"] == "mtp_transition"
+    assert payload["frontier_before"] == 254
+    assert payload["frontier_after"] == 256
+    assert payload["computed_before"] == 254
+    assert payload["computed_after"] == 254
+    assert payload["draft_count"] == 1
+    assert payload["accepted_count"] == 1
+    assert payload["rejected_count"] == 0
+    assert payload["generated_count"] == 2
+    assert payload["appended_count"] == 2
+    assert payload["remaining_speculative_tokens"] == 0
+    assert payload["status"] == "RUNNING"
+    assert payload["stopped"] is False
+    assert payload["crossed_first_window"] is True
+
+    scheduler.update_from_output(scheduler_output, model_output)
+    assert len([event for event in events if event[0] == "deep"]) == 1
+
+    for _ in range(7):
+        assert scheduler_module._mtp_dw_sample_deep_transition(
+            scheduler, request.request_id, 255, 256
+        )
+    assert not scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, request.request_id, 255, 256
+    )
+
+
+def test_deep_finish_and_completed_window_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, num_tokens=256)[0]
+    request.num_computed_tokens = 255
+    request.spec_token_ids = [11]
+    scheduler.add_request(request)
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        lambda stage, **fields: events.append((stage, fields)),
+    )
+    scheduler.kv_cache_manager.remove_saved_decode_window_blocks = Mock(
+        return_value=0
+    )
+
+    completed = KVConnectorOutput(
+        completed_decode_window_saves={request.request_id: 256}
+    )
+    scheduler._update_from_kv_xfer_finished(completed)
+    scheduler._update_from_kv_xfer_finished(completed)
+
+    consumed = [
+        fields
+        for stage, fields in events
+        if stage == "deep" and fields["event"] == "completed_window_consumed"
+    ]
+    assert len(consumed) == 1
+    assert consumed[0]["window_end"] == 256
+    assert consumed[0]["frontier"] == 256
+    assert consumed[0]["request_present"] is True
+    assert consumed[0]["status"] == "WAITING"
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+
+    finish = [
+        fields
+        for stage, fields in events
+        if stage == "deep" and fields["event"] == "finish_state"
+    ]
+    assert len(finish) == 1
+    assert finish[0]["frontier"] == 256
+    assert finish[0]["output_tokens"] == 0
+    assert finish[0]["total_tokens"] == 256
+    assert finish[0]["computed_tokens"] == 255
+    assert finish[0]["max_tokens"] == request.max_tokens
+    assert finish[0]["finish_reason"] == "stop"
+    assert finish[0]["remaining_speculative_tokens"] == 1
+    assert finish[0]["crossed_first_window"] is True
+    assert request.request_id not in scheduler._mtp_dw_deep_completed_requests
+
+
+def test_deep_gates_use_configured_first_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    monkeypatch.setenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "512")
+
+    assert not scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, "req", 255, 256
+    )
+    assert scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, "req", 511, 512
+    )
+    assert scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, "long-prompt", 1023, 1024
+    )
+    assert not scheduler_module._mtp_dw_sample_deep_completion(
+        scheduler, "early", 256
+    )
+    assert scheduler_module._mtp_dw_sample_deep_completion(
+        scheduler, "complete", 512
+    )
+
+
+def test_deep_completed_window_handles_missing_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        lambda stage, **fields: events.append((stage, fields)),
+    )
+    completed = KVConnectorOutput(completed_decode_window_saves={"absent": 256})
+
+    scheduler._update_from_kv_xfer_finished(completed)
+    scheduler._update_from_kv_xfer_finished(completed)
+
+    assert events == [
+        (
+            "deep",
+            {
+                "event": "completed_window_consumed",
+                "req": "absent",
+                "worker_rank": None,
+                "tp_rank": None,
+                "tp_world": None,
+                "frontier": None,
+                "window_start": 0,
+                "window_end": 256,
+                "kv_group": None,
+                "request_present": False,
+                "status": None,
+            },
+        )
+    ]
+
+
+def test_deep_state_cleanup_follows_connector_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    scheduler._mtp_dw_deep_transition_counts = {request.request_id: 1}
+    scheduler._mtp_dw_deep_completed_requests = {request.request_id: None}
+
+    def connector_finished(finished_request: Request) -> tuple[bool, None]:
+        assert finished_request is request
+        assert request.request_id in scheduler._mtp_dw_deep_transition_counts
+        assert request.request_id in scheduler._mtp_dw_deep_completed_requests
+        return False, None
+
+    monkeypatch.setattr(scheduler, "_connector_finished", connector_finished)
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler._mtp_dw_deep_transition_counts
+    assert request.request_id not in scheduler._mtp_dw_deep_completed_requests
+
+
 def test_get_num_unfinished_requests():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)

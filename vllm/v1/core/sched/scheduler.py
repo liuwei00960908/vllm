@@ -74,6 +74,12 @@ def _mtp_dw_diag_enabled() -> bool:
     return os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
 
 
+def _mtp_dw_deep_diag_enabled() -> bool:
+    return _mtp_dw_diag_enabled() and os.getenv(
+        "VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"
+    ) == "1"
+
+
 def _mtp_dw_event(stage: str, **fields: Any) -> None:
     if not _mtp_dw_diag_enabled():
         return
@@ -89,13 +95,80 @@ def _mtp_dw_sample_step(owner: Any, req_id: str, frontier: int) -> bool:
         owner._mtp_dw_diag_step_counts = counts
     step = counts.get(req_id, 0)
     counts[req_id] = step + 1
-    raw_window = os.getenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "256")
-    try:
-        window = max(int(raw_window), 1)
-    except ValueError:
-        window = 256
+    window = max(_mtp_dw_window_size(), 1)
     distance = min(frontier % window, (-frontier) % window)
     return step < 3 or distance <= 4
+
+
+def _mtp_dw_window_size() -> int:
+    raw_window = os.getenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "256")
+    try:
+        return max(int(raw_window), 0)
+    except ValueError:
+        return 256
+
+
+def _mtp_dw_sample_deep_transition(
+    owner: Any, req_id: str, frontier_before: int, frontier_after: int
+) -> bool:
+    if not _mtp_dw_deep_diag_enabled():
+        return False
+    window_size = _mtp_dw_window_size()
+    if window_size <= 0:
+        return False
+    window_end = (frontier_before // window_size + 1) * window_size
+    near_boundary = window_end - 8 <= frontier_before < window_end
+    crossed_boundary = frontier_before < window_end <= frontier_after
+    if not (near_boundary or crossed_boundary):
+        return False
+    counts = getattr(owner, "_mtp_dw_deep_transition_counts", None)
+    if counts is None:
+        counts = {}
+        owner._mtp_dw_deep_transition_counts = counts
+    if req_id not in counts and len(counts) >= 1024:
+        counts.pop(next(iter(counts)))
+    count = counts.get(req_id, 0)
+    if count >= 8:
+        return False
+    counts[req_id] = count + 1
+    return True
+
+
+def _mtp_dw_sample_deep_completion(
+    owner: Any, req_id: str, window_end: int
+) -> bool:
+    first_window_end = _mtp_dw_window_size()
+    if (
+        not _mtp_dw_deep_diag_enabled()
+        or first_window_end <= 0
+        or window_end < first_window_end
+    ):
+        return False
+    completed_requests = getattr(owner, "_mtp_dw_deep_completed_requests", None)
+    if completed_requests is None:
+        completed_requests = {}
+        owner._mtp_dw_deep_completed_requests = completed_requests
+    if req_id in completed_requests:
+        return False
+    # Completion can arrive after request teardown, so cap retained IDs too.
+    if len(completed_requests) >= 1024:
+        completed_requests.pop(next(iter(completed_requests)))
+    completed_requests[req_id] = None
+    return True
+
+
+def _mtp_dw_cleanup_request(owner: Any, req_id: str) -> None:
+    if _mtp_dw_diag_enabled():
+        counts = getattr(owner, "_mtp_dw_diag_step_counts", None)
+        if counts is not None:
+            counts.pop(req_id, None)
+    for attr in (
+        "_mtp_dw_deep_transition_counts",
+        "_mtp_dw_deep_completed_requests",
+    ):
+        state = getattr(owner, attr, None)
+        if state is not None:
+            state.pop(req_id, None)
 
 
 class Scheduler(SchedulerInterface):
@@ -1385,10 +1458,17 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            deep_transition_before = None
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                num_generated_tokens = len(generated_token_ids)
+                num_accepted = num_generated_tokens - 1
                 num_rejected = num_draft_tokens - num_accepted
+                if _mtp_dw_deep_diag_enabled():
+                    deep_transition_before = (
+                        int(request.num_tokens),
+                        int(request.num_computed_tokens),
+                    )
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1467,6 +1547,49 @@ class Scheduler(SchedulerInterface):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            if deep_transition_before is not None:
+                frontier_before, computed_before = deep_transition_before
+                frontier_after = int(request.num_tokens)
+                window_size = _mtp_dw_window_size()
+                window_end = (
+                    (frontier_before // window_size + 1) * window_size
+                    if window_size > 0
+                    else None
+                )
+                if _mtp_dw_sample_deep_transition(
+                    self, req_id, frontier_before, frontier_after
+                ):
+                    assert window_end is not None
+                    status = request.status
+                    _mtp_dw_event(
+                        "deep",
+                        event="mtp_transition",
+                        req=req_id,
+                        worker_rank=None,
+                        tp_rank=None,
+                        tp_world=None,
+                        window_start=(window_end - window_size),
+                        window_end=window_end,
+                        kv_group=None,
+                        frontier=frontier_after,
+                        frontier_before=frontier_before,
+                        frontier_after=frontier_after,
+                        computed_before=computed_before,
+                        computed_after=int(request.num_computed_tokens),
+                        draft_count=num_draft_tokens,
+                        accepted_count=num_accepted,
+                        rejected_count=num_rejected,
+                        generated_count=num_generated_tokens,
+                        appended_count=frontier_after - frontier_before,
+                        remaining_speculative_tokens=len(request.spec_token_ids),
+                        status=getattr(status, "name", str(status)),
+                        stopped=stopped,
+                        stop_reason=request.stop_reason,
+                        crossed_first_window=(
+                            frontier_before < window_end <= frontier_after
+                        ),
+                    )
 
             routed_experts = None
             finish_reason = None
@@ -1911,6 +2034,39 @@ class Scheduler(SchedulerInterface):
                 remaining_speculative_tokens=len(request.spec_token_ids),
             )
 
+        if _mtp_dw_deep_diag_enabled():
+            finish_reason = request.get_finished_reason()
+            raw_max_tokens = getattr(request, "max_tokens", None)
+            status = request.status
+            _mtp_dw_event(
+                "deep",
+                event="finish_state",
+                req=str(request.request_id),
+                worker_rank=None,
+                tp_rank=None,
+                tp_world=None,
+                window_start=0,
+                window_end=_mtp_dw_window_size(),
+                kv_group=None,
+                frontier=int(request.num_tokens),
+                output_tokens=int(request.num_output_tokens),
+                total_tokens=int(request.num_tokens),
+                computed_tokens=int(request.num_computed_tokens),
+                max_tokens=(
+                    int(raw_max_tokens) if raw_max_tokens is not None else None
+                ),
+                finish_reason=(
+                    str(finish_reason) if finish_reason is not None else None
+                ),
+                stop_reason=request.stop_reason,
+                remaining_speculative_tokens=len(request.spec_token_ids),
+                status=getattr(status, "name", str(status)),
+                crossed_first_window=(
+                    _mtp_dw_window_size() > 0
+                    and request.num_tokens >= _mtp_dw_window_size()
+                ),
+            )
+
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
@@ -1921,6 +2077,8 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+
+        _mtp_dw_cleanup_request(self, request_id)
 
         return kv_xfer_params
 
@@ -2238,9 +2396,24 @@ class Scheduler(SchedulerInterface):
         for req_id, saved_end in (
             kv_connector_output.completed_decode_window_saves.items()
         ):
-            if req_id not in self.requests:
+            request = self.requests.get(req_id)
+            if request is None:
+                if _mtp_dw_sample_deep_completion(self, req_id, saved_end):
+                    _mtp_dw_event(
+                        "deep",
+                        event="completed_window_consumed",
+                        req=req_id,
+                        worker_rank=None,
+                        tp_rank=None,
+                        tp_world=None,
+                        frontier=None,
+                        window_start=max(0, int(saved_end) - _mtp_dw_window_size()),
+                        window_end=int(saved_end),
+                        kv_group=None,
+                        request_present=False,
+                        status=None,
+                    )
                 continue
-            request = self.requests[req_id]
             removed_blocks = self.kv_cache_manager.remove_saved_decode_window_blocks(
                 req_id,
                 saved_end,
@@ -2255,6 +2428,22 @@ class Scheduler(SchedulerInterface):
                 release_gate="enabled",
                 freed_blocks=removed_blocks,
             )
+            if _mtp_dw_sample_deep_completion(self, req_id, saved_end):
+                status = request.status
+                _mtp_dw_event(
+                    "deep",
+                    event="completed_window_consumed",
+                    req=req_id,
+                    worker_rank=None,
+                    tp_rank=None,
+                    tp_world=None,
+                    frontier=int(request.num_tokens),
+                    window_start=max(0, int(saved_end) - _mtp_dw_window_size()),
+                    window_end=int(saved_end),
+                    kv_group=None,
+                    request_present=True,
+                    status=getattr(status, "name", str(status)),
+                )
             if removed_blocks:
                 logger.debug(
                     "Released %d DSA latent blocks for completed decode "
