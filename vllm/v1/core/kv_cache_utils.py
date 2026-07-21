@@ -1270,17 +1270,21 @@ def get_kv_cache_config_from_groups(
             indexer_ctx_blocks = cdiv(
                 max_model_len, indexer_group.kv_cache_spec.block_size
             )
-            scratch_blocks = (
-                cdiv(
-                    int(dsa_index_topk) * dsa_sparse_rows,
-                    latent_group.kv_cache_spec.block_size,
+            if dsa_index_topk is not None and (
+                int(dsa_index_topk) % latent_group.kv_cache_spec.block_size
+            ):
+                raise ValueError(
+                    "DSA index_topk must be an integer multiple of block_size: "
+                    f"index_topk={dsa_index_topk}, "
+                    f"block_size={latent_group.kv_cache_spec.block_size}"
                 )
+            scratch_blocks = (
+                int(dsa_index_topk)
+                * dsa_sparse_rows
+                // latent_group.kv_cache_spec.block_size
                 if dsa_index_topk is not None
                 else 0
             )
-            scratch_blocks_env = os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS")
-            if scratch_blocks_env is not None:
-                scratch_blocks = max(scratch_blocks, int(scratch_blocks_env))
             full_context_bundles = cdiv(
                 latent_ctx_blocks, latent_blocks_per_bundle
             ) + cdiv(indexer_ctx_blocks, indexer_blocks_per_bundle)
@@ -1401,16 +1405,15 @@ def get_kv_cache_config_from_groups(
             # No clamping — it sizes for the target so the case runs at that batch.
             # Env knobs; revert after the experiment.
             block = kv_cache_groups[0].kv_cache_spec.block_size
-            default_scratch = (
-                cdiv(int(dsa_index_topk) * dsa_sparse_rows, block)
-                if dsa_index_topk is not None
-                else 16
-            )
-            scratch_env = os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS")
+            if dsa_index_topk is not None and int(dsa_index_topk) % block:
+                raise ValueError(
+                    "DSA index_topk must be an integer multiple of block_size: "
+                    f"index_topk={dsa_index_topk}, block_size={block}"
+                )
             scratch = (
-                max(default_scratch, int(scratch_env))
-                if scratch_env is not None
-                else default_scratch
+                int(dsa_index_topk) * dsa_sparse_rows // block
+                if dsa_index_topk is not None
+                else 0
             )
             test_batch = int(os.getenv("DSA_TEST_BATCH", "11"))
             ctx_blocks = int(

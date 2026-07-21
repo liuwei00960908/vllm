@@ -415,11 +415,11 @@ class KVCacheManager:
     def remove_saved_decode_window_blocks(
         self,
         request_id: str,
-        saved_end: int,
+        committed_end: int,
     ) -> int:
         """Free DSA latent blocks covered by a completed decode-window save."""
         return self.coordinator.remove_saved_decode_window_blocks(
-            request_id, saved_end
+            request_id, committed_end
         )
 
     def evict_blocks(self, block_ids: set[int]) -> None:

@@ -6,7 +6,13 @@ import random
 import pytest
 import torch
 
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, DSASharedLogicalBlockPool
+from vllm.v1.core.dsa_shared_pool import (
+    DSASharedBlockLayout,
+    DSASharedBlockOwner,
+    DSASharedBundleAllocator,
+    dsa_scratch_blocks_for_topk,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -370,16 +376,68 @@ def test_dsa_latent_decode_window_release_waits_for_completed_save(monkeypatch):
     manager.remove_skipped_blocks("test", total_computed_tokens=6, num_prompt_tokens=4)
     assert_block_id(block_table, original_block_ids)
 
-    assert manager.remove_saved_decode_window_blocks("test", saved_end=4) == 0
+    assert manager.remove_saved_decode_window_blocks("test", committed_end=4) == 0
     assert_block_id(block_table, original_block_ids)
 
-    assert manager.remove_saved_decode_window_blocks("test", saved_end=8) == 2
+    assert manager.remove_saved_decode_window_blocks("test", committed_end=8) == 2
     assert_block_id(
         block_table,
         original_block_ids[:2]
         + [null_block_id, null_block_id]
         + original_block_ids[4:],
     )
+
+
+def test_dsa_scratch_capacity_uses_max_mtp_rows_and_requires_topk_alignment():
+    assert dsa_scratch_blocks_for_topk(2048, 256, num_rows=2) == 16
+    with pytest.raises(ValueError, match="integer multiple.*index_topk=2049"):
+        dsa_scratch_blocks_for_topk(2049, 256, num_rows=2)
+
+
+def test_dsa_release_keeps_fixed_mtp_union_scratch_prefix():
+    attention_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=64, enable_caching=False, hash_block_size=256
+    )
+    manager = get_dsa_latent_manager(attention_spec, block_pool)
+    manager.scratch_blocks = 16  # (1 + one speculative token) * 2048 / 256
+    blocks = block_pool.get_new_blocks(40)
+    manager.req_to_blocks["mtp"] = blocks
+
+    assert manager.remove_saved_decode_window_blocks("mtp", 512) == 0
+    assert manager.remove_saved_decode_window_blocks("mtp", 3072) == 0
+    assert manager.remove_saved_decode_window_blocks("mtp", 8192) == 16
+    assert all(block != block_pool.null_block for block in blocks[:16])
+    assert all(block == block_pool.null_block for block in blocks[16:32])
+    assert all(block != block_pool.null_block for block in blocks[32:])
+
+
+@pytest.mark.parametrize(
+    "owner", [DSASharedBlockOwner.LATENT, DSASharedBlockOwner.INDEXER]
+)
+def test_dsa_shared_pool_reclaims_bundle_after_partial_frees(owner):
+    layout = DSASharedBlockLayout(
+        latent_page_size_bytes=576,
+        indexer_page_size_bytes=128,
+        capacity_bundles=4,
+    )
+    allocator = DSASharedBundleAllocator(layout)
+    pool = DSASharedLogicalBlockPool(allocator, owner)
+    blocks = pool.get_new_blocks(pool.blocks_per_bundle)
+    assert allocator.free_bundle_count == 3
+
+    pool.free_blocks(blocks[:1])
+    assert allocator.free_bundle_count == 3
+    assert blocks[0].ref_cnt == 0
+
+    pool.free_blocks(blocks[1:])
+    assert allocator.free_bundle_count == 4
+    assert all(block.ref_cnt == 0 for block in blocks)
 
 
 def test_get_num_blocks_to_allocate():

@@ -2393,12 +2393,12 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
 
-        for req_id, saved_end in (
+        for req_id, committed_end in (
             kv_connector_output.completed_decode_window_saves.items()
         ):
             request = self.requests.get(req_id)
             if request is None:
-                if _mtp_dw_sample_deep_completion(self, req_id, saved_end):
+                if _mtp_dw_sample_deep_completion(self, req_id, committed_end):
                     _mtp_dw_event(
                         "deep",
                         event="completed_window_consumed",
@@ -2407,8 +2407,10 @@ class Scheduler(SchedulerInterface):
                         tp_rank=None,
                         tp_world=None,
                         frontier=None,
-                        window_start=max(0, int(saved_end) - _mtp_dw_window_size()),
-                        window_end=int(saved_end),
+                        window_start=max(
+                            0, int(committed_end) - _mtp_dw_window_size()
+                        ),
+                        window_end=int(committed_end),
                         kv_group=None,
                         request_present=False,
                         status=None,
@@ -2416,19 +2418,19 @@ class Scheduler(SchedulerInterface):
                 continue
             removed_blocks = self.kv_cache_manager.remove_saved_decode_window_blocks(
                 req_id,
-                saved_end,
+                committed_end,
             )
             _mtp_dw_event(
                 "release",
                 req=req_id,
                 event="completed_save_consumed",
                 frontier=len(request.all_token_ids),
-                saved_end=saved_end,
+                committed_end=committed_end,
                 speculative_reserved_tokens=len(request.spec_token_ids),
                 release_gate="enabled",
                 freed_blocks=removed_blocks,
             )
-            if _mtp_dw_sample_deep_completion(self, req_id, saved_end):
+            if _mtp_dw_sample_deep_completion(self, req_id, committed_end):
                 status = request.status
                 _mtp_dw_event(
                     "deep",
@@ -2438,8 +2440,10 @@ class Scheduler(SchedulerInterface):
                     tp_rank=None,
                     tp_world=None,
                     frontier=int(request.num_tokens),
-                    window_start=max(0, int(saved_end) - _mtp_dw_window_size()),
-                    window_end=int(saved_end),
+                    window_start=max(
+                        0, int(committed_end) - _mtp_dw_window_size()
+                    ),
+                    window_end=int(committed_end),
                     kv_group=None,
                     request_present=True,
                     status=getattr(status, "name", str(status)),
@@ -2447,10 +2451,10 @@ class Scheduler(SchedulerInterface):
             if removed_blocks:
                 logger.debug(
                     "Released %d DSA latent blocks for completed decode "
-                    "window save: request=%s saved_end=%d",
+                    "window save: request=%s committed_end=%d",
                     removed_blocks,
                     req_id,
-                    saved_end,
+                    committed_end,
                 )
 
         # KV Connector:: update recv and send status from last step.

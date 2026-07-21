@@ -41,7 +41,13 @@ def dsa_scratch_blocks_for_topk(
         raise ValueError("block_size must be positive")
     if num_rows <= 0:
         raise ValueError("num_rows must be positive")
-    return _cdiv(index_topk * num_rows, block_size)
+    if index_topk % block_size:
+        raise ValueError(
+            "DSA index_topk must be an integer multiple of block_size: "
+            f"index_topk={index_topk}, block_size={block_size}. Configure "
+            "index_topk to N * block_size."
+        )
+    return num_rows * index_topk // block_size
 
 
 class DSASharedBlockOwner(str, Enum):

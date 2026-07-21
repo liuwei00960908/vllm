@@ -12,7 +12,6 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.dsa_shared_pool import (
-    DSASharedBlockLayout,
     DSASharedBlockOwner,
     DSASharedBundleAllocator,
 )
@@ -78,24 +77,30 @@ class DSASharedLogicalBlockPool:
         blocks_list = [block for block in ordered_blocks if not block.is_null]
         if not blocks_list:
             return
+        affected_bundle_ids: set[int] = set()
         for block in blocks_list:
-            block.ref_cnt -= 1
-
-        releasable = [block for block in blocks_list if block.ref_cnt == 0]
-        by_bundle: dict[int, set[int]] = {}
-        for block in releasable:
-            bundle_id = self.layout.bundle_id_for_block(self.owner, block.block_id)
-            by_bundle.setdefault(bundle_id, set()).add(block.block_id)
-
-        bundle_ids: list[int] = []
-        for bundle_id, block_ids in by_bundle.items():
-            expected = set(self.layout.block_ids_for_bundle(self.owner, bundle_id))
-            if block_ids != expected:
+            if block.ref_cnt <= 0:
                 raise ValueError(
-                    f"partial DSA {self.owner.value} bundle free: "
-                    f"bundle={bundle_id}, block_ids={sorted(block_ids)}"
+                    f"DSA {self.owner.value} block {block.block_id} is already free"
                 )
-            bundle_ids.append(bundle_id)
+            block.ref_cnt -= 1
+            affected_bundle_ids.add(
+                self.layout.bundle_id_for_block(self.owner, block.block_id)
+            )
+
+        # Logical blocks may become unused across several release calls. The
+        # shared allocator owns physical bundles, so return a bundle only after
+        # every logical block in it has reached ref_cnt == 0.
+        bundle_ids: list[int] = []
+        for bundle_id in affected_bundle_ids:
+            bundle_blocks = (
+                self.blocks[block_id]
+                for block_id in self.layout.block_ids_for_bundle(
+                    self.owner, bundle_id
+                )
+            )
+            if all(block.ref_cnt == 0 for block in bundle_blocks):
+                bundle_ids.append(bundle_id)
         self.allocator.free(self.owner, bundle_ids)
 
     def get_num_bundles_to_allocate(self, num_blocks: int) -> int:

@@ -198,9 +198,6 @@ class KVCacheCoordinator(ABC):
                         manager.block_size,
                         dsa_scratch_rows,
                     )
-                    scratch_blocks_env = os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS")
-                    if scratch_blocks_env is not None:
-                        scratch_blocks = max(scratch_blocks, int(scratch_blocks_env))
                     manager.scratch_blocks = scratch_blocks
                     logger.info(
                         "DSA latent scratch blocks: topk=%d spec_tokens=%d "
@@ -623,13 +620,13 @@ class KVCacheCoordinator(ABC):
     def remove_saved_decode_window_blocks(
         self,
         request_id: str,
-        saved_end: int,
+        committed_end: int,
     ) -> int:
         removed_blocks = 0
         for manager in self.single_type_managers:
             if isinstance(manager, DSALatentManager):
                 removed_blocks += manager.remove_saved_decode_window_blocks(
-                    request_id, saved_end
+                    request_id, committed_end
                 )
         return removed_blocks
 
