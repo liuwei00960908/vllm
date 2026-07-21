@@ -41,7 +41,9 @@ def dsa_scratch_blocks_for_topk(
         raise ValueError("block_size must be positive")
     if num_rows <= 0:
         raise ValueError("num_rows must be positive")
-    return _cdiv(index_topk * num_rows, block_size)
+    # Rows receive independent block-table prefixes, so each row must start at
+    # a block boundary even when index_topk is not block aligned.
+    return _cdiv(index_topk, block_size) * num_rows
 
 
 class DSASharedBlockOwner(str, Enum):
@@ -167,9 +169,7 @@ class DSASharedBundleAllocator:
     def __init__(self, layout: DSASharedBlockLayout) -> None:
         self.layout = layout
         self._owners: dict[int, DSASharedBlockOwner] = {}
-        self._free_ranges: list[tuple[int, int]] = [
-            (1, layout.capacity_bundles)
-        ]
+        self._free_ranges: list[tuple[int, int]] = [(1, layout.capacity_bundles)]
 
     @property
     def free_bundle_count(self) -> int:

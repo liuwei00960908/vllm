@@ -238,6 +238,11 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Per-request DSA latent scratch blocks. These blocks are owned separately
+    # from the logical request block table and are stable for the decode life of
+    # the request.
+    dsa_scratch_block_ids: dict[str, list[int]] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

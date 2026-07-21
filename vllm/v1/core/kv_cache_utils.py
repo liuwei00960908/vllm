@@ -1272,9 +1272,10 @@ def get_kv_cache_config_from_groups(
             )
             scratch_blocks = (
                 cdiv(
-                    int(dsa_index_topk) * dsa_sparse_rows,
+                    int(dsa_index_topk),
                     latent_group.kv_cache_spec.block_size,
                 )
+                * dsa_sparse_rows
                 if dsa_index_topk is not None
                 else 0
             )
@@ -1402,7 +1403,7 @@ def get_kv_cache_config_from_groups(
             # Env knobs; revert after the experiment.
             block = kv_cache_groups[0].kv_cache_spec.block_size
             default_scratch = (
-                cdiv(int(dsa_index_topk) * dsa_sparse_rows, block)
+                cdiv(int(dsa_index_topk), block) * dsa_sparse_rows
                 if dsa_index_topk is not None
                 else 16
             )

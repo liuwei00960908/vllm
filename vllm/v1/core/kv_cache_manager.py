@@ -415,11 +415,11 @@ class KVCacheManager:
     def remove_saved_decode_window_blocks(
         self,
         request_id: str,
-        saved_end: int,
+        committed_end: int,
     ) -> int:
         """Free DSA latent blocks covered by a completed decode-window save."""
         return self.coordinator.remove_saved_decode_window_blocks(
-            request_id, saved_end
+            request_id, committed_end
         )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -500,6 +500,10 @@ class KVCacheManager:
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
+
+    def get_dsa_scratch_block_ids(self, request_id: str) -> list[int]:
+        """Return decode scratch block IDs bound for a DSA request."""
+        return self.coordinator.get_dsa_scratch_block_ids(request_id)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.

@@ -370,16 +370,75 @@ def test_dsa_latent_decode_window_release_waits_for_completed_save(monkeypatch):
     manager.remove_skipped_blocks("test", total_computed_tokens=6, num_prompt_tokens=4)
     assert_block_id(block_table, original_block_ids)
 
-    assert manager.remove_saved_decode_window_blocks("test", saved_end=4) == 0
-    assert_block_id(block_table, original_block_ids)
-
-    assert manager.remove_saved_decode_window_blocks("test", saved_end=8) == 2
+    assert manager.remove_saved_decode_window_blocks("test", committed_end=4) == 2
     assert_block_id(
         block_table,
-        original_block_ids[:2]
-        + [null_block_id, null_block_id]
-        + original_block_ids[4:],
+        [null_block_id, null_block_id] + original_block_ids[2:],
     )
+    assert manager.remove_saved_decode_window_blocks("test", committed_end=8) == 2
+    assert_block_id(
+        block_table,
+        [null_block_id] * 4 + original_block_ids[4:],
+    )
+
+
+def test_dsa_latent_never_releases_without_committed_end(monkeypatch):
+    monkeypatch.delenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", raising=False)
+    attention_spec = MLAAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(num_gpu_blocks=32, enable_caching=False, hash_block_size=2)
+    manager = get_dsa_latent_manager(attention_spec, block_pool, enable_caching=False)
+    manager.scratch_blocks = 2
+    blocks = [KVCacheBlock(10), KVCacheBlock(11), KVCacheBlock(12)]
+    manager.req_to_blocks["test"] = blocks.copy()
+
+    manager.remove_skipped_blocks("test", 6, num_prompt_tokens=4)
+
+    assert [block.block_id for block in manager.req_to_blocks["test"]] == [10, 11, 12]
+    with pytest.raises(ValueError, match="must be divisible"):
+        manager.remove_saved_decode_window_blocks("test", 3)
+    assert manager.remove_saved_decode_window_blocks("test", 4) == 2
+
+def test_dsa_latent_scratch_is_reserved_then_bound_outside_request_table():
+    attention_spec = MLAAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(num_gpu_blocks=32, enable_caching=False, hash_block_size=2)
+    manager = get_dsa_latent_manager(attention_spec, block_pool, enable_caching=False)
+    manager.scratch_blocks = 4
+
+    required = manager.get_num_blocks_to_allocate("test", 2, [], 0, 2)
+    assert required == 5
+    manager.allocate_new_blocks("test", 2, 2)
+
+    assert manager.get_num_unbound_scratch_blocks() == 4
+    assert manager.get_scratch_block_ids("test") == []
+    assert len(manager.req_to_blocks["test"]) == 1
+
+    manager.remove_skipped_blocks("test", 2, num_prompt_tokens=2)
+
+    scratch_ids = manager.get_scratch_block_ids("test")
+    assert len(scratch_ids) == 4
+    assert len(set(scratch_ids)) == 4
+    assert manager.get_num_unbound_scratch_blocks() == 0
+    assert len(manager.req_to_blocks["test"]) == 1
+    request_block_ids = {
+        block.block_id for block in manager.req_to_blocks["test"]
+    }
+    assert set(scratch_ids).isdisjoint(request_block_ids)
+    row_0_scratch = set(scratch_ids[:2])
+    row_1_scratch = set(scratch_ids[2:])
+    assert row_0_scratch.isdisjoint(row_1_scratch)
+
+    manager.free("test")
+    assert block_pool.get_num_free_blocks() == 31
 
 
 def test_get_num_blocks_to_allocate():

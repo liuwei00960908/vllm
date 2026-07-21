@@ -305,7 +305,15 @@ class KVCacheCoordinator(ABC):
             num_tokens_main_model,
         )
         if self.use_per_group_block_pools:
-            frees = [m.block_pool.get_num_free_blocks() for m in self.single_type_managers]
+            frees = [
+                m.block_pool.get_num_free_blocks()
+                - (
+                    m.get_num_unbound_scratch_blocks()
+                    if isinstance(m, DSALatentManager)
+                    else 0
+                )
+                for m in self.single_type_managers
+            ]
             ok = all(needed <= free for needed, free in zip(per_group, frees))
             if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
                 # [KVSTARVE] one-per-second snapshot of WHICH group blocked an
@@ -328,16 +336,26 @@ class KVCacheCoordinator(ABC):
                 )
             return ok
         if self.use_dsa_shared_block_pool:
+            reserved_bundles = sum(
+                manager.block_pool.get_num_bundles_to_allocate(
+                    manager.get_num_unbound_scratch_blocks()
+                )
+                for manager in self.single_type_managers
+                if isinstance(manager, DSALatentManager)
+            )
+            effective_free_bundles = (
+                self.dsa_shared_allocator.free_bundle_count - reserved_bundles
+            )
             needed_bundles = sum(
                 manager.block_pool.get_num_bundles_to_allocate(needed)
                 for manager, needed in zip(self.single_type_managers, per_group)
             )
-            ok = needed_bundles <= self.dsa_shared_allocator.free_bundle_count
+            ok = needed_bundles <= effective_free_bundles
             if not ok:
                 self._dsa_last_starve = (
                     request_id,
                     needed_bundles,
-                    self.dsa_shared_allocator.free_bundle_count,
+                    effective_free_bundles,
                     per_group,
                 )
             if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
@@ -347,11 +365,18 @@ class KVCacheCoordinator(ABC):
                     "per_group_blocks=%s",
                     request_id,
                     needed_bundles,
-                    self.dsa_shared_allocator.free_bundle_count,
+                    effective_free_bundles,
                     per_group,
-            )
+                )
             return ok
-        return sum(per_group) <= self.block_pool.get_num_free_blocks()
+        reserved_blocks = sum(
+            manager.get_num_unbound_scratch_blocks()
+            for manager in self.single_type_managers
+            if isinstance(manager, DSALatentManager)
+        )
+        return sum(per_group) <= (
+            self.block_pool.get_num_free_blocks() - reserved_blocks
+        )
 
     def maybe_log_dsa_shared_pool_usage(
         self,
@@ -436,9 +461,8 @@ class KVCacheCoordinator(ABC):
                         )
                     )
 
-        bundle_bytes = (
-            layout.bundle_page_size_bytes
-            * getattr(self, "dsa_shared_num_layer_pairs", 1)
+        bundle_bytes = layout.bundle_page_size_bytes * getattr(
+            self, "dsa_shared_num_layer_pairs", 1
         )
         used_gib = used * bundle_bytes / 2**30
         total_gib = capacity * bundle_bytes / 2**30
@@ -623,13 +647,13 @@ class KVCacheCoordinator(ABC):
     def remove_saved_decode_window_blocks(
         self,
         request_id: str,
-        saved_end: int,
+        committed_end: int,
     ) -> int:
         removed_blocks = 0
         for manager in self.single_type_managers:
             if isinstance(manager, DSALatentManager):
                 removed_blocks += manager.remove_saved_decode_window_blocks(
-                    request_id, saved_end
+                    request_id, committed_end
                 )
         return removed_blocks
 
@@ -641,6 +665,12 @@ class KVCacheCoordinator(ABC):
             manager.req_to_blocks.get(request_id) or []
             for manager in self.single_type_managers
         )
+
+    def get_dsa_scratch_block_ids(self, request_id: str) -> list[int]:
+        for manager in self.single_type_managers:
+            if isinstance(manager, DSALatentManager):
+                return manager.get_scratch_block_ids(request_id)
+        return []
 
     @abstractmethod
     def find_longest_cache_hit(
