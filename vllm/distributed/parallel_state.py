@@ -1919,7 +1919,11 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
     from vllm.platforms import current_platform
 
     if not current_platform.is_cpu():
-        torch.accelerator.empty_cache()
+        # Use the cache implementation registered by the active platform.
+        # Out-of-tree platforms such as NPU may not use PyTorch's generic
+        # DeviceAllocator, so torch.accelerator.empty_cache() can fail even
+        # though their platform-specific allocator is valid.
+        current_platform.empty_cache()
         try:
             torch._C._host_emptyCache()
         except AttributeError:
