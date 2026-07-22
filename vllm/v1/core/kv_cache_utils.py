@@ -1219,7 +1219,11 @@ def get_kv_cache_config_from_groups(
             num_layer_pairs = len(latent_group.layer_names)
             slot_count = available_memory // (num_layer_pairs * bundle_page)
             natural_bundles = slot_count - 1
-            if natural_bundles <= 0:
+            num_bundles = may_override_num_blocks(
+                vllm_config,
+                natural_bundles,
+            )
+            if num_bundles <= 0:
                 raise ValueError(
                     "No available memory for DSA shared pool after reserving "
                     "bundle slot 0."
@@ -1258,8 +1262,6 @@ def get_kv_cache_config_from_groups(
                 natural_bundles,
                 natural_nonshared_blocks,
             )
-            num_bundles = natural_bundles
-            num_bundles = may_override_num_blocks(vllm_config, num_bundles)
             tensor_size = (num_bundles + 1) * bundle_page
             shared_pool_bytes = num_layer_pairs * tensor_size
             max_model_len = vllm_config.model_config.max_model_len
