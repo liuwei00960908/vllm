@@ -510,6 +510,129 @@ class DSALatentManager(FullAttentionManager):
 
     scratch_blocks = 0
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # PD consumers can restore a sparse latent layout: the fixed scratch
+        # prefix and the prompt tail are resident, while the persisted middle
+        # is represented by null blocks.
+        self._external_sparse_layouts: dict[str, tuple[int, int]] = {}
+
+    def set_external_sparse_layout(
+        self,
+        request_id: str,
+        prompt_len: int,
+        tail_chunk_start: int,
+    ) -> None:
+        if prompt_len <= 0:
+            raise ValueError("DSA sparse PD prompt_len must be positive")
+        if tail_chunk_start < 0 or tail_chunk_start >= prompt_len:
+            raise ValueError(
+                "DSA sparse PD tail start must identify the chunk containing "
+                f"the last prompt token: prompt_len={prompt_len}, "
+                f"tail_chunk_start={tail_chunk_start}"
+            )
+        if tail_chunk_start % self.block_size:
+            raise ValueError(
+                f"tail_chunk_start={tail_chunk_start} must be divisible by "
+                f"block_size={self.block_size}"
+            )
+        self._external_sparse_layouts[request_id] = (
+            prompt_len,
+            tail_chunk_start,
+        )
+
+    def _external_sparse_block_counts(
+        self, request_id: str
+    ) -> tuple[int, int, int] | None:
+        layout = self._external_sparse_layouts.get(request_id)
+        if layout is None:
+            return None
+        prompt_len, tail_chunk_start = layout
+        prompt_blocks = cdiv(prompt_len, self.block_size)
+        tail_start_block = tail_chunk_start // self.block_size
+        prefix_blocks = min(self.scratch_blocks, prompt_blocks)
+        # Prefix and tail can overlap for prompts close to the threshold.
+        resident_blocks = prefix_blocks + max(
+            prompt_blocks - max(prefix_blocks, tail_start_block), 0
+        )
+        return prompt_blocks, tail_start_block, resident_blocks
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> int:
+        counts = self._external_sparse_block_counts(request_id)
+        if counts is None or request_id in self.num_cached_block:
+            return super().get_num_blocks_to_allocate(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                total_computed_tokens,
+                num_tokens_main_model,
+            )
+        if new_computed_blocks:
+            raise RuntimeError(
+                "DSA sparse PD layout cannot be combined with local latent "
+                f"prefix-cache blocks for request {request_id}"
+            )
+        prompt_blocks, _, resident_blocks = counts
+        extra_blocks = max(cdiv(num_tokens, self.block_size) - prompt_blocks, 0)
+        return resident_blocks + extra_blocks
+
+    def allocate_new_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        counts = self._external_sparse_block_counts(request_id)
+        if counts is None:
+            super().allocate_new_computed_blocks(
+                request_id,
+                new_computed_blocks,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+            return
+        if new_computed_blocks or num_local_computed_tokens:
+            raise RuntimeError(
+                "DSA sparse PD layout requires an external-only latent hit: "
+                f"request={request_id}, local_tokens={num_local_computed_tokens}, "
+                f"local_blocks={len(new_computed_blocks)}"
+            )
+        req_blocks = self.req_to_blocks[request_id]
+        if req_blocks:
+            raise RuntimeError(
+                f"DSA sparse PD layout initialized twice for request {request_id}"
+            )
+        prompt_blocks, tail_start_block, resident_blocks = counts
+        prefix_blocks = min(self.scratch_blocks, prompt_blocks)
+        resident = self.block_pool.get_new_blocks(resident_blocks)
+        prefix = resident[:prefix_blocks]
+        tail = resident[prefix_blocks:]
+        req_blocks.extend(prefix)
+        req_blocks.extend(
+            [self._null_block]
+            * (max(prefix_blocks, tail_start_block) - prefix_blocks)
+        )
+        req_blocks.extend(tail)
+        if len(req_blocks) != prompt_blocks:
+            raise RuntimeError(
+                "DSA sparse PD block layout has incorrect logical length: "
+                f"request={request_id}, got={len(req_blocks)}, "
+                f"expected={prompt_blocks}"
+            )
+        self.num_cached_block[request_id] = len(req_blocks)
+
+    def free(self, request_id: str) -> None:
+        self._external_sparse_layouts.pop(request_id, None)
+        super().free(request_id)
+
     def remove_skipped_blocks(
         self,
         request_id: str,

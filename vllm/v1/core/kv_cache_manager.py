@@ -326,6 +326,16 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        dsa_tail_chunk_start = getattr(
+            request, "dsa_external_tail_chunk_start", None
+        )
+        if dsa_tail_chunk_start is not None:
+            self.coordinator.set_external_sparse_layout(
+                request.request_id,
+                request.num_prompt_tokens,
+                int(dsa_tail_chunk_start),
+            )
+
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
         # We can do this even if we cannot schedule this request due to
