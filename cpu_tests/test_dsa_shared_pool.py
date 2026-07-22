@@ -160,7 +160,9 @@ def test_shared_pool_uses_each_group_own_logical_pool():
 def test_scratch_blocks_are_derived_from_index_topk():
     assert dsa_scratch_blocks_for_topk(2048, 128) == 16
     assert dsa_scratch_blocks_for_topk(1024, 128) == 8
-    assert dsa_scratch_blocks_for_topk(2049, 128) == 17
+
+    with pytest.raises(ValueError, match="integer multiple.*index_topk=2049"):
+        dsa_scratch_blocks_for_topk(2049, 128)
 
     with pytest.raises(ValueError, match="index_topk"):
         dsa_scratch_blocks_for_topk(0, 128)
