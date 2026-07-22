@@ -517,18 +517,6 @@ class KVCacheCoordinator(ABC):
                 num_external_computed_tokens,
             )
 
-    def set_external_sparse_layout(
-        self,
-        request_id: str,
-        prompt_len: int,
-        tail_chunk_start: int,
-    ) -> None:
-        for manager in self.single_type_managers:
-            if isinstance(manager, DSALatentManager):
-                manager.set_external_sparse_layout(
-                    request_id, prompt_len, tail_chunk_start
-                )
-
     def allocate_new_blocks(
         self,
         request_id: str,

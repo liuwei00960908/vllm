@@ -417,7 +417,13 @@ def test_dsa_release_keeps_fixed_mtp_union_scratch_prefix():
     assert all(block != block_pool.null_block for block in blocks[32:])
 
 
-def test_dsa_pd_short_prompt_allocates_every_latent_block():
+@pytest.mark.parametrize(
+    ("request_id", "prompt_len", "external_tokens"),
+    [("short", 3000, 2999), ("long", 8192, 8191)],
+)
+def test_dsa_external_prefix_hit_allocates_every_latent_block(
+    request_id, prompt_len, external_tokens
+):
     attention_spec = MLAAttentionSpec(
         block_size=256,
         num_kv_heads=1,
@@ -429,40 +435,11 @@ def test_dsa_pd_short_prompt_allocates_every_latent_block():
     )
     manager = get_dsa_latent_manager(attention_spec, block_pool)
     manager.scratch_blocks = 16
-    manager.set_external_sparse_layout("short", 3000, 2816)
+    manager.allocate_new_computed_blocks(request_id, [], 0, external_tokens)
 
-    assert manager.get_num_blocks_to_allocate("short", 3000, [], 2999, 3000) == 12
-    manager.allocate_new_computed_blocks("short", [], 0, 2999)
-
-    blocks = manager.req_to_blocks["short"]
-    assert len(blocks) == 12
+    blocks = manager.req_to_blocks[request_id]
+    assert len(blocks) == (prompt_len + 255) // 256
     assert all(block != block_pool.null_block for block in blocks)
-
-
-def test_dsa_pd_long_prompt_allocates_scratch_and_tail_with_null_middle():
-    attention_spec = MLAAttentionSpec(
-        block_size=256,
-        num_kv_heads=1,
-        head_size=512,
-        dtype=torch.float32,
-    )
-    block_pool = BlockPool(
-        num_gpu_blocks=64, enable_caching=False, hash_block_size=256
-    )
-    manager = get_dsa_latent_manager(attention_spec, block_pool)
-    manager.scratch_blocks = 16
-    # The final full LMCache chunk is the live tail too: the decoder restores
-    # it and recomputes the prompt's last token into its final block.
-    manager.set_external_sparse_layout("long", 8192, 7936)
-
-    assert manager.get_num_blocks_to_allocate("long", 8191, [], 8191, 8191) == 17
-    manager.allocate_new_computed_blocks("long", [], 0, 8191)
-
-    blocks = manager.req_to_blocks["long"]
-    assert len(blocks) == 32
-    assert all(block != block_pool.null_block for block in blocks[:16])
-    assert all(block == block_pool.null_block for block in blocks[16:31])
-    assert blocks[31] != block_pool.null_block
 
 
 @pytest.mark.parametrize(
