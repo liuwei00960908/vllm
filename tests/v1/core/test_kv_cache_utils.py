@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -155,6 +156,45 @@ def new_chunked_local_attention_spec(
         page_size_padded=page_size_padded,
         attention_chunk_size=attention_chunk_size,
     )
+
+
+def test_dsa_shared_pool_honors_num_blocks_override(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=4,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=20_000,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+        num_speculative_tokens=0,
+    )
+    groups = [
+        KVCacheGroupSpec(["latent"], new_kv_cache_spec(head_size=64)),
+        KVCacheGroupSpec(["indexer"], new_kv_cache_spec(head_size=32)),
+    ]
+
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        config,
+        groups,
+        available_memory=0,
+    )
+
+    assert result.num_blocks == 4
+    assert all(tensor.size > 0 for tensor in result.kv_cache_tensors)
+
+    config.cache_config.num_gpu_blocks_override = None
+    with pytest.raises(ValueError, match="No available memory"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            config,
+            groups,
+            available_memory=0,
+        )
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

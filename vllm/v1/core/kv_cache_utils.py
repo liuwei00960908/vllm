@@ -5,11 +5,11 @@
 import copy
 import hashlib
 import os
-from math import lcm
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
+from math import lcm
 from typing import Any, NewType, TypeAlias, overload
 
 from vllm import envs
@@ -1219,7 +1219,11 @@ def get_kv_cache_config_from_groups(
             num_layer_pairs = len(latent_group.layer_names)
             slot_count = available_memory // (num_layer_pairs * bundle_page)
             natural_bundles = slot_count - 1
-            if natural_bundles <= 0:
+            num_bundles = may_override_num_blocks(
+                vllm_config,
+                natural_bundles,
+            )
+            if num_bundles <= 0:
                 raise ValueError(
                     "No available memory for DSA shared pool after reserving "
                     "bundle slot 0."
@@ -1258,8 +1262,6 @@ def get_kv_cache_config_from_groups(
                 natural_bundles,
                 natural_nonshared_blocks,
             )
-            num_bundles = natural_bundles
-            num_bundles = may_override_num_blocks(vllm_config, num_bundles)
             tensor_size = (num_bundles + 1) * bundle_page
             shared_pool_bytes = num_layer_pairs * tensor_size
             max_model_len = vllm_config.model_config.max_model_len
@@ -1346,7 +1348,9 @@ def get_kv_cache_config_from_groups(
                 pairs = list(zip(latent_group.layer_names, indexer_group.layer_names))
                 used_indexers = {indexer for _, indexer in pairs}
             if used_indexers != indexer_by_name:
-                raise ValueError("DSA shared pool could not pair latent/indexer layers.")
+                raise ValueError(
+                    "DSA shared pool could not pair latent/indexer layers."
+                )
 
             logger.info(
                 "DSA shared pool sizing: bundles=%d, bundle_page=%.2f MiB, "
@@ -1422,7 +1426,10 @@ def get_kv_cache_config_from_groups(
             gen_blocks = cdiv(int(os.getenv("DSA_TEST_GEN_TOKENS", "1000")), block)
             prefill_conc = int(os.getenv("DSA_TEST_PREFILL_CONC", "1"))
 
-            latent_blocks = prefill_conc * ctx_blocks + test_batch * (scratch + gen_blocks)
+            latent_blocks = (
+                prefill_conc * ctx_blocks
+                + test_batch * (scratch + gen_blocks)
+            )
             idx_blocks = test_batch * ctx_blocks
             num_blocks_per_group = [latent_blocks, idx_blocks]
             num_blocks = max(num_blocks_per_group)
@@ -1442,7 +1449,11 @@ def get_kv_cache_config_from_groups(
                 latent_blocks, latent_layers * latent_blocks * latent_page / 2**30,
                 idx_blocks, idx_layers * idx_blocks * idx_page / 2**30,
                 need / 2**30, available_memory / 2**30,
-                "" if need <= available_memory else "  [OVER BUDGET -> add --enforce-eager]",
+                (
+                    ""
+                    if need <= available_memory
+                    else "  [OVER BUDGET -> add --enforce-eager]"
+                ),
             )
 
         nonshared_group_bytes = [
