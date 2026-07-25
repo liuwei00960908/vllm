@@ -80,6 +80,8 @@ def _parse_log_rows(
                     "malformed [DSA-TOPK] header",
                     line_number=line_number,
                 )
+            if headers[0]["req"] == "?":
+                continue
             grouped_headers: dict[tuple[str, int, str, int], list] = {}
             for header in headers:
                 if header["req"] == "?":
