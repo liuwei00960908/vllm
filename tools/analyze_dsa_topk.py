@@ -526,6 +526,43 @@ def _write_summary_csv(
         writer.writerows(rows)
 
 
+def _merge_partial_rank_rows(
+    rows_by_rank: dict[int, list[LogRow]],
+) -> tuple[list[LogRow], set[int]]:
+    merged: dict[tuple[int, int, str, int], tuple[int, LogRow]] = {}
+    used_ranks: set[int] = set()
+    for rank, rank_rows in sorted(rows_by_rank.items()):
+        step = 0
+        previous_layer: int | None = None
+        for row in rank_rows:
+            if previous_layer is not None and row.layer_index < previous_layer:
+                step += 1
+            previous_layer = row.layer_index
+            key = (step, row.layer_index, row.request_id, row.row)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = (rank, row)
+                used_ranks.add(rank)
+                continue
+            existing_rank, existing_row = existing
+            if (
+                existing_row.layer_name != row.layer_name
+                or existing_row.n_valid != row.n_valid
+                or existing_row.positions != row.positions
+            ):
+                raise LogFormatError(
+                    "conflicting clean TP copies for "
+                    f"step={step}, layer={row.layer_index}, "
+                    f"request={row.request_id!r}, row={row.row}: "
+                    f"TP{existing_rank} line {existing_row.line_number} "
+                    f"differs from TP{rank} line {row.line_number}"
+                )
+    ordered_rows = [
+        item[1] for _, item in sorted(merged.items(), key=lambda pair: pair[0])
+    ]
+    return ordered_rows, used_ranks
+
+
 def load_input_directory(
     input_dir: Path,
     *,
@@ -556,53 +593,48 @@ def load_input_directory(
         else:
             candidate_ranks = [tp_rank]
 
-        failures: list[tuple[int, Exception]] = []
-        selected = None
-        for candidate_rank in candidate_ranks:
-            try:
-                candidate_rows = parse_log_rows(
-                    log_path,
-                    tp_rank=candidate_rank,
-                    topk=topk,
-                    num_layers=num_layers,
-                )
-                candidate_records = reconstruct_union_topk(
-                    candidate_rows, num_layers=num_layers
-                )
-                candidate_request_ids = {item.request_id for item in candidate_records}
-                if len(candidate_request_ids) != 1:
-                    raise LogFormatError(
-                        f"{log_path} contains "
-                        f"{len(candidate_request_ids)} real requests "
-                        f"{sorted(candidate_request_ids)} for TP"
-                        f"{candidate_rank}; each input file must contain "
-                        "exactly one"
+        if tp_rank is not None:
+            rows = parse_log_rows(
+                log_path,
+                tp_rank=tp_rank,
+                topk=topk,
+                num_layers=num_layers,
+            )
+            records = reconstruct_union_topk(rows, num_layers=num_layers)
+            used_ranks = {tp_rank}
+        else:
+            rows_by_rank: dict[int, list[LogRow]] = {}
+            failures: list[tuple[int, Exception]] = []
+            for candidate_rank in candidate_ranks:
+                try:
+                    rows_by_rank[candidate_rank] = parse_log_rows(
+                        log_path,
+                        tp_rank=candidate_rank,
+                        topk=topk,
+                        num_layers=num_layers,
                     )
-            except (LogFormatError, ValueError) as error:
-                failures.append((candidate_rank, error))
-                if tp_rank is not None:
-                    raise
-                continue
-            selected = (
-                candidate_rank,
-                candidate_rows,
-                candidate_records,
-                candidate_request_ids,
-            )
-            break
+                except (LogFormatError, ValueError) as error:
+                    failures.append((candidate_rank, error))
+            if not rows_by_rank:
+                summary = "\n".join(
+                    f"  TP{rank}: {str(error).splitlines()[0]}"
+                    for rank, error in failures
+                )
+                raise LogFormatError(
+                    f"{log_path}: no TP rank produced clean records:\n{summary}"
+                )
+            rows, used_ranks = _merge_partial_rank_rows(rows_by_rank)
+            records = reconstruct_union_topk(rows, num_layers=num_layers)
 
-        if selected is None:
-            summary = "\n".join(
-                f"  TP{rank}: {str(error).splitlines()[0]}" for rank, error in failures
-            )
-            last_error = failures[-1][1]
+        request_ids = {item.request_id for item in records}
+        if len(request_ids) != 1:
             raise LogFormatError(
-                f"{log_path}: every TP rank failed strict reconstruction:\n"
-                f"{summary}\nlast failure details:\n{last_error}"
-            ) from last_error
-
-        selected_rank, rows, records, request_ids = selected
-        print(f"Selected Worker_TP{selected_rank} for {log_path}")
+                f"{log_path} contains {len(request_ids)} real requests "
+                f"{sorted(request_ids)}; each input file must contain "
+                "exactly one"
+            )
+        rank_text = ", ".join(f"TP{rank}" for rank in sorted(used_ranks))
+        print(f"Assembled {log_path} from {rank_text}")
         request_id = next(iter(request_ids))
         if request_id in request_sources:
             raise LogFormatError(

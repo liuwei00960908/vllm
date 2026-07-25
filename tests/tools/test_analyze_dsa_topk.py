@@ -169,16 +169,10 @@ def test_rejects_multiple_requests_in_one_file(tmp_path):
         load_input_directory(tmp_path, tp_rank=0, topk=2, num_layers=2)
 
 
-def test_auto_rank_falls_back_from_interleaved_tp0_to_clean_tp1(tmp_path):
+def test_auto_rank_merges_partial_clean_layers_across_ranks(tmp_path):
     log = tmp_path / "01.txt"
-    contaminated_tp0 = _line(0, 0, 0, "req-a", [1, 2]).replace(
-        "(Worker_TP0 pid=1)",
-        "(Worker_TP0 pid=1) (Worker_TP2 pid=2)",
-    )
     log.write_text(
-        contaminated_tp0
-        + _line(1, 0, 0, "req-a", [1, 2])
-        + _line(1, 1, 0, "req-a", [2, 3]),
+        _line(0, 0, 0, "req-a", [1, 2]) + _line(1, 1, 0, "req-a", [2, 3]),
         encoding="utf-8",
     )
 
