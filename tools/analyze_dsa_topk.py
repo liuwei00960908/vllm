@@ -688,10 +688,12 @@ def parse_topk_tensor(
     tensor = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(tensor, torch.Tensor):
         raise LogFormatError(f"{path} does not contain a torch.Tensor")
+    original_shape = tuple(tensor.shape)
+    while tensor.ndim > 2 and tensor.shape[1] == 1:
+        tensor = tensor.squeeze(1)
     if tensor.ndim != 2 or tuple(tensor.shape) != (rows, file_topk):
         raise LogFormatError(
-            f"{path} has tensor shape {tuple(tensor.shape)}, "
-            f"expected ({rows}, {file_topk})"
+            f"{path} has tensor shape {original_shape}, expected ({rows}, {file_topk})"
         )
     if tensor.is_floating_point() or tensor.is_complex():
         raise LogFormatError(f"{path} top-k indices must use an integer dtype")

@@ -89,6 +89,22 @@ def test_parses_filename_metadata(tmp_path):
     assert item.positions == ((1, 2), (2, 3))
 
 
+def test_accepts_singleton_dimension_between_rows_and_topk(tmp_path):
+    path = _dump(
+        tmp_path,
+        layer=64,
+        step=412,
+        seq_len=8601,
+        values=[[1, 2], [2, 3]],
+    )
+    torch.save(torch.tensor([[[1, 2]], [[2, 3]]], dtype=torch.int64), path)
+
+    item = parse_topk_tensor(path, input_dir=tmp_path, topk=2, num_layers=78)
+
+    assert item is not None
+    assert item.positions == ((1, 2), (2, 3))
+
+
 def test_uses_relative_parent_as_request_id(tmp_path):
     request_dir = tmp_path / "request-a"
     _dump(
