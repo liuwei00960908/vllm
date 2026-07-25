@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconstruct and analyze per-step DSA top-k selections from vLLM logs."""
+"""Analyze per-step DSA top-k tensors dumped by vLLM."""
 
 from __future__ import annotations
 
@@ -12,6 +12,13 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+TOPK_FILE_RE = re.compile(
+    r"^dsa_topk__layer-(?P<layer>.+?)__tp-(?P<tp>\d+)"
+    r"__global-(?P<global_rank>\d+)__seq-(?P<seq_len>\d+)"
+    r"__step-(?P<step>\d+)__state-(?P<state>.+?)__pid-(?P<pid>\d+)"
+    r"__rows-(?P<rows>\d+)__k-(?P<k>\d+)\.pt$"
+)
+TENSOR_LAYER_INDEX_RE = re.compile(r"(?:^|_)layers_(\d+)(?:_|$)")
 TOPK_LOG_RE = re.compile(
     r"\[DSA-TOPK\]\s+layer=(?P<layer>\S+)\s+row=(?P<row>\d+)\s+"
     r"req=(?P<req>\S+)\s+n_valid=(?P<n_valid>\d+)\s+"
@@ -52,6 +59,22 @@ class UnionTopK:
     layer_index: int
     row_count: int
     positions: frozenset[int]
+    seq_len: int | None = None
+
+
+@dataclass(frozen=True)
+class TensorTopK:
+    path: Path
+    request_id: str
+    step: int
+    seq_len: int
+    layer_name: str
+    layer_index: int
+    tp_rank: int
+    global_rank: int
+    row_count: int
+    topk: int
+    positions: tuple[tuple[int, ...], ...]
 
 
 def _fail(message: str, *, line_number: int | None = None) -> LogFormatError:
@@ -340,7 +363,11 @@ def infer_base_seq_lengths(records: Sequence[UnionTopK]) -> dict[str, int]:
                 f"request {item.request_id}, step {item.step}, layer "
                 f"{item.layer_index} has an empty union top-k"
             )
-        required = max(item.positions) - item.step + 1
+        required = (
+            item.seq_len - item.step
+            if item.seq_len is not None
+            else max(item.positions) - item.step + 1
+        )
         bases[item.request_id] = max(bases.get(item.request_id, 0), required)
     return bases
 
@@ -615,63 +642,137 @@ def _load_single_log(
     return rows, records, used_ranks
 
 
+def _request_id(input_dir: Path, path: Path) -> str:
+    relative_parent = path.parent.relative_to(input_dir)
+    return (
+        input_dir.name if relative_parent == Path(".") else relative_parent.as_posix()
+    )
+
+
+def parse_topk_tensor(
+    path: Path,
+    *,
+    input_dir: Path,
+    topk: int,
+    num_layers: int,
+) -> TensorTopK | None:
+    """Load one rank-0 top-k dump; return None for other TP ranks."""
+
+    match = TOPK_FILE_RE.fullmatch(path.name)
+    if match is None:
+        raise LogFormatError(f"malformed DSA top-k filename: {path.name}")
+    tp_rank = int(match["tp"])
+    if tp_rank != 0:
+        return None
+
+    layer_name = match["layer"]
+    layer_match = TENSOR_LAYER_INDEX_RE.search(layer_name)
+    if layer_match is None:
+        raise LogFormatError(f"cannot extract layer index from {layer_name!r}")
+    layer_index = int(layer_match.group(1))
+    if not 0 <= layer_index < num_layers:
+        raise LogFormatError(
+            f"layer index {layer_index} is outside [0, {num_layers}): {path}"
+        )
+
+    rows = int(match["rows"])
+    file_topk = int(match["k"])
+    if file_topk != topk:
+        raise LogFormatError(
+            f"{path} has k={file_topk}, expected configured topk={topk}"
+        )
+    try:
+        import torch
+    except ImportError as error:
+        raise RuntimeError("reading DSA top-k dumps requires PyTorch") from error
+    tensor = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(tensor, torch.Tensor):
+        raise LogFormatError(f"{path} does not contain a torch.Tensor")
+    if tensor.ndim != 2 or tuple(tensor.shape) != (rows, file_topk):
+        raise LogFormatError(
+            f"{path} has tensor shape {tuple(tensor.shape)}, "
+            f"expected ({rows}, {file_topk})"
+        )
+    if tensor.is_floating_point() or tensor.is_complex():
+        raise LogFormatError(f"{path} top-k indices must use an integer dtype")
+    if torch.any(tensor < 0):
+        raise LogFormatError(f"{path} contains a negative top-k position")
+
+    return TensorTopK(
+        path=path,
+        request_id=_request_id(input_dir, path),
+        step=int(match["step"]),
+        seq_len=int(match["seq_len"]),
+        layer_name=layer_name,
+        layer_index=layer_index,
+        tp_rank=tp_rank,
+        global_rank=int(match["global_rank"]),
+        row_count=rows,
+        topk=file_topk,
+        positions=tuple(tuple(int(value) for value in row) for row in tensor.tolist()),
+    )
+
+
 def load_input_directory(
     input_dir: Path,
     *,
     tp_rank: int | None,
     topk: int,
     num_layers: int,
-) -> tuple[list[LogRow], list[UnionTopK]]:
+) -> tuple[list[TensorTopK], list[UnionTopK]]:
     if not input_dir.is_dir():
         raise ValueError(f"input must be a directory: {input_dir}")
-    log_paths = sorted(input_dir.glob("*.txt"))
-    if not log_paths:
-        raise ValueError(f"input directory contains no .txt files: {input_dir}")
+    if tp_rank not in (None, 0):
+        raise ValueError("tensor dumps are analyzed from TP rank 0 only")
+    paths = sorted(input_dir.rglob("dsa_topk__*.pt"))
+    if not paths:
+        raise ValueError(
+            f"input directory contains no DSA top-k .pt files: {input_dir}"
+        )
 
-    all_rows: list[LogRow] = []
-    all_records: list[UnionTopK] = []
-    request_sources: dict[str, Path] = {}
-    skipped: list[tuple[Path, str]] = []
-    for log_path in log_paths:
-        try:
-            rows, records, used_ranks = _load_single_log(
-                log_path,
-                tp_rank=tp_rank,
+    tensors = [
+        parsed
+        for path in paths
+        if (
+            parsed := parse_topk_tensor(
+                path,
+                input_dir=input_dir,
                 topk=topk,
                 num_layers=num_layers,
             )
-            request_ids = {item.request_id for item in records}
-            if len(request_ids) != 1:
-                raise LogFormatError(
-                    f"{log_path} contains {len(request_ids)} real requests "
-                    f"{sorted(request_ids)}; each input file must contain "
-                    "exactly one"
-                )
-            request_id = next(iter(request_ids))
-            if request_id in request_sources:
-                raise LogFormatError(
-                    f"request {request_id!r} appears in both "
-                    f"{request_sources[request_id]} and {log_path}"
-                )
-        except (LogFormatError, ValueError) as error:
-            reason = str(error).splitlines()[0]
-            skipped.append((log_path, reason))
-            print(f"SKIP {log_path}: {reason}")
-            continue
-
-        rank_text = ", ".join(f"TP{rank}" for rank in sorted(used_ranks))
-        print(f"Assembled {log_path} from {rank_text}")
-        request_sources[request_id] = log_path
-        all_rows.extend(rows)
-        all_records.extend(records)
-    if not all_records:
-        summary = "\n".join(f"  {path}: {reason}" for path, reason in skipped)
-        raise LogFormatError(
-            "all input log files failed strict reconstruction:\n" + summary
         )
-    if skipped:
-        print(f"Skipped {len(skipped)} of {len(log_paths)} input log files")
-    return all_rows, all_records
+        is not None
+    ]
+    if not tensors:
+        raise LogFormatError(f"{input_dir} contains no TP rank 0 DSA top-k tensors")
+
+    seen: set[tuple[str, int, int]] = set()
+    records: list[UnionTopK] = []
+    for item in sorted(
+        tensors, key=lambda item: (item.request_id, item.step, item.layer_index)
+    ):
+        key = (item.request_id, item.step, item.layer_index)
+        if key in seen:
+            raise LogFormatError(
+                "duplicate TP0 tensor for "
+                f"request={item.request_id!r}, step={item.step}, "
+                f"layer={item.layer_index}"
+            )
+        seen.add(key)
+        records.append(
+            UnionTopK(
+                request_id=item.request_id,
+                step=item.step,
+                layer_name=item.layer_name,
+                layer_index=item.layer_index,
+                row_count=item.row_count,
+                positions=frozenset(
+                    position for row in item.positions for position in row
+                ),
+                seq_len=item.seq_len,
+            )
+        )
+    return tensors, records
 
 
 def analyze(args: argparse.Namespace) -> None:
@@ -849,11 +950,8 @@ def analyze(args: argparse.Namespace) -> None:
         writer.writerow(["request_id", "inferred_base_seq_len"])
         writer.writerows(sorted(bases.items()))
 
-    rank_mode = (
-        "automatic per-file ranks" if args.tp_rank is None else f"TP{args.tp_rank}"
-    )
-    print(f"Parsed {len(rows)} rows using {rank_mode}")
-    print(f"Reconstructed {len(records)} request/step/layer union top-k records")
+    print(f"Loaded {len(rows)} TP0 top-k tensors")
+    print(f"Built {len(records)} request/step/layer union top-k records")
     for request_id, base in sorted(bases.items()):
         print(f"inferred base_seq_len[{request_id}]={base}")
     print(f"Wrote results to {args.output_dir}")
@@ -878,7 +976,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "input_dir",
         type=Path,
-        help="directory containing one request log per .txt file",
+        help="directory containing dsa_topk__*.pt tensor dumps",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("dsa_topk_stats"))
     parser.add_argument(
@@ -898,10 +996,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, default=256)
     parser.add_argument(
         "--tp-rank",
-        default=None,
+        default=0,
         type=_parse_tp_rank,
         metavar="auto|N",
-        help="TP rank to use, or auto to select the first clean rank (default)",
+        help="TP rank to use; tensor dumps currently support rank 0 only",
     )
     return parser
 
