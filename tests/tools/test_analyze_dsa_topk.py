@@ -181,3 +181,21 @@ def test_auto_rank_merges_partial_clean_layers_across_ranks(tmp_path):
     assert len(rows) == 2
     assert len(records) == 2
     assert [item.layer_index for item in records] == [0, 1]
+
+
+def test_skips_incomplete_file_and_keeps_valid_file(tmp_path, capsys):
+    bad = tmp_path / "01.txt"
+    good = tmp_path / "02.txt"
+    bad.write_text(
+        _line(0, 0, 0, "req-bad", [1, 2]),
+        encoding="utf-8",
+    )
+    _write_log(good)
+
+    rows, records = load_input_directory(tmp_path, tp_rank=0, topk=2, num_layers=2)
+
+    assert len(rows) == 12
+    assert {item.request_id for item in records} == {"req-a"}
+    output = capsys.readouterr().out
+    assert f"SKIP {bad}:" in output
+    assert "Skipped 1 of 2 input log files" in output

@@ -563,6 +563,58 @@ def _merge_partial_rank_rows(
     return ordered_rows, used_ranks
 
 
+def _load_single_log(
+    log_path: Path,
+    *,
+    tp_rank: int | None,
+    topk: int,
+    num_layers: int,
+) -> tuple[list[LogRow], list[UnionTopK], set[int]]:
+    if tp_rank is None:
+        ranks_in_file: set[int] = set()
+        with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                ranks_in_file.update(int(value) for value in TP_RANK_RE.findall(line))
+        candidate_ranks = sorted(ranks_in_file)
+        if not candidate_ranks:
+            raise LogFormatError(f"{log_path} contains no Worker_TP rank prefixes")
+    else:
+        candidate_ranks = [tp_rank]
+
+    if tp_rank is not None:
+        rows = parse_log_rows(
+            log_path,
+            tp_rank=tp_rank,
+            topk=topk,
+            num_layers=num_layers,
+        )
+        records = reconstruct_union_topk(rows, num_layers=num_layers)
+        return rows, records, {tp_rank}
+
+    rows_by_rank: dict[int, list[LogRow]] = {}
+    failures: list[tuple[int, Exception]] = []
+    for candidate_rank in candidate_ranks:
+        try:
+            rows_by_rank[candidate_rank] = parse_log_rows(
+                log_path,
+                tp_rank=candidate_rank,
+                topk=topk,
+                num_layers=num_layers,
+            )
+        except (LogFormatError, ValueError) as error:
+            failures.append((candidate_rank, error))
+    if not rows_by_rank:
+        summary = "\n".join(
+            f"  TP{rank}: {str(error).splitlines()[0]}" for rank, error in failures
+        )
+        raise LogFormatError(
+            f"{log_path}: no TP rank produced clean records:\n{summary}"
+        )
+    rows, used_ranks = _merge_partial_rank_rows(rows_by_rank)
+    records = reconstruct_union_topk(rows, num_layers=num_layers)
+    return rows, records, used_ranks
+
+
 def load_input_directory(
     input_dir: Path,
     *,
@@ -579,71 +631,46 @@ def load_input_directory(
     all_rows: list[LogRow] = []
     all_records: list[UnionTopK] = []
     request_sources: dict[str, Path] = {}
+    skipped: list[tuple[Path, str]] = []
     for log_path in log_paths:
-        if tp_rank is None:
-            ranks_in_file: set[int] = set()
-            with log_path.open("r", encoding="utf-8", errors="replace") as stream:
-                for line in stream:
-                    ranks_in_file.update(
-                        int(value) for value in TP_RANK_RE.findall(line)
-                    )
-            candidate_ranks = sorted(ranks_in_file)
-            if not candidate_ranks:
-                raise LogFormatError(f"{log_path} contains no Worker_TP rank prefixes")
-        else:
-            candidate_ranks = [tp_rank]
-
-        if tp_rank is not None:
-            rows = parse_log_rows(
+        try:
+            rows, records, used_ranks = _load_single_log(
                 log_path,
                 tp_rank=tp_rank,
                 topk=topk,
                 num_layers=num_layers,
             )
-            records = reconstruct_union_topk(rows, num_layers=num_layers)
-            used_ranks = {tp_rank}
-        else:
-            rows_by_rank: dict[int, list[LogRow]] = {}
-            failures: list[tuple[int, Exception]] = []
-            for candidate_rank in candidate_ranks:
-                try:
-                    rows_by_rank[candidate_rank] = parse_log_rows(
-                        log_path,
-                        tp_rank=candidate_rank,
-                        topk=topk,
-                        num_layers=num_layers,
-                    )
-                except (LogFormatError, ValueError) as error:
-                    failures.append((candidate_rank, error))
-            if not rows_by_rank:
-                summary = "\n".join(
-                    f"  TP{rank}: {str(error).splitlines()[0]}"
-                    for rank, error in failures
-                )
+            request_ids = {item.request_id for item in records}
+            if len(request_ids) != 1:
                 raise LogFormatError(
-                    f"{log_path}: no TP rank produced clean records:\n{summary}"
+                    f"{log_path} contains {len(request_ids)} real requests "
+                    f"{sorted(request_ids)}; each input file must contain "
+                    "exactly one"
                 )
-            rows, used_ranks = _merge_partial_rank_rows(rows_by_rank)
-            records = reconstruct_union_topk(rows, num_layers=num_layers)
+            request_id = next(iter(request_ids))
+            if request_id in request_sources:
+                raise LogFormatError(
+                    f"request {request_id!r} appears in both "
+                    f"{request_sources[request_id]} and {log_path}"
+                )
+        except (LogFormatError, ValueError) as error:
+            reason = str(error).splitlines()[0]
+            skipped.append((log_path, reason))
+            print(f"SKIP {log_path}: {reason}")
+            continue
 
-        request_ids = {item.request_id for item in records}
-        if len(request_ids) != 1:
-            raise LogFormatError(
-                f"{log_path} contains {len(request_ids)} real requests "
-                f"{sorted(request_ids)}; each input file must contain "
-                "exactly one"
-            )
         rank_text = ", ".join(f"TP{rank}" for rank in sorted(used_ranks))
         print(f"Assembled {log_path} from {rank_text}")
-        request_id = next(iter(request_ids))
-        if request_id in request_sources:
-            raise LogFormatError(
-                f"request {request_id!r} appears in both "
-                f"{request_sources[request_id]} and {log_path}"
-            )
         request_sources[request_id] = log_path
         all_rows.extend(rows)
         all_records.extend(records)
+    if not all_records:
+        summary = "\n".join(f"  {path}: {reason}" for path, reason in skipped)
+        raise LogFormatError(
+            "all input log files failed strict reconstruction:\n" + summary
+        )
+    if skipped:
+        print(f"Skipped {len(skipped)} of {len(log_paths)} input log files")
     return all_rows, all_records
 
 
