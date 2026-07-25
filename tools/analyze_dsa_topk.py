@@ -24,6 +24,10 @@ TP_RANK_RE = re.compile(r"Worker_TP(\d+)")
 class LogFormatError(RuntimeError):
     """Raised when strict reconstruction finds an inconsistent log."""
 
+    def __init__(self, message: str, *, line_number: int | None = None):
+        super().__init__(message)
+        self.line_number = line_number
+
 
 @dataclass(frozen=True)
 class LogRow:
@@ -48,10 +52,10 @@ class UnionTopK:
 
 def _fail(message: str, *, line_number: int | None = None) -> LogFormatError:
     prefix = f"line {line_number}: " if line_number is not None else ""
-    return LogFormatError(prefix + message)
+    return LogFormatError(prefix + message, line_number=line_number)
 
 
-def parse_log_rows(
+def _parse_log_rows(
     log_path: Path,
     *,
     tp_rank: int,
@@ -126,6 +130,48 @@ def parse_log_rows(
     if not rows:
         raise _fail(f"no [DSA-TOPK] records for Worker_TP{tp_rank} in {log_path}")
     return rows
+
+
+def _format_log_context(log_path: Path, line_number: int) -> str:
+    context: list[tuple[int, str]] = []
+    first_line = max(1, line_number - 1)
+    last_line = line_number + 1
+    with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+        for current_line, text in enumerate(stream, 1):
+            if current_line < first_line:
+                continue
+            if current_line > last_line:
+                break
+            context.append((current_line, text.rstrip("\r\n")))
+    rendered = [f"log context: {log_path}"]
+    for current_line, text in context:
+        marker = ">" if current_line == line_number else " "
+        rendered.append(f"{marker} {current_line}: {text}")
+    return "\n".join(rendered)
+
+
+def parse_log_rows(
+    log_path: Path,
+    *,
+    tp_rank: int,
+    topk: int,
+    num_layers: int,
+) -> list[LogRow]:
+    try:
+        return _parse_log_rows(
+            log_path,
+            tp_rank=tp_rank,
+            topk=topk,
+            num_layers=num_layers,
+        )
+    except LogFormatError as error:
+        if error.line_number is None:
+            raise
+        context = _format_log_context(log_path, error.line_number)
+        raise LogFormatError(
+            f"{error}\n{context}",
+            line_number=error.line_number,
+        ) from error
 
 
 def reconstruct_union_topk(

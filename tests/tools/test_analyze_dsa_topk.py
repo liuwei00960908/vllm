@@ -71,6 +71,28 @@ def test_non_topk_named_row_is_fatal(tmp_path):
         parse_log_rows(log, tp_rank=0, topk=2, num_layers=1)
 
 
+def test_parse_error_prints_previous_current_and_next_lines(tmp_path):
+    log = tmp_path / "log.txt"
+    log.write_text(
+        "before context\n"
+        "(Worker_TP0 pid=1) INFO [sfa_v1.py:1] [DSA-TOPK] "
+        "layer=model.layers.0.self_attn.attn row=0 req=req-a "
+        "n_valid=2 pos_head=[1, broken]\n"
+        "after context\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LogFormatError) as caught:
+        parse_log_rows(log, tp_rank=0, topk=2, num_layers=1)
+
+    message = str(caught.value)
+    assert f"log context: {log}" in message
+    assert "  1: before context" in message
+    assert "> 2:" in message
+    assert "broken" in message
+    assert "  3: after context" in message
+
+
 def test_loads_one_request_per_text_file(tmp_path):
     first = tmp_path / "01.txt"
     second = tmp_path / "02.txt"
