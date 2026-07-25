@@ -105,7 +105,7 @@ def test_accepts_singleton_dimension_between_rows_and_topk(tmp_path):
     assert item.positions == ((1, 2), (2, 3))
 
 
-def test_accepts_mtp_layer_beyond_configured_main_layers(tmp_path):
+def test_ignores_mtp_layer_beyond_configured_main_layers(tmp_path):
     path = _dump(
         tmp_path,
         layer=78,
@@ -116,8 +116,7 @@ def test_accepts_mtp_layer_beyond_configured_main_layers(tmp_path):
 
     item = parse_topk_tensor(path, input_dir=tmp_path, topk=2, num_layers=78)
 
-    assert item is not None
-    assert item.layer_index == 78
+    assert item is None
 
 
 def test_uses_relative_parent_as_request_id(tmp_path):

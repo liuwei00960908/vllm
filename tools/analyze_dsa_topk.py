@@ -670,6 +670,8 @@ def parse_topk_tensor(
     if layer_match is None:
         raise LogFormatError(f"cannot extract layer index from {layer_name!r}")
     layer_index = int(layer_match.group(1))
+    if layer_index >= num_layers:
+        return None
 
     rows = int(match["rows"])
     file_topk = int(match["k"])
