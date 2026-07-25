@@ -74,70 +74,99 @@ def _parse_log_rows(
             ranks = [int(value) for value in TP_RANK_RE.findall(line)]
             if not ranks or ranks[0] != tp_rank:
                 continue
-            header = TOPK_HEADER_RE.search(line)
-            if header is None:
+            headers = list(TOPK_HEADER_RE.finditer(line))
+            if not headers:
                 raise _fail(
                     "malformed [DSA-TOPK] header",
                     line_number=line_number,
                 )
-            if header["req"] == "?":
-                continue
-            match = TOPK_LOG_RE.search(line)
-            if match is None:
-                raise _fail("malformed [DSA-TOPK] record", line_number=line_number)
-            layer_match = LAYER_INDEX_RE.search(match["layer"])
-            if layer_match is None:
-                raise _fail(
-                    f"cannot extract layer index from {match['layer']!r}",
-                    line_number=line_number,
+            grouped_headers: dict[tuple[str, int, str, int], list] = {}
+            for header in headers:
+                if header["req"] == "?":
+                    continue
+                key = (
+                    header["layer"],
+                    int(header["row"]),
+                    header["req"],
+                    int(header["n_valid"]),
                 )
-            layer_index = int(layer_match.group(1))
-            if not 0 <= layer_index < num_layers:
-                raise _fail(
-                    f"layer index {layer_index} is outside [0, {num_layers})",
-                    line_number=line_number,
+                grouped_headers.setdefault(key, []).append(header)
+
+            for key, copies in grouped_headers.items():
+                layer_name, row, request_id, n_valid = key
+                if n_valid != topk:
+                    raise _fail(
+                        f"request {request_id!r} has n_valid={n_valid}, "
+                        f"expected configured topk={topk}",
+                        line_number=line_number,
+                    )
+                layer_match = LAYER_INDEX_RE.search(layer_name)
+                if layer_match is None:
+                    raise _fail(
+                        f"cannot extract layer index from {layer_name!r}",
+                        line_number=line_number,
+                    )
+                layer_index = int(layer_match.group(1))
+                if not 0 <= layer_index < num_layers:
+                    raise _fail(
+                        f"layer index {layer_index} is outside [0, {num_layers})",
+                        line_number=line_number,
+                    )
+
+                valid_positions: set[tuple[int, ...]] = set()
+                errors: list[str] = []
+                for header in copies:
+                    match = TOPK_LOG_RE.match(line, header.start())
+                    if match is None:
+                        errors.append("record has no closing pos_head bracket")
+                        continue
+                    positions_text = match["positions"].strip()
+                    try:
+                        positions = (
+                            tuple(
+                                int(value.strip())
+                                for value in positions_text.split(",")
+                            )
+                            if positions_text
+                            else ()
+                        )
+                    except ValueError as error:
+                        errors.append(f"invalid integer: {error}")
+                        continue
+                    if len(positions) != n_valid:
+                        errors.append(
+                            f"contains {len(positions)} values, expected {n_valid}"
+                        )
+                        continue
+                    if any(position < 0 for position in positions):
+                        errors.append("contains a negative top-k position")
+                        continue
+                    valid_positions.add(positions)
+
+                if not valid_positions:
+                    details = "; ".join(errors)
+                    raise _fail(
+                        f"request {request_id!r}, layer {layer_index}, "
+                        f"row {row} has no complete copy: {details}",
+                        line_number=line_number,
+                    )
+                if len(valid_positions) != 1:
+                    raise _fail(
+                        f"request {request_id!r}, layer {layer_index}, "
+                        f"row {row} has conflicting complete copies",
+                        line_number=line_number,
+                    )
+                rows.append(
+                    LogRow(
+                        line_number=line_number,
+                        layer_name=layer_name,
+                        layer_index=layer_index,
+                        row=row,
+                        request_id=request_id,
+                        n_valid=n_valid,
+                        positions=valid_positions.pop(),
+                    )
                 )
-            positions_text = match["positions"].strip()
-            try:
-                positions = (
-                    tuple(int(value.strip()) for value in positions_text.split(","))
-                    if positions_text
-                    else ()
-                )
-            except ValueError as error:
-                raise _fail(
-                    f"invalid integer in pos_head: {error}", line_number=line_number
-                ) from error
-            n_valid = int(match["n_valid"])
-            request_id = match["req"]
-            if n_valid != topk:
-                raise _fail(
-                    f"request {request_id!r} has n_valid={n_valid}, "
-                    f"expected configured topk={topk}",
-                    line_number=line_number,
-                )
-            if len(positions) != n_valid:
-                raise _fail(
-                    f"request {request_id!r} declares n_valid={n_valid}, but "
-                    f"pos_head contains {len(positions)} values",
-                    line_number=line_number,
-                )
-            if any(position < 0 for position in positions):
-                raise _fail(
-                    f"request {request_id!r} contains a negative top-k position",
-                    line_number=line_number,
-                )
-            rows.append(
-                LogRow(
-                    line_number=line_number,
-                    layer_name=match["layer"],
-                    layer_index=layer_index,
-                    row=int(match["row"]),
-                    request_id=request_id,
-                    n_valid=n_valid,
-                    positions=positions,
-                )
-            )
     if not rows:
         raise _fail(f"no [DSA-TOPK] records for Worker_TP{tp_rank} in {log_path}")
     return rows

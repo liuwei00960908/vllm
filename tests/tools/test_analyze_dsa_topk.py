@@ -110,6 +110,32 @@ def test_ignores_graph_padding_before_parsing_positions(tmp_path):
     assert rows[0].positions == (1, 2)
 
 
+def test_uses_complete_duplicate_when_same_key_copy_is_corrupted(tmp_path):
+    log = tmp_path / "log.txt"
+    complete = _line(2, 0, 0, "req-a", [1, 2]).rstrip()
+    log.write_text(
+        "(Worker_TP0 pid=1) INFO [sfa_v1.py:1] [DSA-TOPK] "
+        "layer=model.layers.0.self_attn.attn row=0 req=req-a "
+        "n_valid=2 pos_head=[1, broken " + complete + "\n",
+        encoding="utf-8",
+    )
+
+    rows = parse_log_rows(log, tp_rank=0, topk=2, num_layers=1)
+
+    assert len(rows) == 1
+    assert rows[0].positions == (1, 2)
+
+
+def test_rejects_conflicting_complete_copies(tmp_path):
+    log = tmp_path / "log.txt"
+    first = _line(0, 0, 0, "req-a", [1, 2]).rstrip()
+    second = _line(2, 0, 0, "req-a", [2, 3])
+    log.write_text(first + second, encoding="utf-8")
+
+    with pytest.raises(LogFormatError, match="conflicting complete copies"):
+        parse_log_rows(log, tp_rank=0, topk=2, num_layers=1)
+
+
 def test_loads_one_request_per_text_file(tmp_path):
     first = tmp_path / "01.txt"
     second = tmp_path / "02.txt"
