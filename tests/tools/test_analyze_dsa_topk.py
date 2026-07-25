@@ -93,6 +93,23 @@ def test_parse_error_prints_previous_current_and_next_lines(tmp_path):
     assert "  3: after context" in message
 
 
+def test_ignores_graph_padding_before_parsing_positions(tmp_path):
+    log = tmp_path / "log.txt"
+    log.write_text(
+        _line(0, 0, 0, "req-a", [1, 2])
+        + "(Worker_TP0 pid=1) INFO [sfa_v1.py:1] [DSA-TOPK] "
+        "layer=model.layers.0.self_attn.attn row=1 req=? "
+        "n_valid=1026 pos_head=[garbage INFO [another log without closure\n",
+        encoding="utf-8",
+    )
+
+    rows = parse_log_rows(log, tp_rank=0, topk=2, num_layers=1)
+
+    assert len(rows) == 1
+    assert rows[0].request_id == "req-a"
+    assert rows[0].positions == (1, 2)
+
+
 def test_loads_one_request_per_text_file(tmp_path):
     first = tmp_path / "01.txt"
     second = tmp_path / "02.txt"
@@ -104,7 +121,7 @@ def test_loads_one_request_per_text_file(tmp_path):
 
     rows, records = load_input_directory(tmp_path, tp_rank=0, topk=2, num_layers=2)
 
-    assert len(rows) == 36
+    assert len(rows) == 24
     assert {item.request_id for item in records} == {"req-a", "req-b"}
     assert max(item.step for item in records) == 2
 

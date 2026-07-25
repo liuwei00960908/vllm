@@ -17,6 +17,10 @@ TOPK_LOG_RE = re.compile(
     r"req=(?P<req>\S+)\s+n_valid=(?P<n_valid>\d+)\s+"
     r"pos_head=\[(?P<positions>[^\]]*)\]"
 )
+TOPK_HEADER_RE = re.compile(
+    r"\[DSA-TOPK\]\s+layer=(?P<layer>\S+)\s+row=(?P<row>\d+)\s+"
+    r"req=(?P<req>\S+)\s+n_valid=(?P<n_valid>\d+)\s+pos_head=\["
+)
 LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 TP_RANK_RE = re.compile(r"Worker_TP(\d+)")
 
@@ -70,6 +74,14 @@ def _parse_log_rows(
             ranks = [int(value) for value in TP_RANK_RE.findall(line)]
             if not ranks or ranks[0] != tp_rank:
                 continue
+            header = TOPK_HEADER_RE.search(line)
+            if header is None:
+                raise _fail(
+                    "malformed [DSA-TOPK] header",
+                    line_number=line_number,
+                )
+            if header["req"] == "?":
+                continue
             match = TOPK_LOG_RE.search(line)
             if match is None:
                 raise _fail("malformed [DSA-TOPK] record", line_number=line_number)
@@ -98,24 +110,23 @@ def _parse_log_rows(
                 ) from error
             n_valid = int(match["n_valid"])
             request_id = match["req"]
-            if request_id != "?":
-                if n_valid != topk:
-                    raise _fail(
-                        f"request {request_id!r} has n_valid={n_valid}, "
-                        f"expected configured topk={topk}",
-                        line_number=line_number,
-                    )
-                if len(positions) != n_valid:
-                    raise _fail(
-                        f"request {request_id!r} declares n_valid={n_valid}, but "
-                        f"pos_head contains {len(positions)} values",
-                        line_number=line_number,
-                    )
-                if any(position < 0 for position in positions):
-                    raise _fail(
-                        f"request {request_id!r} contains a negative top-k position",
-                        line_number=line_number,
-                    )
+            if n_valid != topk:
+                raise _fail(
+                    f"request {request_id!r} has n_valid={n_valid}, "
+                    f"expected configured topk={topk}",
+                    line_number=line_number,
+                )
+            if len(positions) != n_valid:
+                raise _fail(
+                    f"request {request_id!r} declares n_valid={n_valid}, but "
+                    f"pos_head contains {len(positions)} values",
+                    line_number=line_number,
+                )
+            if any(position < 0 for position in positions):
+                raise _fail(
+                    f"request {request_id!r} contains a negative top-k position",
+                    line_number=line_number,
+                )
             rows.append(
                 LogRow(
                     line_number=line_number,
