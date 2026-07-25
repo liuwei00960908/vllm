@@ -74,12 +74,16 @@ def _parse_log_rows(
             ranks = [int(value) for value in TP_RANK_RE.findall(line)]
             if not ranks or ranks[0] != tp_rank:
                 continue
+            if len(set(ranks)) > 1:
+                continue
             headers = list(TOPK_HEADER_RE.finditer(line))
             if not headers:
                 raise _fail(
                     "malformed [DSA-TOPK] header",
                     line_number=line_number,
                 )
+            if len(headers) > 1:
+                continue
             if headers[0]["req"] == "?":
                 continue
             grouped_headers: dict[tuple[str, int, str, int], list] = {}
@@ -525,7 +529,7 @@ def _write_summary_csv(
 def load_input_directory(
     input_dir: Path,
     *,
-    tp_rank: int,
+    tp_rank: int | None,
     topk: int,
     num_layers: int,
 ) -> tuple[list[LogRow], list[UnionTopK]]:
@@ -539,19 +543,66 @@ def load_input_directory(
     all_records: list[UnionTopK] = []
     request_sources: dict[str, Path] = {}
     for log_path in log_paths:
-        rows = parse_log_rows(
-            log_path,
-            tp_rank=tp_rank,
-            topk=topk,
-            num_layers=num_layers,
-        )
-        records = reconstruct_union_topk(rows, num_layers=num_layers)
-        request_ids = {item.request_id for item in records}
-        if len(request_ids) != 1:
-            raise LogFormatError(
-                f"{log_path} contains {len(request_ids)} real requests "
-                f"{sorted(request_ids)}; each input file must contain exactly one"
+        if tp_rank is None:
+            ranks_in_file: set[int] = set()
+            with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    ranks_in_file.update(
+                        int(value) for value in TP_RANK_RE.findall(line)
+                    )
+            candidate_ranks = sorted(ranks_in_file)
+            if not candidate_ranks:
+                raise LogFormatError(f"{log_path} contains no Worker_TP rank prefixes")
+        else:
+            candidate_ranks = [tp_rank]
+
+        failures: list[tuple[int, Exception]] = []
+        selected = None
+        for candidate_rank in candidate_ranks:
+            try:
+                candidate_rows = parse_log_rows(
+                    log_path,
+                    tp_rank=candidate_rank,
+                    topk=topk,
+                    num_layers=num_layers,
+                )
+                candidate_records = reconstruct_union_topk(
+                    candidate_rows, num_layers=num_layers
+                )
+                candidate_request_ids = {item.request_id for item in candidate_records}
+                if len(candidate_request_ids) != 1:
+                    raise LogFormatError(
+                        f"{log_path} contains "
+                        f"{len(candidate_request_ids)} real requests "
+                        f"{sorted(candidate_request_ids)} for TP"
+                        f"{candidate_rank}; each input file must contain "
+                        "exactly one"
+                    )
+            except (LogFormatError, ValueError) as error:
+                failures.append((candidate_rank, error))
+                if tp_rank is not None:
+                    raise
+                continue
+            selected = (
+                candidate_rank,
+                candidate_rows,
+                candidate_records,
+                candidate_request_ids,
             )
+            break
+
+        if selected is None:
+            summary = "\n".join(
+                f"  TP{rank}: {str(error).splitlines()[0]}" for rank, error in failures
+            )
+            last_error = failures[-1][1]
+            raise LogFormatError(
+                f"{log_path}: every TP rank failed strict reconstruction:\n"
+                f"{summary}\nlast failure details:\n{last_error}"
+            ) from last_error
+
+        selected_rank, rows, records, request_ids = selected
+        print(f"Selected Worker_TP{selected_rank} for {log_path}")
         request_id = next(iter(request_ids))
         if request_id in request_sources:
             raise LogFormatError(
@@ -739,11 +790,28 @@ def analyze(args: argparse.Namespace) -> None:
         writer.writerow(["request_id", "inferred_base_seq_len"])
         writer.writerows(sorted(bases.items()))
 
-    print(f"Parsed {len(rows)} TP{args.tp_rank} rows")
+    rank_mode = (
+        "automatic per-file ranks" if args.tp_rank is None else f"TP{args.tp_rank}"
+    )
+    print(f"Parsed {len(rows)} rows using {rank_mode}")
     print(f"Reconstructed {len(records)} request/step/layer union top-k records")
     for request_id, base in sorted(bases.items()):
         print(f"inferred base_seq_len[{request_id}]={base}")
     print(f"Wrote results to {args.output_dir}")
+
+
+def _parse_tp_rank(value: str) -> int | None:
+    if value.lower() == "auto":
+        return None
+    try:
+        rank = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "TP rank must be 'auto' or a non-negative integer"
+        ) from error
+    if rank < 0:
+        raise argparse.ArgumentTypeError("TP rank must be non-negative")
+    return rank
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -769,7 +837,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-layers", type=int, default=78)
     parser.add_argument("--topk", type=int, default=2048)
     parser.add_argument("--chunk-size", type=int, default=256)
-    parser.add_argument("--tp-rank", type=int, default=0)
+    parser.add_argument(
+        "--tp-rank",
+        default=None,
+        type=_parse_tp_rank,
+        metavar="auto|N",
+        help="TP rank to use, or auto to select the first clean rank (default)",
+    )
     return parser
 
 

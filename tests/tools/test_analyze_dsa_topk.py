@@ -128,7 +128,7 @@ def test_ignores_real_rank_copy_embedded_in_padding_line(tmp_path):
     assert rows[0].positions == (1, 2)
 
 
-def test_uses_complete_duplicate_when_same_key_copy_is_corrupted(tmp_path):
+def test_rejects_rank_with_interleaved_worker_copy(tmp_path):
     log = tmp_path / "log.txt"
     complete = _line(2, 0, 0, "req-a", [1, 2]).rstrip()
     log.write_text(
@@ -138,19 +138,7 @@ def test_uses_complete_duplicate_when_same_key_copy_is_corrupted(tmp_path):
         encoding="utf-8",
     )
 
-    rows = parse_log_rows(log, tp_rank=0, topk=2, num_layers=1)
-
-    assert len(rows) == 1
-    assert rows[0].positions == (1, 2)
-
-
-def test_rejects_conflicting_complete_copies(tmp_path):
-    log = tmp_path / "log.txt"
-    first = _line(0, 0, 0, "req-a", [1, 2]).rstrip()
-    second = _line(2, 0, 0, "req-a", [2, 3])
-    log.write_text(first + second, encoding="utf-8")
-
-    with pytest.raises(LogFormatError, match="conflicting complete copies"):
+    with pytest.raises(LogFormatError, match="no \\[DSA-TOPK\\] records"):
         parse_log_rows(log, tp_rank=0, topk=2, num_layers=1)
 
 
@@ -179,3 +167,23 @@ def test_rejects_multiple_requests_in_one_file(tmp_path):
 
     with pytest.raises(LogFormatError, match="exactly one"):
         load_input_directory(tmp_path, tp_rank=0, topk=2, num_layers=2)
+
+
+def test_auto_rank_falls_back_from_interleaved_tp0_to_clean_tp1(tmp_path):
+    log = tmp_path / "01.txt"
+    contaminated_tp0 = _line(0, 0, 0, "req-a", [1, 2]).replace(
+        "(Worker_TP0 pid=1)",
+        "(Worker_TP0 pid=1) (Worker_TP2 pid=2)",
+    )
+    log.write_text(
+        contaminated_tp0
+        + _line(1, 0, 0, "req-a", [1, 2])
+        + _line(1, 1, 0, "req-a", [2, 3]),
+        encoding="utf-8",
+    )
+
+    rows, records = load_input_directory(tmp_path, tp_rank=None, topk=2, num_layers=2)
+
+    assert len(rows) == 2
+    assert len(records) == 2
+    assert [item.layer_index for item in records] == [0, 1]
