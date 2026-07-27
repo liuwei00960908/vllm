@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconstruct and analyze per-step DSA top-k selections from vLLM logs."""
+"""Analyze per-step DSA top-k tensors dumped by vLLM."""
 
 from __future__ import annotations
 
@@ -12,10 +12,21 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+TOPK_FILE_RE = re.compile(
+    r"^dsa_topk__layer-(?P<layer>.+?)__tp-(?P<tp>\d+)"
+    r"__global-(?P<global_rank>\d+)__seq-(?P<seq_len>\d+)"
+    r"__step-(?P<step>\d+)__state-(?P<state>.+?)__pid-(?P<pid>\d+)"
+    r"__rows-(?P<rows>\d+)__k-(?P<k>\d+)\.pt$"
+)
+TENSOR_LAYER_INDEX_RE = re.compile(r"(?:^|_)layers_(\d+)(?:_|$)")
 TOPK_LOG_RE = re.compile(
     r"\[DSA-TOPK\]\s+layer=(?P<layer>\S+)\s+row=(?P<row>\d+)\s+"
     r"req=(?P<req>\S+)\s+n_valid=(?P<n_valid>\d+)\s+"
     r"pos_head=\[(?P<positions>[^\]]*)\]"
+)
+TOPK_HEADER_RE = re.compile(
+    r"\[DSA-TOPK\]\s+layer=(?P<layer>\S+)\s+row=(?P<row>\d+)\s+"
+    r"req=(?P<req>\S+)\s+n_valid=(?P<n_valid>\d+)\s+pos_head=\["
 )
 LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 TP_RANK_RE = re.compile(r"Worker_TP(\d+)")
@@ -48,6 +59,22 @@ class UnionTopK:
     layer_index: int
     row_count: int
     positions: frozenset[int]
+    seq_len: int | None = None
+
+
+@dataclass(frozen=True)
+class TensorTopK:
+    path: Path
+    request_id: str
+    step: int
+    seq_len: int
+    layer_name: str
+    layer_index: int
+    tp_rank: int
+    global_rank: int
+    row_count: int
+    topk: int
+    positions: tuple[tuple[int, ...], ...]
 
 
 def _fail(message: str, *, line_number: int | None = None) -> LogFormatError:
@@ -70,63 +97,105 @@ def _parse_log_rows(
             ranks = [int(value) for value in TP_RANK_RE.findall(line)]
             if not ranks or ranks[0] != tp_rank:
                 continue
-            match = TOPK_LOG_RE.search(line)
-            if match is None:
-                raise _fail("malformed [DSA-TOPK] record", line_number=line_number)
-            layer_match = LAYER_INDEX_RE.search(match["layer"])
-            if layer_match is None:
+            if len(set(ranks)) > 1:
+                continue
+            headers = list(TOPK_HEADER_RE.finditer(line))
+            if not headers:
                 raise _fail(
-                    f"cannot extract layer index from {match['layer']!r}",
+                    "malformed [DSA-TOPK] header",
                     line_number=line_number,
                 )
-            layer_index = int(layer_match.group(1))
-            if not 0 <= layer_index < num_layers:
-                raise _fail(
-                    f"layer index {layer_index} is outside [0, {num_layers})",
-                    line_number=line_number,
+            if len(headers) > 1:
+                continue
+            if headers[0]["req"] == "?":
+                continue
+            grouped_headers: dict[tuple[str, int, str, int], list] = {}
+            for header in headers:
+                if header["req"] == "?":
+                    continue
+                key = (
+                    header["layer"],
+                    int(header["row"]),
+                    header["req"],
+                    int(header["n_valid"]),
                 )
-            positions_text = match["positions"].strip()
-            try:
-                positions = (
-                    tuple(int(value.strip()) for value in positions_text.split(","))
-                    if positions_text
-                    else ()
-                )
-            except ValueError as error:
-                raise _fail(
-                    f"invalid integer in pos_head: {error}", line_number=line_number
-                ) from error
-            n_valid = int(match["n_valid"])
-            request_id = match["req"]
-            if request_id != "?":
+                grouped_headers.setdefault(key, []).append(header)
+
+            for key, copies in grouped_headers.items():
+                layer_name, row, request_id, n_valid = key
                 if n_valid != topk:
                     raise _fail(
                         f"request {request_id!r} has n_valid={n_valid}, "
                         f"expected configured topk={topk}",
                         line_number=line_number,
                     )
-                if len(positions) != n_valid:
+                layer_match = LAYER_INDEX_RE.search(layer_name)
+                if layer_match is None:
                     raise _fail(
-                        f"request {request_id!r} declares n_valid={n_valid}, but "
-                        f"pos_head contains {len(positions)} values",
+                        f"cannot extract layer index from {layer_name!r}",
                         line_number=line_number,
                     )
-                if any(position < 0 for position in positions):
+                layer_index = int(layer_match.group(1))
+                if not 0 <= layer_index < num_layers:
                     raise _fail(
-                        f"request {request_id!r} contains a negative top-k position",
+                        f"layer index {layer_index} is outside [0, {num_layers})",
                         line_number=line_number,
                     )
-            rows.append(
-                LogRow(
-                    line_number=line_number,
-                    layer_name=match["layer"],
-                    layer_index=layer_index,
-                    row=int(match["row"]),
-                    request_id=request_id,
-                    n_valid=n_valid,
-                    positions=positions,
+
+                valid_positions: set[tuple[int, ...]] = set()
+                errors: list[str] = []
+                for header in copies:
+                    match = TOPK_LOG_RE.match(line, header.start())
+                    if match is None:
+                        errors.append("record has no closing pos_head bracket")
+                        continue
+                    positions_text = match["positions"].strip()
+                    try:
+                        positions = (
+                            tuple(
+                                int(value.strip())
+                                for value in positions_text.split(",")
+                            )
+                            if positions_text
+                            else ()
+                        )
+                    except ValueError as error:
+                        errors.append(f"invalid integer: {error}")
+                        continue
+                    if len(positions) != n_valid:
+                        errors.append(
+                            f"contains {len(positions)} values, expected {n_valid}"
+                        )
+                        continue
+                    if any(position < 0 for position in positions):
+                        errors.append("contains a negative top-k position")
+                        continue
+                    valid_positions.add(positions)
+
+                if not valid_positions:
+                    details = "; ".join(errors)
+                    raise _fail(
+                        f"request {request_id!r}, layer {layer_index}, "
+                        f"row {row} has no complete copy: {details}",
+                        line_number=line_number,
+                    )
+                if len(valid_positions) != 1:
+                    raise _fail(
+                        f"request {request_id!r}, layer {layer_index}, "
+                        f"row {row} has conflicting complete copies",
+                        line_number=line_number,
+                    )
+                rows.append(
+                    LogRow(
+                        line_number=line_number,
+                        layer_name=layer_name,
+                        layer_index=layer_index,
+                        row=row,
+                        request_id=request_id,
+                        n_valid=n_valid,
+                        positions=valid_positions.pop(),
+                    )
                 )
-            )
     if not rows:
         raise _fail(f"no [DSA-TOPK] records for Worker_TP{tp_rank} in {log_path}")
     return rows
@@ -294,7 +363,11 @@ def infer_base_seq_lengths(records: Sequence[UnionTopK]) -> dict[str, int]:
                 f"request {item.request_id}, step {item.step}, layer "
                 f"{item.layer_index} has an empty union top-k"
             )
-        required = max(item.positions) - item.step + 1
+        required = (
+            item.seq_len - item.step
+            if item.seq_len is not None
+            else max(item.positions) - item.step + 1
+        )
         bases[item.request_id] = max(bases.get(item.request_id, 0), required)
     return bases
 
@@ -480,23 +553,62 @@ def _write_summary_csv(
         writer.writerows(rows)
 
 
-def load_input_directory(
-    input_dir: Path,
+def _merge_partial_rank_rows(
+    rows_by_rank: dict[int, list[LogRow]],
+) -> tuple[list[LogRow], set[int]]:
+    merged: dict[tuple[int, int, str, int], tuple[int, LogRow]] = {}
+    used_ranks: set[int] = set()
+    for rank, rank_rows in sorted(rows_by_rank.items()):
+        step = 0
+        previous_layer: int | None = None
+        for row in rank_rows:
+            if previous_layer is not None and row.layer_index < previous_layer:
+                step += 1
+            previous_layer = row.layer_index
+            key = (step, row.layer_index, row.request_id, row.row)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = (rank, row)
+                used_ranks.add(rank)
+                continue
+            existing_rank, existing_row = existing
+            if (
+                existing_row.layer_name != row.layer_name
+                or existing_row.n_valid != row.n_valid
+                or existing_row.positions != row.positions
+            ):
+                raise LogFormatError(
+                    "conflicting clean TP copies for "
+                    f"step={step}, layer={row.layer_index}, "
+                    f"request={row.request_id!r}, row={row.row}: "
+                    f"TP{existing_rank} line {existing_row.line_number} "
+                    f"differs from TP{rank} line {row.line_number}"
+                )
+    ordered_rows = [
+        item[1] for _, item in sorted(merged.items(), key=lambda pair: pair[0])
+    ]
+    return ordered_rows, used_ranks
+
+
+def _load_single_log(
+    log_path: Path,
     *,
-    tp_rank: int,
+    tp_rank: int | None,
     topk: int,
     num_layers: int,
-) -> tuple[list[LogRow], list[UnionTopK]]:
-    if not input_dir.is_dir():
-        raise ValueError(f"input must be a directory: {input_dir}")
-    log_paths = sorted(input_dir.glob("*.txt"))
-    if not log_paths:
-        raise ValueError(f"input directory contains no .txt files: {input_dir}")
+) -> tuple[list[LogRow], list[UnionTopK], set[int]]:
+    if tp_rank is None:
+        ranks_in_file: set[int] = set()
+        with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                ranks_in_file.update(int(value) for value in TP_RANK_RE.findall(line))
+        candidate_ranks = sorted(ranks_in_file)
+        if not candidate_ranks:
+            raise LogFormatError(f"{log_path} contains no Worker_TP rank prefixes")
+    else:
+        candidate_ranks = [tp_rank]
 
-    all_rows: list[LogRow] = []
-    all_records: list[UnionTopK] = []
-    request_sources: dict[str, Path] = {}
-    for log_path in log_paths:
+    if tp_rank is not None:
         rows = parse_log_rows(
             log_path,
             tp_rank=tp_rank,
@@ -504,22 +616,163 @@ def load_input_directory(
             num_layers=num_layers,
         )
         records = reconstruct_union_topk(rows, num_layers=num_layers)
-        request_ids = {item.request_id for item in records}
-        if len(request_ids) != 1:
-            raise LogFormatError(
-                f"{log_path} contains {len(request_ids)} real requests "
-                f"{sorted(request_ids)}; each input file must contain exactly one"
+        return rows, records, {tp_rank}
+
+    rows_by_rank: dict[int, list[LogRow]] = {}
+    failures: list[tuple[int, Exception]] = []
+    for candidate_rank in candidate_ranks:
+        try:
+            rows_by_rank[candidate_rank] = parse_log_rows(
+                log_path,
+                tp_rank=candidate_rank,
+                topk=topk,
+                num_layers=num_layers,
             )
-        request_id = next(iter(request_ids))
-        if request_id in request_sources:
-            raise LogFormatError(
-                f"request {request_id!r} appears in both "
-                f"{request_sources[request_id]} and {log_path}"
+        except (LogFormatError, ValueError) as error:
+            failures.append((candidate_rank, error))
+    if not rows_by_rank:
+        summary = "\n".join(
+            f"  TP{rank}: {str(error).splitlines()[0]}" for rank, error in failures
+        )
+        raise LogFormatError(
+            f"{log_path}: no TP rank produced clean records:\n{summary}"
+        )
+    rows, used_ranks = _merge_partial_rank_rows(rows_by_rank)
+    records = reconstruct_union_topk(rows, num_layers=num_layers)
+    return rows, records, used_ranks
+
+
+def _request_id(input_dir: Path, path: Path) -> str:
+    relative_parent = path.parent.relative_to(input_dir)
+    return (
+        input_dir.name if relative_parent == Path(".") else relative_parent.as_posix()
+    )
+
+
+def parse_topk_tensor(
+    path: Path,
+    *,
+    input_dir: Path,
+    topk: int,
+    num_layers: int,
+) -> TensorTopK | None:
+    """Load one rank-0 top-k dump; return None for other TP ranks."""
+
+    match = TOPK_FILE_RE.fullmatch(path.name)
+    if match is None:
+        raise LogFormatError(f"malformed DSA top-k filename: {path.name}")
+    tp_rank = int(match["tp"])
+    if tp_rank != 0:
+        return None
+
+    layer_name = match["layer"]
+    layer_match = TENSOR_LAYER_INDEX_RE.search(layer_name)
+    if layer_match is None:
+        raise LogFormatError(f"cannot extract layer index from {layer_name!r}")
+    layer_index = int(layer_match.group(1))
+    if layer_index >= num_layers:
+        return None
+
+    rows = int(match["rows"])
+    file_topk = int(match["k"])
+    if file_topk != topk:
+        raise LogFormatError(
+            f"{path} has k={file_topk}, expected configured topk={topk}"
+        )
+    try:
+        import torch
+    except ImportError as error:
+        raise RuntimeError("reading DSA top-k dumps requires PyTorch") from error
+    tensor = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(tensor, torch.Tensor):
+        raise LogFormatError(f"{path} does not contain a torch.Tensor")
+    original_shape = tuple(tensor.shape)
+    while tensor.ndim > 2 and tensor.shape[1] == 1:
+        tensor = tensor.squeeze(1)
+    if tensor.ndim != 2 or tuple(tensor.shape) != (rows, file_topk):
+        raise LogFormatError(
+            f"{path} has tensor shape {original_shape}, expected ({rows}, {file_topk})"
+        )
+    if tensor.is_floating_point() or tensor.is_complex():
+        raise LogFormatError(f"{path} top-k indices must use an integer dtype")
+    if torch.any(tensor < 0):
+        raise LogFormatError(f"{path} contains a negative top-k position")
+
+    return TensorTopK(
+        path=path,
+        request_id=_request_id(input_dir, path),
+        step=int(match["step"]),
+        seq_len=int(match["seq_len"]),
+        layer_name=layer_name,
+        layer_index=layer_index,
+        tp_rank=tp_rank,
+        global_rank=int(match["global_rank"]),
+        row_count=rows,
+        topk=file_topk,
+        positions=tuple(tuple(int(value) for value in row) for row in tensor.tolist()),
+    )
+
+
+def load_input_directory(
+    input_dir: Path,
+    *,
+    tp_rank: int | None,
+    topk: int,
+    num_layers: int,
+) -> tuple[list[TensorTopK], list[UnionTopK]]:
+    if not input_dir.is_dir():
+        raise ValueError(f"input must be a directory: {input_dir}")
+    if tp_rank not in (None, 0):
+        raise ValueError("tensor dumps are analyzed from TP rank 0 only")
+    paths = sorted(input_dir.rglob("dsa_topk__*.pt"))
+    if not paths:
+        raise ValueError(
+            f"input directory contains no DSA top-k .pt files: {input_dir}"
+        )
+
+    tensors = [
+        parsed
+        for path in paths
+        if (
+            parsed := parse_topk_tensor(
+                path,
+                input_dir=input_dir,
+                topk=topk,
+                num_layers=num_layers,
             )
-        request_sources[request_id] = log_path
-        all_rows.extend(rows)
-        all_records.extend(records)
-    return all_rows, all_records
+        )
+        is not None
+    ]
+    if not tensors:
+        raise LogFormatError(f"{input_dir} contains no TP rank 0 DSA top-k tensors")
+
+    seen: set[tuple[str, int, int]] = set()
+    records: list[UnionTopK] = []
+    for item in sorted(
+        tensors, key=lambda item: (item.request_id, item.step, item.layer_index)
+    ):
+        key = (item.request_id, item.step, item.layer_index)
+        if key in seen:
+            raise LogFormatError(
+                "duplicate TP0 tensor for "
+                f"request={item.request_id!r}, step={item.step}, "
+                f"layer={item.layer_index}"
+            )
+        seen.add(key)
+        records.append(
+            UnionTopK(
+                request_id=item.request_id,
+                step=item.step,
+                layer_name=item.layer_name,
+                layer_index=item.layer_index,
+                row_count=item.row_count,
+                positions=frozenset(
+                    position for row in item.positions for position in row
+                ),
+                seq_len=item.seq_len,
+            )
+        )
+    return tensors, records
 
 
 def analyze(args: argparse.Namespace) -> None:
@@ -697,11 +950,25 @@ def analyze(args: argparse.Namespace) -> None:
         writer.writerow(["request_id", "inferred_base_seq_len"])
         writer.writerows(sorted(bases.items()))
 
-    print(f"Parsed {len(rows)} TP{args.tp_rank} rows")
-    print(f"Reconstructed {len(records)} request/step/layer union top-k records")
+    print(f"Loaded {len(rows)} TP0 top-k tensors")
+    print(f"Built {len(records)} request/step/layer union top-k records")
     for request_id, base in sorted(bases.items()):
         print(f"inferred base_seq_len[{request_id}]={base}")
     print(f"Wrote results to {args.output_dir}")
+
+
+def _parse_tp_rank(value: str) -> int | None:
+    if value.lower() == "auto":
+        return None
+    try:
+        rank = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "TP rank must be 'auto' or a non-negative integer"
+        ) from error
+    if rank < 0:
+        raise argparse.ArgumentTypeError("TP rank must be non-negative")
+    return rank
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -709,7 +976,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "input_dir",
         type=Path,
-        help="directory containing one request log per .txt file",
+        help="directory containing dsa_topk__*.pt tensor dumps",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("dsa_topk_stats"))
     parser.add_argument(
@@ -727,7 +994,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-layers", type=int, default=78)
     parser.add_argument("--topk", type=int, default=2048)
     parser.add_argument("--chunk-size", type=int, default=256)
-    parser.add_argument("--tp-rank", type=int, default=0)
+    parser.add_argument(
+        "--tp-rank",
+        default=0,
+        type=_parse_tp_rank,
+        metavar="auto|N",
+        help="TP rank to use; tensor dumps currently support rank 0 only",
+    )
     return parser
 
 
