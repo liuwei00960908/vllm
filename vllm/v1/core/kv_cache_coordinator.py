@@ -217,6 +217,7 @@ class KVCacheCoordinator(ABC):
         num_encoder_tokens: int,
         total_computed_tokens: int,
         num_tokens_main_model: int,
+        dsa_compact_external_load: bool = False,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -245,6 +246,7 @@ class KVCacheCoordinator(ABC):
                 num_encoder_tokens,
                 total_computed_tokens,
                 num_tokens_main_model,
+                dsa_compact_external_load,
             )
         )
 
@@ -256,6 +258,7 @@ class KVCacheCoordinator(ABC):
         num_encoder_tokens: int,
         total_computed_tokens: int,
         num_tokens_main_model: int,
+        dsa_compact_external_load: bool = False,
     ) -> list[int]:
         """Per-group variant of get_num_blocks_to_allocate (one entry per
         kv cache group / single-type manager)."""
@@ -270,8 +273,16 @@ class KVCacheCoordinator(ABC):
                     )
                 )
             else:
+                if dsa_compact_external_load and isinstance(
+                    manager, DSALatentManager
+                ):
+                    get_num_blocks = (
+                        manager.get_num_blocks_to_allocate_compact_external
+                    )
+                else:
+                    get_num_blocks = manager.get_num_blocks_to_allocate
                 num_blocks_to_allocate.append(
-                    manager.get_num_blocks_to_allocate(
+                    get_num_blocks(
                         request_id,
                         num_tokens,
                         new_computed_blocks[i],
@@ -289,6 +300,7 @@ class KVCacheCoordinator(ABC):
         num_encoder_tokens: int,
         total_computed_tokens: int,
         num_tokens_main_model: int,
+        dsa_compact_external_load: bool = False,
     ) -> bool:
         """Whether the allocation can be satisfied. With per-group block pools,
         EVERY group's demand must fit its own pool; with a single shared pool,
@@ -300,6 +312,7 @@ class KVCacheCoordinator(ABC):
             num_encoder_tokens,
             total_computed_tokens,
             num_tokens_main_model,
+            dsa_compact_external_load,
         )
         if self.use_per_group_block_pools:
             frees = [m.block_pool.get_num_free_blocks() for m in self.single_type_managers]
@@ -497,6 +510,7 @@ class KVCacheCoordinator(ABC):
         new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        dsa_compact_external_load: bool = False,
     ) -> None:
         """
         Add the new computed blocks to the request. Optionally allocate new
@@ -510,7 +524,13 @@ class KVCacheCoordinator(ABC):
             num_external_computed_tokens: The number of external computed tokens.
         """
         for i, manager in enumerate(self.single_type_managers):
-            manager.allocate_new_computed_blocks(
+            if dsa_compact_external_load and isinstance(manager, DSALatentManager):
+                allocate_computed = (
+                    manager.allocate_new_computed_blocks_compact_external
+                )
+            else:
+                allocate_computed = manager.allocate_new_computed_blocks
+            allocate_computed(
                 request_id,
                 new_computed_blocks[i],
                 num_local_computed_tokens,
@@ -523,6 +543,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        dsa_compact_external_load: bool = False,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -542,7 +563,12 @@ class KVCacheCoordinator(ABC):
             The new allocated blocks.
         """
         return tuple(
-            manager.allocate_new_blocks(
+            (
+                manager.allocate_new_blocks_compact_external
+                if dsa_compact_external_load
+                and isinstance(manager, DSALatentManager)
+                else manager.allocate_new_blocks
+            )(
                 request_id,
                 num_encoder_tokens
                 if isinstance(manager, CrossAttentionManager)
@@ -638,6 +664,23 @@ class KVCacheCoordinator(ABC):
             manager.req_to_blocks.get(request_id) or []
             for manager in self.single_type_managers
         )
+
+    def get_external_load_validation_block_ids(self, request_id: str) -> list[int]:
+        compact = any(
+            isinstance(manager, DSALatentManager)
+            and manager.is_compact_external(request_id)
+            for manager in self.single_type_managers
+        )
+        if compact:
+            for manager in self.single_type_managers:
+                if not isinstance(manager, DSALatentManager):
+                    return [
+                        block.block_id
+                        for block in manager.req_to_blocks.get(request_id, ())
+                        if not block.is_null
+                    ]
+        (blocks,) = self.get_blocks(request_id)
+        return [block.block_id for block in blocks]
 
     @abstractmethod
     def find_longest_cache_hit(

@@ -440,6 +440,84 @@ def test_dsa_external_prefix_hit_allocates_every_latent_block(
     blocks = manager.req_to_blocks[request_id]
     assert len(blocks) == (prompt_len + 255) // 256
     assert all(block != block_pool.null_block for block in blocks)
+    assert not hasattr(manager, "_compact_external_prefix_tokens")
+
+
+def test_dsa_compact_external_admission_reserves_scratch_and_live_tail():
+    attention_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=128, enable_caching=False, hash_block_size=256
+    )
+    manager = get_dsa_latent_manager(attention_spec, block_pool)
+    manager.scratch_blocks = 16
+
+    manager.allocate_new_computed_blocks_compact_external(
+        "cold", [], 0, 8191
+    )
+    blocks = manager.req_to_blocks["cold"]
+    assert len(blocks) == 32
+    assert sum(not block.is_null for block in blocks) == 16
+    assert all(not block.is_null for block in blocks[:16])
+    assert all(block.is_null for block in blocks[16:])
+    assert (
+        manager.get_num_blocks_to_allocate_compact_external(
+            "cold", 8193, [], 8191, 8192
+        )
+        == 2
+    )
+    tail = manager.allocate_new_blocks_compact_external("cold", 8193, 8192)
+    assert len(tail) == 2
+    assert len(blocks) == 33
+    assert all(block.is_null for block in blocks[16:31])
+    assert all(not block.is_null for block in blocks[31:])
+
+
+def test_dsa_compact_external_grows_tail_without_materializing_prompt():
+    attention_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=128, enable_caching=False, hash_block_size=256
+    )
+    manager = get_dsa_latent_manager(attention_spec, block_pool)
+    manager.scratch_blocks = 16
+    manager.allocate_new_computed_blocks_compact_external("cold", [], 0, 8191)
+
+    new_blocks = manager.allocate_new_blocks("cold", 8194, 8192)
+    blocks = manager.req_to_blocks["cold"]
+    assert len(new_blocks) == 2
+    assert not blocks[31].is_null
+    assert not blocks[32].is_null
+    assert all(block.is_null for block in blocks[16:31])
+
+
+def test_dsa_compact_external_load_failure_expands_dense_prefill():
+    attention_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=128, enable_caching=False, hash_block_size=256
+    )
+    manager = get_dsa_latent_manager(attention_spec, block_pool)
+    manager.scratch_blocks = 16
+    manager.allocate_new_computed_blocks_compact_external("cold", [], 0, 8191)
+    manager.free("cold")
+
+    new_blocks = manager.allocate_new_blocks("cold", 5000, 4999)
+    blocks = manager.req_to_blocks["cold"]
+    assert len(new_blocks) == 20
+    assert all(not block.is_null for block in blocks)
 
 
 @pytest.mark.parametrize(
