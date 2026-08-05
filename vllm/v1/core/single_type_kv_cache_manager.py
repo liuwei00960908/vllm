@@ -526,6 +526,7 @@ class DSALatentManager(FullAttentionManager):
         prefix_tokens: int,
         num_tokens: int,
         num_tokens_main_model: int,
+        released_blocks: int = 0,
     ) -> list[int]:
         scratch_end = self._round_up_to_bundle(self.scratch_blocks)
         if num_tokens_main_model <= prefix_tokens:
@@ -533,7 +534,12 @@ class DSALatentManager(FullAttentionManager):
         required_blocks = self._round_up_to_bundle(
             cdiv(num_tokens, self.block_size)
         )
-        tail_start = self._round_down_to_bundle(prefix_tokens // self.block_size)
+        tail_start = max(
+            self._round_down_to_bundle(prefix_tokens // self.block_size),
+            # Blocks below this frontier were persisted and released. They
+            # are historical holes, not new allocations to send to workers.
+            released_blocks,
+        )
         return list(range(scratch_end)) + list(
             range(max(scratch_end, tail_start), required_blocks)
         )
@@ -589,7 +595,10 @@ class DSALatentManager(FullAttentionManager):
                 num_tokens_main_model,
             )
         required_indices = self._compact_required_indices(
-            prefix_tokens, num_tokens, num_tokens_main_model
+            prefix_tokens,
+            num_tokens,
+            num_tokens_main_model,
+            self._compact_external_released_blocks.get(request_id, 0),
         )
         return self._get_num_missing_blocks(
             request_id, required_indices
@@ -612,6 +621,13 @@ class DSALatentManager(FullAttentionManager):
             compact_requests = {}
             self._compact_external_prefix_tokens = compact_requests
         compact_requests[request_id] = prefix_tokens
+        released_blocks = getattr(
+            self, "_compact_external_released_blocks", None
+        )
+        if released_blocks is None:
+            released_blocks = {}
+            self._compact_external_released_blocks = released_blocks
+        released_blocks[request_id] = 0
 
         scratch_blocks = self._round_up_to_bundle(self.scratch_blocks)
         allocated_blocks = self.block_pool.get_new_blocks(scratch_blocks)
@@ -635,6 +651,7 @@ class DSALatentManager(FullAttentionManager):
             prefix_tokens,
             num_tokens,
             num_tokens_main_model,
+            self._compact_external_released_blocks.get(request_id, 0),
         )
         req_blocks = self.req_to_blocks[request_id]
         if required_indices and len(req_blocks) <= required_indices[-1]:
@@ -687,6 +704,13 @@ class DSALatentManager(FullAttentionManager):
             compact_requests.pop(request_id, None)
             if not compact_requests:
                 del self._compact_external_prefix_tokens
+        released_blocks = getattr(
+            self, "_compact_external_released_blocks", None
+        )
+        if released_blocks is not None:
+            released_blocks.pop(request_id, None)
+            if not released_blocks:
+                del self._compact_external_released_blocks
         super().free(request_id)
 
     def remove_skipped_blocks(
@@ -717,6 +741,14 @@ class DSALatentManager(FullAttentionManager):
             )
         start = self.scratch_blocks
         end = min(committed_end // self.block_size, len(blocks))
+        compact_requests = getattr(
+            self, "_compact_external_prefix_tokens", None
+        )
+        if compact_requests is not None and request_id in compact_requests:
+            released_blocks = self._compact_external_released_blocks
+            released_blocks[request_id] = max(
+                released_blocks.get(request_id, 0), end
+            )
         window_size = _decode_window_save_window_size()
         window_start = max(0, committed_end - window_size) if window_size else None
         if end <= start:

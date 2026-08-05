@@ -499,6 +499,47 @@ def test_dsa_compact_external_grows_tail_without_materializing_prompt():
     assert all(block.is_null for block in blocks[16:31])
 
 
+def test_dsa_compact_external_release_keeps_worker_updates_append_only():
+    attention_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    layout = DSASharedBlockLayout(
+        latent_page_size_bytes=576,
+        indexer_page_size_bytes=128,
+        capacity_bundles=64,
+    )
+    allocator = DSASharedBundleAllocator(layout)
+    block_pool = DSASharedLogicalBlockPool(
+        allocator, DSASharedBlockOwner.LATENT
+    )
+    manager = get_dsa_latent_manager(
+        attention_spec, block_pool, enable_caching=False
+    )
+    manager.scratch_blocks = 16
+
+    manager.allocate_new_computed_blocks_compact_external("cold", [], 0, 8191)
+    manager.allocate_new_blocks_compact_external("cold", 8193, 8192)
+    blocks = manager.req_to_blocks["cold"]
+    worker_block_count = len(blocks)
+    assert worker_block_count == 34
+    assert all(not block.is_null for block in blocks[30:])
+
+    # Once LMCache has persisted blocks 0..31, positions 30 and 31 become
+    # historical holes. A later scheduler update must allocate only the new
+    # suffix: CachedRequestData tells a running worker to append these IDs.
+    assert manager.remove_saved_decode_window_blocks("cold", 8192) == 2
+    assert all(block.is_null for block in blocks[16:32])
+    assert manager.get_num_blocks_to_allocate("cold", 8705, [], 8192, 8704) == 2
+
+    new_blocks = manager.allocate_new_blocks("cold", 8705, 8704)
+    assert len(new_blocks) == 2
+    assert blocks[worker_block_count:] == new_blocks
+    assert len(blocks) == worker_block_count + len(new_blocks)
+
+
 def test_dsa_compact_external_load_failure_expands_dense_prefill():
     attention_spec = MLAAttentionSpec(
         block_size=256,
@@ -513,6 +554,7 @@ def test_dsa_compact_external_load_failure_expands_dense_prefill():
     manager.scratch_blocks = 16
     manager.allocate_new_computed_blocks_compact_external("cold", [], 0, 8191)
     manager.free("cold")
+    assert not hasattr(manager, "_compact_external_released_blocks")
 
     new_blocks = manager.allocate_new_blocks("cold", 5000, 4999)
     blocks = manager.req_to_blocks["cold"]
