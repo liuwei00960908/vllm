@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -23,8 +25,15 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     SlidingWindowSpec,
+    dsa_shared_pool_enabled,
+    dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+# Throttle for the [KVSTARVE] admission-failure diagnostic (seconds).
+_last_starve_log = [0.0]
 
 
 def _validate_prefix_cache_retention_interval(
@@ -87,13 +96,47 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
+        # DSA two-groups per-group mode: every KV cache group is backed by its
+        # OWN BlockPool (sized from num_blocks_per_group) instead of sharing
+        # one pool, so latent/indexer block lifetimes are independent.
+        # Fork semantics: vllm-dsa-two-groups@4575d8a12 kv_cache_coordinator.py
+        # :87-108, :145-168, :177 (shared-bundle variant deferred to Step 5).
+        group_page_sizes = {
+            g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups
+        }
+        self.use_per_group_block_pools = (
+            dsa_two_groups_enabled()
+            and not dsa_shared_pool_enabled()
+            and len(kv_cache_config.kv_cache_groups) > 1
+            and len(group_page_sizes) > 1
         )
+        assert not (self.use_per_group_block_pools and enable_caching), (
+            "DSA two-group mode does not support prefix caching yet; "
+            "launch with --no-enable-prefix-caching."
+        )
+        if self.use_per_group_block_pools:
+            num_pools = len(kv_cache_config.kv_cache_groups)
+            pool_sizes = (
+                kv_cache_config.num_blocks_per_group
+                if kv_cache_config.num_blocks_per_group is not None
+                else [kv_cache_config.num_blocks] * num_pools
+            )
+            logger.info("Per-group KV block pools: %s blocks.", pool_sizes)
+        else:
+            num_pools = 1
+            pool_sizes = [kv_cache_config.num_blocks]
+        self.block_pools = [
+            BlockPool(
+                num_gpu_blocks=pool_sizes[i],
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
+            for i in range(num_pools)
+        ]
+        # Kept for compatibility with single-pool consumers (e.g. metrics).
+        self.block_pool = self.block_pools[0]
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -108,7 +151,10 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                # Per-group mode: group i allocates from its own pool (pool
+                # index == group index); single-pool mode: everyone shares
+                # pool 0.
+                block_pool=self.block_pools[i if self.use_per_group_block_pools else 0],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -182,6 +228,115 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
         return num_blocks_to_allocate
+
+    def get_num_blocks_to_allocate_per_group(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> list[int]:
+        """Per-group variant of get_num_blocks_to_allocate (one entry per KV
+        cache group / single-type manager). Fork semantics:
+        vllm-dsa-two-groups@4575d8a12 kv_cache_coordinator.py:253-293."""
+        num_blocks_to_allocate: list[int] = []
+        for i, manager in enumerate(self.single_type_managers):
+            if isinstance(manager, CrossAttentionManager):
+                num_blocks_to_allocate.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_encoder_tokens,
+                        [],
+                        0,
+                        num_encoder_tokens,
+                        apply_admission_cap=apply_admission_cap,
+                    )
+                )
+            else:
+                num_blocks_to_allocate.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_tokens_main_model,
+                        apply_admission_cap=apply_admission_cap,
+                    )
+                )
+        return num_blocks_to_allocate
+
+    def has_enough_free_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        reserved_blocks: int = 0,
+    ) -> bool:
+        """Whether the allocation can be satisfied.
+
+        With per-group block pools, EVERY group's demand must fit its own
+        pool; with a single shared pool, the summed demand must fit that
+        pool (identical to the official admission comparison). Fork
+        semantics: vllm-dsa-two-groups@4575d8a12 kv_cache_coordinator.py
+        :295-339 ([KVSTARVE] diagnostic kept).
+        """
+        if self.use_per_group_block_pools:
+            assert reserved_blocks == 0, (
+                "DSA per-group mode with async-connector block reservation is "
+                "not supported in this replay slice (reserved_blocks must be 0)."
+            )
+            per_group = self.get_num_blocks_to_allocate_per_group(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                num_encoder_tokens,
+                total_computed_tokens,
+                num_tokens_main_model,
+                apply_admission_cap=apply_admission_cap,
+            )
+            frees = [
+                m.block_pool.get_num_free_blocks() for m in self.single_type_managers
+            ]
+            ok = all(needed <= free for needed, free in zip(per_group, frees))
+            if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
+                # [KVSTARVE] one-per-second snapshot of WHICH group blocked an
+                # admission, with each group's demand vs free blocks.
+                _last_starve_log[0] = time.monotonic()
+                parts = []
+                for i, (needed, free, m) in enumerate(
+                    zip(per_group, frees, self.single_type_managers)
+                ):
+                    spec = getattr(m, "kv_cache_spec", None)
+                    page = getattr(spec, "page_size_bytes", "?")
+                    flag = " <<BLOCKED" if needed > free else ""
+                    parts.append(
+                        f"g{i}({type(m).__name__},page={page}): "
+                        f"need={needed} free={free}{flag}"
+                    )
+                logger.info(
+                    "[KVSTARVE] req=%s not admitted | %s", request_id, "  ".join(parts)
+                )
+            return ok
+        # Single-pool fallback: mathematically identical to the official
+        # `summed demand <= free - reserved` admission comparison.
+        num_blocks_to_allocate = self.get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            num_encoder_tokens,
+            total_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+        )
+        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+        return num_blocks_to_allocate <= available_blocks
 
     def allocate_new_computed_blocks(
         self,

@@ -227,3 +227,120 @@ def test_dsa_two_groups_full_core_chain():
             hash_block_size=128,
         )
         assert coordinator is not None
+
+
+def test_dsa_two_groups_per_group_pools():
+    # Step 4a: each KV cache group is backed by its OWN BlockPool sized from
+    # num_blocks_per_group; managers are bound to their group's pool.
+    with _dsa_two_groups_env():
+        vllm_config = _vllm_config()
+        specs = _make_specs(78, 78)
+        configs = get_kv_cache_configs(vllm_config, [specs], [10 * 2**30])
+        coordinator = get_kv_cache_coordinator(
+            kv_cache_config=generate_scheduler_kv_cache_config(configs),
+            max_model_len=vllm_config.model_config.max_model_len,
+            max_num_batched_tokens=4096,
+            use_eagle=False,
+            enable_caching=False,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            scheduler_block_size=128,
+            hash_block_size=128,
+        )
+        assert coordinator.use_per_group_block_pools
+        assert len(coordinator.block_pools) == 2
+        assert coordinator.block_pools[0] is not coordinator.block_pools[1]
+        assert len(coordinator.single_type_managers) == 2
+        assert (
+            coordinator.single_type_managers[0].block_pool
+            is coordinator.block_pools[0]
+        )
+        assert (
+            coordinator.single_type_managers[1].block_pool
+            is coordinator.block_pools[1]
+        )
+        # Each pool holds num_blocks free blocks (not the scalar max).
+        expected = configs[0].num_blocks_per_group
+        assert expected is not None
+        for pool, size in zip(coordinator.block_pools, expected):
+            assert pool.get_num_free_blocks() == size
+
+
+def test_dsa_two_groups_admission_and_allocate_free():
+    # Step 4a/4a-2: per-group admission predicate + allocate/free smoke.
+    with _dsa_two_groups_env():
+        vllm_config = _vllm_config()
+        specs = _make_specs(78, 78)
+        configs = get_kv_cache_configs(vllm_config, [specs], [10 * 2**30])
+        coordinator = get_kv_cache_coordinator(
+            kv_cache_config=generate_scheduler_kv_cache_config(configs),
+            max_model_len=10000,
+            max_num_batched_tokens=4096,
+            use_eagle=False,
+            enable_caching=False,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            scheduler_block_size=128,
+            hash_block_size=128,
+        )
+        empty_computed = tuple([] for _ in coordinator.single_type_managers)
+
+        # Small demand fits both pools.
+        assert coordinator.has_enough_free_blocks(
+            request_id="r1",
+            num_tokens=1000,
+            new_computed_blocks=empty_computed,
+            num_encoder_tokens=0,
+            total_computed_tokens=0,
+            num_tokens_main_model=1000,
+        )
+        # A max-model-len request per pool boundary: num_blocks must cover it.
+        max_len = 10000
+        assert coordinator.has_enough_free_blocks(
+            request_id="r1",
+            num_tokens=max_len,
+            new_computed_blocks=empty_computed,
+            num_encoder_tokens=0,
+            total_computed_tokens=0,
+            num_tokens_main_model=max_len,
+        )
+        # allocate -> per-pool free count drops by the same amount -> free.
+        per_group_before = [
+            m.block_pool.get_num_free_blocks() for m in coordinator.single_type_managers
+        ]
+        coordinator.allocate_new_blocks("r1", 512, 512)
+        per_group_after = [
+            m.block_pool.get_num_free_blocks() for m in coordinator.single_type_managers
+        ]
+        assert all(b > a for b, a in zip(per_group_before, per_group_after))
+        coordinator.free("r1")
+        per_group_freed = [
+            m.block_pool.get_num_free_blocks() for m in coordinator.single_type_managers
+        ]
+        assert per_group_freed == per_group_before
+
+
+def test_dsa_two_groups_prefix_caching_rejected():
+    # Fork's mutual exclusion: per-group pools require no-prefix-caching.
+    # get_kv_cache_coordinator(enable_caching=True) routes to the hybrid
+    # coordinator which forwards enable_caching=True to the base __init__,
+    # tripping the assertion.
+    with _dsa_two_groups_env():
+        vllm_config = _vllm_config()
+        specs = _make_specs(78, 78)
+        configs = get_kv_cache_configs(vllm_config, [specs], [10 * 2**30])
+        with pytest.raises(AssertionError):
+            get_kv_cache_coordinator(
+                kv_cache_config=generate_scheduler_kv_cache_config(configs),
+                max_model_len=10000,
+                max_num_batched_tokens=4096,
+                use_eagle=False,
+                enable_caching=True,
+                enable_kv_cache_events=False,
+                dcp_world_size=1,
+                pcp_world_size=1,
+                scheduler_block_size=128,
+                hash_block_size=128,
+            )
