@@ -913,6 +913,10 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    # DSA two-group replay (Step 3): per-group block counts when each KV cache
+    # group is backed by its OWN block pool (unbundle-only + per-group mode).
+    # None for every other layout (single pool / official behavior).
+    num_blocks_per_group: list[int] | None = None
 
     @property
     def has_mamba_layers(self) -> bool:

@@ -32,6 +32,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    dsa_shared_pool_enabled,
+    dsa_two_groups_enabled,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -902,6 +904,19 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if (dsa_two_groups_enabled() and not dsa_shared_pool_enabled()
+            and len({g.kv_cache_spec.page_size_bytes
+                     for g in kv_cache_config.kv_cache_groups}) > 1):
+        # Per-group block pools: each pool independently holds num_blocks
+        # blocks, and a request needs cdiv(max_model_len, block_size) blocks
+        # FROM EACH pool. Concurrency is limited by the pool needing the most
+        # blocks per request. Fork semantics:
+        # vllm-dsa-two-groups@4575d8a12 kv_cache_utils.py:820-840.
+        max_blocks_per_req = max(
+            cdiv(vllm_config.model_config.max_model_len, g.kv_cache_spec.block_size)
+            for g in kv_cache_config.kv_cache_groups
+        )
+        return kv_cache_config.num_blocks / max_blocks_per_req
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -938,6 +953,14 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    if (dsa_two_groups_enabled() and not dsa_shared_pool_enabled()
+            and len({g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}) > 1):
+        # DSA per-group: one block id consumes one page in every layer of every
+        # group (mirrors the divisor in get_kv_cache_config_from_groups).
+        return sum(
+            len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_groups
+        )
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
     ):
@@ -1288,6 +1311,46 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
+    elif (dsa_two_groups_enabled() and len(kv_cache_groups) == 2
+          and all(isinstance(g.kv_cache_spec, MLAAttentionSpec)
+                  for g in kv_cache_groups)
+          and len({g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}) == 2):
+        # DSA per-group mode: each group is backed by its OWN block pool. One
+        # block id consumes one page in EVERY layer of EVERY group, so the
+        # divisor is sum(layer_count_g * page_g) — NOT max(page). Every layer
+        # gets its own tensor of group_num_blocks * its own page. Fork
+        # semantics: vllm-dsa-two-groups@4575d8a12 kv_cache_utils.py:1375-1401,
+        # :1459-1492 (DSA_TEST sizing branch :1403-1457 intentionally never
+        # migrated).
+        if dsa_shared_pool_enabled():
+            raise NotImplementedError(
+                "DSA shared pool (replay Step 5) is not implemented; "
+                "set VLLM_ASCEND_DSA_SHARED_POOL=0 for per-group mode."
+            )
+        per_block_bytes = sum(
+            len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_groups
+        )
+        num_blocks = available_memory // per_block_bytes
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        num_blocks_per_group = [num_blocks for _ in kv_cache_groups]
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=group.kv_cache_spec.page_size_bytes * num_blocks,
+                shared_by=[layer_name],
+            )
+            for group in kv_cache_groups
+            for layer_name in group.layer_names
+        ]
+        assert sum(tensor.size for tensor in kv_cache_tensors) <= available_memory, (
+            "DSA per-group sizing exceeded available KV memory."
+        )
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            num_blocks_per_group=num_blocks_per_group,
+        )
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
@@ -1647,6 +1710,44 @@ def get_kv_cache_groups(
         # attention free models.
         return []
 
+    if dsa_two_groups_enabled():
+        # DSA two-groups: split MLA specs into exactly two groups by layout
+        # (latent 576 vs indexer 128). This MUST run before the uniform checks:
+        # UniformTypeKVCacheSpecs.from_specs would otherwise merge all MLA
+        # layers back into a single group. group.kv_cache_spec is a per-layer
+        # merged spec (NOT a summed UniformType spec). Fork semantics:
+        # vllm-dsa-two-groups@4575d8a12 kv_cache_utils.py:1637-1645 adapted to
+        # the final grouping logic; explicit two-group construction keeps
+        # 79/22-style geometry exact.
+        mla = {
+            name: spec
+            for name, spec in kv_cache_spec.items()
+            if isinstance(spec, MLAAttentionSpec)
+        }
+        if len(mla) != len(kv_cache_spec):
+            raise ValueError(
+                "DSA two-groups requires all cache specs to be MLAAttentionSpec; "
+                f"got {len(kv_cache_spec) - len(mla)} non-MLA spec(s)."
+            )
+        layouts: dict[tuple[int, tuple[int, ...] | None], list[str]] = {}
+        for name, spec in mla.items():
+            layouts.setdefault(
+                (spec.head_size, getattr(spec, "sparse_head_dim", None)), []
+            ).append(name)
+        if len(layouts) != 2:
+            raise ValueError(
+                f"DSA two-groups requires exactly 2 distinct layouts, got {len(layouts)}."
+            )
+        grouped_names = sorted(
+            layouts.values(), key=lambda names: -kv_cache_spec[names[0]].page_size_bytes
+        )
+        groups = create_kv_cache_group_specs(kv_cache_spec, grouped_names)
+        assert len(groups) == 2
+        assert (
+            groups[0].kv_cache_spec.page_size_bytes > groups[1].kv_cache_spec.page_size_bytes
+        ), "DSA two-groups: latent group must come first (larger page)."
+        return groups
+
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
@@ -1739,7 +1840,19 @@ def _report_kv_cache_config(
     # their window, so a naive `num_blocks // num_groups * block_size` formula
     # underestimates capacity for these models. DCP/PCP sharding is already
     # accounted for in each spec's `max_memory_usage_bytes`.
-    num_tokens = int(max_concurrency * max_model_len)
+    # DSA per-group mode: each pool independently holds num_blocks blocks, so
+    # the model supports num_blocks * block_size tokens (not divided by the
+    # number of groups). Fork semantics:
+    # vllm-dsa-two-groups@4575d8a12 kv_cache_utils.py:1690-1736.
+    if (dsa_two_groups_enabled() and not dsa_shared_pool_enabled()
+            and len({g.kv_cache_spec.page_size_bytes
+                     for g in kv_cache_config.kv_cache_groups}) > 1):
+        num_tokens = kv_cache_config.num_blocks * min(
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+        )
+    else:
+        num_tokens = int(max_concurrency * max_model_len)
 
     logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
     logger.info_once(
@@ -1763,40 +1876,28 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
+    # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
-        # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         return sum(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
-    elif all(
-        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        for group in kv_cache_groups
-    ):
-        # Special case (only DeepseekV4 for now): all groups are
-        # UniformTypeKVCacheSpecs.
-        # They must already be page_size aligned and share a common padded
-        # layer-tuple layout. Even groups with fewer actual tuples still reserve
-        # the global number of tuple slots in the shared tensor layout.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
-        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
-        num_layer_tuples = max(
-            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
-            for group in kv_cache_groups
-        )
 
-        total_max_mem_usage_bytes = 0
+    # DSA per-group mode (own block pools, different page sizes): one max-length
+    # request needs blocks from EVERY group's pool. Per group:
+    # blocks = cdiv(per-layer bytes for max_len, page); bytes = layers * blocks * page.
+    # Fork semantics: vllm-dsa-two-groups@4575d8a12 kv_cache_utils.py:1786-1821.
+    if (dsa_two_groups_enabled() and not dsa_shared_pool_enabled()
+            and len({g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}) > 1):
+        total = 0
         for group in kv_cache_groups:
-            group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
-            g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
-            g_max_mem_usage_page_bytes = (
-                num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
-            )
-            total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
-        return total_max_mem_usage_bytes
+            page = group.kv_cache_spec.page_size_bytes
+            blocks = cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page)
+            total += len(group.layer_names) * blocks * page
+        return total
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -2072,20 +2173,55 @@ def get_kv_cache_configs(
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    # DSA per-group mode: each group has its OWN block count
+    # (num_blocks_per_group), and a tensor's byte size is a multiple of ITS
+    # group's count, not the scalar num_blocks. Each group is reconciled
+    # against its own cross-rank min; reconciling with the scalar num_blocks
+    # would mis-shrink and trip the divisibility assert. Fork semantics:
+    # vllm-dsa-two-groups@4575d8a12 kv_cache_utils.py:2069-2127.
+    use_per_group = all(
+        kv_cache_config.num_blocks_per_group is not None
+        for kv_cache_config in kv_cache_configs
     )
-    for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
+    if use_per_group:
+        num_groups = len(kv_cache_configs[0].num_blocks_per_group)
+        assert all(
+            len(c.num_blocks_per_group) == num_groups for c in kv_cache_configs
+        ), "All ranks must agree on the number of KV cache groups."
+        min_blocks_per_group = [
+            min(c.num_blocks_per_group[g] for c in kv_cache_configs)
+            for g in range(num_groups)
+        ]
+        for kv_cache_config in kv_cache_configs:
+            old_per_group = kv_cache_config.num_blocks_per_group
+            tensors = iter(kv_cache_config.kv_cache_tensors)
+            for g, group in enumerate(kv_cache_config.kv_cache_groups):
+                old_g = old_per_group[g]
+                new_g = min_blocks_per_group[g]
+                for _ in group.layer_names:
+                    tensor = next(tensors)
+                    assert tensor.size % old_g == 0
+                    if new_g != old_g:
+                        tensor.size = tensor.size // old_g * new_g
+            kv_cache_config.num_blocks_per_group = list(min_blocks_per_group)
+            kv_cache_config.num_blocks = max(min_blocks_per_group)
+            if len(kv_cache_config.kv_cache_groups) > 0:
+                _report_kv_cache_config(vllm_config, kv_cache_config)
+    else:
+        min_num_blocks = min(
+            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        )
+        for kv_cache_config in kv_cache_configs:
+            num_blocks_old = kv_cache_config.num_blocks
+            kv_cache_config.num_blocks = min_num_blocks
 
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            # Shrink tensor size proportionally
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
-        if len(kv_cache_config.kv_cache_groups) > 0:
-            _report_kv_cache_config(vllm_config, kv_cache_config)
+            if len(kv_cache_config.kv_cache_groups) > 0:
+                _report_kv_cache_config(vllm_config, kv_cache_config)
 
     return kv_cache_configs
 
