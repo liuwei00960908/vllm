@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections import Counter
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
@@ -23,6 +24,49 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# DSA KV-organization feature gates (replay Step 1 / V1).
+#
+# These helpers mirror the composite gating semantics of the internal fork
+# (vllm-dsa-two-groups@dsa-two-groups, kv_cache_interface.py:20-47), adapted
+# to official v0.23 structure. Defaults keep behavior identical to upstream:
+# every helper returns False unless explicitly enabled layer by layer.
+#
+# Provenance: fork required VLLM_ASCEND_DSA_UNBUNDLE for spec splitting;
+# two-groups required unbundle; shared pool required two-groups. The composite
+# gates below enforce the same dependency chain so that, e.g., setting only
+# VLLM_ASCEND_DSA_TWO_GROUPS=1 without UNBUNDLE stays a no-op (see
+# test_dsa_env_helpers.py).
+# ---------------------------------------------------------------------------
+
+
+def dsa_unbundle_enabled() -> bool:
+    """Whether DSA latent/indexer spec un-bundling is requested."""
+    return os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0") == "1"
+
+
+def dsa_two_groups_enabled() -> bool:
+    """Whether LATENT/INDEXER form two real KV cache groups.
+
+    Requires :func:`dsa_unbundle_enabled` (fork semantics: two-groups is a
+    refinement of un-bundling, never a standalone mode).
+    """
+    return dsa_unbundle_enabled() and (
+        os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0") == "1"
+    )
+
+
+def dsa_shared_pool_enabled() -> bool:
+    """Whether both groups share one physical bundle pool.
+
+    Requires :func:`dsa_two_groups_enabled`. The raw env default is "1" in
+    the fork; the composite gate makes it effective only under two-groups.
+    """
+    return dsa_two_groups_enabled() and (
+        os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1") == "1"
+    )
 
 
 # ---------------------------------------------------------------------------
