@@ -364,7 +364,21 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            if self.coordinator.use_per_group_block_pools:
+                # DSA per-group pools: every group's demand must fit its own
+                # pool (fork kv_cache_manager admission semantics).
+                if not self.coordinator.has_enough_free_blocks(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                    reserved_blocks=0,
+                ):
+                    return None
+            elif num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -392,10 +406,25 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        if num_blocks_to_allocate > available_blocks:
-            # Cannot allocate new blocks
-            return None
+        if self.coordinator.use_per_group_block_pools:
+            # DSA per-group pools: per-group demand vs per-pool free blocks.
+            if not self.coordinator.has_enough_free_blocks(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=num_local_computed_tokens
+                + num_external_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+                reserved_blocks=reserved_blocks,
+            ):
+                # Cannot allocate new blocks
+                return None
+        else:
+            available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+            if num_blocks_to_allocate > available_blocks:
+                # Cannot allocate new blocks
+                return None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
