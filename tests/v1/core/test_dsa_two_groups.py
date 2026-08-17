@@ -17,12 +17,11 @@
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
@@ -95,26 +94,10 @@ def _make_specs(num_latent: int, num_indexer: int) -> dict[str, KVCacheSpec]:
 
 
 def _vllm_config(max_model_len: int = 10000) -> VllmConfig:
-    return VllmConfig(
-        model_config=SimpleNamespace(
-            max_model_len=max_model_len,
-            original_max_model_len=max_model_len,
-        ),
-        scheduler_config=SimpleNamespace(
-            disable_hybrid_kv_cache_manager=False,
-            max_num_batched_tokens=4096,
-            max_model_len=max_model_len,
-        ),
-        cache_config=SimpleNamespace(
-            num_gpu_blocks_override=None,
-            gpu_memory_utilization=0.9,
-            block_size=128,
-        ),
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-        ),
-    )
+    # Same construction style as upstream test_kv_cache_utils.py: a real
+    # ModelConfig; everything else keeps official defaults (prefix caching
+    # flags, num_gpu_blocks_override=None, dcp/pcp=1).
+    return VllmConfig(model_config=ModelConfig(max_model_len=max_model_len))
 
 
 def _check_two_groups(groups):

@@ -1876,15 +1876,40 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
-    # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
+        # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         return sum(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+    elif all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups
+    ):
+        # Special case (only DeepseekV4 for now): all groups are
+        # UniformTypeKVCacheSpecs.
+        # They must already be page_size aligned and share a common padded
+        # layer-tuple layout. Even groups with fewer actual tuples still reserve
+        # the global number of tuple slots in the shared tensor layout.
+        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
+        num_layer_tuples = max(
+            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
+            for group in kv_cache_groups
+        )
+
+        total_max_mem_usage_bytes = 0
+        for group in kv_cache_groups:
+            group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
+            g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
+            g_max_mem_usage_page_bytes = (
+                num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
+            )
+            total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
+        return total_max_mem_usage_bytes
 
     # DSA per-group mode (own block pools, different page sizes): one max-length
     # request needs blocks from EVERY group's pool. Per group:
