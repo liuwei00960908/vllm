@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -7,7 +8,12 @@ from typing import NamedTuple
 
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, DSASharedLogicalBlockPool
+from vllm.v1.core.dsa_shared_pool import (
+    DSASharedBlockLayout,
+    DSASharedBlockOwner,
+    DSASharedBundleAllocator,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -34,6 +40,23 @@ logger = init_logger(__name__)
 
 # Throttle for the [KVSTARVE] admission-failure diagnostic (seconds).
 _last_starve_log = [0.0]
+
+
+def _get_dsa_pool_log_interval() -> float:
+    """Interval (seconds) for the DSA shared pool usage log; 0 disables.
+
+    Fork semantics: vllm-dsa-two-groups@4575d8a12 kv_cache_coordinator.py
+    reads VLLM_ASCEND_DSA_POOL_LOG_INTERVAL directly (kept as a raw env read
+    here; registering it in vllm's envs.py is unnecessary for one knob).
+    """
+    raw = os.getenv("VLLM_ASCEND_DSA_POOL_LOG_INTERVAL", "5")
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        logger.warning(
+            "Invalid VLLM_ASCEND_DSA_POOL_LOG_INTERVAL=%r; using 5 seconds.", raw
+        )
+        return 5.0
 
 
 def _validate_prefix_cache_retention_interval(
@@ -104,17 +127,66 @@ class KVCacheCoordinator(ABC):
         group_page_sizes = {
             g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups
         }
+        # DSA shared-bundle variant: two logical pools over one physical
+        # bundle pool (Step 5). Fork semantics: vllm-dsa-two-groups@4575d8a12
+        # kv_cache_coordinator.py:90-101.
+        self.use_dsa_shared_block_pool = (
+            dsa_shared_pool_enabled()
+            and dsa_two_groups_enabled()
+            and len(kv_cache_config.kv_cache_groups) == 2
+            and len(group_page_sizes) > 1
+        )
         self.use_per_group_block_pools = (
             dsa_two_groups_enabled()
-            and not dsa_shared_pool_enabled()
+            and not self.use_dsa_shared_block_pool
             and len(kv_cache_config.kv_cache_groups) > 1
             and len(group_page_sizes) > 1
         )
-        assert not (self.use_per_group_block_pools and enable_caching), (
+        assert not (
+            (self.use_per_group_block_pools or self.use_dsa_shared_block_pool)
+            and enable_caching
+        ), (
             "DSA two-group mode does not support prefix caching yet; "
             "launch with --no-enable-prefix-caching."
         )
-        if self.use_per_group_block_pools:
+        self._dsa_pool_last_log = 0.0
+        self._dsa_pool_log_interval = _get_dsa_pool_log_interval()
+        self._dsa_last_starve: tuple[str, int, int, list[int]] | None = None
+        if self.use_dsa_shared_block_pool:
+            latent_group = max(
+                kv_cache_config.kv_cache_groups,
+                key=lambda g: g.kv_cache_spec.page_size_bytes,
+            )
+            indexer_group = min(
+                kv_cache_config.kv_cache_groups,
+                key=lambda g: g.kv_cache_spec.page_size_bytes,
+            )
+            layout = DSASharedBlockLayout(
+                latent_page_size_bytes=latent_group.kv_cache_spec.page_size_bytes,
+                indexer_page_size_bytes=indexer_group.kv_cache_spec.page_size_bytes,
+                capacity_bundles=kv_cache_config.num_blocks,
+            )
+            self.dsa_shared_allocator = DSASharedBundleAllocator(layout)
+            self.dsa_shared_num_layer_pairs = len(latent_group.layer_names)
+            self.block_pools = []
+            for group in kv_cache_config.kv_cache_groups:
+                owner = (
+                    DSASharedBlockOwner.LATENT
+                    if group.kv_cache_spec.page_size_bytes
+                    == latent_group.kv_cache_spec.page_size_bytes
+                    else DSASharedBlockOwner.INDEXER
+                )
+                self.block_pools.append(
+                    DSASharedLogicalBlockPool(self.dsa_shared_allocator, owner)
+                )
+            logger.info(
+                "DSA shared KV bundle pool: %d bundles, latent=%d blocks/bundle, "
+                "indexer=%d blocks/bundle.",
+                kv_cache_config.num_blocks,
+                layout.latent_blocks_per_bundle,
+                layout.indexer_blocks_per_bundle,
+            )
+        elif self.use_per_group_block_pools:
             num_pools = len(kv_cache_config.kv_cache_groups)
             pool_sizes = (
                 kv_cache_config.num_blocks_per_group
@@ -125,16 +197,19 @@ class KVCacheCoordinator(ABC):
         else:
             num_pools = 1
             pool_sizes = [kv_cache_config.num_blocks]
-        self.block_pools = [
-            BlockPool(
-                num_gpu_blocks=pool_sizes[i],
-                enable_caching=enable_caching,
-                hash_block_size=hash_block_size,
-                enable_kv_cache_events=enable_kv_cache_events,
-                metrics_collector=metrics_collector,
-            )
-            for i in range(num_pools)
-        ]
+        if not self.use_dsa_shared_block_pool:
+            # Real BlockPools (single shared pool or per-group pools); the
+            # DSA shared variant builds its logical pools above instead.
+            self.block_pools = [
+                BlockPool(
+                    num_gpu_blocks=pool_sizes[i],
+                    enable_caching=enable_caching,
+                    hash_block_size=hash_block_size,
+                    enable_kv_cache_events=enable_kv_cache_events,
+                    metrics_collector=metrics_collector,
+                )
+                for i in range(num_pools)
+            ]
         # Kept for compatibility with single-pool consumers (e.g. metrics).
         self.block_pool = self.block_pools[0]
 
@@ -151,10 +226,18 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
-                # Per-group mode: group i allocates from its own pool (pool
-                # index == group index); single-pool mode: everyone shares
-                # pool 0.
-                block_pool=self.block_pools[i if self.use_per_group_block_pools else 0],
+                # DSA per-group and shared modes: group i allocates from its
+                # own (logical) pool at index i; single-pool mode: everyone
+                # shares pool 0. Mirrors dsa_block_pool_index() from
+                # dsa_shared_pool.py.
+                block_pool=self.block_pools[
+                    i
+                    if (
+                        self.use_per_group_block_pools
+                        or self.use_dsa_shared_block_pool
+                    )
+                    else 0
+                ],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -324,6 +407,43 @@ class KVCacheCoordinator(ABC):
                     "[KVSTARVE] req=%s not admitted | %s", request_id, "  ".join(parts)
                 )
             return ok
+        if self.use_dsa_shared_block_pool:
+            # Shared bundle: demands from both logical pools are converted to
+            # bundles and compared against the single physical free count.
+            # Fork semantics: vllm-dsa-two-groups@4575d8a12
+            # kv_cache_coordinator.py:340-363.
+            per_group = self.get_num_blocks_to_allocate_per_group(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                num_encoder_tokens,
+                total_computed_tokens,
+                num_tokens_main_model,
+                apply_admission_cap=apply_admission_cap,
+            )
+            needed_bundles = sum(
+                manager.block_pool.get_num_bundles_to_allocate(needed)
+                for manager, needed in zip(self.single_type_managers, per_group)
+            )
+            ok = needed_bundles <= self.dsa_shared_allocator.free_bundle_count
+            if not ok:
+                self._dsa_last_starve = (
+                    request_id,
+                    needed_bundles,
+                    self.dsa_shared_allocator.free_bundle_count,
+                    per_group,
+                )
+                if (time.monotonic() - _last_starve_log[0]) > 1.0:
+                    _last_starve_log[0] = time.monotonic()
+                    logger.info(
+                        "[KVSTARVE] req=%s not admitted | need_bundles=%d free=%d "
+                        "per_group_blocks=%s",
+                        request_id,
+                        needed_bundles,
+                        self.dsa_shared_allocator.free_bundle_count,
+                        per_group,
+                    )
+            return ok
         # Single-pool fallback: mathematically identical to the official
         # `summed demand <= free - reserved` admission comparison.
         num_blocks_to_allocate = self.get_num_blocks_to_allocate(
@@ -337,6 +457,74 @@ class KVCacheCoordinator(ABC):
         )
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         return num_blocks_to_allocate <= available_blocks
+
+    def maybe_log_dsa_shared_pool_usage(
+        self,
+        requests: dict[str, Request],
+        running_count: int,
+        waiting_count: int,
+        max_running_count: int,
+    ) -> None:
+        """Periodic usage log for the DSA shared bundle pool.
+
+        Transcribed (reduced) from fork kv_cache_coordinator.py:366-505: the
+        prefill/post-prefill per-request block walk is omitted (depends on
+        manager.req_to_blocks internals); owner bundle split, fragmentation,
+        and the last starve snapshot are kept. Returns immediately when the
+        shared pool is not active, so the scheduler-side call is free for
+        every other mode.
+        """
+        if not self.use_dsa_shared_block_pool:
+            return
+        if self._dsa_pool_log_interval <= 0:
+            return
+        now = time.monotonic()
+        if now - self._dsa_pool_last_log < self._dsa_pool_log_interval:
+            return
+        self._dsa_pool_last_log = now
+
+        allocator = self.dsa_shared_allocator
+        layout = allocator.layout
+        capacity = layout.capacity_bundles
+        free = allocator.free_bundle_count
+        used = capacity - free
+        owner_counts = allocator.owner_bundle_counts()
+        latent_owner_bundles = owner_counts.get(DSASharedBlockOwner.LATENT, 0)
+        indexer_owner_bundles = owner_counts.get(DSASharedBlockOwner.INDEXER, 0)
+        bundle_bytes = (
+            layout.bundle_page_size_bytes * self.dsa_shared_num_layer_pairs
+        )
+        used_gib = used * bundle_bytes / 2**30
+        total_gib = capacity * bundle_bytes / 2**30
+
+        starve_req = "-"
+        starve_need = 0
+        starve_free = free
+        starve_per_group: list[int] = []
+        if self._dsa_last_starve is not None:
+            starve_req, starve_need, starve_free, starve_per_group = (
+                self._dsa_last_starve
+            )
+        logger.info(
+            "DSA shared pool usage: running=%d waiting=%d used_bundles=%d "
+            "(latent=%d indexer=%d) free_bundles=%d free_ranges=%d "
+            "largest_free_range=%d used=%.2f/%.2f GiB | last_starve=%s "
+            "need=%d free=%d per_group=%s",
+            running_count,
+            waiting_count,
+            used,
+            latent_owner_bundles,
+            indexer_owner_bundles,
+            free,
+            allocator.free_range_count,
+            allocator.largest_free_range,
+            used_gib,
+            total_gib,
+            starve_req,
+            starve_need,
+            starve_free,
+            starve_per_group,
+        )
 
     def allocate_new_computed_blocks(
         self,

@@ -964,6 +964,16 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+            # DSA shared bundle pool usage log (no-op for every other mode;
+            # the coordinator returns immediately when the pool is inactive).
+            # Fork semantics: vllm-dsa-two-groups@4575d8a12
+            # scheduler.py:1048-1055.
+            self.kv_cache_manager.maybe_log_dsa_shared_pool_usage(
+                requests=self.requests,
+                running_count=len(self.running),
+                waiting_count=len(self.waiting) + len(self.skipped_waiting),
+                max_running_count=self.max_num_running_reqs,
+            )
         return scheduler_output
 
     def _build_kv_connector_meta(

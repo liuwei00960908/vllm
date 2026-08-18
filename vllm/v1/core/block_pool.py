@@ -11,6 +11,10 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.dsa_shared_pool import (
+    DSASharedBlockOwner,
+    DSASharedBundleAllocator,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -29,6 +33,113 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class DSASharedLogicalBlockPool:
+    """BlockPool-compatible logical view over a DSA shared bundle allocator.
+
+    One instance per KV cache group (owner = LATENT or INDEXER); both views
+    hand out logical blocks through the single physical DSASharedBundleAllocator.
+    Whole-bundle rent/return: a bundle returns to the physical pool only when
+    every logical block of THIS owner's view in it has ref_cnt == 0, at which
+    point the other owner can claim it.
+
+    Fork provenance: vllm-dsa-two-groups@4575d8a12 block_pool.py:37-131
+    (copied verbatim; DSA replay Step 5 / 5a-2).
+    """
+
+    dsa_shared_pool = True
+
+    def __init__(
+        self,
+        allocator: DSASharedBundleAllocator,
+        owner: DSASharedBlockOwner,
+    ) -> None:
+        self.allocator = allocator
+        self.owner = owner
+        self.layout = allocator.layout
+        self.enable_caching = False
+        self.hash_block_size = 0
+        self.num_gpu_blocks = self.layout.row_count(owner)
+        self.blocks_per_bundle = self.layout.blocks_per_bundle(owner)
+        self.blocks: list[KVCacheBlock] = [
+            KVCacheBlock(idx) for idx in range(self.num_gpu_blocks)
+        ]
+        self.null_block = self.blocks[0]
+        self.null_block.is_null = True
+        self.kv_event_queue: list[KVCacheEvent] = []
+
+    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        if num_blocks > self.get_num_free_blocks():
+            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        bundle_count = self.allocator.bundle_count_for_blocks(self.owner, num_blocks)
+        bundle_ids = self.allocator.allocate(self.owner, bundle_count)
+        block_ids: list[int] = []
+        for bundle_id in bundle_ids:
+            block_ids.extend(self.layout.block_ids_for_bundle(self.owner, bundle_id))
+
+        ret = [self.blocks[block_id] for block_id in block_ids]
+        for block in ret:
+            assert block.ref_cnt == 0
+            block.ref_cnt = 1
+        return ret
+
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        blocks_list = [block for block in ordered_blocks if not block.is_null]
+        if not blocks_list:
+            return
+        affected_bundle_ids: set[int] = set()
+        for block in blocks_list:
+            if block.ref_cnt <= 0:
+                raise ValueError(
+                    f"DSA {self.owner.value} block {block.block_id} is already free"
+                )
+            block.ref_cnt -= 1
+            affected_bundle_ids.add(
+                self.layout.bundle_id_for_block(self.owner, block.block_id)
+            )
+
+        # Logical blocks may become unused across several release calls. The
+        # shared allocator owns physical bundles, so return a bundle only after
+        # every logical block in it has reached ref_cnt == 0.
+        bundle_ids: list[int] = []
+        for bundle_id in affected_bundle_ids:
+            bundle_blocks = (
+                self.blocks[block_id]
+                for block_id in self.layout.block_ids_for_bundle(
+                    self.owner, bundle_id
+                )
+            )
+            if all(block.ref_cnt == 0 for block in bundle_blocks):
+                bundle_ids.append(bundle_id)
+        self.allocator.free(self.owner, bundle_ids)
+
+    def get_num_bundles_to_allocate(self, num_blocks: int) -> int:
+        return self.allocator.bundle_count_for_blocks(self.owner, num_blocks)
+
+    def get_num_free_blocks(self) -> int:
+        return self.allocator.free_bundle_count * self.blocks_per_bundle
+
+    def get_usage(self) -> float:
+        total = self.layout.capacity_bundles
+        if total == 0:
+            return 0.0
+        return 1.0 - (self.allocator.free_bundle_count / total)
+
+    def cache_full_blocks(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError("DSA shared pool does not support prefix caching")
+
+    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+        raise NotImplementedError("DSA shared pool does not support prefix caching")
+
+    def evict_blocks(self, block_ids: set[int]) -> None:
+        raise NotImplementedError("DSA shared pool does not support prefix caching")
+
+    def reset_prefix_cache(self) -> bool:
+        return True
+
+    def take_events(self) -> list[KVCacheEvent]:
+        return []
 
 
 class BlockHashToBlockMap:
