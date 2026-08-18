@@ -474,6 +474,26 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def maybe_log_dsa_shared_pool_usage(
+        self,
+        requests: dict[str, Request],
+        running_count: int,
+        waiting_count: int,
+        max_running_count: int,
+    ) -> None:
+        """Forward the periodic DSA shared pool usage log to the coordinator.
+
+        No-op unless the shared bundle pool is active (the coordinator method
+        returns immediately otherwise). Fork semantics:
+        vllm-dsa-two-groups@4575d8a12 kv_cache_manager.py:535-547.
+        """
+        self.coordinator.maybe_log_dsa_shared_pool_usage(
+            requests=requests,
+            running_count=running_count,
+            waiting_count=waiting_count,
+            max_running_count=max_running_count,
+        )
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
