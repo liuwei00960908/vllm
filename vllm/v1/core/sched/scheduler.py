@@ -50,7 +50,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, dsa_two_groups_enabled
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -2132,7 +2132,15 @@ class Scheduler(SchedulerInterface):
             # all connectors to support HMA.
             # Hybrid memory allocator should be already turned off for this
             # code path, but let's double-check here.
-            assert len(self.kv_cache_config.kv_cache_groups) == 1
+            # DSA two-group mode: group 0 is the MLA latent — the only group the
+            # connector offloads (the indexer group stays NPU-resident via the
+            # registration trim in vllm-ascend), so passing block_ids[0] to a
+            # non-HMA connector remains correct. Fork semantics:
+            # vllm-dsa-two-groups@4575d8a12 scheduler.py:2290-2297.
+            assert (
+                len(self.kv_cache_config.kv_cache_groups) == 1
+                or dsa_two_groups_enabled()
+            )
             return self.connector.request_finished(request, block_ids[0])
 
         return self.connector.request_finished_all_groups(request, block_ids)
