@@ -14,6 +14,7 @@ import pytest
 
 from vllm.v1.kv_cache_interface import (
     dsa_shared_pool_enabled,
+    dsa_shrink_stage,
     dsa_two_groups_enabled,
     dsa_unbundle_enabled,
 )
@@ -21,11 +22,12 @@ from vllm.v1.kv_cache_interface import (
 
 @contextmanager
 def _dsa_env(**kwargs: str | None):
-    """Temporarily set/unset the three DSA env variables."""
+    """Temporarily set/unset the DSA env variables."""
     names = (
         "VLLM_ASCEND_DSA_UNBUNDLE",
         "VLLM_ASCEND_DSA_TWO_GROUPS",
         "VLLM_ASCEND_DSA_SHARED_POOL",
+        "VLLM_ASCEND_DSA_SHRINK_LATENT",
     )
     saved = {name: os.environ.get(name) for name in names}
     try:
@@ -97,6 +99,57 @@ def test_invalid_values_are_off():
     # Non-"1" values are treated as disabled (fork semantics: exact "1" match).
     with _dsa_env(VLLM_ASCEND_DSA_UNBUNDLE="true"):
         assert not dsa_unbundle_enabled()
+
+
+def test_shrink_defaults_off():
+    with _dsa_env():
+        assert dsa_shrink_stage() == 0
+
+
+def test_shrink_requires_two_groups():
+    # Reverse dependency: SHRINK_LATENT=2 without the two-group chain is a
+    # no-op (fork semantics: shrink operates on the latent group).
+    with _dsa_env(VLLM_ASCEND_DSA_SHRINK_LATENT="2"):
+        assert dsa_shrink_stage() == 0
+    with _dsa_env(VLLM_ASCEND_DSA_UNBUNDLE="1", VLLM_ASCEND_DSA_SHRINK_LATENT="2"):
+        assert dsa_shrink_stage() == 0
+
+
+def test_shrink_stages():
+    with _dsa_env(
+        VLLM_ASCEND_DSA_UNBUNDLE="1",
+        VLLM_ASCEND_DSA_TWO_GROUPS="1",
+        VLLM_ASCEND_DSA_SHRINK_LATENT="1",
+    ):
+        assert dsa_shrink_stage() == 1
+    with _dsa_env(
+        VLLM_ASCEND_DSA_UNBUNDLE="1",
+        VLLM_ASCEND_DSA_TWO_GROUPS="1",
+        VLLM_ASCEND_DSA_SHRINK_LATENT="2",
+    ):
+        assert dsa_shrink_stage() == 2
+    with _dsa_env(
+        VLLM_ASCEND_DSA_UNBUNDLE="1",
+        VLLM_ASCEND_DSA_TWO_GROUPS="1",
+        VLLM_ASCEND_DSA_SHRINK_LATENT="3",
+    ):
+        assert dsa_shrink_stage() == 3
+
+
+def test_shrink_invalid_value_falls_back_to_zero():
+    # Fail-safe: a malformed stage value never enables the release chain.
+    with _dsa_env(
+        VLLM_ASCEND_DSA_UNBUNDLE="1",
+        VLLM_ASCEND_DSA_TWO_GROUPS="1",
+        VLLM_ASCEND_DSA_SHRINK_LATENT="yes",
+    ):
+        assert dsa_shrink_stage() == 0
+    with _dsa_env(
+        VLLM_ASCEND_DSA_UNBUNDLE="1",
+        VLLM_ASCEND_DSA_TWO_GROUPS="1",
+        VLLM_ASCEND_DSA_SHRINK_LATENT="",
+    ):
+        assert dsa_shrink_stage() == 0
 
 
 if __name__ == "__main__":

@@ -1307,6 +1307,35 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _dsa_shrink_config_kwargs(
+    vllm_config: VllmConfig,
+) -> dict[str, int | None]:
+    """DSA shrink replay (B1a): per-config scratch sizing inputs.
+
+    Reads index_topk from the hf text config and the speculative token count
+    from the vllm config, exactly as the fork passes them into KVCacheConfig
+    (vllm-dsa-two-groups@4575d8a12 kv_cache_utils.py:1158-1176). Values are
+    inert unless the coordinator finds DSALatentManager instances to inject
+    scratch into (shrink stage 2); non-DSA models keep the None/0 defaults.
+    """
+    if not dsa_two_groups_enabled():
+        return {}
+    hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    index_topk = getattr(hf_text_config, "index_topk", None)
+    if index_topk is None:
+        return {}
+    speculative_config = vllm_config.speculative_config
+    num_speculative_tokens = (
+        int(speculative_config.num_speculative_tokens)
+        if speculative_config is not None
+        else 0
+    )
+    return {
+        "dsa_index_topk": int(index_topk),
+        "dsa_num_speculative_tokens": num_speculative_tokens,
+    }
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1331,6 +1360,10 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
         )
+
+    # DSA shrink replay (B1a): scratch sizing inputs for the latent group
+    # manager; {} for every non-DSA model.
+    dsa_shrink_kwargs = _dsa_shrink_config_kwargs(vllm_config)
 
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
@@ -1426,6 +1459,7 @@ def get_kv_cache_config_from_groups(
                 num_blocks=num_bundles,
                 kv_cache_tensors=kv_cache_tensors,
                 kv_cache_groups=kv_cache_groups,
+                **dsa_shrink_kwargs,
             )
         # DSA per-group mode: each group is backed by its OWN block pool. One
         # block id consumes one page in EVERY layer of EVERY group, so the
@@ -1457,6 +1491,7 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors=kv_cache_tensors,
             kv_cache_groups=kv_cache_groups,
             num_blocks_per_group=num_blocks_per_group,
+            **dsa_shrink_kwargs,
         )
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
@@ -1499,6 +1534,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        **dsa_shrink_kwargs,
     )
 
 
