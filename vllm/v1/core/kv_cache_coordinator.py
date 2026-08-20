@@ -13,6 +13,7 @@ from vllm.v1.core.dsa_shared_pool import (
     DSASharedBlockLayout,
     DSASharedBlockOwner,
     DSASharedBundleAllocator,
+    dsa_scratch_blocks_for_topk,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -23,6 +24,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    DSALatentManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -246,6 +248,43 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+        # DSA shrink replay (B2a): inject the compact-scratch reservation
+        # into every DSALatentManager (the latent group under shrink stage
+        # 2). scratch blocks = ceil(index_topk / block_size) * rows where
+        # rows = num_speculative_tokens + 1 (16 blocks for GLM-5.1 topk
+        # 2048 / block 128 / MTP off; doubles automatically when MTP is
+        # revived). Non-shrink configs have no DSALatentManager instances,
+        # so this block is a no-op for them.
+        # Provenance: vllm-dsa-two-groups@4575d8a12 kv_cache_coordinator.py
+        # :190-210 (the verbose capacity-logging branch of the fork stays
+        # unmigrated; dsa_scratch_blocks_for_topk raises on misaligned
+        # topk, preserving the fork's fail-closed check).
+        dsa_index_topk = getattr(
+            self.kv_cache_config, "dsa_index_topk", None
+        )
+        if dsa_index_topk is not None:
+            dsa_scratch_rows = (
+                getattr(
+                    self.kv_cache_config, "dsa_num_speculative_tokens", 0
+                )
+                + 1
+            )
+            for manager in self.single_type_managers:
+                if isinstance(manager, DSALatentManager):
+                    manager.scratch_blocks = dsa_scratch_blocks_for_topk(
+                        dsa_index_topk,
+                        manager.block_size,
+                        dsa_scratch_rows,
+                    )
+                    logger.info(
+                        "DSA latent scratch: %d blocks (topk=%d rows=%d "
+                        "block_size=%d).",
+                        manager.scratch_blocks,
+                        dsa_index_topk,
+                        dsa_scratch_rows,
+                        manager.block_size,
+                    )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
