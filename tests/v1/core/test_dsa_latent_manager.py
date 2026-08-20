@@ -197,5 +197,28 @@ def test_factory_off_paths_stay_official():
         assert type(m) is FullAttentionManager
 
 
+def test_scratch_injection_formula():
+    # B2a semantics via the real helper: 16 blocks for topk 2048 / block
+    # 128 / 1 row; 32 for 2 rows (MTP1); misaligned topk fails closed.
+    from vllm.v1.core.dsa_shared_pool import dsa_scratch_blocks_for_topk
+
+    assert dsa_scratch_blocks_for_topk(2048, 128, 1) == 16
+    assert dsa_scratch_blocks_for_topk(2048, 128, 2) == 32
+    with pytest.raises(ValueError):
+        dsa_scratch_blocks_for_topk(2000, 128, 1)
+
+
+def test_injected_scratch_governs_release_start():
+    # End-to-end within the manager: injection sets scratch_blocks, which
+    # immediately becomes the release lower bound (the coordinator writes
+    # the attribute after construction; B2a mirrors that).
+    manager, pool = _manager(scratch_blocks=0)
+    _alloc(manager, "r1", 100)
+    assert manager.scratch_blocks == 0
+    manager.scratch_blocks = 16  # coordinator injection (B2a)
+    assert manager.remove_saved_decode_window_blocks("r1", 100 * 128) == 84
+    assert all(b != manager._null_block for b in manager.req_to_blocks["r1"][:16])
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
