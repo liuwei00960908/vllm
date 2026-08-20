@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    dsa_shrink_stage,
+    dsa_two_groups_enabled,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -1308,6 +1310,90 @@ class SinkFullAttentionManager(FullAttentionManager):
         self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
 
 
+class DSALatentManager(FullAttentionManager):
+    """DSA shrink-latent (stage 2): manager for the MLA latent group.
+
+    The compact-scratch prefix (the request's first scratch_blocks blocks,
+    i.e. ceil(topk/block_size) rounded up to whole bundles) stays resident
+    and is never released before request completion. Blocks past it are
+    released ONLY through an LMCache-completed ``committed_end`` receipt
+    (append-only: released slots become null_block holes, never compacted).
+
+    Provenance: vllm-dsa-two-groups@4575d8a12 single_type_kv_cache_manager.py
+    :503-818, selectively migrated — the compact-external admission/
+    allocation protocol (:524-714) and diagnostics are intentionally not
+    ported in this slice.
+    """
+
+    scratch_blocks = 0
+    """Set by the KV cache coordinator after construction (B2a); 0 keeps
+    this manager fully behavior-compatible with FullAttentionManager."""
+
+    # ---- bundle alignment helpers (fork :511-522) ----
+
+    def _blocks_per_bundle(self) -> int:
+        return getattr(self.block_pool, "blocks_per_bundle", 1)
+
+    def _round_up_to_bundle(self, num_blocks: int) -> int:
+        blocks_per_bundle = self._blocks_per_bundle()
+        return cdiv(num_blocks, blocks_per_bundle) * blocks_per_bundle
+
+    def _round_down_to_bundle(self, num_blocks: int) -> int:
+        blocks_per_bundle = self._blocks_per_bundle()
+        return num_blocks // blocks_per_bundle * blocks_per_bundle
+
+    # ---- release chain (fork :716-817, diagnostics removed) ----
+
+    def remove_skipped_blocks(
+        self, request_id: str, total_computed_tokens: int
+    ) -> None:
+        """No-op: computed/prompt progress does not prove that LMCache
+        persisted the KV. Release is exclusively gated by
+        :meth:`remove_saved_decode_window_blocks` (LMCache completed
+        receipts); freeing on progress could drop the only NPU copy before
+        the CPU copy exists (fork :716-724)."""
+        return
+
+    def remove_saved_decode_window_blocks(
+        self,
+        request_id: str,
+        committed_end: int,
+    ) -> int:
+        """Release latent blocks in [scratch, committed_end/block_size).
+
+        ``committed_end`` is an LMCache decode-window save receipt: the
+        prefix below it is persisted, so the local blocks can return to the
+        pool. Idempotent by construction: null holes are skipped, so
+        duplicate/overlapping receipts free nothing twice. Returns the
+        number of blocks freed.
+        """
+        if committed_end <= 0:
+            return 0
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return 0
+        if committed_end % self.block_size:
+            raise ValueError(
+                f"committed_end={committed_end} must be divisible by "
+                f"block_size={self.block_size}"
+            )
+        start = self._round_up_to_bundle(self.scratch_blocks)
+        end = min(committed_end // self.block_size, len(blocks))
+        if end <= start:
+            # Short prompts live entirely inside the scratch prefix; the
+            # release chain stays inert for them by design.
+            return 0
+
+        removed_blocks: list[KVCacheBlock] = []
+        for i in range(end - 1, start - 1, -1):
+            if blocks[i] == self._null_block:
+                continue
+            removed_blocks.append(blocks[i])
+            blocks[i] = self._null_block
+        self.block_pool.free_blocks(removed_blocks)
+        return len(removed_blocks)
+
+
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
     max_num_batched_tokens: int,
@@ -1328,6 +1414,21 @@ def get_manager_for_kv_cache_spec(
     Returns:
         An instance of the appropriate SingleTypeKVCacheManager subclass
     """
+    # DSA shrink-latent (replay B1b): under the two-group layout with
+    # shrink stage 2, the latent group (MLA head >= 512, e.g. GLM's 576)
+    # swaps to DSALatentManager; the indexer group (head 128) stays a plain
+    # FullAttentionManager. The branch precedes the registry lookup so
+    # every other config (including all env-off paths) is byte-identical
+    # to upstream. Provenance: fork single_type_kv_cache_manager.py
+    # :1460-1475 (adapted to the registry factory signature).
+    if (
+        dsa_two_groups_enabled()
+        and dsa_shrink_stage() == 2
+        and isinstance(kv_cache_spec, MLAAttentionSpec)
+        and kv_cache_spec.head_size >= 512
+    ):
+        return DSALatentManager(kv_cache_spec, **kwargs)
+
     manager_class = KVCacheSpecRegistry.get_manager_class(kv_cache_spec)
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
