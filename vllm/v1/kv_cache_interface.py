@@ -69,6 +69,29 @@ def dsa_shared_pool_enabled() -> bool:
     )
 
 
+def dsa_shrink_stage() -> int:
+    """DSA shrink-latent stage (replay B1/B2).
+
+    Mirrors the fork's tri-party stage contract (vllm / vllm-ascend / LMCache
+    must all agree on this value):
+      0 = off (default; identical to upstream behavior)
+      1 = compact-scratch decode read path, latent blocks NOT released
+      2 = stage 1 + the committed-receipt release chain (production)
+      3 = isolation diagnostics (remap+FA over garbage scratch, no LMCache)
+
+    Requires :func:`dsa_two_groups_enabled`: shrink operates on the latent
+    group of a two-group layout, never standalone.
+
+    Provenance: vllm-dsa-two-groups@4575d8a12 kv_cache_interface.py:37-47.
+    """
+    if not dsa_two_groups_enabled():
+        return 0
+    try:
+        return int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0") or "0")
+    except ValueError:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # KV cache quantization mode
 # ---------------------------------------------------------------------------
@@ -917,6 +940,16 @@ class KVCacheConfig:
     # group is backed by its OWN block pool (unbundle-only + per-group mode).
     # None for every other layout (single pool / official behavior).
     num_blocks_per_group: list[int] | None = None
+
+    # DSA shrink replay (B1/B2): inputs for compact-scratch sizing on the
+    # latent group. dsa_index_topk comes from hf_text_config.index_topk and
+    # must be an integer multiple of the block size (checked by
+    # dsa_scratch_blocks_for_topk); dsa_num_speculative_tokens comes from the
+    # vllm config (0 in the MTP-off slice; scratch rows = spec + 1).
+    # None / 0 keep upstream behavior.
+    # Provenance: vllm-dsa-two-groups@4575d8a12 kv_cache_interface.py:540-545.
+    dsa_index_topk: int | None = None
+    dsa_num_speculative_tokens: int = 0
 
     @property
     def has_mamba_layers(self) -> bool:
