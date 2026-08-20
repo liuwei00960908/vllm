@@ -104,6 +104,20 @@ class KVConnectorModelRunnerMixin:
             )
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
+            # DSA shrink replay (B1c): collect completed decode-window save
+            # receipts (req_id -> committed token end) for the scheduler to
+            # release latent blocks. Duck-typed: official connectors without
+            # this method keep the empty default, leaving the release chain
+            # inert. Timing is inherently correct here: this finally block
+            # runs after wait_for_save(), so only persisted windows can be
+            # reported. Provenance: fork kv_connector_model_runner_mixin.py
+            # :136-142.
+            get_completed_saves = getattr(
+                kv_connector, "get_completed_decode_window_saves", None
+            )
+            if callable(get_completed_saves):
+                output.completed_decode_window_saves = get_completed_saves()
+
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
             output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()

@@ -90,6 +90,7 @@ class KVOutputAggregator:
         aggregated_kv_connector_worker_meta = None
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
+        merged_window_saves: dict[str, int] = {}
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -153,6 +154,18 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
 
+            # DSA shrink replay (B1c): merge decode-window save receipts
+            # per-request with max — the latest committed frontier across
+            # workers wins. With save_only_first_rank only rank 0 reports,
+            # so this is mostly defensive (output_rank mismatch must not
+            # drop receipts). Provenance: fork utils.py:158-163.
+            for req_id, window_end in (
+                kv_output.completed_decode_window_saves or {}
+            ).items():
+                merged_window_saves[req_id] = max(
+                    merged_window_saves.get(req_id, 0), window_end
+                )
+
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
 
@@ -165,6 +178,7 @@ class KVOutputAggregator:
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,
             invalid_block_ids=invalid_block_ids,
             expected_finished_count=self._expected_finished_count,
+            completed_decode_window_saves=merged_window_saves,
         )
 
         return output

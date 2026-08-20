@@ -341,6 +341,20 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             agg_block_ids |= c.get_block_ids_with_load_errors()
         return agg_block_ids
 
+    def get_completed_decode_window_saves(self) -> dict[str, int]:
+        """DSA shrink replay (B1c): aggregate sub-connector receipts per
+        request with max (latest committed frontier wins). Connectors
+        without the method contribute nothing. Provenance: fork
+        multi_connector.py:313-321."""
+        agg: dict[str, int] = {}
+        for c in self._connectors:
+            get_saves = getattr(c, "get_completed_decode_window_saves", None)
+            if not callable(get_saves):
+                continue
+            for req_id, window_end in (get_saves() or {}).items():
+                agg[req_id] = max(agg.get(req_id, 0), window_end)
+        return agg
+
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Set xPU-specific copy ops for all sub-connectors."""
         for c in self._connectors:

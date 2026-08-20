@@ -2265,6 +2265,31 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
 
+        # DSA shrink replay (B1c): consume completed decode-window save
+        # receipts — each (req_id, committed_end) proves the prefix below
+        # committed_end is persisted in the external cache, so the local
+        # latent blocks can be released (DSALatentManager releases only
+        # above the scratch prefix; short requests stay inert). Receipts
+        # for finished requests are skipped: free() already reclaimed
+        # everything. Provenance: fork sched/scheduler.py:2405-2467
+        # (diagnostics removed).
+        for req_id, committed_end in (
+            kv_connector_output.completed_decode_window_saves or {}
+        ).items():
+            if req_id not in self.requests:
+                continue
+            freed = self.kv_cache_manager.remove_saved_decode_window_blocks(
+                req_id, committed_end
+            )
+            if freed:
+                logger.info(
+                    "[DECODE_WINDOW_RELEASE] req=%s committed_end=%d "
+                    "freed_latent_blocks=%d",
+                    req_id,
+                    committed_end,
+                    freed,
+                )
+
     def _update_requests_with_invalid_blocks(
         self,
         requests: Iterable[Request],

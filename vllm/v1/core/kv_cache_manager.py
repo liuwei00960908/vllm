@@ -507,6 +507,17 @@ class KVCacheManager:
         """
         self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def remove_saved_decode_window_blocks(
+        self, request_id: str, committed_end: int
+    ) -> int:
+        """DSA shrink replay (B1c): release latent blocks below an LMCache
+        decode-window committed receipt. Returns the number of blocks
+        freed (0 when the release chain is inert).
+        Provenance: fork kv_cache_manager.py:419-427."""
+        return self.coordinator.remove_saved_decode_window_blocks(
+            request_id, committed_end
+        )
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 
