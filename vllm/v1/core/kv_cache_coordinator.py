@@ -646,6 +646,22 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def remove_saved_decode_window_blocks(
+        self, request_id: str, committed_end: int
+    ) -> int:
+        """DSA shrink replay (B1c): forward committed receipts to the
+        DSALatentManager (the only manager that implements the release);
+        other managers contribute 0. Provenance: fork
+        kv_cache_coordinator.py:646-657."""
+        freed = 0
+        for manager in self.single_type_managers:
+            release = getattr(
+                manager, "remove_saved_decode_window_blocks", None
+            )
+            if callable(release):
+                freed += release(request_id, committed_end)
+        return freed
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.

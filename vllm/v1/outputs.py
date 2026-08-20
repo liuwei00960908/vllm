@@ -209,6 +209,15 @@ class KVConnectorOutput:
     # It captures a static setup info and should almost always remain constant
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
+    # DSA shrink replay (B1c): req_id -> token end offset for decode windows
+    # that were saved to the external KV connector and can be evicted from
+    # the local latent KV cache. Produced by the worker-side connector
+    # (duck-typed get_completed_decode_window_saves), aggregated per-request
+    # with max across workers, and consumed by the scheduler to release
+    # latent blocks through DSALatentManager. Empty dict = release chain
+    # inert (official connectors never populate it).
+    # Provenance: vllm-dsa-two-groups@4575d8a12 outputs.py:155/:195-215.
+    completed_decode_window_saves: dict[str, int] = field(default_factory=dict)
 
     def is_empty(self):
         return (
@@ -218,6 +227,7 @@ class KVConnectorOutput:
             and not self.kv_cache_events
             and not self.invalid_block_ids
             and not self.kv_connector_worker_meta
+            and not self.completed_decode_window_saves
         )
 
 
