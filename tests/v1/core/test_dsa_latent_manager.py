@@ -14,7 +14,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from vllm.v1.core.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.core.single_type_kv_cache_manager import (
     DSALatentManager,
     FullAttentionManager,
@@ -81,7 +81,13 @@ def _manager(block_size: int = 128, scratch_blocks: int = 16,
         head_size=576,
         dtype=torch.bfloat16,
     )
-    manager = DSALatentManager(spec, block_pool=pool, kv_cache_group_id=0)
+    manager = DSALatentManager(
+        spec,
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
     manager.scratch_blocks = scratch_blocks
     return manager, pool
 
@@ -162,7 +168,8 @@ def test_factory_selects_dsa_latent_manager():
     with _dsa_env("2"):
         manager = get_manager_for_kv_cache_spec(
             spec, max_num_batched_tokens=4096, max_model_len=10000,
-            block_pool=_FakeBlockPool(), kv_cache_group_id=0,
+            block_pool=_FakeBlockPool(), enable_caching=False,
+            kv_cache_group_id=0, scheduler_block_size=128,
         )
         assert isinstance(manager, DSALatentManager)
         assert isinstance(manager, FullAttentionManager)
@@ -180,19 +187,22 @@ def test_factory_off_paths_stay_official():
     with _dsa_env("0"):
         m = get_manager_for_kv_cache_spec(
             spec, max_num_batched_tokens=4096, max_model_len=10000,
-            block_pool=_FakeBlockPool(), kv_cache_group_id=0,
+            block_pool=_FakeBlockPool(), enable_caching=False,
+            kv_cache_group_id=0, scheduler_block_size=128,
         )
         assert type(m) is FullAttentionManager
     with _dsa_env("1"):  # stage 1: read path only, no release manager swap
         m = get_manager_for_kv_cache_spec(
             spec, max_num_batched_tokens=4096, max_model_len=10000,
-            block_pool=_FakeBlockPool(), kv_cache_group_id=0,
+            block_pool=_FakeBlockPool(), enable_caching=False,
+            kv_cache_group_id=0, scheduler_block_size=128,
         )
         assert type(m) is FullAttentionManager
     with _dsa_env("2"):  # indexer head stays plain
         m = get_manager_for_kv_cache_spec(
             indexer_spec, max_num_batched_tokens=4096, max_model_len=10000,
-            block_pool=_FakeBlockPool(), kv_cache_group_id=1,
+            block_pool=_FakeBlockPool(), enable_caching=False,
+            kv_cache_group_id=1, scheduler_block_size=128,
         )
         assert type(m) is FullAttentionManager
 
