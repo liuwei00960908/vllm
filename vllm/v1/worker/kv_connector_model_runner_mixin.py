@@ -61,15 +61,34 @@ class KVConnectorModelRunnerMixin:
         )
 
     @staticmethod
-    def finalize_kv_connector() -> None:
+    def finalize_kv_connector() -> dict[str, int]:
         """Finalize the KV connector: wait_for_save and clear metadata.
 
         Call after draft model forward when defer_finalize=True was used.
+
+        Returns the completed decode-window save receipts (req_id ->
+        committed token end) drained after wait_for_save, so the deferred
+        (spec-decode) path can report windows persisted by both the target
+        and draft forwards. Official connectors without the duck-typed
+        method yield an empty dict.
+
+        Provenance: fork kv_connector_model_runner_mixin.py:81-101.
         """
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
-            kv_connector.wait_for_save()
-            kv_connector.clear_connector_metadata()
+            try:
+                kv_connector.wait_for_save()
+                get_completed_saves = getattr(
+                    kv_connector, "get_completed_decode_window_saves", None
+                )
+                return (
+                    get_completed_saves()
+                    if get_completed_saves is not None
+                    else {}
+                )
+            finally:
+                kv_connector.clear_connector_metadata()
+        return {}
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
