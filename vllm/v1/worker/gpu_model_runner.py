@@ -4558,7 +4558,24 @@ class GPUModelRunner(
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
         if spec_config is not None:
-            self.finalize_kv_connector()
+            completed_decode_window_saves = self.finalize_kv_connector()
+            # The finally-block collection ran before the draft forward's
+            # saves completed (defer path skips wait_for_save), so it may
+            # miss windows. Merge the receipts drained here - after
+            # wait_for_save - keeping the most advanced committed end per
+            # request. Provenance: fork gpu_model_runner.py:4043-4059.
+            if completed_decode_window_saves:
+                if self.kv_connector_output is None:
+                    self.kv_connector_output = KVConnectorOutput()
+                for req_id, window_end in completed_decode_window_saves.items():
+                    self.kv_connector_output.completed_decode_window_saves[
+                        req_id
+                    ] = max(
+                        self.kv_connector_output.completed_decode_window_saves.get(
+                            req_id, 0
+                        ),
+                        window_end,
+                    )
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
