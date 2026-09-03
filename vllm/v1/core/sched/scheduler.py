@@ -733,9 +733,11 @@ class Scheduler(SchedulerInterface):
                 # extra block gets allocated which
                 # creates a mismatch between the number
                 # of local and remote blocks.
-                limit_lookahead_tokens = load_kv_async and self.use_eagle
+                # Provenance: vllm-dsa-two-groups scheduler.py:816-823. The
+                # first prefill (num_computed_tokens == 0) allocates no
+                # lookahead; the next step adds it once compute has begun.
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
