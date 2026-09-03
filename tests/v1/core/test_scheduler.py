@@ -4552,3 +4552,51 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+def test_first_prefill_suppresses_lookahead_blocks():
+    """PD + spec decoding: the first prefill allocates no lookahead blocks.
+
+    Provenance: vllm-dsa-two-groups scheduler.py:816-823. When the P-side
+    first prefill allocates speculative lookahead, D re-allocates from the
+    transferred prefix by token count and the block counts diverge (the
+    "extra block ... mismatch between the number of local and remote
+    blocks" regression).
+    """
+    scheduler = create_scheduler(num_speculative_tokens=1)
+    requests = create_requests(num_requests=1, num_tokens=128)
+    for req in requests:
+        scheduler.add_request(req)
+
+    allocate_slots = Mock(wraps=scheduler.kv_cache_manager.allocate_slots)
+    scheduler.kv_cache_manager.allocate_slots = allocate_slots
+
+    scheduler.schedule()
+
+    assert allocate_slots.call_count == 1
+    assert allocate_slots.call_args.kwargs["num_lookahead_tokens"] == 0
+
+
+def test_resumed_prefill_keeps_lookahead_blocks():
+    """A request with compute already done keeps its lookahead allocation.
+
+    This covers the D-side async-load / resumed chunked-prefill shape
+    (num_computed_tokens > 0), which must NOT be suppressed.
+    """
+    scheduler = create_scheduler(num_speculative_tokens=1)
+    requests = create_requests(num_requests=1, num_tokens=128)
+    for req in requests:
+        scheduler.add_request(req)
+
+    req = requests[0]
+    req.num_computed_tokens = 64
+    allocate_slots = Mock(wraps=scheduler.kv_cache_manager.allocate_slots)
+    scheduler.kv_cache_manager.allocate_slots = allocate_slots
+
+    scheduler.schedule()
+
+    assert allocate_slots.call_count == 1
+    assert (
+        allocate_slots.call_args.kwargs["num_lookahead_tokens"]
+        == scheduler.num_lookahead_tokens
+    )
